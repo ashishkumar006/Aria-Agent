@@ -1,0 +1,14 @@
+# V8 agent → provider pinning. Map a skill name (the `agent` field on
+# /v1/chat) to a preferred provider name. Callers can still override
+# per-call by sending provider=... explicitly.
+#
+# NOTE: As of 2026-08-14 this file is intentionally EMPTY. We want the
+# gateway to route every agent call freely through its natural failover
+# ladder (LLM_ORDER / router pool / MODEL_ROUTES / auto_route) instead of
+# forcing everything to Gemini. The gateway's router picks the best
+# available backend per request.
+#
+# To pin a skill again later, add a `skill: provider` line, e.g.:
+#   planner: gemini
+# The pin is a preference, not a hard binding — failover still happens if
+# the preferred provider is unavailable.

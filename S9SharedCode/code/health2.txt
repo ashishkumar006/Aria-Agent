@@ -1,0 +1,4 @@
+{
+    "agent":  "ready",
+    "gateway_up":  true
+}

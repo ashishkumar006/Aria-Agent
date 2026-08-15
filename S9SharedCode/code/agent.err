@@ -1,0 +1,180 @@
+INFO:     Started server process [7152]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8500 (Press CTRL+C to quit)
+[08/15/26 14:52:08] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 14:52:09] INFO     HTTP Request: GET                  _client.py:1025
+                             https://api.github.com/user/repos                 
+                             "HTTP/1.1 200 OK"                                 
+                    INFO     Processing request of type           server.py:727
+                             ListToolsRequest                                  
+[08/15/26 15:01:58] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 15:02:00] INFO     HTTP Request: GET                  _client.py:1025
+                             https://gmail.googleapis.com/gmail                
+                             /v1/users/me/messages?q=is%3Ainbox                
+                             &maxResults=5 "HTTP/1.1 200 OK"                   
+                    INFO     Processing request of type           server.py:727
+                             ListToolsRequest                                  
+[08/15/26 15:02:04] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 15:02:05] INFO     HTTP Request: GET                  _client.py:1025
+                             https://gmail.googleapis.com/gmail                
+                             /v1/users/me/messages/1a004b2b9249                
+                             87fe?format=full "HTTP/1.1 200 OK"                
+[08/15/26 15:02:09] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 15:02:10] INFO     HTTP Request: GET                  _client.py:1025
+                             https://gmail.googleapis.com/gmail                
+                             /v1/users/me/messages/1a00200bb97f                
+                             d91c?format=full "HTTP/1.1 200 OK"                
+[08/15/26 15:02:14] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 15:02:15] INFO     HTTP Request: GET                  _client.py:1025
+                             https://gmail.googleapis.com/gmail                
+                             /v1/users/me/messages/19ffc3425be8                
+                             2c70?format=full "HTTP/1.1 200 OK"                
+[08/15/26 15:02:19] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 15:02:20] INFO     HTTP Request: GET                  _client.py:1025
+                             https://gmail.googleapis.com/gmail                
+                             /v1/users/me/messages/19fe76408e5d                
+                             ca7f?format=full "HTTP/1.1 200 OK"                
+[08/15/26 15:02:24] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 15:02:25] INFO     HTTP Request: GET                  _client.py:1025
+                             https://gmail.googleapis.com/gmail                
+                             /v1/users/me/messages/19fc92d13424                
+                             5ecd?format=full "HTTP/1.1 200 OK"                
+[08/15/26 17:31:10] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[08/15/26 17:31:16] INFO     response:                               lib.rs:444
+                             https://en.wikipedia.org/w/api.php?acti           
+                             on=opensearch&profile=fuzzy&limit=1&sea           
+                             rch=benefits%20of%20vector%20databases%           
+                             20for%20RAG 200                                   
+[08/15/26 17:31:18] INFO     response:                               lib.rs:444
+                             https://grokipedia.com/api/typeahead?qu           
+                             ery=benefits+of+vector+databases+for+RA           
+                             G&limit=1 200                                     
+[08/15/26 17:31:19] INFO     response:                               lib.rs:444
+                             https://search.brave.com/search?q=benef           
+                             its+of+vector+databases+for+RAG&source=           
+                             web 200                                           
+                    INFO     Processing request of type           server.py:727
+                             ListToolsRequest                                  
+[08/15/26 17:31:23] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[INIT]...[08/15/26 17:31:33] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[INIT]...[08/15/26 17:31:38] INFO     Processing request of type           server.py:727
+                             CallToolRequest                                   
+[INIT]...Exception ignored in: <function _ProactorBasePipeTransport.__del__ at 0x000001CEB66EE520>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 116, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function BaseSubprocessTransport.__del__ at 0x000001CEB66ECCC0>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\base_subprocess.py", line 125, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\base_subprocess.py", line 70, in __repr__
+    info.append(f'stdin={stdin.pipe}')
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function _ProactorBasePipeTransport.__del__ at 0x000001CEB66EE520>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 116, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function _ProactorBasePipeTransport.__del__ at 0x000001CEB66EE520>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 116, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function BaseSubprocessTransport.__del__ at 0x000001CEB66ECCC0>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\base_subprocess.py", line 125, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\base_subprocess.py", line 70, in __repr__
+    info.append(f'stdin={stdin.pipe}')
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function _ProactorBasePipeTransport.__del__ at 0x000001CEB66EE520>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 116, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function _ProactorBasePipeTransport.__del__ at 0x000001CEB66EE520>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 116, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function BaseSubprocessTransport.__del__ at 0x000001CEB66ECCC0>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\base_subprocess.py", line 125, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\base_subprocess.py", line 70, in __repr__
+    info.append(f'stdin={stdin.pipe}')
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe
+Exception ignored in: <function _ProactorBasePipeTransport.__del__ at 0x000001CEB66EE520>
+Traceback (most recent call last):
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 116, in __del__
+    _warn(f"unclosed transport {self!r}", ResourceWarning, source=self)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\proactor_events.py", line 80, in __repr__
+    info.append(f'fd={self._sock.fileno()}')
+                      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\AISHWARYA\AppData\Roaming\uv\python\cpython-3.11.13-windows-x86_64-none\Lib\asyncio\windows_utils.py", line 102, in fileno
+    raise ValueError("I/O operation on closed pipe")
+ValueError: I/O operation on closed pipe

@@ -1,0 +1,41 @@
+# ── Secrets / environment ────────────────────────────────────────────────
+# NEVER commit real credentials. Keep .env.example (no secrets) tracked.
+.env
+.env.*
+!.env.example
+
+# ── Large model binaries (download separately, not in git) ───────────────
+# Kokoro TTS weights (~350 MB) — fetch from the official release.
+S9SharedCode/code/models/*.onnx
+S9SharedCode/code/models/*.bin
+S9SharedCode/code/models/
+
+# ── Runtime state / generated artifacts ──────────────────────────────────
+state/
+sandbox/
+usage.json
+*.faiss
+memory.json
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.pkl
+
+# ── OS / editor ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# ── Logs / temp ──────────────────────────────────────────────────────────
+*.log
+tmp/
+.cache/
+
+# ── Archive (debug scripts, test dumps — not part of the deliverable) ─────
+archive/
