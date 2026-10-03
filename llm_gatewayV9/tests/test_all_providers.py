@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Per-provider matrix test for llm_gatewayV2.
+"""Per-provider matrix test for llm_gatewayV9.
 
-Tests A (basic), B (tools), C (structured), D (caching), E (reasoning)
-against each of the 7 providers. Prints a matrix at the end.
+Manual live script (run: `uv run python tests/test_all_providers.py`) —
+functions are deliberately named check_* so pytest does NOT collect them
+(they need a live gateway + spend real quota).
 
-Assumes V2 is running at http://localhost:8100 (env LLM_GATEWAY_V2_URL to override).
+Checks A (basic), B (tools), C (structured), D (caching), E (reasoning)
+against each of the 9 providers. Prints a matrix at the end.
+
+Assumes V9 is running at http://localhost:8109 (env LLM_GATEWAY_V9_URL to override).
 """
 from __future__ import annotations
 import os, sys, json, time, httpx
 
-URL = os.getenv("LLM_GATEWAY_V2_URL", "http://localhost:8100")
-PROVIDERS = ["o", "g", "n", "gr", "c", "or", "gh"]
-PROVIDER_NAMES = {"o":"ollama","g":"gemini","n":"nvidia","gr":"groq","c":"cerebras","or":"openrouter","gh":"github"}
+URL = os.getenv("LLM_GATEWAY_V9_URL", os.getenv("LLM_GATEWAY_V2_URL", "http://localhost:8109"))
+PROVIDERS = ["o", "g", "g35l", "n", "gr", "c", "or", "gh", "k"]
+PROVIDER_NAMES = {"o":"ollama","g":"gemini","g35l":"gemini35lite","n":"nvidia","gr":"groq","c":"cerebras","or":"openrouter","gh":"github","k":"kilo"}
 
 ADD_TOOL = {
     "name": "add",
@@ -54,7 +58,7 @@ def _budget(p, default):
     return 1024 if p == "o" else default
 
 
-def test_basic(p):
+def check_basic(p):
     code, d = post({"prompt": "Say hi in 3 words.", "provider": p, "max_tokens": _budget(p, 256)},
                    timeout=120 if p != "o" else 180)
     if code == 200 and d.get("text", "").strip():
@@ -62,7 +66,7 @@ def test_basic(p):
     return "FAIL", f"code={code} {str(d)[:80]}"
 
 
-def test_tools(p):
+def check_tools(p):
     msgs = [{"role": "user", "content": "What is 7 plus 5? Use the add tool."}]
     code, d = post({"messages": msgs, "provider": p, "tools": [ADD_TOOL], "tool_choice": "auto",
                     "max_tokens": _budget(p, 512), "temperature": 0}, timeout=180)
@@ -91,7 +95,7 @@ def test_tools(p):
     return "PARTIAL", f"final='{final[:60]}'"
 
 
-def test_structured(p):
+def check_structured(p):
     body = {
         "prompt": "Paris is in which country? Respond with JSON {city,country}.",
         "provider": p,
@@ -114,7 +118,7 @@ def test_structured(p):
     return "PARTIAL", f"parsed={parsed} text='{(d.get('text') or '')[:80]}'"
 
 
-def test_caching(p):
+def check_caching(p):
     if p == "o":
         return "SKIP", "ollama: local, no upstream cache"
     long_sys = ("You are a meticulous geography tutor. Always answer concisely. " * 200).strip()
@@ -140,7 +144,7 @@ def test_caching(p):
     return "n/a", f"no cache signal cr1={cr1} cr2={cr2} (provider may not surface)"
 
 
-def test_reasoning(p):
+def check_reasoning(p):
     body = {
         "prompt": "If a train leaves Boston at 3pm at 60mph and another leaves NYC (200mi south) at 4pm at 80mph headed north, when do they meet? Be brief.",
         "provider": p,
@@ -161,9 +165,9 @@ def run_provider(p):
     name = PROVIDER_NAMES[p]
     row = {}
     details = {}
-    for col, fn in [("basic", test_basic), ("tools", test_tools),
-                    ("struct", test_structured), ("cache", test_caching),
-                    ("reasoning", test_reasoning)]:
+    for col, fn in [("basic", check_basic), ("tools", check_tools),
+                    ("struct", check_structured), ("cache", check_caching),
+                    ("reasoning", check_reasoning)]:
         try:
             status, info = fn(p)
         except Exception as e:

@@ -50,12 +50,18 @@ def _find_calc_button(elements: list[dict], ch: str) -> int | None:
     equalButton, clearButton, …) are locale-stable so we prefer those.
     """
     # Map char → candidate substrings to look for in label/name/id.
+    # NOTE: keep these TIGHT. "add"/"subtract" are deliberately excluded from
+    # the + / - entries because the Calculator's memory row has "Memory add"
+    # (idx ~11) and "Memory subtract" (idx ~12) which contain those substrings
+    # and would match BEFORE the real "Plus"/"Minus" operator buttons (idx
+    # ~40/~39). "plus"/"minus" match both the operator label and its stable
+    # id (plusButton/minusButton), so the looser terms are unnecessary.
     want = {
         "0": ("zero", "num0"), "1": ("one", "num1"), "2": ("two", "num2"),
         "3": ("three", "num3"), "4": ("four", "num4"), "5": ("five", "num5"),
         "6": ("six", "num6"), "7": ("seven", "num7"), "8": ("eight", "num8"),
         "9": ("nine", "num9"),
-        "+": ("plus", "add"), "-": ("minus", "subtract"),
+        "+": ("plus",), "-": ("minus",),
         "*": ("multiply", "times"), "/": ("divide", "divide by"),
         "=": ("equal",), "clear": ("clear",),
     }.get(ch, ())
@@ -63,11 +69,41 @@ def _find_calc_button(elements: list[dict], ch: str) -> int | None:
         label = (e.get("label") or "").lower()
         name = (e.get("name") or "").lower()
         eid = (e.get("id") or e.get("automation_id") or "").lower()
+        # Skip the Memory-row buttons (Memory add/subtract/store/recall): they
+        # share substrings with the operator buttons and sit earlier in the
+        # tree, so matching them first would drive the wrong button.
+        if "memory" in label or "memory" in name or "memory" in eid:
+            continue
         blob = f"{label} {name} {eid}"
         for w in want:
             if w in blob:
                 return e.get("element_index")
     return None
+
+
+def resolve_index(elements: list[dict], action: dict) -> int | None:
+    """Re-resolve an element_index from a fresh AX tree.
+
+    The Calculator's AX tree can reflow between plan time and dispatch time,
+    invalidating indices that were resolved from an earlier scan. Plan actions
+    carry a ``match`` field (the character/role used to find the button); this
+    function re-finds the button in the *current* elements so a multi-click
+    plan never hits a stale index. Returns None only if the button truly isn't
+    present in the fresh tree.
+    """
+    match = action.get("match")
+    if match is None:
+        # No match key — fall back to the plan-time index (non-deterministic
+        # actions shouldn't normally reach here).
+        return action.get("element_index")
+    if match in ("document",):
+        # Notepad-style: resolve by role.
+        for e in elements:
+            if (e.get("role") or "").lower() in ("document", "edit", "textbox"):
+                return e.get("element_index")
+        return action.get("element_index")
+    # Calculator-style: resolve by character.
+    return _find_calc_button(elements, match)
 
 
 def _calc_plan(expression: str, elements: list[dict] | None = None) -> DeterministicPlan:
@@ -89,14 +125,16 @@ def _calc_plan(expression: str, elements: list[dict] | None = None) -> Determini
     clear_idx = idx("clear")
     actions = []
     if clear_idx is not None:
-        actions.append({"type": "click", "element_index": clear_idx})
+        # Carry the "match" key so the engine can re-resolve this index from a
+        # fresh AX tree at dispatch time (the tree reflows after each click).
+        actions.append({"type": "click", "element_index": clear_idx, "match": "clear"})
     for ch in expr:
         i = idx(ch)
         if i is not None:
-            actions.append({"type": "click", "element_index": i})
+            actions.append({"type": "click", "element_index": i, "match": ch})
     eq = idx("=")
     if eq is not None and not expr.endswith("="):
-        actions.append({"type": "click", "element_index": eq})
+        actions.append({"type": "click", "element_index": eq, "match": "="})
     return DeterministicPlan(
         app="calculator",
         description=f"Click buttons for '{expr}' in Calculator",
@@ -127,7 +165,7 @@ def _notepad_write_plan(text: str, filename: str,
         app="notepad",
         description=f"Write '{text[:30]}...' and save as {filename}",
         actions=[
-            {"type": "click", "element_index": doc_idx},  # focus document
+            {"type": "click", "element_index": doc_idx, "match": "document"},  # focus document
             {"type": "type", "value": text},
             {"type": "press_key", "value": "s", "modifiers": ["ctrl"]},
         ],

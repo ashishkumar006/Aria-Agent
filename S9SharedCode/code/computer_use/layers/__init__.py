@@ -16,7 +16,7 @@ from .sequencing import scan_act_verify, TurnResult
 from .recovery import RecoveryPolicy
 from .vision import VisionFallback, draw_set_of_marks
 from .extract import try_extract, read_document_text, read_clipboard, read_field_value
-from .deterministic import try_deterministic, DeterministicPlan
+from .deterministic import try_deterministic, DeterministicPlan, resolve_index
 
 __all__ = [
     "decompose_goal", "Subgoal",
@@ -25,5 +25,5 @@ __all__ = [
     "RecoveryPolicy",
     "VisionFallback", "draw_set_of_marks",
     "try_extract", "read_document_text", "read_clipboard", "read_field_value",
-    "try_deterministic", "DeterministicPlan",
+    "try_deterministic", "DeterministicPlan", "resolve_index",
 ]

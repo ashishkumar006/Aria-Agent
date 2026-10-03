@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway V9 · Connections</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #12161f; --panel-2: #171c28;
+    --border: #232a38; --border-soft: #1b2130;
+    --text: #e7eaf1; --muted: #8b93a5; --faint: #5b6376;
+    --accent: #7c6cf0; --accent-dim: rgba(124,108,240,.14);
+    --green: #3fb950; --green-dim: rgba(63,185,80,.13);
+    --red: #f85149; --red-dim: rgba(248,81,73,.12);
+    --blue: #58a6ff; --blue-dim: rgba(88,166,255,.13);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); margin: 0; }
+  a { color: var(--blue); }
+</style>
+<link rel="stylesheet" href="/static/console-theme.css">
+</head>
+<body>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item active"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">Connections</div><div class="spacer"></div><button class="ghost palette-trigger" onclick="togglePalette()" title="Commands (Ctrl/⌘+K)">⌘K</button><span class="badge" id="port-badge"></span></div>
+<main>
+  <div class="status-strip">
+    <span class="badge" id="conn-ess">—</span>
+    <span class="badge" id="conn-adv">—</span>
+    <span class="badge" id="conn-keys">—</span>
+    <button onclick="testAllConn()">Test all</button>
+    <button class="ghost" onclick="loadConnections()">Refresh</button>
+  </div>
+  <div id="conn-out" class="hint" style="margin-bottom:4px;"></div>
+
+  <h2 class="sec">Essential for agents</h2>
+  <p class="hint" style="margin:0 0 6px;">Everyday messaging + services the agent uses most. Wire these first.</p>
+  <div id="conn-essential"></div>
+
+  <h2 class="sec">Advanced</h2>
+  <p class="hint" style="margin:0 0 6px;">Specialist channels — regional apps, telco paths, enterprise setups. Add only what you use.</p>
+  <div id="conn-advanced"></div>
+</main>
+<footer>LLM Gateway V9 · operator console · values never leave the server<br>API: <a href="/v1/channels">channels</a> · <a href="/v1/integrations">integrations</a> · <a href="/v1/config/keys">key status</a></footer>
+</div>
+<script>
+const SERVICES = [
+ {group: 'ess', name: 'telegram', kind: 'channel', blurb: 'Bot messaging — cheapest alerts, answers and approvals.',
+  keys: [['TELEGRAM_BOT_TOKEN', '@BotFather → /newbot']],
+  steps: ['Open Telegram, message <b>@BotFather</b> → <b>/newbot</b>, pick a name + username, copy the token.', 'Message <b>@userinfobot</b> for your numeric chat id (used as <b>to</b>).'],
+  use: 'Send via <b>POST /v1/channels/telegram/send</b> with your chat id. Zero-delivery probe: <b>to “0”</b> → expect “chat not found”.'},
+ {group: 'ess', name: 'gmail', kind: 'channel + integration', blurb: 'Passwordless email send + read over OAuth (no SMTP).',
+  keys: [['GMAIL_CLIENT_ID', 'Google Cloud → OAuth Desktop client'], ['GMAIL_CLIENT_SECRET', 'client secret (token minted by setup)']],
+  steps: ['Google Cloud → OAuth client (Desktop) → put the id + secret below, Save, restart gateway.', 'Run once: <b>uv run python gmail_oauth_setup.py</b> in <b>llm_gatewayV9/</b> — writes <b>GMAIL_TOKEN</b> + refresh automatically.'],
+  use: 'Read via <b>POST /v1/integrations/gmail/query</b>. Hourly expiry renews with the MCP <b>gmail_refresh_token()</b> tool.'},
+ {group: 'ess', name: 'github', kind: 'integration', blurb: 'Repos, issues and code search for the coder skill.',
+  keys: [['GITHUB_TOKEN', 'PAT with repo + read:org']],
+  steps: ['github.com → Settings → Developer settings → <b>Personal access tokens</b> (repo, read:org) → copy.'],
+  use: 'Query via <b>POST /v1/integrations/github/query</b> — try <b>list_repos</b> (read-only).'},
+ {group: 'ess', name: 'slack', kind: 'channel', blurb: 'Workplace posts, threads and approvals where teams live.',
+  keys: [['SLACK_BOT_TOKEN', 'bot token xoxb-… (chat:write)'], ['SLACK_SIGNING_SECRET', 'Events API secret (inbound)'], ['SLACK_REFRESH_TOKEN', 'rotation only: refresh token (12h tokens)'], ['SLACK_CLIENT_ID', 'rotation only: app client id'], ['SLACK_CLIENT_SECRET', 'rotation only: app client secret']],
+  steps: ['<b>api.slack.com/apps</b> → Create New App → From scratch → pick the workspace.', 'OAuth &amp; Permissions → Bot Token Scopes → add <b>chat:write</b> (+ <b>channels:read</b>, <b>users:read</b> recommended) → <b>Install to Workspace</b> → Allow → copy the token.', 'Adding a scope later needs a <b>reinstall</b> (else missing_scope) — reinstall mints a NEW token pair, so re-paste everything.', 'Rotation ON (12h tokens)? Also paste refresh token + client id + secret — the gateway auto-refreshes on token_expired, or call the <b>slack_refresh_token</b> tool. For inbound: signing secret lives under Basic Information; point Event Subscriptions at <b>POST /v1/hooks/slack</b>.'],
+  use: 'Invite <b>@bot</b> into the channel first; send with <b>to</b> = channel id. Sources: docs.slack.dev quickstart + tokens + token-rotation.'},
+ {group: 'ess', name: 'notion', kind: 'integration', blurb: 'Pages, databases and docs the agent can read and append.',
+  keys: [['NOTION_TOKEN', 'internal integration secret_…']],
+  steps: ['<b>notion.so/my-integrations</b> → New integration → copy the <b>secret_…</b> token → share pages with it.'],
+  use: 'Query via <b>POST /v1/integrations/notion/query</b> — try <b>list_pages</b>.'},
+ {group: 'ess', name: 'calendar', kind: 'integration', blurb: 'Google Calendar event creation (OAuth, auto-refreshing).',
+  keys: [['GOOGLE_CALENDAR_TOKEN', 'access token (~1h, minted by setup)'], ['GOOGLE_CALENDAR_REFRESH_TOKEN', 'long-lived refresh token'], ['GOOGLE_CALENDAR_CLIENT_ID', 'OAuth Desktop client id'], ['GOOGLE_CALENDAR_CLIENT_SECRET', 'OAuth client secret']],
+  steps: ['Google Cloud → OAuth client (Desktop) → enable the Calendar API → paste the client id + secret below, Save, restart gateway.', 'Run once: <b>uv run python calendar_oauth_setup.py</b> in <b>llm_gatewayV9/</b> — browser consent writes TOKEN + REFRESH automatically.', 'Hourly expiry auto-renews on 401; or call the <b>calendar_refresh_token</b> tool.'],
+  use: 'Create via <b>POST /v1/integrations/calendar/create</b>.'},
+ {group: 'ess', name: 'websearch', kind: 'integration', blurb: 'Web research for the researcher skill (Tavily primary, DDG fallback).',
+  keys: [['TAVILY_API_KEY', 'tavily.com (optional — DDG works keyless)']],
+  steps: ['Optional: <b>tavily.com</b> → API key. Without it the gateway uses keyless DuckDuckGo. Monthly cap 950 enforced gateway-side.'],
+  use: 'Search via <b>POST /v1/integrations/websearch/query</b>.'},
+ {group: 'ess', name: 'webhook', kind: 'channel', blurb: 'Catch-all HTTP in/out for scripts, CI and IoT.',
+  keys: [['WEBHOOK_SECRET', 'optional HMAC secret'], ['WEBHOOK_OUT_URL', 'optional outbound URL']],
+  steps: ['Nothing required. Optional: set a shared <b>WEBHOOK_SECRET</b> (checked against X-Signature headers) and <b>WEBHOOK_OUT_URL</b> for outbound delivery.'],
+  use: 'POST any JSON to <b>/v1/hooks/webhook</b> → normalized envelope, trust <b>untrusted</b> without HMAC.'},
+ {group: 'ess', name: 'webui', kind: 'channel', blurb: 'This dashboard as a channel — localhost is owner.',
+  keys: [],
+  steps: ['Nothing to configure. Pair other operators via <b>POST /v1/control/pair</b>.'],
+  use: 'Delivery to browsers rides the agent SSE stream; gateway send() only logs.'},
+ {group: 'ess', name: 'local_mic', kind: 'channel', blurb: 'Voice loop pointer: mic → STT → agent → TTS.',
+  keys: [],
+  steps: ['Nothing to configure. Browser capture needs a mic grant; transcripts arrive with <b>owner</b> trust.'],
+  use: 'Audio goes to <b>/v1/stt</b>, replies come from <b>/v1/tts</b>.'},
+ {group: 'adv', name: 'discord', kind: 'channel', blurb: 'Community servers and dev/gaming groups.',
+  keys: [['DISCORD_BOT_TOKEN', 'developer portal → Bot token (view-once)']],
+  steps: ['<b>discord.com/developers/applications</b> → New Application → <b>Bot → Reset Token</b> → copy immediately (shown once).', 'Enable needed <b>Privileged Gateway Intents</b>, then OAuth2 → URL Generator → scopes <b>bot + applications.commands</b> → open the URL → Authorize.'],
+  use: 'Send with <b>to</b> = channel id. Inbound websocket stays a deployment concern.'},
+ {group: 'adv', name: 'matrix', kind: 'channel', blurb: 'Federated, self-hostable chat.',
+  keys: [['MATRIX_HOMESERVER', 'e.g. https://matrix.org'], ['MATRIX_USER', '@you:matrix.org'], ['MATRIX_PASSWORD', 'password']],
+  steps: ['Create an account on a homeserver (easiest: <b>matrix.org</b> via Element). Note user id, homeserver URL, password.'],
+  use: 'Gateway logs in once and caches the token. Send with <b>to</b> = room id; inbound via one-shot sync poll.'},
+ {group: 'adv', name: 'line', kind: 'channel', blurb: 'Dominant chat app in Japan, Taiwan and Thailand.',
+  keys: [['LINE_CHANNEL_SECRET', 'Basic settings tab'], ['LINE_ACCESS_TOKEN', 'Messaging API tab (v2.1 or long-lived)']],
+  steps: ['In <b>LINE Official Account Manager</b> create an Official Account and enable the <b>Messaging API</b> (creates the channel).', 'LINE Developers Console → channel → <b>Messaging API</b> tab → issue a token; <b>Basic settings</b> → channel secret. Webhook needs public HTTPS.'],
+  use: 'Push anytime; quota-free replies via <b>thread_id reply:&lt;token&gt;</b>.'},
+ {group: 'adv', name: 'signal', kind: 'channel', blurb: 'Private encrypted messaging via signal-cli.',
+  keys: [['SIGNAL_NUMBER', '+… (signal-cli linked)'], ['SIGNAL_DATA_DIR', 'keys dir']],
+  steps: ['Install <b>signal-cli</b> (github.com/AsamK/signal-cli). Easiest: <b>signal-cli link</b> → QR → scan in app; or <b>register + verify</b> a number.', 'Daemonize <b>signal-cli jsonRpc</b>; set number + data dir below.'],
+  use: 'Send with <b>to</b> = +… number; poll() returns inbound JSON.'},
+ {group: 'adv', name: 'imap', kind: 'channel', blurb: 'Any non-Gmail mailbox over standard protocols.',
+  keys: [['IMAP_HOST', 'e.g. imap.gmail.com'], ['IMAP_USER', 'login user'], ['IMAP_PASS', 'app password, NOT login'], ['SMTP_HOST', 'e.g. smtp.gmail.com'], ['SMTP_USER', 'login user'], ['SMTP_PASS', 'app password']],
+  steps: ['Create an <b>app password</b>: Google → myaccount → Security → App passwords; Apple → app-specific password; Microsoft → app passwords.', 'Fill hosts (Gmail 993/465-587 · Outlook 993/587 · iCloud 993/587 · Yahoo 993/465).'],
+  use: 'Fallback inbox when Gmail OAuth is unavailable; threading on References headers.'},
+ {group: 'adv', name: 'twilio_sms', kind: 'channel', blurb: 'Real SMS to any phone.',
+  keys: [['TWILIO_SID', 'console dashboard'], ['TWILIO_AUTH', 'console dashboard'], ['TWILIO_FROM', 'your Twilio number'], ['TWILIO_WEBHOOK_URL', 'exact public URL (signature depends on it)']],
+  steps: ['<b>twilio.com/console</b> → copy Account SID + Auth Token → <b>Buy a number</b> (trial credit covers dev).'],
+  use: 'Send with <b>to</b> = E.164 number. Trial dev-only; US production needs A2P 10DLC.'},
+ {group: 'adv', name: 'whatsapp_twilio', kind: 'channel', blurb: 'WhatsApp without Meta ceremony — fastest WA route.',
+  keys: [['WHATSAPP_FROM', 'whatsapp:+… sandbox number']],
+  steps: ['Twilio Console → <b>Messaging → Try out WhatsApp</b> → each test phone messages <b>join &lt;code&gt;</b> to the sandbox number.'],
+  use: 'Addresses carry the <b>whatsapp:</b> prefix. Outside the 24h window only ContentSid templates deliver.'},
+ {group: 'adv', name: 'teams', kind: 'channel', blurb: 'Microsoft-365 enterprises where Teams is mandatory.',
+  keys: [['TEAMS_APP_ID', 'Entra Application (client) ID'], ['TEAMS_APP_PASSWORD', 'client secret VALUE (shown once)'], ['TEAMS_TENANT', 'Directory (tenant) ID']],
+  steps: ['Azure Portal → <b>Entra ID → App registrations → New</b> → note client + tenant IDs.', '<b>Certificates &amp; secrets → New client secret</b> → copy the Value now.', 'Create an <b>Azure Bot</b> → use existing app reg → messaging endpoint = public HTTPS → enable Teams channel → install to tenant.'],
+  use: 'Sends need the conversation serviceUrl; replies thread on replyToId.'},
+ {group: 'adv', name: 'whatsapp_meta', kind: 'channel', blurb: 'Official WhatsApp Business at scale (slowest setup).',
+  keys: [['WA_TOKEN', 'permanent system-user token'], ['WA_PHONE_ID', 'phone number ID'], ['WA_VERIFY_TOKEN', 'a string YOU invent']],
+  steps: ['<b>developers.facebook.com</b> → app + WhatsApp → connect business account → test number works on a 24h token.', '<b>Business Settings → System users → Add</b> (Admin) → assign app + WA account → <b>Generate token</b> (business_management + whatsapp_business_messaging + whatsapp_business_management).', 'Webhook → <b>GET /v1/hooks/whatsapp_meta</b> with your verify string. Business verification takes days.'],
+  use: 'Reply once to open the 24h customer window for free text; otherwise templates only.'},
+ {group: 'adv', name: 'twilio_voice', kind: 'channel', blurb: 'Real phone calls — spoken text or audio streams.',
+  keys: [['TWILIO_VOICE_FROM', 'voice-capable Twilio number'], ['VOICE_WS_URL', 'wss:// media endpoint you host']],
+  steps: ['Twilio number with <b>Voice</b> capability (SID/AUTH shared with SMS).', 'Host a WebSocket media endpoint, or skip it: plain calls just speak <b>text</b> via TwiML &lt;Say&gt;.'],
+  use: 'Create calls with spoken text; per-minute cost hint recorded.'},
+];
+let CONN_BUILT = false;
+async function loadConnections() {
+  const out = document.getElementById('conn-out');
+  let chans = [], svcs = [], keys = [];
+  try {
+    const c = await fetch('/v1/channels').then(r => r.json());
+    const i = await fetch('/v1/integrations').then(r => r.json());
+    const k = await fetch('/v1/config/keys').then(r => r.json());
+    chans = c.channels || []; svcs = i.integrations || []; keys = k.keys || [];
+  } catch (e) { out.textContent = 'connections load failed: ' + e.message; return; }
+  const sig = JSON.stringify([chans, svcs, keys.map((x) => x.name + '=' + x.set)]);
+  if (loadConnections._s === sig) return;
+  loadConnections._s = sig;
+  const chanByName = {};
+  chans.forEach((c) => { chanByName[c.name] = c; });
+  const svcByName = {};
+  svcs.forEach((s) => { svcByName[s.service] = s; });
+  const keySet = {};
+  keys.forEach((k) => { keySet[k.name] = k.set; });
+  const essBox = document.getElementById('conn-essential');
+  const advBox = document.getElementById('conn-advanced');
+  essBox.innerHTML = ''; advBox.innerHTML = '';
+  let essLive = 0, essTotal = 0, advLive = 0, advTotal = 0, keysSet = 0, keysTotal = 0;
+  SERVICES.forEach((s) => {
+    const isEss = s.group === 'ess';
+    if (isEss) essTotal++; else advTotal++;
+    let live = false, needs = [];
+    if (s.kind.includes('channel')) {
+      const c = chanByName[s.name];
+      if (c) { live = live || !!c.configured; needs = needs.concat(c.required_keys || []); }
+    }
+    if (s.kind.includes('integration')) {
+      const g = svcByName[s.name];
+      if (g) { live = live || !!g.configured; needs = needs.concat(g.required_keys || []); }
+    }
+    if (live) { if (isEss) essLive++; else advLive++; }
+    const card = document.createElement('section');
+    card.className = 'card';
+    const keyRows = (s.keys || []).map(([v, hint]) => {
+      keysTotal++;
+      const isSet = !!keySet[v];
+      if (isSet) keysSet++;
+      return `<tr><td class="prov" title="${hint}">${v}<div class="model">${hint}</div></td>` +
+        `<td><span class="pill ${isSet ? 'ok' : 'err'}">${isSet ? 'set' : 'missing'}</span></td>` +
+        `<td><input data-keyinput="${v}" type="password" placeholder="paste ${v}…" autocomplete="off" spellcheck="false" style="min-width:240px" /></td>` +
+        `<td><button class="ghost" onclick="saveConnKey('${v}')">Save</button></td></tr>`;
+    }).join('');
+    card.innerHTML =
+      `<div class="card-head"><div><h2>${s.name} <span class="pill cap">${s.kind}</span> ` +
+      `<span class="pill ${live ? 'ok' : 'err'}">${live ? 'live' : 'not configured'}</span></h2><p>${s.blurb}</p></div>` +
+      `<div class="side"><span class="badge">${needs.length ? needs.join(', ') : 'keyless'}</span> <span data-tp="${s.name}"></span> <button class="ghost" onclick="testConn('${s.name}')">Test</button>${s.name === 'slack' ? ` <button class="ghost" onclick="testConnRotate('slack')" title="Consume the refresh token now to prove the whole triple">Rotate</button>` : ''}</div></div>` +
+      `<div class="card-body">` +
+      `<details style="margin-bottom:10px;"><summary style="cursor:pointer;color:var(--blue);font-size:12px;">How to get the key + how to use it here</summary>` +
+      `<ol class="hint" style="margin:8px 0 4px 18px;padding:0;">${s.steps.map((x) => `<li>${x}</li>`).join('')}</ol>` +
+      `<p class="hint" style="margin:4px 0 2px;">${s.use}</p></details>` +
+      (keyRows
+        ? `<table><thead><tr><th>Key</th><th>Status</th><th>Paste value</th><th></th></tr></thead><tbody>${keyRows}</tbody></table>`
+        : `<p class="hint" style="margin:0;">No key needed — live out of the box.</p>`) +
+      `</div>`;
+    (isEss ? essBox : advBox).appendChild(card);
+  });
+  document.getElementById('conn-ess').textContent = `essential ${essLive}/${essTotal} live`;
+  document.getElementById('conn-adv').textContent = `advanced ${advLive}/${advTotal} live`;
+  document.getElementById('conn-keys').textContent = `${keysSet}/${keysTotal} keys set`;
+  out.textContent = '';
+  CONN_BUILT = true;
+}
+async function saveConnKey(v) {
+  const out = document.getElementById('conn-out');
+  const inp = document.querySelector(`[data-keyinput="${v}"]`);
+  const val = (inp.value || '').trim();
+  if (!val) { out.textContent = v + ': fill the box first.'; return; }
+  out.textContent = v + ': saving…';
+  try {
+    const r = await fetch('/v1/control/keys', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({keys: {[v]: val}})});
+    const d = await r.json();
+    if (!r.ok) { out.textContent = '❌ ' + (d.detail || JSON.stringify(d)); return; }
+    inp.value = '';
+    out.textContent = '✅ saved ' + (d.saved || []).join(', ') + ' — restart gateway to be certain';
+    if (window.toast) toast('Saved ' + v, 'ok');
+    loadConnections._s = null;
+    loadConnections();
+  } catch (e) { out.textContent = '❌ ' + e.message; }
+}
+async function testConn(name) {
+  const pill = document.querySelector(`[data-tp="${name}"]`);
+  if (pill) pill.innerHTML = '<span class="pill cap">testing…</span>';
+  try {
+    const r = await fetch('/v1/control/channel-test', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({channel: name})});
+    const d = await r.json();
+    const row = (d.results || [])[0] || {status: 'ERROR', detail: r.statusText};
+    if (pill) pill.innerHTML = `<span class="pill ${row.status === 'WORKING' ? 'ok' : (row.status === 'FAILED' ? 'err' : 'cap')}">${row.status}</span>`;
+    if (window.toast) toast(`${name}: ${row.status} — ${row.detail || ''}`, row.status === 'WORKING' ? 'ok' : (row.status === 'FAILED' ? 'err' : 'info'));
+    return row;
+  } catch (e) {
+    if (pill) pill.innerHTML = '<span class="pill err">ERROR</span>';
+    return {status: 'ERROR', detail: e.message};
+  }
+}
+async function testConnRotate(name) {
+  const pill = document.querySelector(`[data-tp="${name}"]`);
+  const out = document.getElementById('conn-out');
+  if (pill) pill.innerHTML = '<span class="pill cap">rotating…</span>';
+  out.textContent = 'Rotating Slack tokens (consumes the single-use refresh token)…';
+  try {
+    const r = await fetch('/v1/control/channel-test', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({channel: name, rotate: true})});
+    const d = await r.json();
+    const row = (d.results || [])[0] || {status: 'ERROR', detail: r.statusText};
+    if (pill) pill.innerHTML = `<span class="pill ${row.status === 'WORKING' ? 'ok' : 'err'}">${row.status}</span>`;
+    out.textContent = `Rotate: ${row.status} — ${row.detail || ''} (new pair saved, restart gateway)`;
+    if (window.toast) toast(`Slack rotation: ${row.status}`, row.status === 'WORKING' ? 'ok' : 'err');
+  } catch (e) {
+    if (pill) pill.innerHTML = '<span class="pill err">ERROR</span>';
+    out.textContent = '❌ ' + e.message;
+  }
+}
+async function testAllConn() {
+  const out = document.getElementById('conn-out');
+  out.textContent = 'Testing all channels (read-only, zero delivery)…';
+  let w = 0, f = 0, u = 0, done = 0;
+  for (const s of SERVICES) {
+    const d = await testConn(s.name);
+    done++;
+    if (d.status === 'WORKING') w++;
+    else if (d.status === 'FAILED' || d.status === 'ERROR') f++;
+    else u++;
+    out.textContent = `Testing… ${done}/${SERVICES.length} (ok ${w} · failed ${f} · unkeyed ${u})`;
+  }
+  out.textContent = `Done: ${w} working · ${f} failed · ${u} unkeyed. Key fixes: Connections boxes above; then restart gateway.`;
+  if (window.toast) toast(`Channel tests: ${w} ok, ${f} failed, ${u} unkeyed`, f ? 'err' : 'ok');
+}
+document.getElementById('port-badge').textContent = 'port ' + location.port;
+loadConnections();
+setInterval(loadConnections, 15000);
+</script>
+<script src="/static/gateway.js"></script>
+</body>
+</html>

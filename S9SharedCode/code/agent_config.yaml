@@ -1,11 +1,11 @@
-# Session 8 skills catalogue.
+# Session 9 skills catalogue (grown from the Session 8 set).
 #
 # Each entry below names one skill (the node "type" the orchestrator can
 # run). The two files that define a skill are this yaml entry and the
 # referenced `prompt:` markdown — there is no Python class per skill.
 #
 # Fields:
-#   prompt              path to the system prompt, relative to S8/code/
+#   prompt              path to the system prompt, relative to S9SharedCode/code/
 #   description         one-line summary (shown in dashboards / replay)
 #   provider_pin        OPTIONAL preferred provider; overridden by
 #                       agent_routing.yaml in the gateway if set there.
@@ -34,14 +34,24 @@ planner:
 
 retriever:
   prompt: prompts/retriever.md
-  tools_allowed: [search_knowledge]
+  # recall_preferences to answer "how do I like things?" (a standing
+  # preference must beat a lexical match on topic words), and
+  # remember_preference because a correction often arrives mid-retrieval
+  # ("no, I always want the publication date") and that turn is the only
+  # place it was said out loud.
+  tools_allowed: [search_knowledge, recall_preferences, remember_preference]
   temperature: 0.2         # retrieval is mostly deterministic
   max_tokens: 1200
   description: Searches Memory and the FAISS index for material relevant to a query.
 
 researcher:
   prompt: prompts/researcher.md
-  tools_allowed: [web_search, fetch_url]
+  # remember_preference: a research run is where "always give me the
+  # publication date" and "no paywalled sources" get said out loud. Without a
+  # write path here, preferences said during research were lost.
+  tools_allowed: [web_search, fetch_url, arxiv_search, wikipedia_search,
+                  openalex_search, news_search, fetch_pdf, extract_tables,
+                  wayback_fetch, remember_preference, recall_preferences]
   temperature: 0.7         # exploratory; let the model choose phrasings
   max_tokens: 2500
   description: Performs multi-step web research and produces normalised text outputs.
@@ -79,10 +89,15 @@ sandbox_executor:
 
 coder:
   prompt: prompts/coder.md
+  # The sandbox file tools had NO skill wired to them (present in the MCP
+  # server + catalog, callable by nothing). The coder writes code FOR the
+  # sandbox, so it reads/greps first, then emits.
+  tools_allowed: [read_file, list_dir, search_files, create_file,
+                  update_file, edit_file, delete_file, index_document]
   internal_successors: [sandbox_executor]
   temperature: 0.2
   max_tokens: 1500
-  description: STUB. Student assignment for Session 8. Emits Python code; the orchestrator hands it to sandbox_executor next.
+  description: Emits Python code for a task; the orchestrator hands it to sandbox_executor next.
 
 browser:
   prompt: prompts/browser.md
@@ -102,22 +117,36 @@ browser:
 
 # Session 9 — general-assistant integration skill. The "action" node is the
 # agent's hands: it can call the real-world integration tools (Telegram,
-# email, Google Calendar, weather) plus the existing web/file tools. The
+# email, Google Calendar) plus the existing web/file tools. The
 # Planner routes any "do something" request here. It is NOT a terminal node
 # by itself — pair it with a formatter so the user gets a confirmation.
 action:
   prompt: prompts/action.md
-  tools_allowed: [send_telegram, send_email, gmail_refresh_token, create_calendar_event, get_weather,
-                  gmail_query, github_query, slack_message, notion_query,
-                  web_search, fetch_url, get_time, currency_convert]
+  tools_allowed: [send_telegram, send_email, gmail_refresh_token, create_calendar_event, calendar_refresh_token,
+                  calendar_query, gmail_query, github_query, slack_message, slack_refresh_token, slack_history,
+                  discord_message, notion_query,
+                  web_search, fetch_url,
+                  schedule_task, list_scheduled, cancel_scheduled]
   temperature: 0.2
   max_tokens: 1500
   description: |
     Executes real-world actions on the user's behalf: send a Telegram
-    message, send an email, create a Google Calendar event, or fetch
-    current weather. Also has web + time + currency tools for context.
+    message, send an email, or create a Google Calendar event.
+    Also has web + time + currency tools for context.
     Returns a structured confirmation of what was done. Pair with a
     formatter node to render the result to the user.
+
+# Session 9 — local-image understanding. Sends a file already on disk
+# (screenshot, photo, scan) to the V9 vision model. No browser, no fetch.
+vision_file:
+  prompt: prompts/vision_file.md
+  temperature: 0.2
+  max_tokens: 1200
+  description: |
+    Describes or answers questions about a LOCAL image file via the V9
+    vision model. Inputs in metadata: path (required local image path)
+    and goal (optional question). Use for "what's in this screenshot?",
+    "read the text in this image", "describe my photo".
 
 # Session 9 — gated computer-use. Lets the agent act on the user's own
 # machine (run a command, read/write a file, open an app). Ships DISABLED

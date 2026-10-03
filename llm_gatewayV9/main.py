@@ -1,7 +1,22 @@
 import os, time, json
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from contextlib import asynccontextmanager
+
+# Stdio is UTF-8, unconditionally. Dozens of `print()` calls across the
+# gateway log user-influenced content (descriptors, errors, doc ids); on a
+# Windows cp1252 locale the FIRST non-ASCII character (an arrow, emoji,
+# CJK) crashed the request with UnicodeEncodeError — e.g. POST
+# /v1/memory/remember 503'd on a descriptor containing →. This one
+# reconfigure removes the entire bug class (same fix as the MCP server).
+for _s in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+    try:
+        if _s is not None and hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _s
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -18,14 +33,32 @@ load_dotenv(ROOT.parent / ".env")
 
 import db
 import providers as P
-from router import Router, RouterPool, DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS, resolve
+from router import Router, RouterPool, DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS, resolve, limits_for, expand_order
 from cache import GeminiCache
-from schemas import ChatRequest, ChatResponse, ToolCall, RouterDecision, EmbedRequest, EmbedResponse, BatchChatRequest, VisionRequest, ResponseFormat
+from schemas import (ChatRequest, ChatResponse, ToolCall, RouterDecision,
+                     EmbedRequest, EmbedResponse, EmbedBatchRequest,
+                     BatchChatRequest, VisionRequest, ResponseFormat)
 import embedders as E
+
+# Document indexing batch width. 16 measured at ~3.2 chunks/s (311ms/chunk)
+# against ~0.45 chunks/s one call at a time; 32 reaches ~4.0/s but leaves less
+# headroom for memory recall to interleave, so 16 is the default and 32 is
+# available by configuration.
+_DOC_BATCH_DEFAULT = max(1, min(32, int(
+    os.getenv("DOCUMENT_EMBED_BATCH", "16") or 16)))
+_DOC_BATCH_MAX = 32
+from channels_api import router as channels_router
+from voice_api import router as voice_router
+from integrations_api import router as integrations_router
+from memory_api import router as memory_router
 
 DEFAULT_ORDER = ["gemini35lite", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github", "kilo"]
 ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
 ROUTER_ORDER = [x.strip() for x in os.getenv("ROUTER_ORDER", ",".join(DEFAULT_ROUTER_ORDER)).split(",") if x.strip()]
+# NOTE (M1): only GATEWAY_V9_PORT is honoured. A stale GATEWAY_V3_PORT=8101
+# line from the V3 era must NOT move V9 off 8109 (every client — agent
+# gateway.py, dashboards, tests — targets :8109), so it is deliberately
+# ignored here and should be deleted from llm_gatewayV9/.env.
 PORT = int(os.getenv("GATEWAY_V9_PORT", "8109"))
 
 # V8: agent_routing.yaml maps `agent="<name>"` to a preferred provider name.
@@ -38,11 +71,11 @@ if _AGENT_ROUTING_PATH.exists():
     try:
         AGENT_ROUTING = yaml.safe_load(_AGENT_ROUTING_PATH.read_text()) or {}
     except Exception as e:  # pragma: no cover - logged then ignored
-        print(f"[v8] failed to parse agent_routing.yaml: {e!r}")
+        print(f"[gateway] failed to parse agent_routing.yaml: {e!r}")
         AGENT_ROUTING = {}
 
 # Tier -> worker failover order. TINY prefers small fast workers; LARGE prefers
-# long-context Gemini; HUGE is rejected (Summarizer Agent will live in V7).
+# long-context Gemini; HUGE is rejected (no summarizer agent exists yet).
 TIER_TO_ORDER = {
     "TINY":  ["github", "openrouter", "groq", "nvidia", "cerebras", "gemini35lite", "gemini", "kilo"],
     "LARGE": ["gemini35lite", "gemini", "groq", "nvidia", "cerebras", "github", "openrouter", "kilo"],
@@ -121,7 +154,7 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
     last_latency = 0
 
     for name in router_pool.candidates():
-        ok, why = router_pool.state[name].can_use(LIMITS[name], 400)
+        ok, why = router_pool.state[name].can_use(limits_for(name), 400)
         if not ok:
             continue
         provider = router_pool.providers[name]
@@ -161,14 +194,16 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
                             latency_ms=latency, status="error",
                             error=f"unparseable tier reply: {result.get('text','')[:100]}",
                             prompt_chars=len(envelope),
-                            call_role=call_role, router_decision="unparseable")
+                            call_role=call_role, router_decision="unparseable",
+                            agent=req.agent, session=req.session)
                 continue
             db.log_call(provider=name, model=result.get("model", provider.model),
                         input_tokens=result.get("input_tokens", 0),
                         output_tokens=result.get("output_tokens", 0),
                         latency_ms=latency, status="ok",
                         prompt_chars=len(envelope), response_chars=len(result.get("text", "")),
-                        call_role=call_role, router_decision=tier)
+                        call_role=call_role, router_decision=tier,
+                        agent=req.agent, session=req.session)
             return RouterDecision(
                 role=role, tier=tier, estimated_tokens=estimated,
                 router_provider=name, router_model=result.get("model", provider.model),
@@ -180,9 +215,15 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
             db.log_call(provider=name, model=provider.model,
                         status="error", error=str(e)[:500],
                         latency_ms=latency, call_role=call_role,
-                        router_decision="error")
-            # Move on to the next router. No backoff for routing — keep the
-            # router pool aggressive since each call is cheap.
+                        router_decision="error",
+                        agent=req.agent, session=req.session)
+            # Back off hard-failing routers (dead model, dead account):
+            # without this a permanently-broken router is retried first on
+            # EVERY classify (it's first in pool order). Transient blips
+            # cost at most 5 minutes of pool absence; the pool has spares.
+            router_pool.state[name].mark_unavailable(
+                300, f"router error: {str(e)[:80]}")
+            # Move on to the next router.
             continue
 
     # All routers in the pool failed — deterministic token-count fallback.
@@ -199,15 +240,35 @@ async def lifespan(app: FastAPI):
     db.init()
     app.state.cache = GeminiCache(ttl_seconds=300)
     app.state.providers = P.build_providers(app.state.cache)
-    app.state.router = Router(app.state.providers, ORDER)
-    app.state.router_providers = P.build_router_providers()
-    app.state.router_pool = RouterPool(app.state.router_providers, ROUTER_ORDER)
+    # Gemini-only mode (GATEWAY_GEMINI_ONLY=true): the gateway touches
+    # Gemini keys and nothing else. Router pool empties → tier
+    # classification uses the deterministic fallback (see _classify_tier).
+    app.state.gemini_only = os.getenv("GATEWAY_GEMINI_ONLY", "false").lower() in ("1", "true", "yes")
+    if app.state.gemini_only:
+        app.state.providers = P.keep_gemini_only(app.state.providers)
+        app.state.router_providers = {}
+    else:
+        app.state.router_providers = P.build_router_providers()
+    # Key-pool siblings (gemini-2, …) slot in right after their canonical
+    # member so one key's 429/cooldown fails over to the next key.
+    app.state.router = Router(app.state.providers, expand_order(ORDER, app.state.providers))
+    app.state.router_pool = RouterPool(app.state.router_providers,
+                                       expand_order(ROUTER_ORDER, app.state.router_providers))
     app.state.embedders, app.state.embed_order = E.build_embedders()
     yield
 
 
-app = FastAPI(title="LLM Gateway V9", lifespan=lifespan)
+app = FastAPI(title="LLM Gateway V9", lifespan=lifespan,
+              redirect_slashes=False)
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+# V10 adaptor plane (channels/hooks/policy/spend/control) + voice services
+# + keyed third-party integrations (ex-agent Tier-1 tools).
+app.include_router(channels_router)
+app.include_router(voice_router)
+app.include_router(integrations_router)
+app.include_router(memory_router)
+from deploy_api import router as deploy_router
+app.include_router(deploy_router)
 
 
 def _normalize_messages(req: ChatRequest):
@@ -216,6 +277,32 @@ def _normalize_messages(req: ChatRequest):
     msgs = []
     msgs.append({"role": "user", "content": req.prompt or ""})
     return msgs
+
+
+def _has_real_turn(messages) -> bool:
+    """Does this conversation contain anything to answer?
+
+    An empty `messages: []` (or a lone empty system turn) used to reach the
+    provider and bill a real LLM call, which then confidently invented an
+    answer to a question nobody asked — observed live answering "how do I set
+    up a weekly review?" to an empty request. That is a cost bug and a
+    correctness bug, so it is refused before routing.
+    """
+    for m in messages or []:
+        role = (m.get("role") or "").lower()
+        if role in ("system", "developer"):
+            continue          # instructions, not something to answer
+        content = m.get("content")
+        if isinstance(content, list):
+            has_text = any(
+                isinstance(b, dict) and str(b.get("text") or "").strip()
+                for b in content)
+            if has_text:
+                return True
+            continue
+        if str(content or "").strip():
+            return True
+    return False
 
 
 def _system_blocks(req: ChatRequest):
@@ -259,6 +346,11 @@ def _backoff_for(err: Exception, has_model_override: bool = False):
         return 30, "rate limited"
     if status and 500 <= status < 600: return 20, f"upstream {status}"
     if status == 408 or "timeout" in msg: return 10, "timeout"
+    if status == 402:
+        # Payment/quota required (observed live: entire Cerebras account
+        # 402s on every model). Back off hard instead of burning a round
+        # trip on every pick; billing fixes revive it with no code change.
+        return 300, "payment required (quota/billing)"
     if status in (401, 403):
         # When the caller explicitly picked a model, 403/404 likely means
         # "this model not available to your account" rather than "key dead".
@@ -355,6 +447,8 @@ async def chat(req: ChatRequest):
     router = app.state.router
     router_pool = app.state.router_pool
     messages = _normalize_messages(req)
+    if not _has_real_turn(messages):
+        raise HTTPException(400, "no user message to answer")
     # V9: pre-resolve any http(s) image URLs to data: URLs once, centrally.
     # Cheap when there are no images (function is a pass-through).
     if any(P._content_has_image(m.get("content")) for m in messages):
@@ -401,7 +495,8 @@ async def chat(req: ChatRequest):
     # per-provider failover loop below already rotates providers on
     # ProviderError; this counter exists for the single-provider retry case
     # (mostly meaningful when `provider=` is explicit). One retry, backoff
-    # capped at 2s as the spec says.
+    # capped at 2s as the spec says. NOTE: `retries` counts same-provider
+    # retries only — provider failovers are recorded in `attempted`, not here.
     retries = 0
 
     # V3: auto_route runs a router-LLM classifier first and uses tier-specific
@@ -414,14 +509,16 @@ async def chat(req: ChatRequest):
                 503,
                 {
                     "error": "input exceeds 8000 tokens",
-                    "hint": "Use the Summarizer Agent (V7, not yet implemented). "
+                    "hint": "No summarizer agent exists yet; chunk the input or narrow the query. "
                             "For now, chunk the input or set provider=g explicitly to try Gemini anyway.",
                     "router_decision": router_decision.model_dump(),
                 },
             )
         # Replace failover order with the tier-specific one, intersected with
-        # what's actually wired in this gateway.
-        tier_order = TIER_TO_ORDER[router_decision.tier]
+        # what's actually wired in this gateway. Defensive .get: TIER_TO_ORDER
+        # only defines TINY/LARGE and HUGE 503s above, but a future tier
+        # string must degrade to the default order, never KeyError.
+        tier_order = expand_order(TIER_TO_ORDER.get(router_decision.tier, ORDER), router.providers)
         candidates = [p for p in tier_order if p in router.providers]
     else:
         candidates = router.candidates(req.provider) if req.provider else list(router.order)
@@ -441,7 +538,7 @@ async def chat(req: ChatRequest):
             name, _ = router.pick(est, candidates, required_caps=required_caps)
             if name is not None:
                 break
-            cd = router.state[candidates[0]].snapshot(LIMITS[candidates[0]])["cooldown_remaining"]
+            cd = router.state[candidates[0]].snapshot(limits_for(candidates[0]))["cooldown_remaining"]
             if cd <= 0 or cd > 30:
                 break
             await _asyncio.sleep(min(cd + 0.05, 5))
@@ -478,7 +575,13 @@ async def chat(req: ChatRequest):
                                 yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
                         text = "".join(agg)
                         latency = int((time.time() - t0) * 1000)
+                        # Streaming providers return text only (no usage block),
+                        # so estimate tokens the same way the pre-flight does
+                        # (chars//4) instead of logging zeros that undercount
+                        # cost in by_agent.
                         db.log_call(provider=name, model=req.model or provider.model,
+                                    input_tokens=len(prompt_text) // 4,
+                                    output_tokens=len(text) // 4,
                                     latency_ms=latency, status="ok",
                                     prompt_chars=len(prompt_text), response_chars=len(text),
                                     override=req.provider, attempted=_attempts_str(all_attempts),
@@ -576,6 +679,13 @@ async def chat(req: ChatRequest):
                         call_role="worker",
                         router_decision=router_decision.tier if router_decision else None,
                         agent=req.agent, session=req.session, retries=retries)
+            # Tool ledger: name every completed model tool call (batch and
+            # vision funnel through here too). Names only — never arguments.
+            for tc in (result["tool_calls"] or []):
+                db.log_tool_use(str((tc or {}).get("name") or "tool"),
+                                provider=name, model=result["model"],
+                                agent=req.agent, session=req.session,
+                                call_role="worker")
             return ChatResponse(
                 provider=name,
                 model=result["model"],
@@ -719,7 +829,7 @@ async def cost_by_agent(session: Optional[str] = None, agent: Optional[str] = No
 
 @app.post("/v1/embed")
 async def embed(req: EmbedRequest):
-    """Single new V7 endpoint. Failover ring runs Ollama → configured fallback.
+    """Single embed endpoint. Failover ring runs Ollama → configured fallback.
     `provider` pins the choice (returns 502 on failure with no fallback).
     Rejects inputs over MAX_INPUT_CHARS with 413 — caller must chunk."""
     embedders = app.state.embedders
@@ -730,8 +840,8 @@ async def embed(req: EmbedRequest):
         raise HTTPException(
             413,
             f"text is {len(req.text)} chars; embed input is capped at "
-            f"{E.MAX_INPUT_CHARS} chars (~{E.MAX_INPUT_CHARS // 4} tokens, the "
-            f"gemini-embedding-001 ceiling). Chunk the input and embed each chunk.",
+            f"{E.MAX_INPUT_CHARS} chars (~{E.MAX_INPUT_CHARS // 4} tokens). "
+            f"Chunk the input and embed each chunk.",
         )
 
     t0 = time.time()
@@ -742,14 +852,15 @@ async def embed(req: EmbedRequest):
     except E.EmbedderError as e:
         latency = int((time.time() - t0) * 1000)
         db.log_call(
-            provider=req.provider or "(any)",
-            model="(none)",
+            provider=req.provider or "embed",
+            model="embed",
             status="error",
             error=str(e)[:500],
             latency_ms=latency,
             prompt_chars=len(req.text),
             override=req.provider,
             call_role="embed",
+            agent=req.agent, session=req.session,
         )
         if req.provider:
             # Pinned provider: surface upstream status faithfully.
@@ -770,6 +881,7 @@ async def embed(req: EmbedRequest):
         attempted=_attempts_str(attempts),
         call_role="embed",
         embed_dim=result["dim"],
+        agent=req.agent, session=req.session,
     )
     return EmbedResponse(
         provider=name,
@@ -779,6 +891,100 @@ async def embed(req: EmbedRequest):
         latency_ms=latency,
         attempted=attempts,
     ).model_dump()
+
+
+@app.post("/v1/embed/batch")
+async def embed_batch(req: EmbedBatchRequest):
+    """Batch embedding for document chunks.
+
+    `/v1/embed` takes a single string, so indexing a document meant one HTTP
+    round trip per chunk. Measured on this machine: one-at-a-time reached
+    0.45 chunks/s, while Ollama's native array path (`/api/embed`, which takes
+    a list) reached 3.2 chunks/s at batch 16 and 4.0 at 32 - roughly 3x the
+    ceiling of plain concurrency, because it amortises per-request overhead
+    instead of merely overlapping it.
+
+    Batch size defaults to 16 and may be raised to 32 (DOCUMENT_EMBED_BATCH).
+    The response repeats `embed_model` and `embed_dim` for every vector so a
+    caller can persist provenance: vectors from different models must never
+    be compared against each other.
+    """
+    embedders = app.state.embedders
+    if not embedders:
+        raise HTTPException(503, "no embedding providers configured")
+    texts = req.texts
+    if not texts:
+        return {"embeddings": [], "model": "", "dim": 0, "latency_ms": 0,
+                "batch_size": 0}
+
+    # One oversized input would fail the whole batch, losing every other
+    # chunk with it. Reject it here, naming the position, so the caller can fix
+    # that chunk and retry the rest.
+    for i, t in enumerate(texts):
+        if len(t) > E.MAX_INPUT_CHARS:
+            raise HTTPException(413, f"texts[{i}] is {len(t)} chars; the limit "
+                                     f"is {E.MAX_INPUT_CHARS}. Split it.")
+        if not t.strip():
+            raise HTTPException(400, f"texts[{i}] is empty")
+
+    # `0 or 16` would silently ignore an explicit 0, so check for None.
+    want = (req.batch_size if req.batch_size is not None
+            else _DOC_BATCH_DEFAULT)
+    size = max(1, min(int(want), _DOC_BATCH_MAX))
+    t0 = time.time()
+    out: list[dict] = []
+    model = ""
+    dim = 0
+    for start in range(0, len(texts), size):
+        window = texts[start:start + size]
+        try:
+            result = await E.embed_batch_with_failover(
+                embedders, window, req.task_type, explicit=req.provider)
+            vecs = result["embeddings"]
+            model = result.get("model") or model
+            dim = result.get("dim") or dim or (len(vecs[0]) if vecs else 0)
+        except E.EmbedderError as e:
+            if req.provider:
+                raise HTTPException(502, f"{req.provider} batch embed "
+                                          f"failed: {e}")
+            # Fall back to per-chunk so a single bad input costs one chunk
+            # rather than the whole window. Report which index failed.
+            vecs = []
+            for j, t in enumerate(window):
+                try:
+                    one = await E.embed_with_failover(
+                        embedders, t, req.task_type, explicit=req.provider)
+                    vecs.append(one[1]["embedding"])
+                    model = model or one[1].get("model", "")
+                    dim = dim or one[1].get("dim", 0)
+                except Exception:
+                    vecs.append(None)          # noqa: E741
+        for v in vecs:
+            out.append({"embedding": v, "index": start + len(out)})
+
+    latency = int((time.time() - t0) * 1000)
+    db.log_call(
+        provider="embed_batch",
+        model=model or "embed",
+        status="ok" if all(o["embedding"] is not None for o in out) else "partial",
+        latency_ms=latency,
+        prompt_chars=sum(len(t) for t in texts),
+        call_role="embed",
+        embed_dim=dim,
+        agent=req.agent, session=req.session,
+    )
+    failed = [o["index"] for o in out if o["embedding"] is None]
+    return {
+        "embeddings": [o["embedding"] for o in out],
+        "model": model,
+        "embed_model": model,
+        "dim": dim,
+        "embed_dim": dim,
+        "count": len(out),
+        "failed_indices": failed,
+        "batch_size": size,
+        "latency_ms": latency,
+    }
 
 
 @app.get("/v1/embedders")
@@ -815,10 +1021,11 @@ async def capabilities():
         # per-model overrides
         caps = P.model_capabilities(name, p.model, caps)
         caps["model"] = p.model
+        _lim = limits_for(name)
         caps.update({
-            "max_ctx": LIMITS[name]["max_ctx"],
-            "rpm": LIMITS[name]["rpm"],
-            "rpd": LIMITS[name]["rpd"],
+            "max_ctx": _lim["max_ctx"],
+            "rpm": _lim["rpm"],
+            "rpd": _lim["rpd"],
         })
         out[name] = caps
     return out
@@ -828,7 +1035,8 @@ async def capabilities():
 async def status():
     r = app.state.router
     return {"order": r.order, "live": r.all_status(),
-            "today": db.aggregate(call_role="worker"), "limits": LIMITS}
+            "today": db.aggregate(call_role="worker"), "limits": LIMITS,
+            "gemini_only": bool(getattr(app.state, "gemini_only", False))}
 
 
 @app.get("/v1/routers")
@@ -842,7 +1050,7 @@ async def routers():
         "models": {n: p.model for n, p in rp.providers.items()},
         "live": rp.all_status(),
         "today": db.aggregate(call_role="router"),
-        "limits": {k: LIMITS[k] for k in rp.providers},
+        "limits": {k: limits_for(k) for k in rp.providers},
         "tier_to_order": TIER_TO_ORDER,
     }
 
@@ -850,6 +1058,17 @@ async def routers():
 @app.get("/v1/calls")
 async def calls(limit: int = 100, provider: Optional[str] = None, status: Optional[str] = None):
     return db.recent(limit=limit, provider=provider, status=status)
+
+
+@app.get("/v1/tools/usage")
+async def tools_usage():
+    """Tool ledger: per-tool completions (uses, ok/errors, providers,
+    agents, last use) since calendar day. Names only — arguments, which
+    may carry secrets, are never stored."""
+    tools = db.tool_usage()
+    return {"tools": tools,
+            "total_uses": sum(t["uses"] for t in tools),
+            "total_tools": len(tools)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -863,5 +1082,9 @@ async def help_page():
 
 
 if __name__ == "__main__":
+    import os as _os
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    # Loopback by default (holds secrets + spend). Opt into LAN with
+    # GATEWAY_HOST=0.0.0.0 — and then put bearer auth in front.
+    _host = _os.environ.get("GATEWAY_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    uvicorn.run("main:app", host=_host, port=PORT, reload=False)

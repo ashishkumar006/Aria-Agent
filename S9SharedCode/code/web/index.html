@@ -1,70 +1,295 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>Aria — General AI Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div class="app">
-    <header class="topbar">
-      <div class="brand">
-        <div class="logo">◆</div>
-        <div class="brand-text">
-          <h1>Aria</h1>
-          <p>General AI Agent · voice-enabled</p>
+  <div class="shell">
+    <!-- ═══ Sidebar ═══ -->
+    <aside class="sidebar" id="sidebar" aria-label="Conversations and panels">
+      <div class="side-head">
+        <div class="brand">
+          <div class="logo" aria-hidden="true">◆</div>
+          <div class="brand-text"><h1>Aria</h1><p>General AI Agent</p></div>
+        </div>
+        <div class="side-head-btns">
+          <button class="icon-btn sm" id="themeBtn" title="Theme: dark / light / system">◐</button>
+          <button class="icon-btn sm only-mobile" id="menuClose" title="Close">✕</button>
         </div>
       </div>
-      <div class="status" id="status">
+
+      <button id="newChat" class="primary-btn">＋ New chat</button>
+
+      <div class="search-wrap">
+        <span class="search-ico" aria-hidden="true">⌕</span>
+        <input id="convSearch" class="search" placeholder="Search conversations…" autocomplete="off" />
+        <kbd>⌘K</kbd>
+      </div>
+
+      <div class="side-meta">
         <span class="dot" id="statusDot"></span>
         <span id="statusText">connecting…</span>
+        <span class="pill" id="modelBadge" title="Top provider by calls today">—</span>
       </div>
-    </header>
 
-    <main id="messages" class="messages" aria-live="polite"></main>
+      <div class="sess-label">Conversations</div>
+      <div class="sess-list" id="convList" role="listbox" aria-label="Conversations"></div>
 
-    <section id="cuPanel" class="cu-panel" hidden>
-      <div class="cu-head">
-        <h2>Computer-use approvals</h2>
-        <span class="cu-cap" id="cuCap"></span>
-      </div>
-      <ul id="cuList" class="cu-list"></ul>
-    </section>
+      <nav class="views-nav" aria-label="Views">
+        <button class="tab active" data-view="chat">💬 Chat</button>
+        <button class="tab" data-view="sessions">📚 Sessions</button>
+        <button class="tab" data-view="analytics">📊 Analytics</button>
+        <button class="tab" data-view="tools">🧰 Tools</button>
+        <button class="tab" data-view="config">⚙️ Config</button>
+        <button class="tab" data-view="computer">🖥️ Computer</button>
+        <button class="tab" data-view="templates">📋 Templates</button>
+      </nav>
 
-    <section id="replayPanel" class="replay-panel" hidden>
-      <div class="replay-head">
-        <h2>Computer-use replay</h2>
-        <button type="button" id="replayRefresh" class="icon-btn" title="Refresh">⟳</button>
+      <div class="quick-actions" aria-label="Panels">
+        <button class="chip" id="costToggle" title="Spend panel">💲<span>Spend</span></button>
+        <button class="chip" id="schedToggle" title="Schedule panel">⏰<span>Schedule</span></button>
+        <button class="chip" id="memToggle" title="Memory panel">🧠<span>Memory</span></button>
+        <button class="chip" id="compToggle" title="Computer ops">
+          🖥️<span>Ops</span><span class="badge" id="cuBadge" hidden></span>
+        </button>
       </div>
-      <ul id="replayList" class="replay-list"></ul>
-      <div id="replayDetail" class="replay-detail" hidden></div>
-    </section>
 
-    <div class="composer-wrap">
-      <div class="suggestions" id="suggestions">
-        <button type="button" class="chip" data-q="Read my latest 3 emails and tell me the sender and subject.">📧 Read my emails</button>
-        <button type="button" class="chip" data-q="List my GitHub repositories.">🐙 List my repos</button>
-        <button type="button" class="chip" data-q="What's the weather in London?">🌤️ Weather</button>
-        <button type="button" class="chip" data-q="Summarise the benefits of vector databases for RAG.">🧠 Research topic</button>
-        <button type="button" class="chip" data-q="Open Spotify and play something.">🎵 Play music</button>
+      <div class="side-foot">
+        <span id="sessCount">—</span><span class="sep">·</span><span id="spendFoot">—</span>
       </div>
-      <form id="composer" class="composer">
-        <button type="button" id="mic" class="icon-btn" title="Voice input" aria-label="Voice input">🎤</button>
-        <textarea id="input" rows="1" placeholder="Type or speak your question…" autocomplete="off"></textarea>
-        <button type="button" id="stop" class="icon-btn stop-btn" title="Stop" aria-label="Stop" hidden>■</button>
-        <button type="submit" id="send" class="send-btn" title="Send" aria-label="Send">➤</button>
-      </form>
-      <div class="toolbar">
-        <label class="switch">
-          <input type="checkbox" id="tts" />
-          <span>🔊 Speak responses</span>
-        </label>
-        <span class="hint" id="voiceHint"></span>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+
+    <!-- ═══ Main ═══ -->
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn sm only-mobile" id="menuBtn" title="Menu">☰</button>
+        <div class="conv-title" id="convTitle">New conversation</div>
+        <div class="top-actions">
+          <span class="pill ghost" id="gwLatency" title="Gateway round-trip">—</span>
+          <label class="switch" title="Speak responses (Kokoro TTS)">
+            <input type="checkbox" id="tts" /><span>🔊</span>
+          </label>
+          <select id="voiceSel" title="TTS voice"></select>
+          <select id="speedSel" title="TTS speed">
+            <option value="0.85">0.85×</option><option value="1.0" selected>1×</option>
+            <option value="1.25">1.25×</option><option value="1.5">1.5×</option>
+          </select>
+          <button class="icon-btn sm" id="paletteBtn" title="Command palette (Ctrl+K)">⌘K</button>
+        </div>
+      </header>
+
+      <!-- Chat view -->
+      <section class="pane active" id="view-chat">
+        <div class="chat-grid">
+          <div class="chat-col">
+            <main id="messages" class="messages" aria-live="polite"></main>
+            <div class="composer-wrap">
+              <div class="suggestions" id="suggestions">
+                <button type="button" class="chip" data-q="Read my latest 3 emails and tell me the sender and subject.">📧 Emails</button>
+                <button type="button" class="chip" data-q="List my GitHub repositories.">🐙 Repos</button>
+                <button type="button" class="chip" data-q="What's the weather in London?">🌤️ Weather</button>
+                <button type="button" class="chip" data-q="Summarise the benefits of vector databases for RAG.">🧠 Research</button>
+                <button type="button" class="chip" data-q="Write and run Python code that computes the sum of primes below 100.">💻 Code</button>
+              </div>
+              <form id="composer" class="composer">
+                <button type="button" id="mic" class="icon-btn" title="Voice input (Chrome/Edge)">🎤</button>
+                <textarea id="input" rows="1" placeholder="Message Aria…  (Enter to send)" autocomplete="off"></textarea>
+                <button type="button" id="stop" class="icon-btn stop-btn" title="Stop" hidden>■</button>
+                <button type="submit" id="send" class="send-btn" title="Send">➤</button>
+              </form>
+              <div class="toolbar">
+                <span class="hint" id="voiceHint"></span>
+                <span class="hint" id="convHint"></span>
+                <button type="button" id="sttBtn" class="link" title="Transcribe an audio file">🎙 Transcribe</button>
+                <input type="file" id="audioFile" accept="audio/*" hidden />
+              </div>
+            </div>
+          </div>
+          <aside class="rail" aria-label="Run inspector">
+            <div class="card">
+              <div class="card-head">
+                <h3>Skill DAG</h3>
+                <div class="card-tools">
+                  <button class="link" id="dagZoomOut" title="Zoom out">−</button>
+                  <button class="link" id="dagZoomIn" title="Zoom in">＋</button>
+                  <button class="link" id="dagRefresh" title="Refresh">⟳</button>
+                </div>
+              </div>
+              <div id="dag" class="dag"><span class="muted">No run yet — send a message.</span></div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>Run detail</h3></div>
+              <div id="runDetail" class="run-detail muted">Turns, cost and tool calls appear here.</div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>This turn</h3></div>
+              <div id="turnCost" class="run-detail muted">Cost lands here after each answer.</div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- Sessions view -->
+      <section class="pane" id="view-sessions">
+        <div class="pane-head">
+          <h2>Sessions</h2>
+          <div class="pane-tools">
+            <input id="sessFilter" class="search sm" placeholder="Filter…" />
+            <button class="link" id="sessRefresh">⟳ Refresh</button>
+          </div>
+        </div>
+        <div id="sessTable" class="table-wrap"><span class="muted">Loading…</span></div>
+      </section>
+
+      <!-- Analytics view -->
+      <section class="pane" id="view-analytics">
+        <div class="pane-head">
+          <h2>Analytics</h2>
+          <div class="pane-tools"><button class="link" id="costRefresh">⟳ Refresh</button></div>
+        </div>
+        <div class="stat-grid" id="statCards"></div>
+        <div class="two-col">
+          <div class="card"><div class="card-head"><h3>Spend by agent</h3></div><canvas id="chartSpend" height="220"></canvas></div>
+          <div class="card"><div class="card-head"><h3>Tokens by agent</h3></div><canvas id="chartToks" height="220"></canvas></div>
+        </div>
+        <div class="card"><div class="card-head"><h3>Calls by agent</h3></div><div id="costTable" class="table-wrap"></div></div>
+      </section>
+
+      <!-- Tools view -->
+      <section class="pane" id="view-tools">
+        <div class="pane-head">
+          <h2>Tools &amp; skills</h2>
+          <div class="pane-tools">
+            <input id="toolsSearch" class="search sm" placeholder="Search tools…" />
+            <button class="link" id="toolsRefresh">⟳</button>
+          </div>
+        </div>
+        <div class="muted" id="toolsCount"></div>
+        <div id="toolsGrid" class="cards-grid"></div>
+      </section>
+
+      <!-- Config view -->
+      <section class="pane" id="view-config">
+        <div class="pane-head"><h2>Configuration</h2></div>
+        <div id="skillCards" class="cards-grid"></div>
+        <div class="card">
+          <div class="card-head"><h3>agent_config.yaml</h3>
+            <input id="configSearch" class="search sm" placeholder="Highlight…" />
+          </div>
+          <pre id="configPre" class="code">loading…</pre>
+        </div>
+      </section>
+
+      <!-- Computer view -->
+      <section class="pane" id="view-computer">
+        <div class="pane-head">
+          <h2>Computer ops</h2>
+          <div class="pane-tools">
+            <span class="muted" id="cuCap"></span>
+            <button class="link" id="cuRefresh">⟳</button>
+          </div>
+        </div>
+        <div class="banner warn" id="dryBanner" hidden>DRY-RUN mode — actions describe only, nothing executes.</div>
+        <div class="two-col">
+          <div class="card"><div class="card-head"><h3>Pending approvals</h3></div><ul id="cuList" class="cu-list"></ul></div>
+          <div class="card"><div class="card-head"><h3>Recorded runs</h3></div>
+            <ul id="replayList" class="replay-list"></ul><div id="replayDetail" class="replay-detail" hidden></div>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="card"><div class="card-head"><h3>Deliveries</h3></div><ul id="notifList" class="replay-list"></ul></div>
+          <div class="card"><div class="card-head"><h3>Audit log</h3>
+            <input id="auditSearch" class="search sm" placeholder="Filter…" /></div>
+            <pre id="cuAudit" class="code">loading…</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- Templates view -->
+      <section class="pane" id="view-templates">
+        <div class="pane-head"><h2>Templates</h2></div>
+        <div class="card">
+          <div class="card-head"><h3>New template</h3></div>
+          <div class="form-grid">
+            <input id="tmplName" placeholder="name — e.g. research_topic" />
+            <input id="tmplQuery" placeholder="query — use {var} placeholders" />
+            <input id="tmplVars" placeholder="vars — comma separated, e.g. topic, depth" />
+            <button id="tmplCreate" class="primary-btn sm">Save template</button>
+          </div>
+        </div>
+        <div id="tmplList" class="cards-grid"></div>
+      </section>
+    </div>
+
+    <!-- ═══ Sliding panel (Spend / Schedule / Memory / Ops) ═══ -->
+    <aside class="side-panel" id="sidePanel" aria-hidden="true" aria-label="Quick panels">
+      <div class="side-panel-head">
+        <h2 id="sideTitle">Spend</h2>
+        <button class="icon-btn sm ghost" id="sideClose" title="Close (Esc)">✕</button>
       </div>
+      <div class="side-panel-body">
+        <div id="costPanel" class="panel" hidden>
+          <div id="costTotals" class="cost-totals"></div>
+          <ul id="costRows" class="cost-list"></ul>
+        </div>
+        <div id="schedPanel" class="panel" hidden>
+          <form id="schedForm" class="sched-form">
+            <label class="field"><span>Query to run</span>
+              <input id="schedQuery" type="text" placeholder="e.g. Check the weather in London" required /></label>
+            <label class="field"><span>When</span>
+              <input id="schedWhen" type="text" placeholder="in 10m / daily@09:00 / every 30m" required /></label>
+            <button type="submit" class="primary-btn sm">＋ Add schedule</button>
+          </form>
+          <ul id="schedRows" class="sched-list"></ul>
+        </div>
+        <div id="memPanel" class="panel" hidden></div>
+        <div id="compPanel" class="panel" hidden>
+          <div class="comp-status muted" id="cuStatus">daemon: …</div>
+          <h4>Pending approvals</h4>
+          <ul id="cuApprovals" class="cu-list"></ul>
+          <h4>Recorded runs</h4>
+          <ul id="replayList2" class="replay-list"></ul>
+          <h4>Deliveries</h4>
+          <ul id="notifList2" class="replay-list"></ul>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ═══ Command palette ═══ -->
+  <div class="palette-wrap" id="paletteWrap" hidden>
+    <div class="palette" role="dialog" aria-label="Command palette">
+      <input id="paletteInput" placeholder="Type a command, session, or tool…" autocomplete="off" />
+      <ul id="paletteList" role="listbox"></ul>
+      <div class="palette-foot"><span><kbd>↑↓</kbd> navigate</span><span><kbd>↵</kbd> run</span><span><kbd>esc</kbd> close</span></div>
     </div>
   </div>
 
+  <!-- ═══ Lightbox ═══ -->
+  <div class="lightbox" id="lightbox" hidden>
+    <button class="icon-btn" id="lightPrev" title="Previous">‹</button>
+    <figure>
+      <img id="lightboxImg" alt="Screenshot" />
+      <figcaption id="lightboxCap"></figcaption>
+    </figure>
+    <button class="icon-btn" id="lightNext" title="Next">›</button>
+    <button class="icon-btn light-close" id="lightClose" title="Close">✕</button>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

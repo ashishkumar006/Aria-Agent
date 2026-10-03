@@ -62,7 +62,10 @@ def run_python(
           "stderr_truncated": bool,
           "files_written": [{"name": str, "size_bytes": int}, ...],
           "timed_out": bool,
-          "cwd": str,                # the temp dir, kept for the artifact pipeline
+          "timeout_s": int,          # wall-clock cap that was enforced
+          "cwd": str,                # temp dir path (DELETED on return —
+                                     # files_written carries names/sizes only;
+                                     # read file contents from stdout instead)
         }
     """
     scrubbed = {k: os.environ[k] for k in env_whitelist if k in os.environ}
@@ -111,5 +114,6 @@ def run_python(
             "stderr_truncated": se_trunc,
             "files_written": files,
             "timed_out": timed_out,
+            "timeout_s": timeout_s,
             "cwd": cwd,
         }

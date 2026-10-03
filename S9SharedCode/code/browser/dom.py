@@ -176,8 +176,12 @@ class PageSnapshot:
         return text
 
 
-async def enumerate_interactives(page: Page) -> PageSnapshot:
-    raw = await page.evaluate(_ENUMERATE_JS)
+async def enumerate_interactives(page: Page, timeout: float = 15.0) -> PageSnapshot:
+    import asyncio as _asyncio
+    try:
+        raw = await _asyncio.wait_for(page.evaluate(_ENUMERATE_JS), timeout=timeout)
+    except _asyncio.TimeoutError as e:
+        raise TimeoutError(f"DOM enumerate timed out after {timeout}s") from e
     els = [Element(**e) for e in raw["elements"]]
     return PageSnapshot(
         elements=els,

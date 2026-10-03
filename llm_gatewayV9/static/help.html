@@ -11,10 +11,15 @@
   }
   * { box-sizing: border-box; }
   body { background: var(--bg); color: var(--text); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin: 0; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
-  header nav a { color: var(--blue); margin-left: 16px; text-decoration: none; }
-  main { padding: 24px 20px; max-width: 1000px; margin: 0 auto; }
+  header.top { padding: 12px 22px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; position: sticky; top: 0; z-index: 10; background: rgba(13,17,23,.94); backdrop-filter: blur(8px); }
+  header.top h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header.top nav { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; font-size: 13px; }
+  header.top nav a { color: var(--muted); text-decoration: none; padding: 6px 11px; border-radius: 7px; }
+  header.top nav a:hover { color: var(--text); background: #21262d; }
+  header.top nav a.active { color: var(--text); background: rgba(163,113,247,.14); font-weight: 600; }
+  header.top nav .sep { width: 1px; height: 18px; background: var(--border); margin: 0 6px; }
+  main { padding: 24px 20px; max-width: 1000px; margin: 0 auto 60px; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 18px; opacity: .7; }
   h2 { font-size: 18px; margin-top: 36px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
   h3 { font-size: 16px; margin-top: 24px; color: var(--blue); }
   table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 13px; }
@@ -31,18 +36,26 @@
   .err { color: var(--red); }
   a { color: var(--blue); }
 </style>
+<link rel="stylesheet" href="/static/console-theme.css">
 </head>
 <body>
-<header>
-  <h1>📚 LLM Gateway · Help</h1>
-  <nav>
-    <a href="/">Dashboard</a>
-    <a href="/help">Help</a>
-  </nav>
-</header>
-<main>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item active"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">📚 Help</div><div class="spacer"></div><button class="ghost palette-trigger" onclick="togglePalette()" title="Commands (Ctrl/⌘+K)">⌘K</button></div>
+<main class="narrow">
 
-<p>This service routes LLM calls across <strong>seven free providers</strong>, with automatic failover, rate-limit tracking, persistent logging, and a manual override. Below: how to use it, what each provider offers, and how to get free keys.</p>
+<p>This service (V9, port 8109) routes LLM calls across <strong>eight providers</strong> (gemini, gemini35lite, nvidia, groq, cerebras, openrouter, github, kilo — plus local ollama, env-gated and off by default), with automatic failover, rate-limit tracking, persistent logging, vision + embeddings, and a manual override. Manage it from the <a href="/">Overview</a>, <a href="/static/connections.html">Connections</a> and <a href="/static/system.html">System</a> pages. Below: how to use it, what each provider offers, and how to get free keys.</p>
 
 <h2>Using the gateway</h2>
 
@@ -52,7 +65,7 @@
 # one-shot
 print(ask("Explain transformers in 3 lines"))
 
-# explicit provider (shortcut keys: g, n, o, gr, c, or, gh)
+# explicit provider (shortcut keys: g, g35l, n, o, gr, c, or, gh, k)
 print(ask("hi", provider="gr"))   # groq
 print(ask("hi", provider="g"))    # gemini
 
@@ -66,7 +79,7 @@ for chunk in llm.stream("count to 5"):
     print(chunk, end="", flush=True)</code></pre>
 
 <h3>HTTP (OpenAI-style)</h3>
-<pre><code>curl http://localhost:8099/v1/chat \
+<pre><code>curl http://localhost:8109/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"prompt": "hello", "provider": "g", "max_tokens": 128}'</code></pre>
 
@@ -74,12 +87,14 @@ for chunk in llm.stream("count to 5"):
 <table>
   <tr><th>Key</th><th>Provider</th><th>Aliases</th></tr>
   <tr><td><code>g</code></td><td>Gemini</td><td><code>gem</code>, <code>gemini</code></td></tr>
+  <tr><td><code>g35l</code></td><td>Gemini 3.5 Flash-Lite</td><td><code>gem35l</code>, <code>gemini35lite</code></td></tr>
   <tr><td><code>n</code></td><td>NVIDIA NIM</td><td><code>nv</code>, <code>nvidia</code></td></tr>
   <tr><td><code>o</code></td><td>Ollama (local)</td><td><code>oll</code>, <code>ollama</code></td></tr>
   <tr><td><code>gr</code></td><td>Groq</td><td><code>groq</code></td></tr>
   <tr><td><code>c</code></td><td>Cerebras</td><td><code>cer</code>, <code>cerebras</code></td></tr>
   <tr><td><code>or</code></td><td>OpenRouter</td><td><code>opr</code>, <code>openrouter</code></td></tr>
   <tr><td><code>gh</code></td><td>GitHub Models</td><td><code>ghb</code>, <code>github</code></td></tr>
+  <tr><td><code>k</code></td><td>Kilo</td><td><code>kilo</code></td></tr>
 </table>
 <p>Without <code>provider</code>, the gateway tries them in failover order (configurable via <code>LLM_ORDER</code> in <code>.env</code>). Explicit provider = no failover (errors surface immediately).</p>
 
@@ -205,25 +220,28 @@ for chunk in llm.stream("count to 5"):
 <h2>Summary table</h2>
 <table>
   <tr><th>Provider</th><th>Default model</th><th>RPM</th><th>RPD</th><th>Other limits</th></tr>
-  <tr><td>Ollama</td><td>gemma4:31b</td><td>—</td><td>—</td><td>local, unlimited</td></tr>
-  <tr><td>Cerebras</td><td>zai-glm-4.7</td><td>30</td><td>—</td><td>1M tokens/day · 8K ctx cap</td></tr>
-  <tr><td>Groq</td><td>llama-3.3-70b-versatile</td><td>30</td><td>1,000</td><td>6K TPM · 500K tok/day</td></tr>
-  <tr><td>NVIDIA NIM</td><td>deepseek-ai/deepseek-v3.2</td><td>40</td><td>—</td><td>1K credits on signup</td></tr>
-  <tr><td>Gemini</td><td>gemini-3.1-flash-lite-preview</td><td>15</td><td>1,000</td><td>250K TPM · 1M ctx</td></tr>
+  <tr><td>Ollama</td><td>set OLLAMA_MODEL (env-gated, off by default)</td><td>—</td><td>—</td><td>local, unlimited</td></tr>
+  <tr><td>Cerebras</td><td>zai-glm-4.7</td><td>30</td><td>9999</td><td>1M tokens/day · 8K ctx cap</td></tr>
+  <tr><td>Groq</td><td>openai/gpt-oss-120b</td><td>30</td><td>1,000</td><td>6K TPM</td></tr>
+  <tr><td>NVIDIA NIM</td><td>deepseek-ai/deepseek-v3.2</td><td>40</td><td>9999</td><td>100K TPM</td></tr>
+  <tr><td>Gemini</td><td>gemini-2.5-flash</td><td>15</td><td>1,000</td><td>250K TPM · 1M ctx</td></tr>
+  <tr><td>Gemini 3.5 Lite</td><td>gemini-3.5-flash-lite</td><td>15</td><td>1,000</td><td>250K TPM · 1M ctx</td></tr>
   <tr><td>OpenRouter</td><td>nvidia/nemotron-3-super-120b-a12b:free</td><td>20</td><td>50</td><td>per model · pooled</td></tr>
-  <tr><td>GitHub Models</td><td>openai/gpt-4.1-mini</td><td>10–15</td><td>50–150</td><td>8K in / 4K out per req</td></tr>
+  <tr><td>GitHub Models</td><td>openai/gpt-4.1-mini</td><td>10</td><td>50</td><td>8K ctx</td></tr>
+  <tr><td>Kilo</td><td>tencent/hy3:free</td><td>60</td><td>9999</td><td>262K ctx</td></tr>
 </table>
 
 <h2>Configuration (.env)</h2>
-<p>The gateway reads from <code>EAGV3/.env</code>. All keys are optional — providers without keys are skipped.</p>
+<p>The gateway reads its own <code>llm_gatewayV9/.env</code> first, then the parent project <code>.env</code> as a non-overriding fallback. All keys are optional — providers without keys are skipped. Run <code>uv run python check_keys.py</code> to see what is set (names only, never values).</p>
 <pre><code>GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-3.1-flash-lite-preview
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_35_LITE_MODEL=gemini-3.5-flash-lite
 
 NVIDIA_API_KEY=...
 NVIDIA_MODEL=deepseek-ai/deepseek-v3.2
 
 GROQ_API_KEY=...
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
 
 CEREBRAS_API_KEY=...
 CEREBRAS_MODEL=zai-glm-4.7
@@ -234,19 +252,38 @@ OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free
 GITHUB_ACCESS_TOKEN=...
 GITHUB_MODEL=openai/gpt-4.1-mini
 
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=gemma4:31b
+KILO_API_KEY=...
+KILO_MODEL=tencent/hy3:free
+KILO_BASE_URL=https://api.kilo.ai/api/gateway
 
-LLM_ORDER=ollama,gemini,nvidia,groq,cerebras,openrouter,github
-GATEWAY_PORT=8099</code></pre>
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=&lt;set to enable&gt;
+ENABLE_OLLAMA_LLM=true
+
+LLM_ORDER=gemini35lite,gemini,nvidia,groq,cerebras,openrouter,github,kilo
+GATEWAY_V9_PORT=8109</code></pre>
 
 <h2>HTTP API reference</h2>
 <table>
   <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
-  <tr><td>POST</td><td><code>/v1/chat</code></td><td>Send a chat request (with optional <code>provider</code>, <code>model</code>, <code>stream</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/chat</code></td><td>Send a chat request (with optional <code>provider</code>, <code>model</code>, <code>stream</code>, <code>auto_route</code>, <code>agent</code>, <code>session</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/chat/batch</code></td><td>N chat requests in one round-trip (bounded parallelism)</td></tr>
+  <tr><td>POST</td><td><code>/v1/vision</code></td><td>Single-image vision call (<code>image</code> data:/http URL + <code>prompt</code>, optional JSON <code>schema</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/embed</code></td><td>768-dim embedding (<code>text</code>, <code>task_type</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/memory/search</code></td><td>Memory recall, vector-first with keyword fallback (<code>query</code>, <code>kinds</code>, <code>top_k</code>, <code>session_id</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/memory/remember</code></td><td>Structured memory write (<code>kind</code>, <code>descriptor</code>, <code>keywords</code>, <code>value</code>, <code>source</code>, <code>run_id</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/memory/record_outcome</code></td><td>Tool-outcome write (<code>tool</code>, <code>arguments</code>, <code>result_text</code>)</td></tr>
+  <tr><td>GET</td><td><code>/v1/memory?limit=&amp;session_id=</code></td><td>Newest-first memory items (dashboard Memory panel)</td></tr>
+  <tr><td>GET</td><td><code>/v1/memory/stats</code></td><td>Item counts, index size/dim, embed dim</td></tr>
+  <tr><td>DELETE</td><td><code>/v1/memory?session_id=</code></td><td>Wipe memory globally or one session's items</td></tr>
   <tr><td>GET</td><td><code>/v1/providers</code></td><td>List configured providers, shortcuts, default models, limits</td></tr>
+  <tr><td>GET</td><td><code>/v1/capabilities</code></td><td>Per-provider capability flags (tools/vision/structured/...)</td></tr>
+  <tr><td>GET</td><td><code>/v1/routers</code></td><td>Router pool state (P/M/D classifiers)</td></tr>
   <tr><td>GET</td><td><code>/v1/status</code></td><td>Live RPM/RPD/TPM usage per provider, today's stats</td></tr>
+  <tr><td>GET</td><td><code>/v1/embedders</code></td><td>Embedder order, models, fixed dim</td></tr>
+  <tr><td>GET</td><td><code>/v1/cost/by_agent?session=&amp;agent=</code></td><td>Per-agent token + dollar rollup</td></tr>
   <tr><td>GET</td><td><code>/v1/calls?limit=100&amp;provider=&amp;status=</code></td><td>Recent call log</td></tr>
+  <tr><td>GET</td><td><code>/v1/tools/usage</code></td><td>Tool ledger — per-tool completions, providers, agents (see Ledger page)</td></tr>
   <tr><td>GET</td><td><code>/</code></td><td>Dashboard</td></tr>
   <tr><td>GET</td><td><code>/help</code></td><td>This page</td></tr>
 </table>
@@ -264,9 +301,34 @@ GATEWAY_PORT=8099</code></pre>
   </li>
   <li>First eligible provider gets the call. On 5xx / timeout / 429 → moves to next.</li>
   <li>If <code>provider=...</code> was explicitly set, no failover — error surfaces.</li>
-  <li>Every call (success or fail) is logged to <code>gateway.db</code> with provider, model, tokens, latency, status.</li>
+  <li>Every call (success or fail) is logged to <code>gateway_v8.db</code> with provider, model, tokens, latency, status.</li>
 </ol>
 
+<h2>Channels, integrations &amp; keys</h2>
+<table>
+  <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+  <tr><td>GET</td><td><code>/v1/channels</code></td><td>Adaptor inventory — 16 channels, configured flags, required keys (see <a href="/static/connections.html">Connections page</a>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/channels/{name}/send</code></td><td>Send via a channel (<code>to</code>, <code>text</code>, optional <code>thread_id</code>); policy runs first</td></tr>
+  <tr><td>POST/GET</td><td><code>/v1/hooks/{name}</code></td><td>Inbound provider webhooks (signature verified, handshake answered first)</td></tr>
+  <tr><td>GET</td><td><code>/v1/integrations</code></td><td>Service inventory — gmail, calendar, github, notion, websearch (see <a href="/static/connections.html">Connections page</a>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/integrations/{service}/{op}</code></td><td>Run a service op (gmail query/send, github query, notion query, …); fail-soft when unkeyed</td></tr>
+  <tr><td>GET</td><td><code>/v1/config/keys</code></td><td>Names-only key status for the dashboard (values never leave the server)</td></tr>
+  <tr><td>POST</td><td><code>/v1/control/keys</code></td><td>Save pasted keys to the gateway <code>.env</code> — <strong>localhost only</strong></td></tr>
+  <tr><td>POST</td><td><code>/v1/control/channel-test</code></td><td>Safe per-channel probe (<code>{"channel": "telegram"}</code> or <code>"all"</code>) — read-only, zero delivery, <strong>localhost only</strong></td></tr>
+  <tr><td>POST</td><td><code>/v1/control/deploy-test?scope=…</code></td><td>Scoped self-test: <code>quick</code> (all areas, free) · <code>system</code> (System page APIs) · <code>ledger</code> (ledger reads) · <code>full=true</code> adds live chat/vision/TTS — <strong>localhost only</strong></td></tr>
+  <tr><td>POST</td><td><code>/v1/policy/evaluate</code></td><td>Test a policy verdict without sending anything</td></tr>
+  <tr><td>GET</td><td><code>/v1/policy</code></td><td>List policy rules + dry-run mode (see <a href="/static/system.html">System page</a>)</td></tr>
+  <tr><td>GET</td><td><code>/v1/spend</code></td><td>Unified spend ledger vs daily caps</td></tr>
+  <tr><td>GET</td><td><code>/v1/control/presence</code></td><td>Gateway vitals (version, channels live)</td></tr>
+  <tr><td>POST</td><td><code>/v1/control/pair</code></td><td>Pair yourself as owner — <strong>localhost only</strong></td></tr>
+  <tr><td>POST</td><td><code>/v1/tts</code></td><td>Text-to-speech → WAV (<code>text</code>, <code>voice</code>, <code>speed</code>)</td></tr>
+  <tr><td>POST</td><td><code>/v1/stt</code></td><td>Speech-to-text (multipart audio, 25&nbsp;MB cap)</td></tr>
+  <tr><td>GET</td><td><code>/v1/tts/voices</code></td><td>List available TTS voices</td></tr>
+</table>
+
 </main>
+<footer>LLM Gateway V9 · <a href="/">Overview</a> · <a href="/static/connections.html">Connections</a> · <a href="/static/system.html">System</a> · <a href="/static/architecture.html">Architecture</a></footer>
+</div>
+<script src="/static/gateway.js"></script>
 </body>
 </html>

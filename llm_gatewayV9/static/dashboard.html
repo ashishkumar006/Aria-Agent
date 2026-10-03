@@ -2,114 +2,193 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>LLM Gateway V7 · Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway V9 · Overview</title>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #c9d1d9;
-    --muted: #8b949e; --green: #3fb950; --red: #f85149; --blue: #58a6ff;
-    --yellow: #d29922; --accent: #a371f7;
+    --bg: #0b0e14; --panel: #12161f; --panel-2: #171c28;
+    --border: #232a38; --border-soft: #1b2130;
+    --text: #e7eaf1; --muted: #8b93a5; --faint: #5b6376;
+    --accent: #7c6cf0; --accent-dim: rgba(124,108,240,.14);
+    --green: #3fb950; --green-dim: rgba(63,185,80,.13);
+    --red: #f85149; --red-dim: rgba(248,81,73,.12);
+    --blue: #58a6ff; --blue-dim: rgba(88,166,255,.13);
+    --yellow: #d29922;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    --radius: 10px;
   }
   * { box-sizing: border-box; }
-  body { background: var(--bg); color: var(--text); font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin: 0; padding: 0; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
-  header nav a { color: var(--blue); margin-left: 16px; text-decoration: none; }
-  header nav a:hover { text-decoration: underline; }
-  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
-  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin: 24px 0 10px; font-weight: 600; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
-  .card .name { font-weight: 600; font-size: 15px; }
-  .card .model { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-all; }
-  .bar { height: 6px; background: #21262d; border-radius: 3px; margin-top: 4px; overflow: hidden; }
-  .bar > div { height: 100%; background: var(--green); transition: width 0.3s; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); margin: 0; }
+  a { color: var(--blue); }
+  header.top { position: sticky; top: 0; z-index: 10; background: rgba(11,14,20,.94); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border); padding: 12px 22px; display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 650; }
+  .brand .bolt { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #4a8ff7);
+    display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
+  .brand .v { color: var(--accent); font-weight: 700; }
+  nav.links { display: flex; gap: 4px 4px; flex-wrap: wrap; font-size: 13px; align-items: center; }
+  nav.links a { color: var(--muted); text-decoration: none; padding: 6px 11px; border-radius: 7px; }
+  nav.links a:hover { color: var(--text); background: var(--panel-2); }
+  nav.links a.active { color: var(--text); background: var(--accent-dim); font-weight: 600; }
+  nav.links .sep { width: 1px; height: 18px; background: var(--border); margin: 0 6px; }
+  main { padding: 22px; max-width: 1420px; margin: 0 auto 60px; }
+  .status-strip { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 4px 0 6px; font-size: 12.5px; }
+  .status-strip a { text-decoration: none; }
+  section.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin: 16px 0; overflow: hidden; }
+  .card-head { padding: 13px 18px; border-bottom: 1px solid var(--border-soft); display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .card-head p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+  .card-head .side { font-size: 11.5px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+  .card-body { padding: 14px 18px 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; }
+  .tile { background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 13px 14px; }
+  .tile .name { font-weight: 650; font-size: 14.5px; }
+  .tile .model { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-all; font-family: var(--mono); }
+  .bar { height: 6px; background-color: #202634; border-radius: 3px; margin-top: 4px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--green); transition: width .3s; }
   .bar > div.warn { background: var(--yellow); }
   .bar > div.err { background: var(--red); }
-  .row { display: flex; justify-content: space-between; font-size: 12px; margin-top: 10px; color: var(--muted); }
-  .row b { color: var(--text); font-weight: 500; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; }
-  th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
-  td.ok { color: var(--green); }
+  .row { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; margin-top: 9px; color: var(--muted); }
+  .row b { color: var(--text); font-weight: 550; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; color: var(--muted);
+    font-weight: 600; text-transform: uppercase; font-size: 10.5px; letter-spacing: .6px; white-space: nowrap; }
+  tbody td { padding: 8px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,.015); }
+  td.ok { color: var(--green); font-weight: 600; }
   td.err { color: var(--red); }
-  td.prov { color: var(--blue); font-weight: 500; }
-  .controls { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
-  select, input { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-size: 13px; }
-  button { background: var(--blue); border: none; color: white; padding: 6px 14px; border-radius: 4px; font-size: 13px; cursor: pointer; }
-  button:hover { background: #3a8cf2; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #21262d; color: var(--muted); }
-  .pill { padding: 1px 6px; border-radius: 3px; font-size: 11px; }
-  .pill.ok { background: rgba(63,185,80,0.15); color: var(--green); }
-  .pill.err { background: rgba(248,81,73,0.15); color: var(--red); }
-  .pill.cap { background: rgba(88,166,255,0.15); color: var(--blue); margin-right: 4px; }
-  .pill.capx { background: #21262d; color: var(--muted); margin-right: 4px; text-decoration: line-through; }
-  .err-msg { color: var(--red); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.prov { color: var(--blue); font-weight: 600; white-space: nowrap; }
+  .controls { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+  select, input[type="text"], input:not([type]), input[type="password"] { background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 7px 11px; border-radius: 7px; font-size: 13px; font-family: var(--sans); }
+  select:focus, input:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  button { background: var(--accent); border: 1px solid transparent; color: #fff; padding: 7px 15px; border-radius: 7px;
+    font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--text); font-weight: 500; }
+  button.ghost:hover { border-color: var(--accent); }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11.5px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+  a.badge:hover { border-color: var(--accent); color: var(--text); }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 650; }
+  .pill.ok { background: var(--green-dim); color: var(--green); }
+  .pill.err { background: var(--red-dim); color: var(--red); }
+  .pill.cap { background: var(--blue-dim); color: var(--blue); margin: 1px 4px 1px 0; font-weight: 500; }
+  .pill.capx { background: var(--panel-2); color: var(--faint); margin: 1px 4px 1px 0; text-decoration: line-through; font-weight: 500; }
+  .err-msg { color: var(--muted); font-family: var(--mono); font-size: 11.5px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
   .test-area { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
-  .test-area textarea { flex: 1; min-width: 300px; min-height: 70px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px; border-radius: 4px; font: 13px ui-monospace, monospace; }
-  #test-out { margin-top: 10px; padding: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; white-space: pre-wrap; font: 13px ui-monospace, monospace; min-height: 40px; }
-  .order-list { color: var(--accent); font-family: ui-monospace, monospace; font-size: 12px; }
+  .test-area textarea { flex: 1; min-width: 300px; min-height: 72px; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 9px 11px; border-radius: 7px; font: 13px var(--mono); resize: vertical; }
+  #test-out, #cost-out { margin-top: 10px; padding: 12px 14px; background: var(--panel-2); border: 1px solid var(--border-soft);
+    border-radius: 7px; white-space: pre-wrap; font: 12.5px var(--mono); min-height: 40px; }
+  .order-list { color: var(--accent); font-family: var(--mono); font-size: 12.5px; }
   .caps-row { margin-top: 8px; }
-  .stat { display: inline-block; margin-right: 14px; font-size: 11px; color: var(--muted); }
+  .stat { display: inline-block; margin-right: 14px; font-size: 11.5px; color: var(--muted); }
   .stat b { color: var(--text); }
+  .hint { font-size: 12px; color: var(--muted); }
+  .model { color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+  footer { text-align: center; color: var(--faint); font-size: 12px; padding: 18px; }
+  @media (max-width: 720px) { main { padding: 14px; } header.top { padding: 10px 14px; } }
 </style>
+<link rel="stylesheet" href="/static/console-theme.css">
 </head>
 <body>
-<header>
-  <h1>⚡ LLM Gateway <span style="color:var(--accent)">V7</span> <span class="badge" id="port-badge"></span></h1>
-  <nav>
-    <a href="/">Dashboard</a>
-    <a href="/help">Help / Free Keys</a>
-    <a href="/v1/capabilities">API: capabilities</a>
-    <a href="/v1/providers">API: providers</a>
-    <a href="/v1/routers">API: routers</a>
-    <a href="/v1/status">API: status</a>
-  </nav>
-</header>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item active"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">Overview</div><div class="spacer"></div><button class="ghost palette-trigger" onclick="togglePalette()" title="Commands (Ctrl/⌘+K)">⌘K</button><span class="badge" id="port-badge"></span></div>
 <main>
-  <h2>Failover order</h2>
-  <div id="order" class="order-list">loading…</div>
-
-  <h2>Worker pool <span style="float:right; font-size:11px; text-transform:none; letter-spacing:0; color:var(--muted)">cache+tool aware routing</span></h2>
-  <div id="providers" class="grid"></div>
-
-  <h2>Router pool <span style="float:right; font-size:11px; text-transform:none; letter-spacing:0; color:var(--accent)">P/M/D classifiers — separate quotas, never touch worker RPMs</span></h2>
-  <div id="router-order" class="order-list" style="font-size:11px; margin-bottom:8px;">loading…</div>
-  <div id="routers" class="grid"></div>
-
-  <h2>Embedders <span style="float:right; font-size:11px; text-transform:none; letter-spacing:0; color:var(--accent)">fixed 768-dim, Ollama only (Gemini fallback removed)</span></h2>
-  <div id="embed-order" class="order-list" style="font-size:11px; margin-bottom:8px;">loading…</div>
-  <div id="embedders" class="grid"></div>
-
-  <h2>Quick test (V7 features supported)</h2>
-  <div class="test-area">
-    <select id="test-prov"><option value="">auto (failover)</option></select>
-    <select id="test-route">
-      <option value="">no auto_route</option>
-      <option value="perception">auto_route=perception</option>
-      <option value="memory">auto_route=memory</option>
-      <option value="decision">auto_route=decision</option>
-    </select>
-    <textarea id="test-prompt" placeholder="prompt…">Say hello in one short line.</textarea>
-    <button onclick="runTest()">Send</button>
+  <div class="status-strip">
+    <a class="badge" id="chan-summary" href="/static/connections.html">—</a>
+    <a class="badge" id="keys-summary" href="/static/connections.html">—</a>
+    <a class="badge" id="int-summary" href="/static/connections.html">—</a>
+    <a class="badge" id="mem-summary" href="/static/system.html">—</a>
+    <a class="badge" id="spend-summary" href="/static/system.html">—</a>
+    <a class="badge" id="policy-mode" href="/static/system.html">—</a>
   </div>
-  <div id="test-out">—</div>
 
-  <h2>Recent calls
-    <span style="float:right; font-size:11px; text-transform:none; letter-spacing:0;">
-      <select id="filter-prov" onchange="loadCalls()"><option value="">all providers</option></select>
-      <select id="filter-status" onchange="loadCalls()">
-        <option value="">all</option><option value="ok">ok</option><option value="error">errors</option>
-      </select>
-    </span>
-  </h2>
-  <table id="calls-table">
-    <thead>
-      <tr><th>Time</th><th>Role</th><th>Provider</th><th>Model</th><th>Status</th>
-      <th>In</th><th>Out</th><th>Tier</th><th>Tools</th><th>Latency</th><th>Override</th><th>Error / Attempts</th></tr>
-    </thead>
-    <tbody></tbody>
-  </table>
+  <section class="card">
+    <div class="card-head"><div><h2>Failover order</h2><p>Worker ladder used when routing has no explicit pin.</p></div></div>
+    <div class="card-body"><div id="order" class="order-list">loading…</div></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Worker pool</h2><p>Cache- and tool-aware routing across live LLM providers.</p></div></div>
+    <div class="card-body"><div id="providers" class="grid"></div></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Router pool</h2><p>Small classifiers that pick the tier — separate quotas, never touch worker limits.</p></div></div>
+    <div class="card-body">
+      <div id="router-order" class="order-list" style="font-size:11.5px; margin-bottom:8px;">loading…</div>
+      <div id="routers" class="grid"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Embedders</h2><p>Fixed 768-dim vectors · Ollama only (Gemini fallback removed).</p></div></div>
+    <div class="card-body">
+      <div id="embed-order" class="order-list" style="font-size:11.5px; margin-bottom:8px;">loading…</div>
+      <div id="embedders" class="grid"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Quick test</h2><p>Send one chat completion through the failover ladder.</p></div></div>
+    <div class="card-body">
+      <div class="test-area">
+        <select id="test-prov"><option value="">auto (failover)</option></select>
+        <select id="test-route">
+          <option value="">no auto_route</option>
+          <option value="perception">auto_route=perception</option>
+          <option value="memory">auto_route=memory</option>
+          <option value="decision">auto_route=decision</option>
+        </select>
+        <label class="hint"><input type="checkbox" id="test-stream" /> stream</label>
+        <input id="test-session" placeholder="session (optional)" style="max-width:170px" />
+        <textarea id="test-prompt" placeholder="prompt…">Say hello in one short line.</textarea>
+        <button onclick="runTest()">Send</button>
+        <button class="ghost" onclick="loadCost()">Cost by agent</button>
+      </div>
+      <div id="test-out">—</div>
+      <div id="cost-out" class="hint" style="margin-top:8px;"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Recent calls</h2><p>Latest ledger rows — errors and attempts included.</p></div>
+      <div class="side">
+        <select id="filter-prov" onchange="loadCalls()"><option value="">all providers</option></select>
+        <div class="seg" id="filter-status-seg">
+          <button data-v="" class="on">All</button><button data-v="ok">OK</button><button data-v="error">Errors</button>
+        </div>
+      </div>
+    </div>
+    <div class="card-body scrollable">
+      <table id="calls-table">
+        <thead>
+          <tr><th>Time</th><th>Role</th><th>Provider</th><th>Model</th><th>Status</th>
+          <th>In</th><th>Out</th><th>Tier</th><th>Tools</th><th>Latency</th><th>Override</th><th>Error / Attempts</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
 </main>
+<footer>LLM Gateway V9 · operator console · <a href="/static/connections.html">connections</a> · <a href="/static/system.html">system</a><br>API: <a href="/v1/capabilities">capabilities</a> · <a href="/v1/providers">providers</a> · <a href="/v1/routers">routers</a> · <a href="/v1/status">status</a> · <a href="/v1/calls?limit=100">calls</a> · <a href="/v1/spend">spend</a></footer>
+</div>
 
 <script>
 function fmtAgo(ts) {
@@ -127,33 +206,32 @@ function barClass(used, limit) {
   return '';
 }
 function capPills(caps) {
-  const items = [['tools','tools'],['caching','cache'],['reasoning','think'],['structured','struct'],['parallel_tools','parallel']];
+  const items = [['tools','tools'],['caching','cache'],['reasoning','think'],['structured','struct'],['parallel_tools','parallel'],['vision','vision']];
   return items.map(([k,label]) => `<span class="pill ${caps[k] ? 'cap' : 'capx'}">${label}</span>`).join('');
 }
-
 let CAPS = {};
-
-async function loadCaps() {
-  CAPS = await fetch('/v1/capabilities').then(r => r.json());
-}
-
+async function loadCaps() { CAPS = await fetch('/v1/capabilities').then(r => r.json()); }
 async function refresh() {
-  const r = await fetch('/v1/status').then(r => r.json());
-  document.getElementById('order').textContent = r.order.join(' → ');
-
+  let r;
+  try { r = await fetch('/v1/status').then(x => x.json()); }
+  catch (e) { return; }
+  const _sig = JSON.stringify(r.live);
+  if (refresh._s === _sig) return;
+  refresh._s = _sig;
+  const isGem = (n) => n === 'gemini' || n === 'gemini35lite' || n.startsWith('gemini-') || n.startsWith('gemini35lite-');
+  document.getElementById('order').textContent = r.order.join(' → ') + (r.gemini_only ? '  ·  gemini-only mode' : '');
   const grid = document.getElementById('providers');
   const provSelect = document.getElementById('test-prov');
   const filterSelect = document.getElementById('filter-prov');
   const existingOpts = new Set([...provSelect.options].map(o => o.value));
   const filterOpts = new Set([...filterSelect.options].map(o => o.value));
-
   grid.innerHTML = '';
-  Object.keys(r.live).forEach(name => {
+  Object.keys(r.live).filter((n) => !r.gemini_only || isGem(n)).forEach(name => {
     const s = r.live[name];
     const today = (r.today && r.today[name]) || {};
     const caps = (CAPS[name]) || s.capabilities || {};
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'tile';
     const cdLeft = s.cooldown_remaining > 0 ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
     const boLeft = s.backoff_remaining > 0 ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s</span>` : '';
     card.innerHTML = `
@@ -166,7 +244,7 @@ async function refresh() {
       </div>
       <div style="margin-top:8px;">
         <div class="row"><span>RPD</span><b>${s.rpd_used} / ${s.rpd_limit}</b></div>
-        <div class="bar"><div class="${barClass(s.rpd_used, s.rpd_limit)}" style="width:${Math.min(100, s.rpd_used/s.rpd_limit*100)}%"></div></div>
+        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${Math.min(100, s.rpd_used/s.rpd_limit*100)}%"></div></div>
       </div>
       <div class="row" style="margin-top:10px;">
         <span class="stat">calls today <b>${today.calls || 0}</b></span>
@@ -176,12 +254,8 @@ async function refresh() {
         <span class="stat">cache reads <b>${today.cache_reads || 0}</b></span>
         <span class="stat">cache writes <b>${today.cache_creates || 0}</b></span>
       </div>
-      <div class="row">
-        <span>Last call</span><b>${fmtAgo(s.last_call)}</b>
-      </div>
-    `;
+      <div class="row"><span>Last call</span><b>${fmtAgo(s.last_call)}</b></div>`;
     grid.appendChild(card);
-
     if (!existingOpts.has(name)) {
       const o = document.createElement('option'); o.value = name; o.textContent = name;
       provSelect.appendChild(o);
@@ -192,19 +266,25 @@ async function refresh() {
     }
   });
 }
-
 async function refreshRouters() {
   let r;
   try { r = await fetch('/v1/routers').then(x => x.json()); }
   catch (e) { return; }
+  const _sig = JSON.stringify(r.live);
+  if (refreshRouters._s === _sig) return;
+  refreshRouters._s = _sig;
   document.getElementById('router-order').textContent = 'failover: ' + r.order.join(' → ');
   const grid = document.getElementById('routers');
   grid.innerHTML = '';
+  if (!Object.keys(r.live).length) {
+    grid.innerHTML = '<div class="tile"><div class="name">router pool off</div><div class="model">gemini-only mode — tier falls back to the token-count rule</div></div>';
+    return;
+  }
   Object.keys(r.live).forEach(name => {
     const s = r.live[name];
     const today = (r.today && r.today[name]) || {};
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'tile';
     card.style.borderLeft = '3px solid var(--accent)';
     const cdLeft = s.cooldown_remaining > 0 ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
     const boLeft = s.backoff_remaining > 0 ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s</span>` : '';
@@ -217,23 +297,20 @@ async function refreshRouters() {
       </div>
       <div style="margin-top:8px;">
         <div class="row"><span>RPD</span><b>${s.rpd_used} / ${s.rpd_limit}</b></div>
-        <div class="bar"><div class="${barClass(s.rpd_used, s.rpd_limit)}" style="width:${Math.min(100, s.rpd_used/s.rpd_limit*100)}%"></div></div>
+        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${Math.min(100, s.rpd_used/s.rpd_limit*100)}%"></div></div>
       </div>
-      <div class="row" style="margin-top:10px;">
-        <span class="stat">routing calls today <b>${today.calls || 0}</b></span>
-      </div>
-      <div class="row">
-        <span>Last call</span><b>${fmtAgo(s.last_call)}</b>
-      </div>
-    `;
+      <div class="row" style="margin-top:10px;"><span class="stat">routing calls today <b>${today.calls || 0}</b></span></div>
+      <div class="row"><span>Last call</span><b>${fmtAgo(s.last_call)}</b></div>`;
     grid.appendChild(card);
   });
 }
-
 async function refreshEmbedders() {
   let r;
   try { r = await fetch('/v1/embedders').then(x => x.json()); }
   catch (e) { return; }
+  const _sig = JSON.stringify([r.live, r.today]);
+  if (refreshEmbedders._s === _sig) return;
+  refreshEmbedders._s = _sig;
   document.getElementById('embed-order').innerHTML =
     `<b>${r.order.join(' → ')}</b> · fixed dim <b>${r.fixed_dim}</b> · max input <b>${r.max_input_chars}</b> chars · backoff ${r.backoff_steps_s.join(' → ')}s`;
   const grid = document.getElementById('embedders');
@@ -242,14 +319,12 @@ async function refreshEmbedders() {
     const s = r.live[name];
     const today = (r.today && r.today[name]) || {};
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'tile';
     card.style.borderLeft = '3px solid var(--accent)';
     const rpmLabel = s.rpm_limit > 0 ? `${s.rpm_used} / ${s.rpm_limit}` : `${s.rpm_used} / ∞`;
     const rpmPct = s.rpm_limit > 0 ? Math.min(100, s.rpm_used / s.rpm_limit * 100) : 0;
-    const cdPill = s.cooldown_remaining > 0
-      ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
-    const boPill = s.backoff_remaining > 0
-      ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s (step ${s.backoff_step})</span>` : '';
+    const cdPill = s.cooldown_remaining > 0 ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
+    const boPill = s.backoff_remaining > 0 ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s (step ${s.backoff_step})</span>` : '';
     card.innerHTML = `
       <div class="name">${name}${cdPill}${boPill}</div>
       <div class="model">${r.models[name]}</div>
@@ -259,20 +334,29 @@ async function refreshEmbedders() {
       </div>
       <div class="row" style="margin-top:8px;"><span>Cooldown</span><b>${s.cooldown_s}s</b></div>
       <div class="row"><span>Today</span><b>${today.calls || 0} calls · ${today.errors || 0} errors</b></div>
-      <div class="row"><span>Avg latency</span><b>${today.avg_latency ? today.avg_latency.toFixed(0) + 'ms' : '—'}</b></div>
-    `;
+      <div class="row"><span>Avg latency</span><b>${today.avg_latency ? today.avg_latency.toFixed(0) + 'ms' : '—'}</b></div>`;
     grid.appendChild(card);
   });
 }
-
+document.addEventListener('click', (e) => {
+  const b = e.target.closest ? e.target.closest('#filter-status-seg button') : null;
+  if (!b) return;
+  document.querySelectorAll('#filter-status-seg button').forEach((x) => x.classList.remove('on'));
+  b.classList.add('on');
+  loadCalls();
+});
 async function loadCalls() {
   const prov = document.getElementById('filter-prov').value;
-  const stat = document.getElementById('filter-status').value;
+  const segOn = document.querySelector('#filter-status-seg button.on');
+  const stat = segOn ? (segOn.dataset.v || '') : '';
   const params = new URLSearchParams({limit: 100});
   if (prov) params.set('provider', prov);
   if (stat) params.set('status', stat);
   const rows = await fetch('/v1/calls?' + params).then(r => r.json());
+  const _sig = JSON.stringify(rows.map((c) => [c.ts, c.provider, c.status, c.latency_ms]));
   const tb = document.querySelector('#calls-table tbody');
+  if (tb.dataset.sig === _sig) return;
+  tb.dataset.sig = _sig;
   tb.innerHTML = '';
   rows.forEach(c => {
     const tr = document.createElement('tr');
@@ -283,37 +367,45 @@ async function loadCalls() {
       ? `<span class="pill cap" style="background:rgba(163,113,247,0.2);color:var(--accent)">${role.replace('router_','rt:')}</span>`
       : `<span class="pill ok">worker</span>`;
     const tier = c.router_decision ? `<span class="badge">${c.router_decision}</span>` : '—';
-    tr.innerHTML = `
-      <td>${dt}</td>
-      <td>${roleBadge}</td>
-      <td class="prov">${c.provider}</td>
-      <td>${c.model}</td>
-      <td class="${c.status === 'ok' ? 'ok' : 'err'}">${c.status}</td>
-      <td>${c.input_tokens || 0}</td>
-      <td>${c.output_tokens || 0}</td>
-      <td>${tier}</td>
-      <td>${c.tool_calls || 0}${c.tool_dialect ? ' <span class="badge">'+c.tool_dialect+'</span>' : ''}</td>
-      <td>${c.latency_ms}ms</td>
-      <td>${c.override || '—'}</td>
-      <td class="err-msg" title="${(c.error || '') + (c.attempted ? ' | attempted: ' + c.attempted : '')}">${c.error || (c.attempted || '—')}</td>
-    `;
+    tr.innerHTML = `<td>${dt}</td><td>${roleBadge}</td><td class="prov">${c.provider}</td><td>${c.model}</td>
+      <td class="${c.status === 'ok' ? 'ok' : 'err'}">${c.status}</td><td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td>
+      <td>${tier}</td><td>${c.tool_calls || 0}${c.tool_dialect ? ' <span class="badge">'+c.tool_dialect+'</span>' : ''}</td>
+      <td class="${(c.latency_ms || 0) > 5000 ? 'err' : ((c.latency_ms || 0) > 1500 ? 'warn' : 'ok')}">${c.latency_ms}ms</td><td>${c.override || '—'}</td>
+      <td class="err-msg" title="${(c.error || '') + (c.attempted ? ' | attempted: ' + c.attempted : '')}">${c.error || (c.attempted || '—')}</td>`;
     tb.appendChild(tr);
   });
 }
-
 async function runTest() {
   const prompt = document.getElementById('test-prompt').value;
   const provider = document.getElementById('test-prov').value || null;
   const auto_route = document.getElementById('test-route').value || null;
+  const stream = document.getElementById('test-stream')?.checked;
+  const session = document.getElementById('test-session')?.value || undefined;
   const out = document.getElementById('test-out');
   out.textContent = '⏳ sending…';
   try {
-    const body = {prompt, provider, max_tokens: 200};
+    const body = {prompt, provider, max_tokens: 200, stream: !!stream, agent: 'dashboard'};
     if (auto_route) body.auto_route = auto_route;
-    const r = await fetch('/v1/chat', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body)
-    });
+    if (session) body.session = session;
+    if (stream) {
+      const r = await fetch('/v1/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+      const reader = r.body.getReader(); const dec = new TextDecoder();
+      let buf = "", acc = "";
+      while (true) {
+        const { done, value } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx; while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          if (!chunk.startsWith("data: ")) continue;
+          try { const d = JSON.parse(chunk.slice(6));
+            if (d.delta) { acc += d.delta; out.textContent = acc; }
+            if (d.done) acc += "\n\n[DONE]";
+          } catch {}
+        }
+      }
+      refresh(); refreshRouters(); loadCalls(); return;
+    }
+    const r = await fetch('/v1/chat', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     const d = await r.json();
     if (!r.ok) {
       out.textContent = '❌ ' + (typeof d.detail === 'object' ? JSON.stringify(d.detail, null, 2) : (d.detail || JSON.stringify(d)));
@@ -325,15 +417,72 @@ async function runTest() {
       }
       out.textContent = `${header}\n\n${d.text}`;
     }
-  } catch (e) {
-    out.textContent = '❌ ' + e.message;
-  }
+  } catch (e) { out.textContent = '❌ ' + e.message; }
   refresh(); refreshRouters(); loadCalls();
 }
-
+async function loadCost() {
+  const el = document.getElementById('cost-out');
+  el.textContent = 'loading cost…';
+  try {
+    const r = await fetch('/v1/cost/by_agent');
+    const d = await r.json();
+    const rows = [];
+    if (d && typeof d === 'object') {
+      for (const ag of Object.keys(d)) {
+        if (Array.isArray(d[ag])) {
+          for (const row of d[ag]) {
+            rows.push({agent: row.agent || ag, provider: row.provider || '', calls: row.calls || 0,
+              in_tok: row.in_tok || 0, out_tok: row.out_tok || 0, dollars: Number(row.dollars || 0)});
+          }
+        }
+      }
+    }
+    if (!rows.length) { el.textContent = 'no cost rows yet'; return; }
+    const fmt$ = (v) => '$' + Number(v || 0).toFixed(4);
+    el.innerHTML = rows.slice(0, 20).map(x =>
+      `${x.agent}/${x.provider}: ${x.calls} calls · in=${x.in_tok} out=${x.out_tok} · ${fmt$(x.dollars)}`).join('<br>');
+  } catch (e) { el.textContent = 'cost failed: ' + e.message; }
+}
+// Cross-page status strip (lightweight: no tables on this page).
+async function loadStrip() {
+  try {
+    const c = await fetch('/v1/channels').then(r => r.json());
+    const chans = c.channels || [];
+    document.getElementById('chan-summary').textContent =
+      `channels ${chans.filter(x => x.configured).length}/${chans.length} live`;
+  } catch {}
+  try {
+    const k = await fetch('/v1/config/keys').then(r => r.json());
+    const keys = k.keys || [];
+    document.getElementById('keys-summary').textContent =
+      `keys ${keys.filter(x => x.set).length}/${keys.length} set`;
+  } catch {}
+  try {
+    const i = await fetch('/v1/integrations').then(r => r.json());
+    const svcs = i.integrations || [];
+    document.getElementById('int-summary').textContent =
+      `integrations ${svcs.filter(x => x.configured).length}/${svcs.length} live`;
+  } catch {}
+  try {
+    const m = await fetch('/v1/memory/stats').then(r => r.json());
+    let total = (m.legacy || {}).items || 0;
+    Object.values(m.drawers || {}).forEach(s => { total += (s || {}).items || 0; });
+    document.getElementById('mem-summary').textContent = `memory ${total} records`;
+  } catch {}
+  try {
+    const s = await fetch('/v1/spend').then(r => r.json());
+    document.getElementById('spend-summary').textContent =
+      `spend ${((s.totals || {}).calls) || 0} calls · $${((s.totals || {}).dollars) || 0}`;
+  } catch {}
+  try {
+    const p = await fetch('/v1/policy').then(r => r.json());
+    document.getElementById('policy-mode').textContent = p.dry_run ? 'policy DRY-RUN' : 'policy ENFORCING';
+  } catch {}
+}
 document.getElementById('port-badge').textContent = 'port ' + location.port;
-loadCaps().then(() => { refresh(); refreshRouters(); refreshEmbedders(); loadCalls(); });
-setInterval(() => { refresh(); refreshRouters(); refreshEmbedders(); loadCalls(); }, 5000);
+loadCaps().then(() => { refresh(); refreshRouters(); refreshEmbedders(); loadCalls(); loadStrip(); });
+setInterval(() => { refresh(); refreshRouters(); refreshEmbedders(); loadCalls(); loadStrip(); }, 15000);
 </script>
+<script src="/static/gateway.js"></script>
 </body>
 </html>

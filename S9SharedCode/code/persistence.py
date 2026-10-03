@@ -1,15 +1,12 @@
-"""Session 8 on-disk persistence for the growing graph.
+"""On-disk persistence for the growing graph (Session 8 origin, live in S9).
 
-Lives in its own file because flow.py needs to stay under 350 lines.
-The two surfaces:
+The surfaces:
 
   - SessionStore: per-session directory under state/sessions/<sid>/.
-    Owns reading and writing the graph pickle and the per-node JSON
+    Owns reading and writing the graph JSON and the per-node JSON
     files. Atomic-write semantics (write to tmp, rename) so a SIGKILL
     mid-write does not corrupt the last successful snapshot.
-  - rebuild_graph_state(): given a populated SessionStore, returns the
-    list of NodeState records sorted by completion time so replay.py
-    can walk them in order.
+    (Legacy graph.pkl files are still readable for old sessions.)
 
 The Graph itself (the NetworkX wrapping) lives in flow.py.
 """
@@ -18,13 +15,31 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import uuid
 from pathlib import Path
 
 import networkx as nx
 
 from schemas import AgentResult, NodeState
 
-SESSIONS_ROOT = Path(__file__).parent / "state" / "sessions"
+import re as _re
+
+# Overridable so tests can point at a tmp dir instead of the live store
+# (S9_STATE_DIR=<tmp>/state makes SESSIONS_ROOT land inside it).
+_STATE_DIR = Path(os.environ.get("S9_STATE_DIR") or (Path(__file__).parent / "state"))
+SESSIONS_ROOT = _STATE_DIR / "sessions"
+
+# Session/node ids are minted as s8-<hex>, ct-*, c-*, t-*, L0-* etc. Reject
+# anything else so a crafted id can never escape SESSIONS_ROOT (path
+# traversal) or create junk directories on a typo.
+_ID_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,64}$")
+
+
+def _check_id(kind: str, value: str) -> str:
+    if not isinstance(value, str) or not _ID_RE.match(value):
+        raise ValueError(f"invalid {kind}: {value!r}")
+    return value
 
 
 class SessionLoadError(RuntimeError):
@@ -40,7 +55,14 @@ class SessionLoadError(RuntimeError):
 
 def _atomic_write(path: Path, data: bytes | str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Unique tmp name (not a fixed "<name>.tmp"): two concurrent writers to
+    # the same session (double-sent turns, recovery replan racing the main
+    # loop) must never share a tmp file, and on Windows os.replace fails
+    # when the destination tmp is held open by another writer/antivirus.
+    # Same discipline as turnlog.py and the gateway memory store.
+    tmp = path.with_name(
+        f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}"
+    )
     if isinstance(data, bytes):
         with open(tmp, "wb") as f:
             f.write(data)
@@ -56,20 +78,25 @@ class SessionStore:
     """One on-disk session. Layout:
 
         state/sessions/<sid>/
-            graph.pkl              # NetworkX DiGraph pickle
+            graph.json             # NetworkX DiGraph (node_link_data)
             query.txt              # the user's verbatim query
+            turn_costs.json        # per-turn cost ledger (agent_server)
+            browser/               # browser skill artifacts (screenshots)
             nodes/
                 n_001.json         # NodeState for the n:1 node, etc.
                 n_002.json
                 ...
     """
 
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.dir = SESSIONS_ROOT / session_id
+    def __init__(self, session_id: str, create: bool = True):
+        # Validate BEFORE touching the filesystem: reads must never mkdir
+        # (create=False) and hostile ids must never escape SESSIONS_ROOT.
+        self.session_id = _check_id("session_id", session_id)
+        self.dir = SESSIONS_ROOT / self.session_id
         self.nodes_dir = self.dir / "nodes"
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.nodes_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.nodes_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def query_path(self) -> Path:
@@ -93,12 +120,42 @@ class SessionStore:
     def read_query(self) -> str:
         if not self.query_path.exists():
             return ""
-        return self.query_path.read_text()
+        return self.query_path.read_text(encoding="utf-8-sig")
+
+    @property
+    def plan_path(self) -> Path:
+        """The planner's structured plan, when it emitted one.
+
+        The topic used to be recoverable only by regexing the researcher's
+        system prompt out of query.txt, which is why run titles read "You are
+        a research agent...". The planner may now emit a `research_plan`
+        block; storing it as its own file makes the topic, facets and source
+        hints first-class for the UI and for routing, and keeps working when
+        the prompt wording changes.
+        """
+        return self.dir / "plan.json"
+
+    def write_plan(self, plan: dict) -> None:
+        _atomic_write(self.plan_path, json.dumps(plan, indent=2, default=str))
+
+    def read_plan(self) -> dict:
+        if not self.plan_path.exists():
+            return {}
+        try:
+            blob = json.loads(self.plan_path.read_text(encoding="utf-8-sig"))
+            return blob if isinstance(blob, dict) else {}
+        except Exception:
+            return {}
 
     def write_graph(self, graph_obj: nx.DiGraph) -> None:
         """Serialise the DiGraph to JSON via nx.node_link_data. Per-node
         `result` is an AgentResult (Pydantic) — dump it to a dict so the
         JSON encoder is happy. Reviving on read restores the Pydantic shape.
+
+        NetworkX 3.x uses keyword-only `edges="edges"` (the old 2.x
+        `attrs={"link": "links"}` form is gone — passing `link=` raises
+        TypeError). Files are therefore written with the `"edges"` key;
+        read_graph() still tolerates legacy `"links"` files.
         """
         # node_link_data accepts arbitrary node-attr dicts; we just need
         # every value to be JSON-serialisable.
@@ -111,13 +168,18 @@ class SessionStore:
             h.add_node(n, **attrs)
         for u, v, d in graph_obj.edges(data=True):
             h.add_edge(u, v, **d)
-        payload = nx.node_link_data(h, edges="edges")
+        payload = nx.node_link_data(h)
         _atomic_write(self.graph_path, json.dumps(payload, indent=2, default=str))
 
     def read_graph(self) -> nx.DiGraph | None:
         if self.graph_path.exists():
-            payload = json.loads(self.graph_path.read_text())
-            g = nx.node_link_graph(payload, edges="edges", directed=True)
+            payload = json.loads(self.graph_path.read_text(encoding="utf-8-sig"))
+            # Tolerate legacy files written with the `"links"` edge-list key
+            # (NetworkX 2.x era): rewrite to `"edges"` before handing to
+            # node_link_graph, whose 3.x default is `edges="edges"`.
+            if "links" in payload and "edges" not in payload:
+                payload = {**payload, "edges": payload.pop("links")}
+            g = nx.node_link_graph(payload, directed=True)
             # NOTES_RUNS round-3 review #4: a write tagged a node's `result`
             # as a typed AgentResult via `_result_typed`. If the dict no
             # longer round-trips through AgentResult.model_validate, that
@@ -166,7 +228,7 @@ class SessionStore:
         p = self._node_path(node_id)
         if not p.exists():
             return None
-        return NodeState.model_validate_json(p.read_text())
+        return NodeState.model_validate_json(p.read_text(encoding="utf-8-sig"))
 
     def read_all_nodes(self) -> list[NodeState]:
         """Load every persisted NodeState in this session. Corrupt or
@@ -179,7 +241,7 @@ class SessionStore:
         states: list[NodeState] = []
         for p in sorted(self.nodes_dir.glob("n_*.json")):
             try:
-                states.append(NodeState.model_validate_json(p.read_text()))
+                states.append(NodeState.model_validate_json(p.read_text(encoding="utf-8-sig")))
             except (OSError, ValueError) as e:
                 # OSError = unreadable; ValueError covers JSON decode +
                 # Pydantic ValidationError (which inherits ValueError).

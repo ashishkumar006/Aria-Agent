@@ -1,0 +1,46 @@
+# Aria gateway policy (dry-run defaults — set enforce: true per rule to arm).
+# First matching rule wins; ties resolve to deny. The final catch-all denies
+# all tools for `untrusted` senders. Reloads automatically when edited.
+version: 1
+defaults:
+  dry_run: true            # log verdicts, allow everything (report-only)
+  default_action: deny     # when no rule matches
+
+spend_caps_usd:
+  per_call: 0.50
+  per_agent_per_day: 5.00
+  per_session_per_day: 10.00
+
+rules:
+  # Owner can do anything (still logged + spend-capped).
+  - id: owner-allow
+    when: {trust: owner}
+    action: allow
+
+  # Paired users: messaging + reads allowed, destructive gated to approval.
+  - id: paired-messaging
+    when: {trust: paired, tool: [send_telegram, send_email, gmail_query,
+      github_query, slack_message, notion_query, web_search, fetch_url,
+      get_time, get_weather, currency_convert]}
+    action: allow
+
+  - id: paired-destructive-needs-approval
+    when: {trust: paired, tool: [run_command, write_file, computer_action,
+      schedule_task, kill_app]}
+    action: approve
+
+  # Untrusted: NOTHING with side effects. Read-only info tools only.
+  - id: untrusted-readonly
+    when: {trust: untrusted, tool: [get_time, get_weather, web_search]}
+    action: allow
+
+  - id: deny-untrusted-default
+    when: {trust: untrusted}
+    action: deny
+    reason: "untrusted sender: tools denied by default"
+
+  # Guard spend even for allowed calls.
+  - id: spend-cap
+    when: {over_spend_cap: true}
+    action: deny
+    reason: "spend cap exceeded"

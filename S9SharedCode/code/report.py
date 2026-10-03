@@ -30,10 +30,10 @@ import sys
 from pathlib import Path
 
 import httpx
+from gateway import GATEWAY_URL
 from persistence import SessionStore
 
 ROOT = Path(__file__).parent
-GATEWAY_URL = "http://localhost:8109"
 
 
 def _find_sid(sid: str | None) -> str:
@@ -53,11 +53,21 @@ def _find_sid(sid: str | None) -> str:
 
 
 def _load_graph(sid: str):
+    # Validate through SessionStore (raises SessionLoadError with the file
+    # path on corrupt data) instead of raw json.loads, then re-serialise
+    # to the plain node-link dict form _dag_lines consumes.
+    import networkx as _nx
     store = SessionStore(sid)
-    gp = store.graph_path
-    if not gp.exists():
+    try:
+        g = store.read_graph()
+    except Exception as e:
+        print(f"[report] session graph failed validation: {e}")
         return None
-    return json.loads(gp.read_text())
+    if g is None:
+        return None
+    data = _nx.node_link_data(g)
+    data["links"] = data.pop("edges", [])
+    return data
 
 
 def _dag_lines(graph: dict | None) -> list[str]:
@@ -96,7 +106,7 @@ def _artifact_files(sid: str) -> list[Path]:
 def _fmt_cost(cost: dict) -> list[str]:
     if "_error" in cost:
         return [f"  (cost ledger unavailable: {cost['_error']})",
-                "  fallback turn count from node records below)"]
+                "  (fallback: turn count from node records below)"]
     lines = []
     tot_calls = 0
     tot_in = tot_out = 0

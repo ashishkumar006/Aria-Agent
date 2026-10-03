@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway V9 · Ledger</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #12161f; --panel-2: #171c28;
+    --border: #232a38; --border-soft: #1b2130;
+    --text: #e7eaf1; --muted: #8b93a5; --faint: #5b6376;
+    --accent: #7c6cf0; --accent-dim: rgba(124,108,240,.14);
+    --green: #3fb950; --green-dim: rgba(63,185,80,.13);
+    --red: #f85149; --red-dim: rgba(248,81,73,.12);
+    --blue: #58a6ff; --blue-dim: rgba(88,166,255,.13);
+    --yellow: #d29922;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); margin: 0; }
+  a { color: var(--blue); }
+</style>
+<link rel="stylesheet" href="/static/console-theme.css">
+</head>
+<body>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item active"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">Ledger</div><div class="spacer"></div><button class="ghost palette-trigger" onclick="togglePalette()" title="Commands (Ctrl/⌘+K)">⌘K</button><span class="badge" id="port-badge"></span></div>
+<main>
+  <div class="status-strip">
+    <span class="badge" id="led-calls">—</span>
+    <span class="badge" id="led-tokens">—</span>
+    <span class="badge" id="led-dollars">—</span>
+    <span class="badge" id="led-errors">—</span>
+    <button class="ghost" onclick="loadLedger()">Refresh</button>
+    <button class="ghost" onclick="testLedger()">Test</button>
+    <button class="ghost" onclick="exportLedgerCSV()">Export CSV</button>
+  </div>
+  <div id="led-out" class="hint" style="margin-bottom:4px;"></div>
+
+  <section class="card">
+    <div class="card-head"><div><h2>By provider</h2><p>Calls, success rate, tokens, spend and mean latency per backend.</p></div></div>
+    <div class="card-body">
+      <table id="led-prov-table">
+        <thead><tr><th>Provider</th><th>Calls</th><th>OK%</th><th>In tok</th><th>Out tok</th><th>$</th><th>Avg ms</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Tool usage</h2><p>Which tools models actually completed — uses, success, backends, agents, last use. Names only, never arguments.</p></div>
+      <div class="side"><span class="badge" id="led-tools">—</span></div>
+    </div>
+    <div class="card-body">
+      <table id="led-tool-table">
+        <thead><tr><th>Tool</th><th>Uses</th><th>OK</th><th>Providers</th><th>Agents</th><th>Last used</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>By role</h2><p>Who spent it — workers, routers, integrations, memory, voice, control.</p></div></div>
+    <div class="card-body">
+      <table id="led-role-table">
+        <thead><tr><th>Role</th><th>Calls</th><th>OK%</th><th>$</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Calls</h2><p>Newest first, from the gateway ledger. Filter client-side.</p></div>
+      <div class="side">
+        <select id="led-prov" onchange="renderLedgerCalls()"><option value="">all providers</option></select>
+        <select id="led-role" onchange="renderLedgerCalls()"><option value="">all roles</option></select>
+        <div class="seg" id="led-status-seg">
+          <button data-v="" class="on">All</button><button data-v="ok">OK</button><button data-v="error">Errors</button>
+        </div>
+      </div>
+    </div>
+    <div class="card-body scrollable">
+      <table id="led-calls-table">
+        <thead><tr><th>Time</th><th>Role</th><th>Provider</th><th>Model</th><th>Status</th><th>In</th><th>Out</th><th>Latency</th><th>Error / Attempts</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Errors</h2><p>Failed calls with reasons — your deployment punch-list.</p></div></div>
+    <div class="card-body scrollable">
+      <table id="led-err-table">
+        <thead><tr><th>Time</th><th>Provider</th><th>Role</th><th>Error</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<footer>LLM Gateway V9 · operator console · ledger reads gateway_v8.db via /v1/calls + /v1/spend<br>API: <a href="/v1/calls?limit=100">calls</a> · <a href="/v1/spend">spend</a> · <a href="/v1/cost/by_agent">cost</a></footer>
+</div>
+<script>
+let LED_ROWS = [];
+document.addEventListener('click', (e) => {
+  const b = e.target.closest ? e.target.closest('#led-status-seg button') : null;
+  if (!b) return;
+  document.querySelectorAll('#led-status-seg button').forEach((x) => x.classList.remove('on'));
+  b.classList.add('on');
+  renderLedgerCalls();
+});
+function ledFiltered() {
+  const p = document.getElementById('led-prov').value;
+  const r = document.getElementById('led-role').value;
+  const s = (document.querySelector('#led-status-seg button.on') || {}).dataset;
+  const st = (s && s.v) || '';
+  return LED_ROWS.filter((c) =>
+    (!p || c.provider === p) && (!r || (c.call_role || 'worker') === r) && (!st || c.status === st));
+}
+async function testLedger() {
+  const out = document.getElementById('led-out');
+  out.textContent = 'Testing ledger endpoints…';
+  try {
+    const r = await fetch('/v1/control/deploy-test?scope=ledger', {method: 'POST'});
+    const d = await r.json();
+    const rows = d.results || [];
+    const bad = rows.filter((x) => x.status === 'FAILED');
+    out.textContent = bad.length
+      ? `Ledger test: FAILED — ${bad.map((x) => x.name).join(', ')}`
+      : `Ledger test: all ${rows.length} endpoint reads ok`;
+    if (window.toast) toast(bad.length ? `Ledger test: ${bad.length} failed` : 'Ledger endpoints ok', bad.length ? 'err' : 'ok');
+    loadLedger._s = null;
+    loadLedger();
+  } catch (e) { out.textContent = '❌ ' + e.message; }
+}
+async function loadLedger() {
+  const out = document.getElementById('led-out');
+  try {
+    const rows = await fetch('/v1/calls?limit=1000').then(r => r.json());
+    const sig = JSON.stringify([rows.length, rows.slice(0, 3)]);
+    if (loadLedger._s === sig) return;
+    loadLedger._s = sig;
+    LED_ROWS = rows;
+    const provSel = document.getElementById('led-prov');
+    const roleSel = document.getElementById('led-role');
+    [...new Set(rows.map((c) => c.provider).filter(Boolean))].sort().forEach((p) => {
+      if (![...provSel.options].some((o) => o.value === p)) {
+        const o = document.createElement('option'); o.value = p; o.textContent = p;
+        provSel.appendChild(o);
+      }
+    });
+    [...new Set(rows.map((c) => c.call_role || 'worker'))].sort().forEach((p) => {
+      if (![...roleSel.options].some((o) => o.value === p)) {
+        const o = document.createElement('option'); o.value = p; o.textContent = p;
+        roleSel.appendChild(o);
+      }
+    });
+    let calls = rows.length, oks = 0, it = 0, ot = 0, lat = 0, latn = 0;
+    const byP = {}, byR = {};
+    rows.forEach((c) => {
+      if (c.status === 'ok') oks++;
+      it += c.input_tokens || 0; ot += c.output_tokens || 0;
+      if (c.latency_ms != null) { lat += c.latency_ms; latn++; }
+      const p = byP[c.provider || '?'] || (byP[c.provider || '?'] = {n: 0, ok: 0, i: 0, o: 0, l: 0, ln: 0});
+      p.n++; if (c.status === 'ok') p.ok++; p.i += c.input_tokens || 0; p.o += c.output_tokens || 0;
+      if (c.latency_ms != null) { p.l += c.latency_ms; p.ln++; }
+      const rl = c.call_role || 'worker';
+      const q = byR[rl] || (byR[rl] = {n: 0, ok: 0});
+      q.n++; if (c.status === 'ok') q.ok++;
+    });
+    let spend = {};
+    try { spend = (await fetch('/v1/spend').then(r => r.json())).totals || {}; } catch (e) {}
+    document.getElementById('led-calls').textContent = `${calls} calls`;
+    document.getElementById('led-tokens').textContent = `in ${it} · out ${ot}`;
+    document.getElementById('led-dollars').textContent = `$${spend.dollars || 0}`;
+    document.getElementById('led-errors').textContent = `${calls - oks} errors`;
+    const money = spend.dollars || 0;
+    const escP = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    document.querySelector('#led-prov-table tbody').innerHTML = Object.keys(byP).sort().map((p) => {
+      const v = byP[p];
+      const share = calls ? (v.n / calls) : 0;
+      const failing = v.ok !== v.n;
+      const name = (failing && /^(integration|channel):/.test(p))
+        ? `<a href="/static/connections.html" title="Fix credentials on the Connections page">${escP(p)} ↗</a>`
+        : escP(p);
+      return `<tr><td class="prov">${name}</td><td>${v.n}</td>` +
+        `<td class="${failing ? 'warn' : 'ok'}">${v.n ? Math.round(v.ok / v.n * 100) : 0}%</td>` +
+        `<td>${v.i}</td><td>${v.o}</td><td>$${(money * share).toFixed(4)}</td>` +
+        `<td>${v.ln ? Math.round(v.l / v.ln) : 0}ms</td></tr>`;
+    }).join('') || '<tr><td colspan="7">no calls logged yet</td></tr>';
+    document.querySelector('#led-role-table tbody').innerHTML = Object.keys(byR).sort().map((p) => {
+      const v = byR[p];
+      return `<tr><td class="prov">${p}</td><td>${v.n}</td>` +
+        `<td class="${v.ok === v.n ? 'ok' : 'warn'}">${v.n ? Math.round(v.ok / v.n * 100) : 0}%</td><td>—</td></tr>`;
+    }).join('');
+    try {
+      const tu = await fetch('/v1/tools/usage').then(r => r.json());
+      const tools = tu.tools || [];
+      document.getElementById('led-tools').textContent = `${tu.total_uses || 0} uses · ${tu.total_tools || 0} tools`;
+      document.querySelector('#led-tool-table tbody').innerHTML = tools.map((t) =>
+        `<tr><td class="prov">${t.tool}</td><td>${t.uses}</td>` +
+        `<td class="${t.errors ? 'warn' : 'ok'}">${t.ok}</td>` +
+        `<td>${(t.providers || []).join(', ') || '—'}</td>` +
+        `<td>${(t.agents || []).join(', ') || '—'}</td>` +
+        `<td>${t.last_ts ? new Date(t.last_ts * 1000).toLocaleString() : '—'}</td></tr>`
+      ).join('') || '<tr><td colspan="6">no tool completions logged yet — they appear when models call tools</td></tr>';
+    } catch (e) {
+      document.querySelector('#led-tool-table tbody').innerHTML = '<tr><td colspan="6">tool usage load failed: ' + e.message + '</td></tr>';
+    }
+    const escH = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const errs = rows.filter((c) => c.status !== 'ok').slice(0, 50);
+    document.querySelector('#led-err-table tbody').innerHTML = errs.map((c) => {
+      const prov = String(c.provider || '');
+      // Fix-it link: integration/channel failures are almost always expired
+      // credentials — one click to the Connections page where keys are pasted.
+      const cell = /^(integration|channel):/.test(prov)
+        ? `<a href="/static/connections.html" title="Fix credentials on the Connections page">${escH(prov)} ↗</a>`
+        : escH(prov);
+      return `<tr><td>${new Date(c.ts * 1000).toLocaleString()}</td><td class="prov">${cell}</td>` +
+        `<td>${escH(c.call_role || 'worker')}</td><td class="err-msg">${escH(c.error || c.attempted || '—')}</td></tr>`;
+    }).join('') || '<tr><td colspan="4">no errors — clean ledger</td></tr>';
+    renderLedgerCalls();
+    out.textContent = '';
+  } catch (e) { out.textContent = 'ledger load failed: ' + e.message; }
+}
+function renderLedgerCalls() {
+  const tb = document.querySelector('#led-calls-table tbody');
+  const rows = ledFiltered().slice(0, 200);
+  tb.innerHTML = rows.map((c) => {
+    const dt = new Date(c.ts * 1000).toLocaleTimeString();
+    return `<tr><td>${dt}</td><td>${c.call_role || 'worker'}</td><td class="prov">${c.provider}</td>` +
+      `<td>${c.model}</td><td class="${c.status === 'ok' ? 'ok' : 'err'}">${c.status}</td>` +
+      `<td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td><td>${c.latency_ms}ms</td>` +
+      `<td class="err-msg">${c.error || (c.attempted || '—')}</td></tr>`;
+  }).join('') || '<tr><td colspan="9">no rows match the filters</td></tr>';
+}
+function exportLedgerCSV() {
+  const rows = ledFiltered();
+  const q = (x) => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"';
+  const csv = ['ts,time,role,provider,model,status,in,out,latency_ms,error,attempted']
+    .concat(rows.map((c) => [c.ts, new Date(c.ts * 1000).toISOString(), c.call_role || 'worker',
+      c.provider, c.model, c.status, c.input_tokens || 0, c.output_tokens || 0,
+      c.latency_ms, c.error || '', c.attempted || ''].map(q).join(','))).join('\n');
+  const url = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+  const a = document.createElement('a');
+  a.href = url; a.download = 'gateway-ledger.csv';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  if (window.toast) toast(`Exported ${rows.length} rows`, 'ok');
+}
+document.getElementById('port-badge').textContent = 'port ' + location.port;
+loadLedger();
+setInterval(loadLedger, 15000);
+</script>
+<script src="/static/gateway.js"></script>
+</body>
+</html>

@@ -9,11 +9,11 @@ Available skills:
                          specific filter / sort / trending list
                          ("most-liked on Hugging Face", "top issues
                          on GitHub", "newest papers on arXiv");
-                       - the target page is JavaScript-rendered, has
-                         interactive filter widgets, or requires a
-                         multi-step navigation to surface the data
-                         (Researcher's static fetch_url will return
-                         the page chrome without the listed content);
+                        - the target page is JavaScript-rendered, has
+                          interactive filter widgets, or requires a
+                          multi-step navigation to surface the data
+                          (Researcher's static page fetch will return
+                          the page chrome without the listed content);
                        - recency matters ("this week", "today",
                          "recent") and the data lives behind a
                          site-native sort.
@@ -30,17 +30,22 @@ Available skills:
                      `goal` instead. The skill knows how to drive
                      the page's own filter widgets and that is the
                      point of having Browser in the first place;
-                     a pre-filtered URL would skip the interactive
-                     path the cascade is built for.
-                     Do NOT set metadata.force_path. Let the
-                     cascade choose its own layer; the skill knows
-                     how to escalate from extract → a11y → vision
-                     when needed.
-  researcher         fetch fresh content from the web (general
-                     URLs, search). Use for open-ended research
-                     across multiple sources. Do NOT use when the
-                     answer lives in one specific site's interactive
-                     listing — that is what Browser exists for.
+                      a pre-filtered URL would skip the interactive
+                      path the cascade is built for.
+                      Do NOT set metadata.force_path. Let the
+                      cascade choose its own layer; the skill knows
+                      how to escalate from extract → deterministic →
+                      a11y → vision when needed.
+  researcher         fetch fresh content from the web for open-ended
+                     research across multiple sources. It covers general
+                     web content, academic papers, peer-reviewed
+                     literature with citation weight, background
+                     knowledge, time-filtered current events, PDF
+                     documents, table numbers, and archived pages.
+                     Route "find papers / studies / citations" here, NOT
+                     browser. Do NOT use when the answer lives in one
+                     specific site's interactive listing — that is what
+                     Browser exists for.
 
 ALWAYS insert a `distiller` node between Browser and Formatter when
 the user wants structured fields per item (a list of model_name +
@@ -53,36 +58,67 @@ structured records the Formatter can render cleanly.
   formatter          render the final user-facing answer (TERMINAL)
   coder              emit Python (stub; routes to sandbox_executor)
   sandbox_executor   run Python from coder
-  action             EXECUTE real-world tasks on the user's behalf:
-                     send a Telegram message, send an email, create a
-                     Google Calendar event, or fetch current weather.
-                     Also has web_search / fetch_url / get_time /
-                     currency_convert for context. Use whenever the user
-                     asks the agent to DO something (not just answer):
-                     "email X", "text my friend", "add a calendar event
-                     for ...", "what's the weather in Paris?". ALWAYS
-                     follow an action node with a `formatter` so the user
-                     gets a plain-language confirmation.  computer           operate the user's OWN machine via a SAFETY-GATED
-                     tool (run_command / read_file / write_file /
-                     open_app). Computer-use is OFF by default and
-                     sensitive commands need in-UI approval. Use ONLY
-                     when the user explicitly asks the agent to do
-                     something on their computer ("open Notepad",
-                     "run this script", "read my file at ..."). ALWAYS
-                     follow with a `formatter`.  For a `computer`
-                     node, ALSO set `metadata.app` to the target
-                     desktop app name the user named (e.g. "Calculator",
-                     "Notepad", "Chrome") so the engine focuses the
-                     right window. If no app is named, omit it.
+   action             EXECUTE real-world tasks on the user's behalf:
+                       send messages, send and read email, create and
+                       read calendar events, query GitHub / Slack /
+                       Notion, schedule reminders. Use whenever the
+                       user asks the agent to DO something (not just
+                       answer): "email X", "text my friend", "add
+                       a calendar event for ...", "what's on my
+                       calendar", "what did I miss on Slack",
+                       "remind me in 1 hour". ALWAYS follow an
+                       action node with a `formatter` so the user gets a
+                       plain-language confirmation.
+   computer           operate the user's OWN machine through its
+                       safety-gated engine (drives desktop apps on your
+                       behalf: open, click, type, read and write files,
+                       run commands).
+                       Computer-use is OFF by default (disabled layer) and
+                       defaults to dry-run. Use ONLY when the user
+                       explicitly asks the agent to do something on their
+                       computer ("open Notepad", "run this script", "read
+                       my file at ..."). ALWAYS follow with a `formatter`.
+                      For a `computer` node, set `metadata.goal` (what to
+                      do) and `metadata.app` (target desktop app, e.g.
+                      "Calculator", "Notepad", "Chrome"). Optional:
+                      `metadata.max_turns` (1-12), `metadata.record`
+                      (true to keep a replayable trajectory).
+   vision_file        describe/answer about a LOCAL image file (screenshot,
+                      photo, scan). Set `metadata.path` (required) and
+                      `metadata.goal` (optional question).
 Output (JSON, no markdown):
 {
   "rationale": "<one sentence>",
+  "research_plan": {
+    "topic": "<the user's actual question, 1 line, no preamble>",
+    "facets": ["<sub-question>", "..."],
+    "source_hints": ["wikipedia", "arxiv", "news", "browser"],
+    "depth": "quick | standard | deep"
+  },
   "nodes": [
     {"skill": "<name>",
      "inputs": ["USER_QUERY" or "n:<label>" or "art:<id>"],
      "metadata": {"label": "<short_id>", "question": "<optional hint>"}}
   ]
 }
+
+`research_plan` is OPTIONAL but strongly preferred whenever the task is
+research. `topic` is what the run gets titled with and what the user sees in
+the sidebar, so give the question itself — never an instruction to yourself
+and never a description of what you are about to do. `facets` are the
+independent angles worth researching separately; each one becomes its own
+`researcher` node. `source_hints` steer tool choice (the names above are
+capabilities, not tools). Omit the whole block for non-research tasks.
+
+DIRECT ANSWER (short-circuit): for trivial conversational queries that
+need NO skills at all — greetings ("hi", "hello"), small talk, or a
+simple fact you already know with certainty — emit instead:
+{"rationale": "Trivial query; answering directly.",
+ "answer": "<the complete user-facing answer>"}
+with NO "nodes" key. The executor returns your answer verbatim and
+skips every other skill. Use this sparingly: anything requiring
+lookup, computation, creativity, or multi-step work MUST go through
+the normal nodes path.
 
 Reference upstream nodes as "n:<label>" where label matches a
 sibling's metadata.label. The final node must be a formatter.
@@ -107,6 +143,23 @@ the orchestrator can run them in parallel. Do NOT consolidate.
 Each per-item worker must carry its item in `metadata.question`
 (or in `metadata.goal` for browser nodes) and must NOT list
 USER_QUERY in its inputs.
+
+WHEN TO FAN OUT — the default is ONE worker per question, so ask
+explicitly whether this question decomposes. Emit parallel siblings when
+any of these hold:
+  * it names 3+ concrete entities to look up ("populations of A, B, C",
+    "compare these four papers", "prices for X/Y/Z");
+  * it has independent facets that each need their own retrieval
+    ("history AND current regulation AND open controversies");
+  * a `research_plan.facets` list you emitted has 3+ entries;
+  * the user asked for breadth ("everything about", "survey").
+Keep it to one worker when the question is a single lookup, when the parts
+depend on each other, or when the facets share one source page — three
+workers fetching the same page costs three fetches and returns one answer.
+Siblings run CONCURRENTLY, so 3 workers cost about one worker's wall clock,
+not three. Cap a fan-out at 4 workers; beyond that, emit sequential batches
+inside the plan instead. A `formatter` takes every sibling id so it can
+merge them.
 
 When the user demands a strict format constraint the writer might
 miss ("exactly 5-7-5 syllables", "valid JSON", "≤ 280 characters"),

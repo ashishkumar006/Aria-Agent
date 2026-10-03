@@ -18,6 +18,18 @@ STORE = Path(__file__).parent / "state" / "artifacts"
 STORE.mkdir(parents=True, exist_ok=True)
 
 
+def _digest_for(artifact_id: str) -> str:
+    """Validate an `art:<hex16>` handle and return the digest.
+
+    Raises ValueError on malformed handles instead of leaking a
+    FileNotFoundError from deep in pathlib.
+    """
+    digest = artifact_id.removeprefix("art:")
+    if len(digest) != 16 or any(c not in "0123456789abcdef" for c in digest.lower()):
+        raise ValueError(f"malformed artifact handle: {artifact_id!r}")
+    return digest.lower()
+
+
 def put(blob: bytes, *, content_type: str, source: str, descriptor: str) -> str:
     """Write blob (deduped by content hash) and return its handle."""
     digest = hashlib.sha256(blob).hexdigest()[:16]
@@ -26,28 +38,32 @@ def put(blob: bytes, *, content_type: str, source: str, descriptor: str) -> str:
     meta_path = STORE / f"{digest}.json"
     if not bin_path.exists():
         bin_path.write_bytes(blob)
-        meta = Artifact(
-            id=art_id,
-            content_type=content_type,
-            size_bytes=len(blob),
-            source=source,
-            descriptor=descriptor,
-        )
-        meta_path.write_text(meta.model_dump_json(indent=2))
+    # Always (re)write meta: a same-bytes re-put with a new descriptor or
+    # source must not keep serving the stale first-seen metadata.
+    meta = Artifact(
+        id=art_id,
+        content_type=content_type,
+        size_bytes=len(blob),
+        source=source,
+        descriptor=descriptor,
+    )
+    meta_path.write_text(meta.model_dump_json(indent=2))
     return art_id
 
 
 def get_bytes(artifact_id: str) -> bytes:
-    digest = artifact_id.removeprefix("art:")
-    return (STORE / f"{digest}.bin").read_bytes()
+    return (STORE / f"{_digest_for(artifact_id)}.bin").read_bytes()
 
 
 def get_meta(artifact_id: str) -> Artifact:
-    digest = artifact_id.removeprefix("art:")
+    digest = _digest_for(artifact_id)
     raw = json.loads((STORE / f"{digest}.json").read_text())
     return Artifact.model_validate(raw)
 
 
 def exists(artifact_id: str) -> bool:
-    digest = artifact_id.removeprefix("art:")
+    try:
+        digest = _digest_for(artifact_id)
+    except ValueError:
+        return False
     return (STORE / f"{digest}.bin").exists()

@@ -10,18 +10,36 @@ import re
 
 
 def filter_ax_markdown(tree_markdown: str, query: str | None = None,
-                       max_chars: int = 6000) -> str:
+                       max_chars: int = 12000) -> str:
     """Pre-filter the AX tree markdown.
 
-    - If `query` given, keep only lines mentioning it (case-insensitive).
-    - Truncate to `max_chars` to bound the LLM context window.
+    - If `query` given, keyword filter (stopword-stripped, any keyword hits)
+      instead of full-phrase substring which almost never matched.
+    - Truncate to `max_chars` (default 12k ≈ 3k tokens, up from 6k which
+      dropped controls) to bound the LLM context window.
     - Drop pure-whitespace / decorative lines.
     """
+    import re as _re
+    _STOP = {"the", "a", "an", "to", "of", "in", "on", "and", "or", "is",
+             "what", "does", "do", "show", "me", "my", "please", "click",
+             "open", "app", "window"}
     lines = [ln for ln in tree_markdown.splitlines() if ln.strip()]
     if query:
-        q = query.lower()
-        kept = [ln for ln in lines if q in ln.lower()]
-        lines = kept or lines  # fall back to full if query matches nothing
+        kws = [w.lower() for w in _re.findall(r"[a-z0-9]+", query.lower())
+               if w not in _STOP and len(w) > 2]
+        if kws:
+            scored = []
+            for ln in lines:
+                ll = ln.lower()
+                hits = sum(1 for k in kws if k in ll)
+                if hits:
+                    scored.append((hits, ln))
+            if scored:
+                # Keep all hits sorted by relevance, then truncate.
+                scored.sort(key=lambda x: -x[0])
+                lines = [ln for _, ln in scored] + [
+                    ln for ln in lines if ln not in {s[1] for s in scored}][:200]
+            # else: fall back to full list (no keyword matched)
     text = "\n".join(lines)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n…(truncated)"
@@ -47,4 +65,16 @@ def element_count(tree_markdown: str) -> int:
     The driver's markdown tags elements as `[N] Role "Label"` (observed on
     Windows 0.19.3); some docs show `[element_index N]`. Match both.
     """
-    return len(re.findall(r"\[(\d+)\]\s+\w+", tree_markdown))
+    if not tree_markdown:
+        return 0
+    n1 = len(re.findall(r"\[(\d+)\]\s+\w+", tree_markdown))
+    n2 = len(re.findall(r"\[element_index\s+(\d+)\]", tree_markdown, re.IGNORECASE))
+    # Avoid double-counting lines containing both forms.
+    if n1 and n2:
+        lines = tree_markdown.splitlines()
+        seen = set()
+        for ln in lines:
+            if re.search(r"\[(\d+)\]\s+\w+", ln) or re.search(r"\[element_index\s+(\d+)\]", ln, re.IGNORECASE):
+                seen.add(ln.strip())
+        return len(seen)
+    return max(n1, n2)

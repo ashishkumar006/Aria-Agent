@@ -1,4 +1,4 @@
-"""Provider adapters for llm_gatewayV2.
+"""Provider adapters for llm_gatewayV9.
 
 Each provider implements:
   async chat(messages, *, max_tokens, temperature, model, tools, tool_choice,
@@ -23,6 +23,18 @@ from __future__ import annotations
 import os, json, uuid, hashlib, re, base64
 from typing import AsyncIterator, Optional, Any
 import httpx
+
+
+# Upstream timeout for hosted chat calls. This used to be a flat 180s total,
+# which turned ONE hanging provider key into a three-minute stall before
+# failover — the entire explanation for 300s+ researcher nodes (each LLM hop
+# can hit a hanging key; the ledger shows healthy calls finish in 2-6s).
+# Per-phase timeouts fix it without touching slow-but-alive streams: the
+# read timeout resets on every received byte, so a key that sends NOTHING
+# fails over after 60s while a legitimately slow large answer keeps
+# streaming. Connect gets 10s (a TCP+TLS handshake slower than that is
+# never going to be the fast path).
+_UPSTREAM_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -147,6 +159,36 @@ def _flatten_system(system_blocks) -> tuple[str, list[dict], bool]:
     return "\n".join(parts), blocks, has_cache
 
 
+def _inline_system_turns(messages) -> list[str]:
+    """System turns carried inline in `messages`, in order, empties dropped.
+
+    A request may deliver its instructions two ways: inside `messages` as
+    `role: "system"` turns, or in the top-level `system` field (which becomes
+    `system_blocks`). They are not interchangeable, and a caller is entitled to
+    use both. Every provider adapter must therefore preserve the inline ones —
+    `GeminiProvider` cannot put them in `contents` at all, so it re-attaches
+    them to `systemInstruction`, and the OpenAI-compatible and Ollama adapters
+    merge them into their system message.
+
+    Dropping them is the worst kind of bug here: nothing errors, the request is
+    still billed and still counted, and the model simply answers as if the
+    instruction had never been sent.
+    """
+    out: list[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = _extract_text_blocks(c)
+        if not isinstance(c, str):
+            c = "" if c is None else json.dumps(c)
+        c = c.strip()
+        if c:
+            out.append(c)
+    return out
+
+
 def _empty_result(model: str) -> dict:
     return {
         "text": "", "tool_calls": [],
@@ -230,15 +272,24 @@ class OpenAICompatProvider(BaseProvider):
         Tool/assistant messages are forced to plain strings.
         """
         out = []
+        # Inline `role:"system"` turns must ALWAYS reach the model. They used to
+        # be discarded whenever `system_blocks` was also present, which is the
+        # same defect just fixed in GeminiProvider: Aria's persona and its
+        # retrieved-document block arrive as inline system turns, so a request
+        # carrying both `system=` and `messages=[{"role":"system",...}]` was
+        # logged, billed and counted in prompt_chars, then answered as if the
+        # document had never been sent. Merge them into the prepended system
+        # message instead of dropping them.
+        inline = _inline_system_turns(messages)
         if system_text:
-            out.append({"role": "system", "content": system_text})
+            merged = "\n\n".join([system_text] + inline)
+            out.append({"role": "system", "content": merged})
+        elif inline:
+            out.append({"role": "system", "content": "\n\n".join(inline)})
         for m in messages:
             r = m.get("role")
             if r == "system":
-                # already prepended via system_text — but allow inline if no system_blocks
-                if not system_text:
-                    out.append({"role": "system", "content": m.get("content", "")})
-                continue
+                continue          # already merged above, in order
             if r == "tool":
                 out.append({
                     "role": "tool",
@@ -296,6 +347,49 @@ class OpenAICompatProvider(BaseProvider):
         body["reasoning_effort"] = reasoning
         return True
 
+    async def _post_with_fallbacks(self, client, body):
+        """POST with sequential simplification retries (gateway-owns-quirks):
+        strip reasoning_effort, then downgrade strict json_schema, then hint
+        json_object in prose — one attempt each, in that order. Returns the
+        final response (success or failure; the caller raises)."""
+        r = await client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
+        if r.status_code == 200:
+            return r
+        txt = r.text
+        if "reasoning_effort" in body and "reasoning_effort" in txt:
+            body.pop("reasoning_effort", None)
+            r = await client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
+            if r.status_code == 200:
+                return r
+            txt = r.text
+        if (body.get("response_format") or {}).get("type") == "json_schema":
+            body["response_format"] = {"type": "json_object"}
+            r = await client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
+            if r.status_code == 200:
+                return r
+            txt = r.text
+        # V9: github / azure-openai-flavoured surfaces refuse
+        # response_format=json_object unless the literal word "json"
+        # appears in `messages`. Inject a one-line hint into the
+        # system message and retry. (Gateway-owns-quirks rule.)
+        if r.status_code == 400 and "json" in txt.lower() and (
+            body.get("response_format") or {}
+        ).get("type") == "json_object":
+            _msgs = body.get("messages") or []
+            if _msgs and _msgs[0].get("role") == "system":
+                _msgs[0]["content"] = (
+                    (_msgs[0].get("content") or "")
+                    + "\n\nReturn your reply as a single JSON object."
+                )
+            else:
+                _msgs.insert(0, {
+                    "role": "system",
+                    "content": "Return your reply as a single JSON object.",
+                })
+            body["messages"] = _msgs
+            r = await client.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
+        return r
+
     async def chat(self, messages, *, max_tokens=2048, temperature=0.7, model=None,
                    tools=None, tool_choice=None, reasoning=None, response_format=None,
                    system_blocks=None, cache_system=False):
@@ -313,46 +407,16 @@ class OpenAICompatProvider(BaseProvider):
             if tool_choice is not None:
                 body["tool_choice"] = tool_choice if isinstance(tool_choice, (str, dict)) else "auto"
         self._apply_response_format(body, response_format)
-        reasoning_applied = self._apply_reasoning(body, reasoning, m)
+        self._apply_reasoning(body, reasoning, m)
 
-        async with httpx.AsyncClient(timeout=180) as c:
-            r = await c.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
+        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as c:
+            r = await self._post_with_fallbacks(c, body)
             if r.status_code != 200:
-                # Some providers reject reasoning_effort or strict json_schema — retry without them.
-                txt = r.text
-                if reasoning_applied and "reasoning_effort" in txt:
-                    body.pop("reasoning_effort", None)
-                    reasoning_applied = False
-                    r = await c.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
-                if r.status_code != 200 and "json_schema" in (body.get("response_format") or {}).get("type", ""):
-                    body["response_format"] = {"type": "json_object"}
-                    r = await c.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
-                # V9: github / azure-openai-flavoured surfaces refuse
-                # response_format=json_object unless the literal word "json"
-                # appears in `messages`. Inject a one-line hint into the
-                # system message and retry. (Gateway-owns-quirks rule.)
-                if r.status_code == 400 and "json" in r.text.lower() and (
-                    body.get("response_format") or {}
-                ).get("type") == "json_object":
-                    _msgs = body.get("messages") or []
-                    if _msgs and _msgs[0].get("role") == "system":
-                        _msgs[0]["content"] = (
-                            (_msgs[0].get("content") or "")
-                            + "\n\nReturn your reply as a single JSON object."
-                        )
-                    else:
-                        _msgs.insert(0, {
-                            "role": "system",
-                            "content": "Return your reply as a single JSON object.",
-                        })
-                    body["messages"] = _msgs
-                    r = await c.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
-                if r.status_code != 200:
-                    raise ProviderError(
-                        f"{self.name} HTTP {r.status_code}: {r.text[:300]}",
-                        status=r.status_code,
-                        retryable=(r.status_code not in (400, 401)),
-                    )
+                raise ProviderError(
+                    f"{self.name} HTTP {r.status_code}: {r.text[:300]}",
+                    status=r.status_code,
+                    retryable=(r.status_code not in (400, 401)),
+                )
             d = r.json()
             choice = (d.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
@@ -392,7 +456,9 @@ class OpenAICompatProvider(BaseProvider):
                 "stop_reason": stop_norm,
                 "model": m,
                 "tool_call_dialect": "native",
-                "reasoning_applied": reasoning_applied,
+                # Read off the final body: a stripped reasoning_effort
+                # reports False, matching the old flag-threading behavior.
+                "reasoning_applied": "reasoning_effort" in body,
             }
 
     async def stream(self, messages, *, max_tokens=2048, temperature=0.7, model=None,
@@ -413,7 +479,7 @@ class OpenAICompatProvider(BaseProvider):
                 body["tool_choice"] = tool_choice if isinstance(tool_choice, (str, dict)) else "auto"
         self._apply_response_format(body, response_format)
         self._apply_reasoning(body, reasoning, m)
-        async with httpx.AsyncClient(timeout=180) as c:
+        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as c:
             async with c.stream("POST", f"{self.base_url}/chat/completions",
                                 headers=self._headers(), json=body) as r:
                 if r.status_code != 200:
@@ -466,7 +532,7 @@ class OpenRouterProvider(OpenAICompatProvider):
     def _headers(self):
         h = super()._headers()
         h["HTTP-Referer"] = "http://localhost"
-        h["X-Title"] = "LLM Gateway V2"
+        h["X-Title"] = "LLM Gateway V9"
         return h
 
 
@@ -519,18 +585,54 @@ class GeminiProvider(BaseProvider):
             })
         return [{"function_declarations": decls}]
 
+    def _inline_system(self, messages) -> list[str]:
+        """System turns carried inline in `messages`, in order, empties dropped.
+
+        Gemini's `contents` only accepts user/model roles, so
+        `_translate_messages` has to drop system turns rather than emit an
+        invalid role - which is correct for the *conversation* and catastrophic
+        for the *instruction*: every inline system message then vanishes with
+        no error anywhere. Only `system_blocks` reaches `systemInstruction`.
+
+        Aria puts its persona AND the retrieved-document block in inline system
+        turns, so on this provider both were being discarded. The request was
+        logged, billed and counted (`prompt_chars` included the retrieved text),
+        then the model answered as if it had never been sent: it replied "I
+        don't have access to your menu" to a question whose answer was sitting
+        in the same prompt. Collecting them here and folding them into
+        `systemInstruction` is the only place they can survive.
+        """
+        return _inline_system_turns(messages)
+
     def _translate_messages(self, messages):
         contents = []
+        # `functionResponse.name` must match the `functionCall` it answers.
+        # The canonical tool message carries only `tool_call_id` + `content`
+        # (that is what the module docstring documents and what
+        # `mcp_runner.py` actually sends), so the name has to be recovered from
+        # the assistant turn that made the call. Falling straight through to the
+        # literal "tool" sent `name: "tool"` beside a `functionCall` for
+        # `web_search`, which Gemini rejects - so every Gemini-backed tool skill
+        # 400s on the second hop and surfaces as a 502, while the identical
+        # conversation worked on every OpenAI-compatible provider.
+        names_by_id: dict[str, str] = {}
+        for prev in messages:
+            for tc in (prev.get("tool_calls") or []) if isinstance(prev, dict) else []:
+                if tc.get("id") and tc.get("name"):
+                    names_by_id[str(tc["id"])] = tc["name"]
         for m in messages:
             r = m.get("role")
             if r == "system":
                 continue
             if r == "tool":
+                tcid = str(m.get("tool_call_id") or m.get("id") or "")
+                name = (m.get("tool_name") or m.get("name")
+                        or names_by_id.get(tcid) or "tool")
                 contents.append({
                     "role": "user",
                     "parts": [{
                         "function_response": {
-                            "name": m.get("tool_name") or m.get("name") or "tool",
+                            "name": name,
                             "response": _coerce_obj(m.get("content")),
                         }
                     }],
@@ -574,6 +676,40 @@ class GeminiProvider(BaseProvider):
             contents.append({"role": "user", "parts": parts})
         return contents
 
+    async def _post_with_fallbacks(self, client, url, body, system_text,
+                                    reasoning_applied: bool, instr_parts=None):
+        """POST with one simplification retry on 400: strip thinkingConfig
+        and/or cachedContent, then re-POST once. Returns
+        (response, reasoning_applied, cache_kept).
+
+        `instr_parts` is the assembled system instruction. It must be threaded
+        through because the retry rebuilds `systemInstruction` from it - see the
+        comment at the strip site for what happens if it doesn't."""
+        r = await client.post(url, json=body)
+        if r.status_code == 200:
+            return r, reasoning_applied, True
+        if r.status_code == 400:
+            if reasoning_applied:
+                body["generationConfig"].pop("thinkingConfig", None)
+                reasoning_applied = False
+            cache_kept = True
+            if "cachedContent" in body and "cache" in r.text.lower():
+                body.pop("cachedContent", None)
+                # The instruction must be rebuilt from the SAME parts used on
+                # the first attempt. Re-deriving it from `system_text` alone
+                # dropped the inline system turns again — so the very first
+                # provider that 400s on a cache silently restored the original
+                # bug (persona and retrieved document gone, still billed, still
+                # counted in prompt_chars) and the retry still returned 200.
+                if instr_parts:
+                    body["systemInstruction"] = {"parts": instr_parts}
+                else:
+                    body.pop("systemInstruction", None)
+                cache_kept = False
+            r = await client.post(url, json=body)
+            return r, reasoning_applied, cache_kept
+        return r, reasoning_applied, True
+
     async def chat(self, messages, *, max_tokens=2048, temperature=0.7, model=None,
                    tools=None, tool_choice=None, reasoning=None, response_format=None,
                    system_blocks=None, cache_system=False):
@@ -601,14 +737,26 @@ class GeminiProvider(BaseProvider):
             "contents": self._translate_messages(messages),
             "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
         }
+        # Inline system turns are dropped from `contents` (see `_inline_system`),
+        # so they MUST be re-attached to the instruction or they are lost.
+        # system_blocks first, then inline turns, preserving request order.
+        inline_sys = self._inline_system(messages)
+        # Always bound, so the cache-strip retry can rebuild the instruction
+        # from the same parts rather than re-deriving it and losing them.
+        instr_parts: list[dict] = []
         if cache_name:
             body["cachedContent"] = cache_name
             # Strip cached part from system instruction to avoid double-billing.
             remaining_sys = "\n".join(b["text"] for b in blocks if not b["cache"]) if has_cache_marker else ""
-            if remaining_sys:
-                body["systemInstruction"] = {"parts": [{"text": remaining_sys}]}
-        elif system_text:
-            body["systemInstruction"] = {"parts": [{"text": system_text}]}
+            instr_parts = ([{"text": remaining_sys}] if remaining_sys else [])
+            instr_parts.extend({"text": t} for t in inline_sys)
+            if instr_parts:
+                body["systemInstruction"] = {"parts": instr_parts}
+        else:
+            combined = "\n\n".join(([system_text] if system_text else []) + inline_sys)
+            if combined:
+                instr_parts = [{"text": combined}]
+                body["systemInstruction"] = {"parts": instr_parts}
 
         if tools:
             body["tools"] = self._translate_tools(tools)
@@ -638,27 +786,20 @@ class GeminiProvider(BaseProvider):
                 reasoning_applied = True
 
         url = f"{self.base_url}/models/{m}:generateContent?key={self.api_key}"
-        async with httpx.AsyncClient(timeout=180) as c:
-            r = await c.post(url, json=body)
+        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as c:
+            r, reasoning_applied, cache_kept = await self._post_with_fallbacks(
+                c, url, body, system_text,
+                reasoning_applied=reasoning_applied,
+                instr_parts=(instr_parts or None) or None)
+            if not cache_kept:
+                cache_name = None
+                cache_read_tokens = 0
             if r.status_code != 200:
-                # Retry stripping thinkingConfig / cachedContent on 400.
-                if r.status_code == 400:
-                    if reasoning_applied:
-                        body["generationConfig"].pop("thinkingConfig", None)
-                        reasoning_applied = False
-                    if "cachedContent" in body and "cache" in r.text.lower():
-                        body.pop("cachedContent", None)
-                        if system_text:
-                            body["systemInstruction"] = {"parts": [{"text": system_text}]}
-                        cache_name = None
-                        cache_read_tokens = 0
-                    r = await c.post(url, json=body)
-                if r.status_code != 200:
-                    raise ProviderError(
-                        f"gemini HTTP {r.status_code}: {r.text[:400]}",
-                        status=r.status_code,
-                        retryable=(r.status_code not in (400, 401)),
-                    )
+                raise ProviderError(
+                    f"gemini HTTP {r.status_code}: {r.text[:400]}",
+                    status=r.status_code,
+                    retryable=(r.status_code not in (400, 401)),
+                )
             d = r.json()
             cands = d.get("candidates") or []
             if not cands:
@@ -780,13 +921,25 @@ def _gemini_clean_schema(schema: dict) -> dict:
 
 
 def _coerce_obj(v):
-    if isinstance(v, (dict, list)):
+    """Coerce a tool result into a JSON object.
+
+    Gemini's `functionResponse.response` must be a Struct, but a list or a bare
+    scalar passed straight through. A tool whose result happens to be a number,
+    a boolean or a JSON array — a calculator, a count, a list endpoint — then
+    produced an invalid request body and a 502, while the identical result
+    worked on every OpenAI-compatible provider, which forwards the string
+    as-is. Anything that is not an object gets wrapped rather than trusted.
+    """
+    if isinstance(v, dict):
         return v
+    if isinstance(v, list):
+        return {"result": v}
     if isinstance(v, str):
         try:
-            return json.loads(v)
+            out = json.loads(v)
         except Exception:
             return {"text": v}
+        return out if isinstance(out, dict) else {"result": out}
     return {"value": v}
 
 
@@ -815,13 +968,17 @@ class OllamaProvider(BaseProvider):
 
     def _translate_messages(self, messages, system_text, prompted_fallback=False):
         out = []
+        # Same rule as the OpenAI-compatible adapter: inline system turns are
+        # merged, never dropped. See `_inline_system_turns`.
+        inline = _inline_system_turns(messages)
         if system_text:
-            out.append({"role": "system", "content": system_text})
+            out.append({"role": "system",
+                        "content": "\n\n".join([system_text] + inline)})
+        elif inline:
+            out.append({"role": "system", "content": "\n\n".join(inline)})
         for m in messages:
             r = m.get("role")
             if r == "system":
-                if not system_text:
-                    out.append({"role": "system", "content": m.get("content", "")})
                 continue
             if r == "tool":
                 if prompted_fallback:
@@ -888,6 +1045,9 @@ class OllamaProvider(BaseProvider):
             elif rf.get("type") == "json_object":
                 body["format"] = "json"
 
+        # Local model loads can take minutes on first touch (weights paging
+        # in); the 600s ceiling here is deliberate, unlike the 180s used
+        # for hosted providers.
         async with httpx.AsyncClient(timeout=600) as c:
             r = await c.post(f"{self.base_url}/api/chat", json=body)
             if r.status_code != 200:
@@ -965,6 +1125,8 @@ def _parse_prompted_tool_call(text: str):
 
 # Allow per-model overrides where defaults differ.
 def model_capabilities(provider_name: str, model: str, default_caps: dict) -> dict:
+    # Key-pool siblings resolve to their canonical provider (gemini-2 → gemini).
+    provider_name = _base_provider(provider_name)
     caps = dict(default_caps)
     m = (model or "").lower()
     if provider_name in ("gemini", "gemini35lite"):
@@ -979,64 +1141,150 @@ def model_capabilities(provider_name: str, model: str, default_caps: dict) -> di
     return caps
 
 
-# V9: model-name → provider routing. Populated by build_providers() at startup
-# so a caller can pass only `model=` and the gateway picks the right backend.
+# V9: model-name → provider routing. Populated explicitly by
+# register_model_routes() at the end of build_providers() (not as a
+# hidden side effect mid-build) so a caller can pass only `model=` and
+# the gateway picks the right backend.
 MODEL_ROUTES: dict[str, str] = {}
+
+
+def register_model_routes(providers: dict) -> None:
+    """(Re)build the model-name → provider table from the wired pool."""
+    MODEL_ROUTES.clear()
+    if "kilo" in providers:
+        # A single Kilo instance forwards ANY model name passed via
+        # `model=`, so both known Kilo models are registered for
+        # model-name-only routing.
+        kilo_model = getattr(providers["kilo"], "model", "")
+        for _m in ("stepfun/step-3.7-flash:free", "tencent/hy3:free",
+                   kilo_model):
+            if _m:
+                MODEL_ROUTES[_m] = "kilo"
+    if "gemini35lite" in providers:
+        # Caller passes model="gemini-3.5-flash-lite" with no provider and
+        # it lands on the gemini35lite instance.
+        MODEL_ROUTES["gemini-3.5-flash-lite"] = "gemini35lite"
+
+
+def _key_list(single: str, plural: str) -> list[str]:
+    """All API keys for one provider: SINGULAR first, then the PLURAL var
+    split on commas/whitespace. Dedupes preserving order.
+
+    Values are never logged — report only len() of the result.
+    """
+    keys: list[str] = []
+    if v := (os.getenv(single) or "").strip():
+        keys.append(v)
+    if p := os.getenv(plural):
+        for part in re.split(r"[,\s]+", p):
+            part = part.strip().strip('"').strip("'")
+            if part:
+                keys.append(part)
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _base_provider(name: str) -> str:
+    """Pool-member name → canonical provider (`gemini-2` → `gemini`).
+    Only strips a trailing -N suffix; plain names pass through."""
+    m = re.fullmatch(r"(.+)-(\d+)", name or "")
+    return m.group(1) if m else (name or "")
+
+
+# Providers allowed in Gemini-only mode (GATEWAY_GEMINI_ONLY=true):
+# the gemini worker pair plus any of their key-pool siblings.
+GEMINI_FAMILY = ("gemini", "gemini35lite")
+
+
+def keep_gemini_only(pool: dict) -> dict:
+    """Drop every pool member outside the Gemini family (canonical +
+    siblings). Router pools are emptied entirely — tier classification
+    then uses the deterministic token-count fallback (no non-Gemini
+    key is ever touched)."""
+    return {n: p for n, p in pool.items()
+            if _base_provider(n) in GEMINI_FAMILY}
+
+
+def _fan_out(out: dict, base: str, keys: list[str], make) -> None:
+    """Register one pool member per key: `base` for the first key,
+    `base-2`, `base-3`, … after. The first key keeps the canonical name so
+    existing pins, shortcuts and agent_routing.yaml keep working; siblings
+    join the same failover ladders via expand_order() in router.py."""
+    for i, k in enumerate(keys, 1):
+        out[base if i == 1 else f"{base}-{i}"] = make(k)
 
 
 def build_providers(cache_store):
     """Worker pool — the LLMs that do real work for the agent.
 
     V3 changes vs V2:
-    - cerebras worker default: zai-glm-4.7 (was qwen-3-235b-a22b-instruct-2507, deprecating May 27 2026)
-    - groq worker default: openai/gpt-oss-120b (was llama-3.3-70b-versatile, now moved to router pool)
+    - groq worker default: openai/gpt-oss-120b (was llama-3.3-70b-versatile,
+      now moved to router pool)
+    (2026-09-08: the old cerebras default zai-glm-4.7 is archived upstream;
+    current default gpt-oss-120b — see note at the cerebras entry below.)
     """
     out = {}
-    if k := os.getenv("GEMINI_API_KEY"):
-        out["gemini"] = GeminiProvider(k, os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), cache_store)
-        # V9: Gemini 3.5 Flash-Lite — fastest, most cost-effective 3.5 model for
-        # high-throughput execution. Registered as a separate provider instance
-        # so it coexists with the default gemini (gemini-3.1-flash-lite) and is
-        # selectable by model name or the `gemini35lite` shortcut.
-        out["gemini35lite"] = GeminiProvider(k, os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite"), cache_store)
-    if k := os.getenv("NVIDIA_API_KEY"):
-        out["nvidia"] = NvidiaProvider(k, os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v3.2"))
-    if k := os.getenv("GROQ_API_KEY"):
-        out["groq"] = GroqProvider(k, os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"))
-    if k := os.getenv("CEREBRAS_API_KEY"):
-        out["cerebras"] = CerebrasProvider(k, os.getenv("CEREBRAS_MODEL", "zai-glm-4.7"))
-    if k := os.getenv("OPEN_ROUTER_API_KEY"):
-        out["openrouter"] = OpenRouterProvider(k, os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"))
-    if k := os.getenv("GITHUB_ACCESS_TOKEN"):
-        out["github"] = GitHubProvider(k, os.getenv("GITHUB_MODEL", "openai/gpt-4.1-mini"))
+    _gemini_keys = _key_list("GEMINI_API_KEY", "GEMINI_API_KEYS")
+    if _gemini_keys:
+        # Each Gemini key yields a gemini + gemini35lite pair sharing the
+        # same suffix, so key rotation covers both models together.
+        for i, k in enumerate(_gemini_keys, 1):
+            suf = "" if i == 1 else f"-{i}"
+            out["gemini" + suf] = GeminiProvider(k, os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), cache_store)
+            # V9: Gemini 3.5 Flash-Lite — fastest, most cost-effective 3.5 model for
+            # high-throughput execution. Registered as a separate provider instance
+            # so it coexists with the default gemini and is selectable by model
+            # name or the `gemini35lite` shortcut.
+            out["gemini35lite" + suf] = GeminiProvider(k, os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite"), cache_store)
+    _fan_out(out, "nvidia",
+             _key_list("NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
+             lambda k: NvidiaProvider(k, os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v3.2")))
+    _fan_out(out, "groq",
+             _key_list("GROQ_API_KEY", "GROQ_API_KEYS"),
+             lambda k: GroqProvider(k, os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")))
+    # 2026-09-08: zai-glm-4.7 is ARCHIVED (verified 404). gpt-oss-120b
+    # is a valid catalogue id, but THIS account currently 402s on every
+    # Cerebras model (billing/quota) — picks back off for 5 min via
+    # _backoff_for(402) and failover covers. Fix billing (or the pin)
+    # and this entry works with no code change. CEREBRAS_MODEL override
+    # still wins when set.
+    _fan_out(out, "cerebras",
+             _key_list("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
+             lambda k: CerebrasProvider(k, os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")))
+    _fan_out(out, "openrouter",
+             _key_list("OPEN_ROUTER_API_KEY", "OPEN_ROUTER_API_KEYS"),
+             lambda k: OpenRouterProvider(k, os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")))
+    _fan_out(out, "github",
+             _key_list("GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
+             lambda k: GitHubProvider(k, os.getenv("GITHUB_MODEL", "openai/gpt-4.1-mini")))
     if om := os.getenv("OLLAMA_MODEL"):
         # V9: Ollama is still used for embeddings (see embedders.py), but it is
         # disabled as an LLM *worker* by default — set ENABLE_OLLAMA_LLM=true to
         # re-enable it as a chat/answer provider. This keeps the LLM router on the
         # hosted providers (gemini/nvidia/groq/cerebras/openrouter/github/kilo).
+        # Ollama is keyless (local daemon) so it never fans out.
         if os.getenv("ENABLE_OLLAMA_LLM", "false").lower() in ("1", "true", "yes"):
             out["ollama"] = OllamaProvider(om, os.getenv("OLLAMA_URL", "http://localhost:11434"))
     # V9: Kilo Code Gateway — OpenAI-compatible. Serves free models like
     # stepfun/step-3.7-flash:free and tencent/hy3:free. A single Kilo provider
-    # instance forwards ANY model name passed via `model=`, so both known Kilo
-    # models are registered in MODEL_ROUTES for model-name-only routing.
-    if k := os.getenv("KILO_API_KEY"):
-        kilo_model = os.getenv("KILO_MODEL", "tencent/hy3:free")
-        out["kilo"] = KiloProvider(
-            k, kilo_model,
-            os.getenv("KILO_BASE_URL", "https://api.kilo.ai/api/gateway"),
-        )
-        for _m in ("stepfun/step-3.7-flash:free", "tencent/hy3:free", kilo_model):
-            MODEL_ROUTES[_m] = "kilo"
-    # V9: register the Gemini 3.5 Flash-Lite model name for model-only routing
-    # (caller passes model="gemini-3.5-flash-lite" with no provider and it lands
-    # on the gemini35lite instance).
-    MODEL_ROUTES["gemini-3.5-flash-lite"] = "gemini35lite"
+    # instance forwards ANY model name passed via `model=`.
+    _kilo_base = os.getenv("KILO_BASE_URL", "https://api.kilo.ai/api/gateway")
+    _kilo_model = os.getenv("KILO_MODEL", "tencent/hy3:free")
+    _fan_out(out, "kilo",
+             _key_list("KILO_API_KEY", "KILO_API_KEYS"),
+             lambda k: KiloProvider(k, _kilo_model, _kilo_base))
     # V9: bake per-model capability overrides (vision/reasoning) into each
     # instance, so Router.pick() — which reads provider.capabilities directly —
     # sees the resolved truth instead of the class-level default.
+    # Sibling members (gemini-2, …) resolve to their canonical provider.
     for name, p in out.items():
-        p.capabilities = model_capabilities(name, p.model, getattr(p, "capabilities", {}))
+        p.capabilities = model_capabilities(_base_provider(name), p.model, getattr(p, "capabilities", {}))
+    register_model_routes(out)
     return out
 
 
@@ -1045,12 +1293,12 @@ def build_providers(cache_store):
 # separate per-call markers. Routers receive a bounded envelope (token_count +
 # 800-char sample) and emit a single word (TINY/LARGE/HUGE).
 ROUTER_DEFAULTS = {
-    # NOTE: On the test Cerebras account, gpt-oss-120b / zai-glm-4.7 / qwen-3-32b
-    # all 404 (no entitlement despite docs). Only llama3.1-8b and the deprecating
-    # qwen-3-235b respond. Using llama3.1-8b — small, fast, the natural router
-    # shape. *** DEPRECATES MAY 27, 2026 *** — must update ROUTER_CEREBRAS_MODEL
-    # before then, OR upgrade the Cerebras account to unlock gpt-oss-120b.
-    "cerebras": "llama3.1-8b",
+    # 2026-09-08: llama3.1-8b is GONE from this account's catalogue
+    # (pre-May deprecation note came true). qwen-3.8-27b is the smallest
+    # live model id — though this account currently 402s on ALL Cerebras
+    # models, so the router pool fails over to groq/nvidia in practice
+    # (router exceptions now back the dead entry off for 5 min).
+    "cerebras": "qwen-3.8-27b",
     "groq": "llama-3.3-70b-versatile",
     "nvidia": "nvidia/llama-3.1-nemotron-nano-8b-v1",
     "github": "microsoft/Phi-4-mini-instruct",
@@ -1064,12 +1312,16 @@ def build_router_providers():
     we picked (Cerebras, Groq, NVIDIA, GitHub) all meter per-model, not per-key.
     """
     out = {}
-    if k := os.getenv("CEREBRAS_API_KEY"):
-        out["cerebras"] = CerebrasProvider(k, os.getenv("ROUTER_CEREBRAS_MODEL", ROUTER_DEFAULTS["cerebras"]))
-    if k := os.getenv("GROQ_API_KEY"):
-        out["groq"] = GroqProvider(k, os.getenv("ROUTER_GROQ_MODEL", ROUTER_DEFAULTS["groq"]))
-    if k := os.getenv("NVIDIA_API_KEY"):
-        out["nvidia"] = NvidiaProvider(k, os.getenv("ROUTER_NVIDIA_MODEL", ROUTER_DEFAULTS["nvidia"]))
-    if k := os.getenv("GITHUB_ACCESS_TOKEN"):
-        out["github"] = GitHubProvider(k, os.getenv("ROUTER_GITHUB_MODEL", ROUTER_DEFAULTS["github"]))
+    _fan_out(out, "cerebras",
+             _key_list("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
+             lambda k: CerebrasProvider(k, os.getenv("ROUTER_CEREBRAS_MODEL", ROUTER_DEFAULTS["cerebras"])))
+    _fan_out(out, "groq",
+             _key_list("GROQ_API_KEY", "GROQ_API_KEYS"),
+             lambda k: GroqProvider(k, os.getenv("ROUTER_GROQ_MODEL", ROUTER_DEFAULTS["groq"])))
+    _fan_out(out, "nvidia",
+             _key_list("NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
+             lambda k: NvidiaProvider(k, os.getenv("ROUTER_NVIDIA_MODEL", ROUTER_DEFAULTS["nvidia"])))
+    _fan_out(out, "github",
+             _key_list("GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
+             lambda k: GitHubProvider(k, os.getenv("ROUTER_GITHUB_MODEL", ROUTER_DEFAULTS["github"])))
     return out

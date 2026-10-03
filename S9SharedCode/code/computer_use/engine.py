@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -30,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import daemon
+from . import daemon  # shim re-exporting core.daemon (canonical) — keeps monkeypatch compat
 from . import layers
 from . import prompts as P
 from . import safety
@@ -41,10 +42,16 @@ from .daemon import PreconditionError, DaemonError
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Cheap model for the L2b judgment LLM (per spec: Gemini 3.1 Flash-Lite-class
-# through V9). Override via env.
-_JUDGE_MODEL = os.environ.get("COMPUTER_USE_JUDGE_MODEL", "gemini-3.1-flash-lite")
-_VISION_MODEL = os.environ.get("COMPUTER_USE_VISION_MODEL", "gemini-3.1-flash-lite")
+# NOTE: the L2b/L3 model choice lives in skills.py (_COMPUTER_JUDGE_MODEL /
+# _COMPUTER_VISION_MODEL, defaulting to "" = gateway failover routing).
+# Earlier revisions kept separate defaults here ("gemini-3.1-flash-lite")
+# that were never read — the engine only calls the injected llm_chat /
+# llm_vision callables — so they were removed to end the drift.
+
+# Loop-guard caps (charter §11, AX_TREE_CONTRACT §contract).
+MAX_ACTION_REPEATS = 3  # same action 3x in a row -> abort as loop
+MAX_L3_CALLS = 6  # max vision escalations per run
+MAX_TURNS_HARD = 12
 
 
 @dataclass
@@ -73,25 +80,53 @@ class ComputerUseSkill:
         self._daemon_available = False
         self._dry_run_plan: list[str] = []
         self._recorder = None  # recording is opt-in via run(record=True)
+        self._last_dispatch_error: str = ""
+
+    def _stop_recorder(self) -> None:
+        """Idempotent recorder shutdown — every run() exit path funnels here
+        via _done() so the daemon never leaks an open recording."""
+        rec, self._recorder = self._recorder, None
+        if rec is not None:
+            try:
+                rec.stop()
+            except Exception:
+                pass
+
+    def _done(self, success: bool, layer: str, **kw) -> ComputerResult:
+        self._stop_recorder()
+        return ComputerResult(success, layer, **kw)
 
     # ── public entry ─────────────────────────────────────
     def run(self, goal: str, *, app_hint: str | None = None,
-            max_turns: int = 12) -> ComputerResult:
-        """Execute `goal` against the desktop. Returns ComputerResult."""
+            max_turns: int = 12, record: bool = False) -> ComputerResult:
+        """Execute `goal` against the desktop. Returns ComputerResult.
+
+        `record=True` arms the trajectory Recorder (replay viewer). Kept for
+        backwards-compat with test_computer_use_replay.py which passes it.
+        """
         trace: list[str] = []
+        # Opt-in recording (previously _recorder was never armed, and the id
+        # carried no session correlation). Every exit below funnels through
+        # _done(), which stops the recorder, so no path leaks it.
+        if record:
+            try:
+                from .core.recording import Recorder
+                self._recorder = Recorder(f"{self.session_id}-{int(time.time())}")
+                if hasattr(self._recorder, "start"):
+                    self._recorder.start()
+            except Exception:
+                self._recorder = None
         # 0) Safety gate: enabled?
         if not self.safety.enabled:
-            return ComputerResult(False, "disabled",
-                                  error="Computer-use is disabled. "
-                                        "Set COMPUTER_USE_ENABLED=true to opt in.")
+            return self._done(False, "disabled",
+                              error="Computer-use is disabled. "
+                                    "Set COMPUTER_USE_ENABLED=true to opt in.")
         # 0.5) Permission pre-flight (charter §8.1): fail fast with an
         # actionable error if AX / screenshot / daemon are not usable.
         perm = check_permissions()
         if not perm.ok():
             err = perm.error_message()
-            if self._recorder:
-                self._recorder.stop()
-            return ComputerResult(False, "permission", trace=trace, error=err)
+            return self._done(False, "permission", trace=trace, error=err)
         trace.append("permissions ok")
         # 1) Ensure daemon; if unavailable, fall back to gated-shell L0.
         if not daemon.ensure_daemon():
@@ -103,7 +138,7 @@ class ComputerUseSkill:
         # 2) Pick a target app (launch if needed).
         pid, window_id = self._acquire_target(app_hint)
         if pid is None:
-            return ComputerResult(False, "no-target",
+            return self._done(False, "no-target",
                                   trace=trace, error="No suitable target app found.")
         trace.append(f"target pid={pid} window={window_id}")
 
@@ -111,17 +146,22 @@ class ComputerUseSkill:
         recovery = layers.RecoveryPolicy()
         vision_fb = layers.VisionFallback()
         l2b_failures = 0
+        l3_calls = 0
         last_state = None
         last_screenshot = None
         last_shot_mime = "image/png"
         last_act = None
         last_act_ok = False
+        # Generic loop-guard: track consecutive identical actions (any type).
+        last_act_key: str | None = None
+        repeat_count = 0
+        max_turns = min(max_turns, MAX_TURNS_HARD)
         for turn in range(max_turns):
             # Re-ensure the daemon each turn: on this Windows build the
             # cua-driver daemon self-terminates ~30s after a UIA timeout, so a
             # long cascade can lose its pipe mid-run. Restart it if needed.
             if not daemon.ensure_daemon():
-                return ComputerResult(False, "daemon-error", trace=trace,
+                return self._done(False, "daemon-error", trace=trace,
                                       error="cua-driver daemon unavailable")
             # SCAN (Invariant 1). The driver occasionally returns an empty AX
             # tree on the first scan right after launch; retry a couple times
@@ -135,7 +175,7 @@ class ComputerUseSkill:
                 except PreconditionError:
                     state = None
                 except DaemonError as e:
-                    return ComputerResult(False, "daemon-error", trace=trace, error=str(e))
+                    return self._done(False, "daemon-error", trace=trace, error=str(e))
                 if state is None:
                     continue
                 # Cua Driver 0.17 requires snapshot_id alongside element_index
@@ -155,7 +195,7 @@ class ComputerUseSkill:
                 # Empty AX — wait briefly and re-scan (window still settling).
                 time.sleep(1.0)
             if state is None:
-                return ComputerResult(False, "daemon-error", trace=trace,
+                return self._done(False, "daemon-error", trace=trace,
                                       error="window state unavailable")
 
             # STALE WINDOW GUARD: cua-driver returns only {"text": ...} (no
@@ -164,9 +204,10 @@ class ComputerUseSkill:
             # the target before treating the empty tree as "still settling".
             if not (state.get("tree_markdown") or state.get("elements")
                     or state.get("snapshot_id")):
-                trace.append("stale window_id detected → re-acquiring target")
+                trace.append("stale window_id → re-acquiring target")
                 new_pid, new_wid = self._acquire_target(app_hint)
                 if new_pid is not None:
+                    trace.append(f"re-acquired pid={new_pid} window={new_wid}")
                     pid, window_id = new_pid, new_wid
                     # Re-scan with the fresh window_id.
                     try:
@@ -178,11 +219,11 @@ class ComputerUseSkill:
                     if state is None or not (state.get("tree_markdown")
                                             or state.get("elements")
                                             or state.get("snapshot_id")):
-                        return ComputerResult(False, "no-target",
+                        return self._done(False, "no-target",
                                               trace=trace,
                                               error="target window unavailable")
                 else:
-                    return ComputerResult(False, "no-target", trace=trace,
+                    return self._done(False, "no-target", trace=trace,
                                           error="target window unavailable")
 
             tree_md = state.get("tree_markdown") or ""
@@ -198,7 +239,7 @@ class ComputerUseSkill:
                                                window_id=window_id)
                 if extracted is not None:
                     trace.append(f"L1 extract: {extracted['method']}")
-                    return ComputerResult(
+                    return self._done(
                         True, "L1", output={"content": extracted["content"],
                                            "method": extracted["method"]},
                         trace=trace)
@@ -215,6 +256,10 @@ class ComputerUseSkill:
                     if not ok:
                         ok_all = False
                         break
+                    # Settle: the target app (Calculator, Notepad) needs a brief
+                    # beat to process each input before the next arrives, or
+                    # rapid clicks are dropped/ignored and the result is wrong.
+                    time.sleep(0.4)
                 if ok_all:
                     if det.app == "calculator":
                         # Re-scan and check the display shows a result.
@@ -235,9 +280,9 @@ class ComputerUseSkill:
                                 q = after.find('"')
                                 disp = after[:q].strip() if q >= 0 else after.strip()
                                 break
-                        return ComputerResult(True, "L2a", output={"display": disp},
+                        return self._done(True, "L2a", output={"display": disp},
                                              trace=trace)
-                    return ComputerResult(True, "L2a", output={"plan": det.description},
+                    return self._done(True, "L2a", output={"plan": det.description},
                                          trace=trace)
                 trace.append("L2a deterministic action failed; falling back to L2b")
 
@@ -266,12 +311,34 @@ class ComputerUseSkill:
                         state = dict(state)
                         state["screenshot_png_b64"] = last_screenshot
                         state["screenshot_mime_type"] = last_shot_mime
+                    # Last resort: grab a desktop screenshot directly. cua-driver
+                    # returns screenshots on get_desktop_state even when the
+                    # per-window fetch omits them — without this L3 would almost
+                    # never engage.
+                    if not self._has_screenshot(state):
+                        try:
+                            desk = daemon.call("get_desktop_state", {}, timeout=15)
+                            desk_shot = (desk.get("screenshot") or desk.get("image")
+                                         or desk.get("screenshot_png_b64"))
+                            if desk_shot:
+                                state = dict(state)
+                                state["screenshot_png_b64"] = desk_shot
+                                state["screenshot_mime_type"] = "image/png"
+                                last_screenshot = desk_shot
+                                last_shot_mime = "image/png"
+                        except Exception:
+                            pass
                     if self._has_screenshot(state):
+                        if l3_calls >= MAX_L3_CALLS:
+                            trace.append(f"L3 cap {MAX_L3_CALLS} hit → abort")
+                            return self._done(False, "max-turns", trace=trace,
+                                                  error="L3 vision call cap reached")
                         trace.append("L2b empty → L3 vision")
+                        l3_calls += 1
                         res = self._layer_vision(goal, pid, window_id, state)
                         if res.success:
-                            return ComputerResult(True, "L3", output=res.output, trace=trace)
-                        return ComputerResult(False, "L3", trace=trace,
+                            return self._done(True, "L3", output=res.output, trace=trace)
+                        return self._done(False, "L3", trace=trace,
                                               error=res.error or "vision fallback failed")
                     trace.append("L2b empty but no screenshot → stay on a11y")
                 continue
@@ -279,19 +346,23 @@ class ComputerUseSkill:
             # L2b judgment call (cheap text model).
             # Pre-filter the AX tree by goal keywords to bound the LLM context
             # (charter §10: biggest cost knob is perception interpretation).
-            filtered = layers.filter_ax_markdown(tree_md, query=goal, max_chars=6000)
+            filtered = layers.filter_ax_markdown(tree_md, query=goal, max_chars=12000)
             judge = self._judge_a11y(goal, filtered, pid, app_hint or "app")
             if judge is None:
                 l2b_failures += 1
                 trace.append("L2b judge returned no action")
                 if vision_fb.should_escalate(l2b_failures, None):
+                    if l3_calls >= MAX_L3_CALLS:
+                        return self._done(False, "max-turns", trace=trace,
+                                              error="L3 vision call cap reached")
                     if self._has_screenshot(state):
                         trace.append("L2b retries exhausted → L3 vision")
+                        l3_calls += 1
                         res = self._layer_vision(goal, pid, window_id, state)
-                        return ComputerResult(res.success, "L3", output=res.output,
+                        return self._done(res.success, "L3", output=res.output,
                                               trace=trace, error=res.error)
                     trace.append("L2b retries exhausted; no screenshot for L3 → abort")
-                    return ComputerResult(False, "L2b", trace=trace,
+                    return self._done(False, "L2b", trace=trace,
                                           error="a11y judge unavailable and no screenshot for vision fallback")
                 continue
 
@@ -301,13 +372,17 @@ class ComputerUseSkill:
                 out = dict(judge)
                 if self._dry_run_plan:
                     out["dry_run_plan"] = self._dry_run_plan
-                return ComputerResult(True, "L2b", output=out, trace=trace)
+                return self._done(True, "L2b", output=out, trace=trace)
             if verdict == "escalate":
                 l2b_failures += 1
                 trace.append(f"L2b escalate: {judge.get('action', {}).get('note')}")
                 if vision_fb.should_escalate(l2b_failures, "element_missing"):
+                    if l3_calls >= MAX_L3_CALLS:
+                        return self._done(False, "max-turns", trace=trace,
+                                              error="L3 vision call cap reached")
+                    l3_calls += 1
                     res = self._layer_vision(goal, pid, window_id, state)
-                    return ComputerResult(res.success, "L3", output=res.output,
+                    return self._done(res.success, "L3", output=res.output,
                                           trace=trace, error=res.error)
                 continue
 
@@ -333,15 +408,36 @@ class ComputerUseSkill:
                 out = dict(judge)
                 out["verdict"] = "done"
                 out["success"] = True
-                return ComputerResult(True, "L2b", output=out, trace=trace)
+                return self._done(True, "L2b", output=out, trace=trace)
+            # Generic loop-guard: same action key 3x in a row -> abort.
+            try:
+                import json as _j
+                act_key = _j.dumps(act, sort_keys=True, default=str)
+            except Exception:
+                act_key = str(act)
+            if act_key == last_act_key:
+                repeat_count += 1
+            else:
+                last_act_key = act_key
+                repeat_count = 1
+            if repeat_count >= MAX_ACTION_REPEATS:
+                trace.append(f"loop-guard: same action {repeat_count}x → abort")
+                return self._done(False, "aborted", trace=trace,
+                                      error=f"loop-guard: repeated action {act.get('type')} {repeat_count}x")
             ok = self._dispatch_action(pid, window_id, act, snapshot_id)
             last_act, last_act_ok = act, ok
             trace.append(f"act {act.get('type')} -> {'ok' if ok else 'fail'}")
             if not ok:
-                directive = recovery.handle("action failed")
+                # Pass the structured reason (daemon error text), not a bare
+                # "action failed" — recovery.handle branches on substrings
+                # like element_index/permission and otherwise always rescan.
+                _reason = f"action failed ({act.get('type')})"
+                if self._last_dispatch_error:
+                    _reason += f": {self._last_dispatch_error}"
+                directive = recovery.handle(_reason)
                 if directive == "abort":
-                    return ComputerResult(False, "aborted", trace=trace,
-                                          error="action failed repeatedly")
+                    return self._done(False, "aborted", trace=trace,
+                                      error=f"action failed repeatedly ({self._last_dispatch_error or 'no detail'})")
             last_state = state
 
             # DRY-RUN: the plan IS the deliverable. We never execute on the
@@ -353,13 +449,13 @@ class ComputerUseSkill:
                 out = dict(judge)
                 out["dry_run_plan"] = self._dry_run_plan
                 trace.append("dry-run: plan produced, stopping")
-                return ComputerResult(True, "L2b-dry-run", output=out, trace=trace)
+                return self._done(True, "L2b-dry-run", output=out, trace=trace)
 
         out = {}
         if self._dry_run_plan:
             out["dry_run_plan"] = self._dry_run_plan
-        return ComputerResult(False, "max-turns", output=out, trace=trace,
-                              error="Reached max turns without completing goal.")
+        return self._done(False, "max-turns", output=out, trace=trace,
+                          error="Reached max turns without completing goal.")
 
     # ── target acquisition ───────────────────────────────
     def _launch_by_shell(self, app_hint: str) -> bool:
@@ -389,6 +485,16 @@ class ComputerUseSkill:
         for any app the user can see pinned, with no per-app hardcoding.
         Returns True if a click was issued.
         """
+        # Safety: vision-click launch is a real desktop side-effect — respect
+        # dry-run and approval gates.
+        if self.safety.mode == "dry-run":
+            self._dry_run_plan.append(f"[dry-run] would vision-click icon for '{app_hint}'")
+            return False
+        if self.safety.needs_approval("vision_launch", {"app": app_hint}):
+            aid = self.safety.create_approval("vision_launch", {"app": app_hint})
+            # Don't block the cascade on approval plumbing; record and skip.
+            self._dry_run_plan.append(f"[pending {aid}] vision-click for '{app_hint}'")
+            return False
         if self._llm_vision is None:
             return False
         try:
@@ -402,8 +508,12 @@ class ComputerUseSkill:
         if isinstance(b64, str) and b64.startswith("data:"):
             b64 = b64.split(",", 1)[1]
         shot = f"data:image/png;base64,{b64}"
+        # Sanitise app_hint: strip whitespace, quote characters, and control
+        # characters so a weird app name can't break out of the f-string
+        # prompt or inject instructions to the vision model.
+        safe_hint = re.sub(r"[\s'\"\\\x00-\x1f]+", "_", str(app_hint or ""))[:80]
         prompt = (
-            f"Find the icon for the application '{app_hint}' on this desktop "
+            f"Find the icon for the application '{safe_hint}' on this desktop "
             f"(it may be pinned on the taskbar, on the desktop, or in the "
             f"system tray). Reply with ONLY JSON: "
             f'{{"found": true, "x": <pixel_x>, "y": <pixel_y>}} or '
@@ -548,18 +658,40 @@ class ComputerUseSkill:
         return bool(state.get("screenshot") or state.get("image")
                     or state.get("screenshot_png_b64"))
 
-    def _layer_vision(self, goal: str, pid: int, window_id, state: dict) -> ComputerResult:
+    def _best_screenshot(self, state: dict, pid: int, window_id) -> tuple[str | None, list[dict]]:
+        """Return (screenshot_png_b64, elements), preferring the window state
+        but falling back to a fresh desktop screenshot. cua-driver returns
+        screenshots on ``get_desktop_state`` even when ``get_window_state``
+        omits them, so without this fallback L3 vision would almost always
+        fail with "no screenshot"."""
         raw = (state.get("screenshot") or state.get("image")
                or state.get("screenshot_png_b64"))
-        if not raw or self._llm_vision is None:
+        elements = state.get("elements") or []
+        if raw:
+            return raw, elements
+        # Window state had no screenshot — fetch the desktop shot. Set-of-marks
+        # will be drawn over the (empty) element list, which is fine: the vision
+        # model can still locate the target by pixel coordinates.
+        try:
+            desk = daemon.call("get_desktop_state", {}, timeout=15)
+            desk_raw = (desk.get("screenshot") or desk.get("image")
+                        or desk.get("screenshot_png_b64"))
+            if desk_raw:
+                return desk_raw, elements
+        except Exception:
+            pass
+        return raw, elements
+
+    def _layer_vision(self, goal: str, pid: int, window_id, state: dict) -> ComputerResult:
+        # NOTE: helper — constructs ComputerResult directly (NOT via _done):
+        # only run() exits may stop the recorder.
+        b64, elements = self._best_screenshot(state, pid, window_id)
+        if not b64 or self._llm_vision is None:
             return ComputerResult(False, "L3", error="no screenshot or vision LLM")
         # Normalise to a base64 string (strip data: prefix if present).
-        if raw.startswith("data:"):
-            b64 = raw.split(",", 1)[1] if "," in raw else raw
-        else:
-            b64 = raw
+        if isinstance(b64, str) and b64.startswith("data:"):
+            b64 = b64.split(",", 1)[1] if "," in b64 else b64
         # Draw set-of-marks: numbered dashed boxes over UI elements.
-        elements = state.get("elements") or []
         annotated_b64, legend = layers.draw_set_of_marks(b64, elements)
         screenshot = f"data:image/png;base64,{annotated_b64}"
         prompt = P.USER_VISION_TEMPLATE.format(goal=goal, legend=legend)
@@ -575,7 +707,7 @@ class ComputerUseSkill:
                 verdict = _json.loads(verdict)
             except Exception:
                 return ComputerResult(False, "L3",
-                                      error=f"vision returned non-JSON: {verdict[:120]}")
+                                       error=f"vision returned non-JSON: {verdict[:120]}")
         if not isinstance(verdict, dict):
             return ComputerResult(False, "L3",
                                   error=f"vision returned unexpected type: {type(verdict)}")
@@ -611,6 +743,16 @@ class ComputerUseSkill:
             self._dry_run_plan.append(trace)
             return True
         t = act.get("type")
+        # APPROVAL: the low-level `click`/`type_text`/… primitives require
+        # approval when they match a pattern (mcp_server.py), so the engine
+        # path that performs the identical physical action must too —
+        # otherwise the same click is gated in one path and ungated in the
+        # other. Like vision-launch above: record and skip, don't block the
+        # cascade on approval plumbing.
+        if self.safety.needs_approval(t or "", dict(act)):
+            aid = self.safety.create_approval(t or "", dict(act))
+            self._dry_run_plan.append(f"[pending {aid}] {t} skipped awaiting approval")
+            return False
         # Cua Driver 0.17 requires snapshot_id + window_id for element actions.
         base = {"pid": pid, "window_id": window_id}
         if snapshot_id:
@@ -626,6 +768,14 @@ class ComputerUseSkill:
                 # turn, so re-fetch a fresh snapshot immediately before each
                 # element-targeted click. Without a current snapshot_id the
                 # driver refuses element_index clicks.
+                # RE-RESOLVE: the same fresh snapshot also lets us re-resolve a
+                # stale element_index. Deterministic plans (Calculator, Notepad)
+                # carry their button/role in a ``match`` key; the AX tree reflows
+                # after every click, so an index captured at plan time can point
+                # at the wrong button by the time a later click fires. Resolving
+                # from THIS snapshot's elements guarantees the index and the
+                # snapshot_id are consistent (both from the same scan) — without
+                # this, multi-click plans mis-click and produce wrong results.
                 if act.get("element_index") is not None:
                     try:
                         fresh = daemon.call("get_window_state",
@@ -633,6 +783,10 @@ class ComputerUseSkill:
                                              "include_screenshot": True}, timeout=20)
                         if fresh.get("snapshot_id"):
                             args["snapshot_id"] = fresh["snapshot_id"]
+                        if act.get("match") and fresh.get("elements"):
+                            new_idx = layers.resolve_index(fresh["elements"], act)
+                            if new_idx is not None:
+                                args["element_index"] = new_idx
                     except Exception:
                         pass
                 daemon.call("click", args, timeout=15)
@@ -649,12 +803,24 @@ class ComputerUseSkill:
                                             {"pid": pid, "window_id": window_id,
                                              "include_screenshot": True}, timeout=20)
                         snap = fresh.get("snapshot_id")
+                        # Re-resolve a stale index from the fresh tree (see the
+                        # click handler above for why index/snapshot must match).
+                        if act.get("match") and fresh.get("elements"):
+                            new_idx = layers.resolve_index(fresh["elements"], act)
+                            if new_idx is not None:
+                                eidx = new_idx
                         daemon.call("click", {"pid": pid, "window_id": window_id,
                                              "element_index": eidx,
                                              **({"snapshot_id": snap} if snap else {})},
                                     timeout=15)
                         daemon.call("press_key", {"pid": pid, "window_id": window_id,
                                                  "key": "a", "modifiers": ["ctrl"],
+                                                 **({"snapshot_id": snap} if snap else {})},
+                                    timeout=15)
+                        # Delete the selection so stale text can't survive when
+                        # the subsequent type lands without clearing (contract).
+                        daemon.call("press_key", {"pid": pid, "window_id": window_id,
+                                                 "key": "Delete",
                                                  **({"snapshot_id": snap} if snap else {})},
                                     timeout=15)
                     except Exception:
@@ -669,12 +835,18 @@ class ComputerUseSkill:
                 if act.get("element_index") is not None:
                     args["element_index"] = act["element_index"]
                     # Element-targeted type needs a fresh snapshot too.
+                    # Re-resolve a stale index from that fresh tree so the
+                    # index and snapshot_id are from the same scan.
                     try:
                         fresh = daemon.call("get_window_state",
                                             {"pid": pid, "window_id": window_id,
                                              "include_screenshot": True}, timeout=20)
                         if fresh.get("snapshot_id"):
                             args["snapshot_id"] = fresh["snapshot_id"]
+                        if act.get("match") and fresh.get("elements"):
+                            new_idx = layers.resolve_index(fresh["elements"], act)
+                            if new_idx is not None:
+                                args["element_index"] = new_idx
                     except Exception:
                         pass
                 else:
@@ -699,28 +871,59 @@ class ComputerUseSkill:
                         pargs["snapshot_id"] = fresh["snapshot_id"]
                 except Exception:
                     pass
-                pargs["key"] = act.get("value")
+                # Accept both `key` (driver shape, used by extract.py) and
+                # `value` (judge/deterministic shape) — same physical key.
+                _key = act.get("key", act.get("value"))
+                if _key is None:
+                    return False
+                pargs["key"] = _key
                 if act.get("modifiers"):
                     pargs["modifiers"] = act["modifiers"]
                 daemon.call("press_key", pargs, timeout=15)
             elif t == "hotkey":
                 daemon.call("hotkey", {**base, "keys": act.get("keys")}, timeout=15)
             elif t == "scroll":
-                daemon.call("scroll",
-                            {**base,
-                             "direction": act.get("direction", "down"),
-                             "amount": act.get("amount", 3)}, timeout=15)
+                # Pass element_index through when the judge supplied one —
+                # the driver refuses snapshot-less element scrolls, and
+                # dropping the index silently turned them into no-ops.
+                _sargs: dict = {**base,
+                                "direction": act.get("direction", "down"),
+                                "amount": act.get("amount", 3)}
+                if act.get("element_index") is not None:
+                    _sargs["element_index"] = act["element_index"]
+                    # Fresh snapshot like click/type/press_key — a stale
+                    # turn-start snapshot gets element scrolls refused.
+                    try:
+                        _fresh = daemon.call("get_window_state",
+                                             {"pid": pid, "window_id": window_id,
+                                              "include_screenshot": True}, timeout=20)
+                        if _fresh.get("snapshot_id"):
+                            _sargs["snapshot_id"] = _fresh["snapshot_id"]
+                    except Exception:
+                        if snapshot_id:
+                            _sargs["snapshot_id"] = snapshot_id
+                daemon.call("scroll", _sargs, timeout=15)
             elif t == "wait":
-                time.sleep(act.get("seconds", 1))
+                # Clamp LLM-controlled sleep (same 5s cap as the browser
+                # driver) so a runaway "wait 1000" can't stall the cascade.
+                try:
+                    _secs = float(act.get("seconds", 1))
+                except (TypeError, ValueError):
+                    _secs = 1.0
+                time.sleep(max(0.0, min(_secs, 5.0)))
             else:
+                self._last_dispatch_error = f"unsupported action type {t!r}"
                 return False
+            self._last_dispatch_error = ""
             return True
-        except Exception:
+        except Exception as e:
+            self._last_dispatch_error = f"{type(e).__name__}: {e}"[:300]
             return False
 
     # ── L0 gated-shell fallback (no daemon) ─────────────
     def _gated_shell_fallback(self, goal: str) -> ComputerResult:
         """When the daemon can't run, expose the safe shell surface only."""
+        self._stop_recorder()
         return ComputerResult(
             False, "L0-disabled",
             error="Computer-use daemon unavailable. Gated-shell mode requires "
@@ -729,40 +932,19 @@ class ComputerUseSkill:
         )
 
     # ── direct gated-shell actions (used by MCP computer_action L0) ──
+    # Single source of truth: delegate to GatedShell so fixes can't drift.
+    def _gated(self):
+        from .shell import GatedShell
+        return GatedShell(self.safety)
+
     def shell_run_command(self, command: str, *, force: bool = False) -> dict:
-        if self.safety.cmd_blocked(command):
-            return {"status": "blocked", "message": self.safety.cmd_blocked(command)}
-        if not force and self.safety.needs_approval("run_command", {"command": command}):
-            aid = self.safety.create_approval("run_command", {"command": command})
-            return {"status": "pending", "approval_id": aid,
-                    "message": "Action requires your approval."}
-        if self.safety.mode == "dry-run":
-            return {"status": "dry-run", "command": command,
-                    "message": f"[dry-run] would run: {command}"}
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
-        return {"status": "done", "returncode": proc.returncode,
-                "stdout": proc.stdout[:8000], "stderr": proc.stderr[:4000]}
+        return self._gated().run_command(command, force=force)
 
     def shell_read_file(self, path: str, *, force: bool = False) -> dict:
-        if self.safety.path_blocked(path):
-            return {"status": "blocked", "message": f"path '{path}' is protected"}
-        p = Path(os.path.expanduser(path))
-        if not p.exists():
-            return {"status": "error", "message": "file not found"}
-        return {"status": "done", "path": str(p),
-                "content": p.read_text(encoding="utf-8", errors="replace")[:8000]}
+        return self._gated().read_file(path, force=force)
 
     def shell_write_file(self, path: str, content: str, *, force: bool = False) -> dict:
-        if self.safety.path_blocked(path):
-            return {"status": "blocked", "message": f"path '{path}' is protected"}
-        p = Path(os.path.expanduser(path))
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return {"status": "done", "path": str(p), "bytes": len(content)}
+        return self._gated().write_file(path, content, force=force)
 
     def shell_open_app(self, app: str, *, force: bool = False) -> dict:
-        if os.name == "nt":
-            subprocess.Popen(["cmd", "/c", "start", "", app], shell=False)
-        else:
-            subprocess.Popen(["open", app] if os.name == "posix" else ["xdg-open", app])
-        return {"status": "done", "opened": app}
+        return self._gated().open_app(app, force=force)

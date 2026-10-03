@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway V9 · Architecture Flow</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #12161f; --panel-2: #171c28;
+    --border: #232a38; --border-soft: #1b2130;
+    --text: #e7eaf1; --muted: #8b93a5; --faint: #5b6376;
+    --accent: #7c6cf0; --accent-dim: rgba(124,108,240,.14);
+    --blue: #58a6ff; --yellow: #d29922;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.55 var(--sans); margin: 0; }
+  a { color: var(--blue); }
+  header.top { padding: 12px 22px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; position: sticky; top: 0; z-index: 10; background: rgba(11,14,20,.94); backdrop-filter: blur(8px); }
+  header.top h1 { margin: 0; font-size: 17px; font-weight: 650; }
+  header.top nav { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; font-size: 13px; }
+  header.top nav a { color: var(--muted); text-decoration: none; padding: 6px 11px; border-radius: 7px; }
+  header.top nav a:hover { color: var(--text); background: var(--panel-2); }
+  header.top nav a.active { color: var(--text); background: var(--accent-dim); font-weight: 600; }
+  header.top nav .sep { width: 1px; height: 18px; background: var(--border); margin: 0 6px; }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 22px 22px 60px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 30px 0 10px; font-weight: 650; }
+  code { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); padding: 1px 6px; border-radius: 4px; }
+  pre.mermaid { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; overflow-x: auto; font-size: 12.5px; }
+  .note { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 11px 14px; font-size: 12.5px; color: var(--muted); margin: 14px 0; }
+  .note b { color: var(--text); }
+  footer { text-align: center; color: var(--faint); font-size: 12px; padding: 18px; }
+</style>
+<link rel="stylesheet" href="/static/console-theme.css">
+</head>
+<body>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item active"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">Architecture</div><div class="spacer"></div><button class="ghost palette-trigger" onclick="togglePalette()" title="Commands (Ctrl/⌘+K)">⌘K</button></div>
+<div class="wrap">
+<p>One process on <b>:8109</b> owns every secret, model call, channel, and durable memory.
+Callers rent capabilities over HTTP. Manage it from the <a href="/">Overview</a>,
+<a href="/static/connections.html">Connections</a>
+and <a href="/static/system.html">System</a> pages; the endpoint reference lives in <a href="/help">/help</a>.</p>
+<div class="note" id="mermaid-note" hidden><b>Diagrams need internet once.</b> The renderer loads from a CDN — if you are offline you will see the raw diagram source below instead of pictures. Everything else on this page works offline.</div>
+
+<h2>1 · System map</h2>
+<pre class="mermaid">
+flowchart TB
+    Caller["Callers<br/>(agent :8500 · dashboards · hooks)"]
+    subgraph Routes["ROUTES — thin: validate → policy → dispatch → log"]
+        Chat["POST /v1/chat · /batch · /vision"]
+        Emb["POST /v1/embed"]
+        Chan["POST /v1/channels/:send<br/>POST/GET /v1/hooks/:name"]
+        Integ["POST /v1/integrations/:svc/:op"]
+        Voice["POST /v1/tts · /v1/stt"]
+        Mem["/v1/memory/* (10 routes)"]
+        Ops["/v1/policy/* · /v1/approvals/*<br/>/v1/spend · /v1/cost/* · /v1/control/*"]
+    end
+    subgraph Brains["BRAINS"]
+        Router["router.py<br/>Worker Router + RouterPool"]
+        Policy["policy/engine.py<br/>allow · deny · approve"]
+        Plane["memory/plane.py<br/>legacy + 7 drawers"]
+    end
+    subgraph Backends["BACKENDS (translators, env-keyed)"]
+        Prov["providers.py<br/>8 LLM backends"]
+        Embedders["embedders.py<br/>Ollama 768-dim"]
+        Adapt["adaptors/* ×16"]
+        Svcs["integrations/* ×6"]
+        Vox["kokoro · whisper (lazy)"]
+    end
+    subgraph State["STATE (gateway-owned)"]
+        DB[("gateway_v8.db<br/>call ledger")]
+        MemFS["state/memory.*<br/>JSON + FAISS"]
+        Small["pairing · approvals · usage<br/>versions.json"]
+    end
+    Caller --> Routes
+    Chat --> Router
+    Chan --> Policy
+    Integ --> Policy
+    Mem --> Plane
+    Router --> Prov
+    Chat --> Prov
+    Emb --> Embedders
+    Chan --> Adapt
+    Integ --> Svcs
+    Voice --> Vox
+    Mem --> Embedders
+    Routes --> DB
+    Plane --> MemFS
+    Policy --> DB
+</pre>
+
+<h2>2 · Chat request lifecycle</h2>
+<pre class="mermaid">
+flowchart TD
+    Req(["POST /v1/chat"]) --> Norm["1 · Normalize<br/>prompt→messages · image URLs→data URLs · token estimate"]
+    Norm --> Resolve["2 · Resolve provider<br/>explicit → model map → agent pin → auto_route tier → ladder"]
+    Resolve --> Tier{"auto_route?"}
+    Tier -- yes --> Classify["RouterPool classifies<br/>TINY / LARGE / HUGE<br/>(800-char envelope)"]
+    Classify --> Huge{"HUGE?"}
+    Huge -- yes --> R503(["503 · no summarizer yet"])
+    Huge -- no --> Pick
+    Tier -- no --> Pick["3 · Pick candidate<br/>caps → max_ctx → RPM/RPD/TPM/cooldown/backoff<br/>(every skip → attempted[])"]
+    Pick -- none available --> S503(["503 · attempts attached"])
+    Pick -- provider --> Exec["4 · Execute<br/>1 same-provider retry (retries) → failover<br/>402→5min · 429→15s-1h · 5xx→20s · 401/403→10min"]
+    Exec -- ok --> Struct{"response_format?"}
+    Struct -- yes --> Val["validate JSON schema<br/>1 corrective retry"]
+    Val -- fail --> V503(["503"])
+    Val -- ok --> Log
+    Struct -- no --> Log["5 · Ledger + respond<br/>(tokens · latency · attempts · retries)"]
+    Exec -- explicit pin fails --> E502(["502"])
+    Exec -- all fail --> A503(["503 · last_error"])
+</pre>
+
+<h2>3 · Memory write vs recall</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Write["WRITE · POST /v1/memory/remember"]
+        WReq(["kind + descriptor + role"]) --> Route["route kind→drawer<br/>(chunk ⇒ document)"]
+        Route --> Enforce{"writer map?"}
+        Enforce -- no --> D403(["403 + audit"])
+        Enforce -- yes --> EmbW["embed descriptor"]
+        EmbW --> Persist["JSON append + FAISS add<br/>(dim checked LOUD)"]
+        Persist --> Sup{"supersedes?"}
+        Sup -- yes --> Link["mark old superseded_by<br/>+ audit"]
+    end
+    subgraph Read["RECALL · POST /v1/memory/search"]
+        RReq(["query + drawers?"]) --> OneEmb["ONE query embed"]
+        OneEmb --> Fan["fan out: legacy + each drawer<br/>(skip never-written)"]
+        Fan --> Fuse["per-store RRF fuse<br/>(vector + keyword, k=60)"]
+        Fuse --> Merge["merge: drawer tiers first<br/>drop superseded + stale versions<br/>attach doc neighbors"]
+    end
+</pre>
+
+<h2>4 · Channel send vs inbound hook</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Send["SEND · POST /v1/channels/:name/send"]
+        SReq(["to + text + trust"]) --> SPol{"policy?"}
+        SPol -- deny --> S403(["403"])
+        SPol -- approve --> Pend(["pending approval<br/>(retry later)"])
+        SPol -- allow --> SDo["send in worker thread"]
+        SDo --> SLedger["ledger: channel+trust+policy"]
+    end
+    subgraph Hook["INBOUND · POST /v1/hooks/:name"]
+        HReq(["raw provider payload"]) --> Verify["verify signature"]
+        Verify -- bad --> H403(["403"])
+        Verify -- ok --> Norm2["normalize → trust-stamped envelope"]
+        Norm2 --> HLedger["ledger + typed envelope out"]
+    end
+</pre>
+</div>
+<footer>LLM Gateway V9 · <a href="/">Overview</a> · <a href="/static/connections.html">Connections</a> · <a href="/static/system.html">System</a> · <a href="/help">Help</a></footer>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"
+  onload="mermaid.initialize({ startOnLoad: true, theme: 'dark' })"
+  onerror="document.getElementById('mermaid-note').hidden = false"></script>
+<script src="/static/gateway.js"></script>
+</body>
+</html>

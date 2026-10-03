@@ -25,12 +25,15 @@ ACTION_SCHEMA_JSON = {
             "required": ["type"],
             "properties": {
                 "type": {"type": "string",
-                         "enum": ["click", "double_click", "right_click", "type",
+                         # Dispatch-supported verbs ONLY (engine._dispatch_action).
+                         # double_click/right_click/drag/zoom/set_window_frame/
+                         # invoke_menu/clipboard_*/done are rejected — the SYSTEM
+                         # text says the same; keep both lists in sync.
+                         "enum": ["click", "type",
                                   "replace_text", "press_key", "hotkey", "scroll",
-                                  "drag", "zoom", "set_window_frame", "invoke_menu",
-                                  "clipboard_write", "clipboard_read", "wait", "done"]},
-                "element_index": {"type": "integer", "description": "from get_window_state; required for click/double_click/right_click/scroll"},
-                "value": {"type": "string", "description": "text for type/replace_text/clipboard_write, or key name for press_key (e.g. 'Delete', 'End')"},
+                                  "wait"]},
+                "element_index": {"type": "integer", "description": "from get_window_state; required for click/scroll, optional for type (omit to type into the focused window)"},
+                "value": {"type": "string", "description": "text for type/replace_text, or key name for press_key (e.g. 'Delete', 'End')"},
                 "clear": {"type": "boolean", "description": "DEPRECATED — use replace_text to overwrite"},
                 "modifiers": {"type": "array", "items": {"type": "string"},
                               "description": "for press_key chords, e.g. ['ctrl']"},
@@ -87,21 +90,16 @@ ACTIVATING / TOGGLING CONTROLS — GENERAL RULE:
   back (Play→Pause→Play). If the expected state already appeared, return
   verdict "done" with success=true.
 
-Action vocabulary (use EXACTLY these):
+Action vocabulary (use EXACTLY these — anything else is rejected and aborts
+the turn, so do NOT emit double_click, right_click, drag, zoom,
+set_window_frame, or clipboard_* actions):
 - click:        {"type":"click","element_index":N}
-- double_click: {"type":"double_click","element_index":N}
-- right_click:  {"type":"right_click","element_index":N}
 - type:         {"type":"type","element_index":N,"value":"text"}  (APPEND text)
-- replace_text: {"type":"replace_text","element_index":N,"value":"text"}  (OVERWRITE — selects all + types)
+- replace_text: {"type":"replace_text","element_index":N,"value":"text"}  (OVERWRITE — the engine emulates it as focus + select-all + type)
 - press_key:    {"type":"press_key","value":"Delete"}  or chord {"type":"press_key","value":"a","modifiers":["ctrl"]}
 - hotkey:       {"type":"hotkey","keys":["ctrl","a"]}
 - scroll:       {"type":"scroll","element_index":N,"direction":"down","amount":3}
-- drag:         {"type":"drag","from_x":..,"from_y":..,"to_x":..,"to_y":..}
-- zoom:         {"type":"zoom","x1":..,"y1":..,"x2":..,"y2":..}
-- set_window_frame: {"type":"set_window_frame","x":..,"y":..,"width":..,"height":..}
-- clipboard_write: {"type":"clipboard_write","value":"text"}
-- clipboard_read:  {"type":"clipboard_read"}
-- wait:         {"type":"wait","seconds":1}
+- wait:         {"type":"wait","seconds":1}  (clamped to 5s)
 
 WRITING TEXT — IMPORTANT:
 - For a "write X" goal, FIRST click the Document/TextBox element (the one
@@ -109,15 +107,16 @@ WRITING TEXT — IMPORTANT:
   action to write the text. Example:
     {"type":"click","element_index":N}          # focus the document
     {"type":"type","element_index":N,"value":"hello world"}   # write the text
-  NOTE: cua-driver does NOT support "replace_text" — it is rejected as an
-  unclassified action. Always use "click" + "type" instead. If the document
-  already has different text you must overwrite, select-all first
-  ({"type":"press_key","value":"a","modifiers":["ctrl"]}) then "type".
+  If the document already has different text you must overwrite, EITHER
+  select-all first ({"type":"press_key","value":"a","modifiers":["ctrl"]})
+  then "type", OR use a single "replace_text" action (the engine emulates
+  it as focus + select-all + type).
 - Only use "type" (APPEND) when the user explicitly asks to ADD text to
   existing content.
 - Do NOT use "type" with a "clear" flag — that is not supported.
-- NEVER use "set_value" or "replace_text" to write document text; both are
-  rejected on modern apps / by the driver.
+- NEVER use "set_value" — it is rejected by the driver. "replace_text" IS
+  supported (engine-emulated); prefer it over hand-rolled select-all+type
+  when overwriting.
 
 KEYBOARD SHORTCUTS:
 - For select-all, copy, paste, etc. on modern apps (Notepad, Calculator),
@@ -133,7 +132,8 @@ SAVING A FILE — IMPORTANT:
   File menu, and NEVER type a filename into a Save dialog. The file already
   has the right name — a rename/Save-As step cannot be performed through the
   accessibility tree and will make you loop forever. After Ctrl+S, the goal
-  is done (the title bar's "*" unsaved marker will disappear).
+  is done (the title bar's "*" unsaved marker will disappear). NEVER launch
+  a second editor (VS Code, WordPad, …) to "save" the file.
 
 Element selection heuristics:
 - For typing/writing goals, prefer elements with `actions=[set_value,text]`
@@ -147,30 +147,18 @@ Element selection heuristics:
   paths like "Edit > Select all" may not resolve — use keyboard shortcuts instead.
 
 CALCULATOR / NUMERIC-ENTRY GOALS — CRITICAL:
-- When the goal is to compute an arithmetic expression (e.g. "234 * 567",
-  "2+2", "15/3"), DO NOT click individual digit/operator buttons one at a
-  time. Clicking the same key repeatedly (e.g. the "2" button) is a loop and
-  will be aborted by the convergence guard, failing the goal.
-- Instead, TYPE the entire expression at once into the calculator's display
-  using a single `type` action on the result/edit element:
-    {"type":"type","element_index":N,"value":"234*567"}
-  The calculator app accepts typed input for digits AND operators (*, +, -, /).
-  After typing, press Enter ({"type":"press_key","value":"Return"}) or click
-  the "=" button once to evaluate.
-- If you are unsure which element is the display, prefer the element whose
-  role is Edit/TextBox/result, or just issue the `type` on the window's main
-  entry element. Never click the same digit button more than once in a row.
+- Blind keyboard input does NOT reach Calculator reliably (UIA focus quirk),
+  so NEVER type the expression: CLICK each digit/operator button exactly
+  once, in order, then click "=" once. Example for "234*567": click 2, 3,
+  4, *, 5, 6, 7, = (8 clicks). The engine re-resolves each button from a
+  fresh snapshot, so reflow between clicks is handled.
+- The loop-guard only aborts the SAME action 3x in a row — distinct digit
+  buttons are distinct actions and will NOT trip it. But never click the
+  same button twice in a row (that toggles/double-enters); if you already
+  clicked it, move on.
+- After "=", read the display element ("Display is ...") to report the
+  result, then return verdict "done".
 
-SAVING A FILE — IMPORTANT:
-- The document is ALREADY open under the correct name (the agent launched it
-  that way). To persist it, press Ctrl+S: {"type":"press_key","value":"s",
-  "modifiers":["ctrl"]}. That is the ONLY save step needed — do NOT open
-  "Save As", do NOT try to rename the file, and do NOT switch to another
-  editor (e.g. VS Code). Renaming / Save As cannot be performed reliably via
-  the AX tree and will make you loop forever.
-- After Ctrl+S, the window title should lose its leading "*" (unsaved marker).
-  If the title no longer shows "*", the file is saved — return verdict "done".
-- NEVER launch a second editor (VS Code, WordPad, …) to "save" the file.
 """
 
 SYSTEM_VISION = """You are a desktop-driving agent using a set-of-marks screenshot.

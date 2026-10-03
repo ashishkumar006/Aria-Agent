@@ -53,8 +53,22 @@ class ComputerUse:
                     "message": "Computer-use is disabled. "
                                "Set COMPUTER_USE_ENABLED=true to opt in."}
         if kind == "drive_app":
-            return self.skill.run(payload.get("goal", ""),
-                                  app_hint=payload.get("app"))
+            # skill.run returns a ComputerResult dataclass — normalise it to
+            # the status-dict shape every other action returns so MCP/JSON
+            # callers get a serialisable result instead of a raw object.
+            try:
+                res = self.skill.run(payload.get("goal", ""),
+                                     app_hint=payload.get("app"),
+                                     max_turns=int(payload.get("max_turns", 12) or 12))
+            except Exception as e:
+                return {"status": "error",
+                        "message": f"{type(e).__name__}: {e}"}
+            return {"status": "done" if res.success else "error",
+                    "layer": res.layer,
+                    "output": res.output,
+                    "trace": res.trace[-20:],
+                    "error": res.error,
+                    "message": res.error or f"drive_app finished via {res.layer}"}
         shell = GatedShell(self.safety)
         if kind == "run_command":
             return shell.run_command(payload.get("command", ""))

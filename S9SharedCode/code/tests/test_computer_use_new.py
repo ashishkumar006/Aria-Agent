@@ -76,12 +76,15 @@ class TestDeterministicLayer:
         plan = try_deterministic("compute 234 * 567", "Calculator")
         assert isinstance(plan, DeterministicPlan)
         assert plan.app == "calculator"
-        # Plan clears stale state, then clicks each digit/operator button,
-        # then clicks Equals. No typed expression / Enter key.
-        assert plan.actions[0] == {"type": "press_key", "value": "c"}
-        # 2,3,4 -> *, 5,6,7 -> =  (8 clicks; clear is a separate keypress)
+        # CONTRACT (aligned with deterministic._calc_plan): the plan CLEARS
+        # stale display by CLICKING the discovered Clear button (index 22 in
+        # the fallback table) — NOT by pressing 'c'. Blind keyboard input
+        # does not reach Calculator reliably (UIA focus quirk), so every
+        # action is a click. Then digits/operators, then Equals.
+        assert plan.actions[0] == {"type": "click", "element_index": 22, "match": "clear"}
+        # 2,3,4 -> *, 5,6,7 -> =  (8 clicks after the clear click)
         clicks = [a for a in plan.actions if a["type"] == "click"]
-        assert len(clicks) == 8
+        assert len(clicks) == 9
         assert clicks[-1]["element_index"] == 41  # Equals button
         # Digits map to the correct button indices (2,3,4 then 5,6,7).
         digit_indices = [a["element_index"] for a in clicks if a["element_index"] in range(43, 53)]
@@ -102,7 +105,7 @@ class TestDeterministicLayer:
         assert plan.app == "notepad"
         # cua-driver has no `replace_text` tool, so the plan clicks into the
         # document, types the text, then presses Ctrl+S to save.
-        assert plan.actions[0] == {"type": "click", "element_index": 0}
+        assert plan.actions[0] == {"type": "click", "element_index": 0, "match": "document"}
         assert plan.actions[1]["type"] == "type"
         assert plan.actions[1]["value"] == "hello world"
         assert plan.actions[2] == {"type": "press_key", "value": "s", "modifiers": ["ctrl"]}
@@ -249,10 +252,38 @@ _judge_click.n = 0
 class TestEngineLayerWiring:
     def setup_method(self):
         # Computer-use is OFF unless COMPUTER_USE_ENABLED=true.
+        # ORDER-INDEPENDENCE FIX: snapshot the prior env so teardown_method
+        # can restore it — this class used to leak ENABLED=true/MODE=live
+        # into every test file that ran after it, masking missing-env bugs
+        # in other suites (e.g. test_computer_agent_pipeline).
+        self._prev_enabled = os.environ.get("COMPUTER_USE_ENABLED")
+        self._prev_mode = os.environ.get("COMPUTER_USE_MODE")
         os.environ["COMPUTER_USE_ENABLED"] = "true"
         os.environ["COMPUTER_USE_MODE"] = "live"
         import computer_use.safety
         computer_use.safety.reset_shared_gates()
+        # Mock check_permissions to return all-ok (avoids real screenshot capture).
+        # Must patch in engine module since it imports check_permissions at load time.
+        import computer_use.engine as E
+        self._orig_check = E.check_permissions
+        E.check_permissions = lambda: E.safety.permissions.PermissionReport(
+            binary_present=True, daemon_running=True, ax_ok=True,
+            screenshot_ok=True, elevated=False, platform="win32", apps=[])
+
+    def teardown_method(self):
+        if self._prev_enabled is None:
+            os.environ.pop("COMPUTER_USE_ENABLED", None)
+        else:
+            os.environ["COMPUTER_USE_ENABLED"] = self._prev_enabled
+        if self._prev_mode is None:
+            os.environ.pop("COMPUTER_USE_MODE", None)
+        else:
+            os.environ["COMPUTER_USE_MODE"] = self._prev_mode
+        import computer_use.safety
+        computer_use.safety.reset_shared_gates()
+        # Restore check_permissions in engine module
+        import computer_use.engine as E
+        E.check_permissions = self._orig_check
 
     def test_l1_extract_short_circuits_llm(self, monkeypatch):
         # Goal is a read; try_extract returns content → no L2b judge call.
@@ -290,11 +321,13 @@ class TestEngineLayerWiring:
             res = skill.run("compute 2+2", app_hint="Calculator", max_turns=4)
         finally:
             D.call = orig
-        # L2a dispatched type + press_key; calculator re-scan reads display.
+        # L2a dispatched clicks; calculator re-scan reads display.
         assert res.layer in ("L2a", "L1", "L2b", "L3")
-        # The judge may or may not be called depending on flow, but L2a must
-        # have attempted the deterministic actions.
-        assert any(c[0] in ("type_text", "press_key") for c in fd.calls)
+        # CONTRACT (aligned with deterministic._calc_plan): the calculator
+        # plan is ALL CLICKS (clear button, digits, operator, Equals) — no
+        # type_text / press_key. L2a must have attempted the deterministic
+        # click actions against the daemon.
+        assert any(c[0] == "click" for c in fd.calls)
 
     def test_permission_preflight_blocks_run(self, monkeypatch):
         # Force check_permissions to report failure.

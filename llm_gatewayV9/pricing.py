@@ -21,6 +21,11 @@ from __future__ import annotations
 PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     # Free-tier under the AI-Studio quota used by the course.
     "gemini":     (0.00, 0.00),
+    # Same Gemini free tier under its worker key (explicit entry so the
+    # $0 is deliberate, not a silent "unknown provider" fallback).
+    "gemini35lite": (0.00, 0.00),
+    # Kilo free-tier models (:free suffix) — $0 by definition.
+    "kilo":       (0.00, 0.00),
     # NVIDIA NIM free tier (build.nvidia.com), text models only here.
     "nvidia":     (0.00, 0.00),
     # Groq's openai/gpt-oss-120b: listed at $0.15/$0.75 per Mtok as of 2026-04.

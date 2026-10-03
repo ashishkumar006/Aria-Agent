@@ -1,0 +1,13 @@
+{
+  "name": "aria-desktop",
+  "version": "0.1.0",
+  "description": "Aria agent console as a desktop app (Electron shell over the FastAPI agent + gateway).",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "install-note": "echo Run: npm ci (downloads Electron once, ~100MB)"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

@@ -11,6 +11,30 @@ dependencies = [
     "pydantic>=2.6",
     "jsonschema>=4.21",
     "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
+    # Document parsing for the /documents feature. Each parser degrades
+    # gracefully if one is missing, but indexing is much better with them.
+    "pypdf>=4.0",
+    # Table-aware PDF extraction. pypdf's `extract_text()` flattens a table
+    # into a single run of text: a weekly-menu grid arrives as the day names
+    # once in a header followed by ~35 dishes with no association between them,
+    # which makes "what is the menu on monday" unanswerable from the index.
+    # pypdf's own `extraction_mode="layout"` returns an empty string for such
+    # files, so this is a real dependency, not a nicety. Optional at runtime:
+    # without it the parser degrades to flat text and says so.
+    "pdfplumber>=0.11",
+    "beautifulsoup4>=4.12",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    # Voice services (lazy-loaded; gateway boots fine without them).
+    "kokoro-onnx>=0.5.0",
+    "soundfile>=0.14.0",
+    "faster-whisper>=1.2.1",
+    "tavily-python>=0.5",
+    "ddgs>=0.0",
+    # Memory service (vector retrieval lives on the gateway now).
+    "faiss-cpu>=1.8.0",
+    "numpy>=1.26",
 ]
 
 [dependency-groups]

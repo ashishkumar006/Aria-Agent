@@ -28,7 +28,9 @@ is NOT sufficient — verify the actual UI change.
 ## TEST 1 — Calculator (XAML host beyond Notepad)
 **Goal:** Confirm the XAML-host handling works on a second app.
 **Script outline:**
-- `native.launch_fresh("calculator")` → get pid, wid
+- `native.launch_fresh("calculator")` → get pid, wid (the fresh-`.txt`
+  helper only takes effect for notepad/wordpad/paint; other apps launch
+  normally)
 - Read AX tree; find digit buttons (0-9) and operators (+, =) by `element_index`
 - Click `2`, `+`, `2`, `=` via `dispatch_action` (fresh snapshot each)
 - Read the result `Text` element
@@ -104,7 +106,10 @@ is NOT sufficient — verify the actual UI change.
 
 ## TEST 9 — invoke_menu as agent action (WIRE FIRST)
 **Goal:** Add `invoke_menu` to `dispatch_action`, then test on a classic-menu app.
-**Pre-req:** Wire `invoke_menu` into `actions.py` (pid, window_id, path[]).
+**Pre-req:** Wire `invoke_menu` into `engine._dispatch_action` in
+`computer_use/engine.py` (pid, window_id, path[]) — and add it to the
+judge schema in `computer_use/prompts/__init__.py`, or the judge can
+never emit it.
 **Script outline (e.g. legacy app or Notepad File menu if present):**
 - `invoke_menu` path ["File", "New"] or ["Edit", "Undo"]
 **Expected:** menu item invoked.

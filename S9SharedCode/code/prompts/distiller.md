@@ -36,6 +36,10 @@ Output schema (JSON, no prose, no markdown fences):
 Notes:
   - The fields dictionary is the load-bearing output; downstream
     Formatter nodes read it.
+  - Budget honesty: upstream content is truncated to the prompt budget
+    before you see it (browser content ~1500 chars with the structured
+    card block preserved; total inputs capped). Quote evidence from what
+    IS in your INPUTS — never claim lines you cannot see.
   - `evidence` is a list of the EXACT source lines you drew the fields
     from, copied verbatim from the input (including any block delimited
     by `--- STRUCTURED CARD DATA ... ---`). Reproduce the lines

@@ -1,12 +1,15 @@
-"""V7 embed-endpoint tests. Run from llm_gatewayV7/:  uv run pytest -v tests/test_embed.py
+"""V9 embed-endpoint tests. Run from llm_gatewayV9/:  uv run pytest -v tests/test_embed.py
 
 Markers:
   - local:   requires `ollama` running locally with `nomic-embed-text` pulled
-  - network: requires GEMINI_API_KEY in ../.env and outbound HTTPS
 
-The tests start an in-process httpx ASGI client against the V7 FastAPI app —
-they do NOT require V7 to be running on port 8107. This keeps the test suite
-fast (~5s for the four tests) and self-contained.
+The tests start an in-process httpx ASGI client against the V9 FastAPI app —
+they do NOT require V9 to be running on port 8109. This keeps the test suite
+fast and self-contained.
+
+Note: V9 has no Gemini embedding fallback (Ollama-only by design), so the
+unknown-provider and embedder-down paths below assert the fail-closed
+contract (400/503 with attempts), not a fallback.
 """
 from __future__ import annotations
 
@@ -62,32 +65,22 @@ async def test_ollama_embed(client):
     assert all(isinstance(x, (int, float)) for x in d["embedding"][:5])
 
 
-@pytest.mark.network
 @pytest.mark.asyncio
 async def test_fallback_embed(client):
-    """Hits Gemini gemini-embedding-001; asserts shape and dim > 0 (stable)."""
-    if not os.getenv("GEMINI_API_KEY"):
-        pytest.skip("GEMINI_API_KEY not set")
+    """Unknown embedder name fails closed with 400 (no silent fallback)."""
     r = await client.post("/v1/embed", json={
         "text": "the quick brown fox",
         "task_type": "retrieval_document",
         "provider": "gemini",
     })
-    assert r.status_code == 200, r.text
-    d = r.json()
-    print("gemini:", {k: v for k, v in d.items() if k != "embedding"}, "vec[0:3]:", d["embedding"][:3])
-    assert d["provider"] == "gemini"
-    assert d["model"]
-    assert d["dim"] == EXPECTED_FALLBACK_DIM > 0
-    assert isinstance(d["embedding"], list) and len(d["embedding"]) == d["dim"]
+    assert r.status_code == 400, r.text
+    assert "unknown embedder" in r.text
 
 
-@pytest.mark.network
 @pytest.mark.asyncio
 async def test_failover(client, monkeypatch):
-    """Point Ollama at an unused port → ring should fall over to Gemini."""
-    if not os.getenv("GEMINI_API_KEY"):
-        pytest.skip("GEMINI_API_KEY not set")
+    """Point Ollama at an unused port → single-member ring fails closed
+    with 503 and a non-empty attempts trail (no fallback exists in V9)."""
     # Rebuild embedders with a broken Ollama URL, install onto app state.
     import main as M
     import embedders as E
@@ -100,11 +93,10 @@ async def test_failover(client, monkeypatch):
         "text": "fall over please",
         "task_type": "retrieval_query",
     })
-    assert r.status_code == 200, r.text
+    assert r.status_code == 503, r.text
     d = r.json()
-    print("failover:", {k: v for k, v in d.items() if k != "embedding"})
-    assert d["provider"] == "gemini"
-    assert len(d["attempted"]) >= 1 and d["attempted"][0]["provider"] == "ollama"
+    print("failover:", str(d)[:200])
+    assert "ollama" in str(d)
 
 
 @pytest.mark.local

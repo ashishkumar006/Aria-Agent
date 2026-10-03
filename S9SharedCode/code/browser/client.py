@@ -35,16 +35,22 @@ VisionResult = GatewayResult
 
 
 class V9Client:
-    """One client, two methods: vision() and chat(). Both speak to V9.
+    """One client, two methods: vision() and chat(). Both speak to V9 gateway.
 
-    Every call is routed to the Kilo Code Gateway (provider="kilo") with the
-    free model `stepfun/step-3.7-flash:free` unless the caller overrides it.
-    This keeps the whole S9 stack on one provider per the user's request.
+    Routing: provider/model default to S9_LLM_PROVIDER/S9_LLM_MODEL env.
+    When unset, None is passed through and the gateway decides (least-loaded
+    live provider with failover) — the same contract as gateway.py. A hard
+    pin here used to bypass gateway failover entirely, which hurt exactly
+    when the pinned provider's keys were 503-ing. Operators who want the
+    cheap tier pinned for cost control can still set the env vars.
+    Failover across providers is the gateway's job; this client makes one
+    HTTP attempt per turn and surfaces HTTP errors to the caller for
+    fail-soft handling in skill.py.
     """
-    # Forced routing defaults — overridden only by an explicit per-call arg.
-    # Fast, non-thinking model so we don't burn the token budget on reasoning.
-    DEFAULT_PROVIDER = os.getenv("S9_LLM_PROVIDER", "gemini35lite")
-    DEFAULT_MODEL = os.getenv("S9_LLM_MODEL", "gemini-3.5-flash-lite")
+    # No forced routing default: None lets the gateway decide. Overridden by
+    # S9_LLM_PROVIDER/S9_LLM_MODEL env, then by explicit per-call args.
+    DEFAULT_PROVIDER = os.getenv("S9_LLM_PROVIDER") or None
+    DEFAULT_MODEL = os.getenv("S9_LLM_MODEL") or None
 
     def __init__(
         self,
@@ -83,13 +89,14 @@ class V9Client:
         session: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> GatewayResult:
         body: dict[str, Any] = {
             "image": image_data_url,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.0,
-            "agent": self.agent,
+            "agent": agent or self.agent,
         }
         if schema:        body["schema"] = schema
         if schema:        body["schema_name"] = schema_name
@@ -116,6 +123,7 @@ class V9Client:
         session: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> GatewayResult:
         """Plain text-only call. Used by the Layer-2b a11y driver: legend +
         goal in, action JSON out. Skipping the image cuts ~1K input tokens
@@ -124,7 +132,7 @@ class V9Client:
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.0,
-            "agent": self.agent,
+            "agent": agent or self.agent,
         }
         if schema:
             body["response_format"] = {

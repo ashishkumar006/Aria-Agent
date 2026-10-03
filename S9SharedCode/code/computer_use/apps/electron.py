@@ -71,11 +71,9 @@ def _resolve_app_name(app_name: str) -> str:
     known bundle hints to a launchable name.
     """
     n = app_name.lower().strip()
-    # If it's already a real-looking name (has a space or is a known title),
-    # pass it through.
-    if " " in app_name or app_name in KNOWN_ELECTRON:
-        return app_name
-    # Key -> friendly name the daemon understands.
+    # Key -> friendly name the daemon understands. Checked FIRST: keys like
+    # "vscode" are also in KNOWN_ELECTRON, so testing that first would pass
+    # keys through unresolved and deaden this map.
     KEY_TO_NAME = {
         "vscode": "Visual Studio Code",
         "cursor": "Cursor",
@@ -86,7 +84,13 @@ def _resolve_app_name(app_name: str) -> str:
         "1password": "1Password",
         "linear": "Linear",
     }
-    return KEY_TO_NAME.get(n, app_name)
+    if n in KEY_TO_NAME:
+        return KEY_TO_NAME[n]
+    # Already a real-looking name (has a space or is a known title) —
+    # pass it through.
+    if " " in app_name or n in (k.lower() for k in KNOWN_ELECTRON.values()):
+        return app_name
+    return app_name
 
 
 def launch_with_debug_port(app_name: str, port: int = 9222,
@@ -103,8 +107,12 @@ def launch_with_debug_port(app_name: str, port: int = 9222,
     r = call("launch_app", args, timeout=timeout)
     pid = r.get("pid")
     wid = (r.get("windows") or [{}])[0].get("window_id")
-    if pid is None:
-        raise DaemonError(f"launch_app('{launch_name}') with debug port failed")
+    # Both are required: a pid with window_id=None would only fail later at
+    # bring_to_front with a confusing error. Fail here so the caller falls
+    # through to the normal launch cascade instead.
+    if pid is None or wid is None:
+        raise DaemonError(f"launch_app('{launch_name}') with debug port failed "
+                          f"(pid={pid} window_id={wid})")
     return {"pid": pid, "window_id": wid, "debug_port": port}
 
 

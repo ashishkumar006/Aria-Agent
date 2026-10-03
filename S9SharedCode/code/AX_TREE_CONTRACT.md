@@ -36,7 +36,10 @@ Verified behavior of the cua-driver AX-tree surface on Windows (cua-driver 0.19.
 - Example: `press_key(key="a", modifiers=["ctrl"], delivery_mode="foreground")` = Ctrl+A
 - Verified: Ctrl+A + Delete clears the document on modern Notepad.
 
-**XAML host detection:** `_is_xaml()` checks window title for: `notepad`, `calculator`, `wordpad`, `paint`, `photos`, `settings`.
+**XAML hosts** (notepad, calculator, wordpad, paint, photos, settings)
+need foreground key delivery (`delivery_mode: "foreground"`) and fresh
+snapshots per action. (Note: no `_is_xaml()` helper exists in code — match
+window titles inline where needed.)
 
 ## 4. Parameter shapes (gotchas)
 
@@ -85,21 +88,30 @@ Verified behavior of the cua-driver AX-tree surface on Windows (cua-driver 0.19.
 
 - Works on classic Win32 menus (File, Edit, View with sub-items).
 - **Fails on ribbon apps** (modern Notepad, Settings) — returns `menu_path_unavailable`.
-- Not wired into `dispatch_action` yet (needs deliberate addition).
+- NOT wired into `engine._dispatch_action` (no `invoke_menu` branch there);
+  §13 below describes driver-level verification only. Do not emit it from
+  the L2b judge — dispatch rejects it.
 
 ## 8. `double_click` / `right_click` / `drag` / `scroll`
 
-- All fire successfully (`effect: unverifiable` by design — these are global input actions).
-- **AX tree does NOT expose selection state or viewport position**, so outcomes are unverifiable via tree alone.
+- `scroll` is dispatched by the engine (element_index passed through with a
+  fresh snapshot). `double_click` / `right_click` / `drag` have NO engine
+  branch — dispatch rejects them; the judge schema forbids emitting them.
+- **AX tree does NOT expose selection state or viewport position**, so
+  scroll outcomes are unverifiable via tree alone.
 - Requires screenshot/vision model to confirm real-world effect.
 - `scroll` needs `element_index` + `snapshot_id` or it refuses.
 
 ## 9. Fresh app launch strategy
 
-**`launch_fresh(app_name)`** in `apps/native.py`:
+**`launch_fresh(app_name)`** in `apps/native.py` (used by tests and
+callers that want it — the engine's `_acquire_target` does NOT call it;
+it uses `daemon launch_app` → shell `start` → vision-icon-click, and does
+not kill existing windows):
 - For `notepad`, `wordpad`, `paint`: opens a new empty file in `state/computer_use_sandbox/`.
 - For all other apps: launches normally.
-- Always kills existing windows for the app first (in `_acquire_target`).
+- `launch_fresh` itself kills existing windows for the app first (inside
+  `apps/native.py`, not in `_acquire_target`).
 
 ## 10. Safety mode
 
@@ -119,9 +131,11 @@ Verified behavior of the cua-driver AX-tree surface on Windows (cua-driver 0.19.
 - **Vision-only goals** — needs L3 vision path (screenshot → V9 vision → pixel click).
 - **Recording/replay** — separate daemon-level surface.
 - **OS auth dialogs / CAPTCHAs** — cannot be bypassed.
-## 12. L3 vision path (TEST 6 — VERIFIED)
+## 13. L3 vision path (TEST 6 — VERIFIED)
 
-**Flow:** `get_window_state` (screenshot) → `gateway.LLM().vision(data_url, prompt)` → parse `x,y` → `click_pixel(pid, wid, x, y, snapshot_id)`.
+**Flow:** `get_window_state` (screenshot) → vision judge → parse `x,y` →
+`daemon call "click"` with `{pid, window_id, x, y, snapshot_id}`
+(the tool is named `click`, not `click_pixel`).
 
 **Verified:** Screenshot (base64 PNG) → gemini-3.5-flash-lite vision judge → returned `{"x": 226, "y": 172}` → `click_pixel` landed → typing appeared in document.
 
@@ -131,9 +145,10 @@ Verified behavior of the cua-driver AX-tree surface on Windows (cua-driver 0.19.
 - `click_pixel` uses window-local coordinates (same space as the screenshot).
 - Coordinate mapping is accurate (no offset correction needed on this display).
 
-## 13. invoke_menu (TEST 9 — VERIFIED, app-dependent)
+## 14. invoke_menu (TEST 9 — VERIFIED at driver level, app-dependent)
 
-**Wired into `dispatch_action`** as `{"type": "invoke_menu", "path": ["File", "New"]}`.
+**Verified at the cua-driver tool level** as `{"type": "invoke_menu", "path": ["File", "New"]}`
+— but NOT wired into `engine._dispatch_action`, so the L2b judge must not emit it.
 
 **Verified:**
 - **Paint (classic menu):** `['File']` expanded to show New, Open, Save, etc. — full path resolution works.
@@ -141,9 +156,12 @@ Verified behavior of the cua-driver AX-tree surface on Windows (cua-driver 0.19.
 
 **Rule:** Use `invoke_menu` ONLY on classic Win32/menu apps. For ribbon apps (modern Notepad, Settings), use keyboard shortcuts (`press_key` + modifiers) instead.
 
-## 14. Electron/CDP path (TEST 11 — VERIFIED, read-only)
+## 15. Electron/CDP path (TEST 11 — VERIFIED, read-only)
 
-**Flow:** `electron.launch_with_debug_port(app, port)` → `page` tool with `cdp_port` (or attach to running app via `list_windows` → `pid` + `window_id`).
+**Flow:** `electron.launch_with_debug_port(app, port)` → `page` tool with
+`{pid, action, selector/text/expression/url}` (see `apps/electron.py`
+`page_click/page_type/page_eval/page_navigate` — NOT `cdp_port`/
+`get_text`/`query_dom`/`execute_javascript`/`list_windows` shapes).
 
 **Verified on VS Code (running instance):**
 - `get_text` works (returns UI text: File, Edit, Explorer, etc.)
@@ -155,7 +173,8 @@ Verified behavior of the cua-driver AX-tree surface on Windows (cua-driver 0.19.
 - Mutating actions (click_element, insert_text, type_keystrokes) need unrestricted mode.
 - `launch_app` with `electron_debugging_port` fails if the app is already running (no new window) — attach to existing instance instead.
 
-## 15. Test status (all 12 complete)
+## 16. Test status (historical run — see AX_TREE_TEST_SPEC.md for pre-reqs;
+TEST 9 needs driver-level wiring first, TEST 11 was untested at writing)
 
 | Test | Result |
 |---|---|

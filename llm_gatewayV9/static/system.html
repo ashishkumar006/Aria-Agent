@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway V9 · System</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #12161f; --panel-2: #171c28;
+    --border: #232a38; --border-soft: #1b2130;
+    --text: #e7eaf1; --muted: #8b93a5; --faint: #5b6376;
+    --accent: #7c6cf0; --accent-dim: rgba(124,108,240,.14);
+    --green: #3fb950; --green-dim: rgba(63,185,80,.13);
+    --red: #f85149;
+    --blue: #58a6ff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); margin: 0; }
+  a { color: var(--blue); }
+  header.top { position: sticky; top: 0; z-index: 10; background: rgba(11,14,20,.94); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border); padding: 12px 22px; display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 650; }
+  .brand .bolt { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), #4a8ff7);
+    display: inline-flex; align-items: center; justify-content: center; font-size: 15px; }
+  .brand .v { color: var(--accent); font-weight: 700; }
+  nav.links { display: flex; gap: 4px 4px; flex-wrap: wrap; font-size: 13px; align-items: center; }
+  nav.links a { color: var(--muted); text-decoration: none; padding: 6px 11px; border-radius: 7px; }
+  nav.links a:hover { color: var(--text); background: var(--panel-2); }
+  nav.links a.active { color: var(--text); background: var(--accent-dim); font-weight: 600; }
+  nav.links .sep { width: 1px; height: 18px; background: var(--border); margin: 0 6px; }
+  main { padding: 22px; max-width: 1420px; margin: 0 auto 60px; }
+  section.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin: 16px 0; overflow: hidden; }
+  .card-head { padding: 13px 18px; border-bottom: 1px solid var(--border-soft); display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .card-head p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+  .card-head .side { font-size: 11.5px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+  .card-body { padding: 14px 18px 18px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  thead th { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; color: var(--muted);
+    font-weight: 600; text-transform: uppercase; font-size: 10.5px; letter-spacing: .6px; white-space: nowrap; }
+  tbody td { padding: 8px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,.015); }
+  td.prov { color: var(--blue); font-weight: 600; white-space: nowrap; }
+  button { background: var(--accent); border: 1px solid transparent; color: #fff; padding: 7px 15px; border-radius: 7px;
+    font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--text); font-weight: 500; }
+  button.ghost:hover { border-color: var(--accent); }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11.5px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+  .err-msg { color: var(--muted); font-family: var(--mono); font-size: 11.5px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .test-area { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
+  .test-area textarea { flex: 1; min-width: 300px; min-height: 72px; background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--text); padding: 9px 11px; border-radius: 7px; font: 13px var(--mono); resize: vertical; }
+  .test-area textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #voice-out, #cost-out { margin-top: 10px; padding: 12px 14px; background: var(--panel-2); border: 1px solid var(--border-soft);
+    border-radius: 7px; white-space: pre-wrap; font: 12.5px var(--mono); min-height: 40px; }
+  footer { text-align: center; color: var(--faint); font-size: 12px; padding: 18px; }
+  @media (max-width: 720px) { main { padding: 14px; } header.top { padding: 10px 14px; } }
+</style>
+<link rel="stylesheet" href="/static/console-theme.css">
+</head>
+<body>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/system.html" class="side-item active"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">System</div><div class="spacer"></div><button class="ghost palette-trigger" onclick="togglePalette()" title="Commands (Ctrl/⌘+K)">⌘K</button><span class="badge" id="port-badge"></span></div>
+<main>
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Deployment test</h2><p><b>Test system</b> probes only this section's APIs (roster, memory, policy, spend, voices, key pools — no LLM spend). <b>Full test</b> probes the whole gateway plus live chat, vision and TTS (tiny token spend, ~1–3 min).</p></div>
+      <div class="side"><span class="badge" id="deploy-summary">—</span><button class="ghost" onclick="runDeploy('system')">Test system</button><button onclick="runDeploy('full')">Full test</button></div>
+    </div>
+    <div class="card-body">
+      <div class="status-strip" id="deploy-filters" hidden>
+        <div class="seg" id="deploy-seg">
+          <button class="on" data-f="all">all</button>
+          <button data-f="FAILED">needs attention</button>
+          <button data-f="UNKEYED">unkeyed</button>
+          <button data-f="SKIPPED">skipped</button>
+        </div>
+        <span class="hint" id="deploy-count"></span>
+      </div>
+      <div id="deploy-out" class="hint" style="margin-bottom:8px;">Not run yet.</div>
+      <table id="deploy-table">
+        <thead><tr><th>Area</th><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Provider keys</h2><p>Set how many keys each worker holds — fields are generated for pasting. Saving <b>replaces</b> that worker's whole set (key 1 → SINGULAR var, rest → comma-joined PLURAL), so paste the complete set; the stored count is shown per worker. Values never leave the server — restart the gateway afterwards.</p></div>
+      <div class="side"><span class="badge" id="keys-summary">—</span><button class="ghost" onclick="loadPools()">Refresh</button></div>
+    </div>
+    <div class="card-body">
+      <div id="keys-out" class="hint" style="margin-bottom:8px;"></div>
+      <div id="pools"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Policy</h2><p>Dry-run guardrails — first matching rule wins, ties deny. Arm later per-rule in <span class="hint">policy/policy.yaml</span> (hot-reloads).</p></div>
+      <div class="side"><span class="badge" id="policy-mode">—</span><button class="ghost" onclick="loadPolicy()">Refresh</button></div>
+    </div>
+    <div class="card-body">
+      <table id="policy-table">
+        <thead><tr><th>Rule</th><th>When</th><th>Action</th><th>Enforce</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Memory</h2><p>Legacy store plus seven drawers (working · episode · fact · playbook · policy · audit · document).</p></div>
+      <div class="side"><span class="badge" id="mem-summary">—</span><button class="ghost" onclick="loadMemory()">Refresh</button></div>
+    </div>
+    <div class="card-body">
+      <table id="memory-table">
+        <thead><tr><th>Store</th><th>Items</th><th>Indexed</th><th>Index dim</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Spend</h2><p>Tokens and dollars with daily caps compared.</p></div>
+      <div class="side"><span class="badge" id="spend-summary">—</span><button class="ghost" onclick="loadSpend()">Refresh</button><button class="ghost" onclick="loadCost()">Cost by agent</button></div>
+    </div>
+    <div class="card-body">
+      <table id="spend-table">
+        <thead><tr><th>Agent</th><th>Provider</th><th>Calls</th><th>In tok</th><th>Out tok</th><th>$</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="cost-out" class="hint" style="margin-top:10px;"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Voice</h2><p>Server-side text-to-speech on the gateway.</p></div></div>
+    <div class="card-body">
+      <div class="test-area">
+        <textarea id="voice-text" placeholder="text to speak…">Hello from the gateway voice service.</textarea>
+        <button onclick="runTTS()">Speak (WAV)</button>
+      </div>
+      <div id="voice-out">—</div>
+    </div>
+  </section>
+</main>
+<footer>LLM Gateway V9 · operator console · values never leave the server<br>API: <a href="/v1/policy">policy</a> · <a href="/v1/memory/stats">memory</a> · <a href="/v1/spend">spend</a> · <a href="/v1/cost/by_agent">cost</a> · <a href="/v1/tts/voices">voices</a></footer>
+</div>
+
+<script>
+const POOL_PROVIDERS = ['gemini', 'nvidia', 'groq', 'cerebras', 'openrouter', 'github', 'kilo'];
+let POOLS = {};
+let POOLS_BUILT = false;
+async function loadPools() {
+  const wrap = document.getElementById('pools');
+  const out = document.getElementById('keys-out');
+  try {
+    const d = await fetch('/v1/config/keys').then(r => r.json());
+    POOLS = d.pools || {};
+  } catch (e) { out.textContent = 'pool status load failed: ' + e.message; return; }
+  if (!POOLS_BUILT) {
+    wrap.innerHTML = '';
+    POOL_PROVIDERS.forEach((p) => {
+      const div = document.createElement('div');
+      div.className = 'tile';
+      div.style.marginBottom = '10px';
+      div.id = 'pool-' + p;
+      div.innerHTML = `<div class="name">${p} <span data-badge="1"></span></div>
+        <div class="model" data-members="1"></div>
+        <div class="controls" style="margin:10px 0 0;">
+          <label class="hint">keys: <input data-count="${p}" type="number" min="1" max="20" value="1" style="width:64px" /></label>
+          <button class="ghost" onclick="genFields('${p}')">Generate fields</button>
+          <button onclick="savePool('${p}')">Save keys</button>
+        </div>
+        <div data-fields="${p}" style="display:grid;gap:8px;margin-top:10px;"></div>
+        <div class="hint" data-msg="${p}"></div>`;
+      wrap.appendChild(div);
+    });
+    POOLS_BUILT = true;
+  }
+  let total = 0;
+  POOL_PROVIDERS.forEach((p) => {
+    const info = POOLS[p] || {count: 0, members: []};
+    total += info.count;
+    const div = document.getElementById('pool-' + p);
+    if (!div) return;
+    div.querySelector('[data-badge]').innerHTML =
+      `<span class="pill ${info.count ? 'ok' : 'err'}">${info.count ? info.count + ' stored' : 'no keys'}</span>`;
+    div.querySelector('[data-members]').textContent =
+      info.members && info.members.length ? 'members: ' + info.members.join(', ') : 'members: —';
+    const cnt = div.querySelector(`[data-count="${p}"]`);
+    if (cnt && !document.querySelector(`[data-field="${p}"]`)) cnt.value = Math.max(1, info.count);
+  });
+  document.getElementById('keys-summary').textContent = total + ' provider keys stored';
+  out.textContent = '';
+}
+function genFields(p) {
+  const div = document.getElementById('pool-' + p);
+  const n = Math.min(20, Math.max(1, parseInt(div.querySelector(`[data-count="${p}"]`).value, 10) || 1));
+  const box = div.querySelector(`[data-fields="${p}"]`);
+  box.innerHTML = '';
+  for (let i = 1; i <= n; i++) {
+    const inp = document.createElement('input');
+    inp.type = 'password';
+    inp.placeholder = p + ' key ' + i + ' of ' + n;
+    inp.setAttribute('data-field', p);
+    inp.setAttribute('data-pos', i);
+    inp.autocomplete = 'off'; inp.spellcheck = false;
+    inp.style.minWidth = '280px';
+    box.appendChild(inp);
+  }
+  div.querySelector(`[data-msg="${p}"]`).textContent =
+    'Paste key ' + (n === 1 ? '1' : '1–' + n) + ' in order. Saving replaces the whole ' + p + ' set.';
+}
+async function savePool(p) {
+  const div = document.getElementById('pool-' + p);
+  const msg = div.querySelector(`[data-msg="${p}"]`);
+  const out = document.getElementById('keys-out');
+  const keys = [];
+  div.querySelectorAll(`[data-field="${p}"]`).forEach((inp) => {
+    const v = (inp.value || '').trim();
+    if (v) keys.push(v);
+  });
+  if (!keys.length) { msg.textContent = 'Fill at least one field first (Generate fields if none show).'; return; }
+  const stored = (POOLS[p] || {}).count || 0;
+  if (keys.length < stored) {
+    msg.innerHTML = '⚠️ Only ' + keys.length + ' filled but ' + stored + ' stored — saving will <b>drop</b> keys. Fill every slot to keep them.';
+    return;
+  }
+  msg.textContent = 'saving ' + keys.length + ' keys…';
+  try {
+    const r = await fetch('/v1/control/pool', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({provider: p, keys})});
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = '❌ ' + (d.detail || JSON.stringify(d)); return; }
+    div.querySelectorAll(`[data-field="${p}"]`).forEach((inp) => { inp.value = ''; });
+    msg.textContent = '✅ saved: ' + (d.members || []).join(', ') + ' — restart gateway to activate';
+    if (window.toast) toast('Pool saved: ' + (d.members || []).join(', '), 'ok');
+    out.textContent = '';
+    loadPools();
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+let _deployRows = [];
+let _deployFilter = 'all';
+
+function _renderDeploy() {
+  const tb = document.querySelector('#deploy-table tbody');
+  const esc = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const pill = (s) => `<span class="pill ${s === 'WORKING' ? 'ok' : (s === 'FAILED' ? 'err' : 'cap')}">${esc(s)}</span>`;
+  // Status-first: failures on top, then unkeyed, then the rest. The
+  // operator's question is "what needs me?", not "what passed?".
+  const rank = { FAILED: 0, UNKEYED: 1, WORKING: 2, SKIPPED: 3 };
+  const rows = _deployRows
+    .filter((x) => _deployFilter === 'all'
+      || (_deployFilter === 'FAILED' ? x.status === 'FAILED' : x.status === _deployFilter))
+    .slice()
+    .sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+  const total = _deployRows.length;
+  document.getElementById('deploy-count').textContent =
+    `${rows.length} of ${total} shown`;
+  tb.innerHTML = rows.map((x) =>
+    `<tr${x.status === 'FAILED' ? ' class="selected"' : ''}>` +
+    `<td class="prov">${esc(x.area)}</td><td>${esc(x.name)}</td><td>${pill(x.status)}</td>` +
+    `<td class="err-msg" title="${esc(x.detail)}">${esc(x.detail)}</td></tr>`).join('')
+    || `<tr><td colspan="4" class="hint">nothing in this filter</td></tr>`;
+}
+
+document.addEventListener('click', (e) => {
+  const b = e.target.closest ? e.target.closest('#deploy-seg button') : null;
+  if (!b) return;
+  document.querySelectorAll('#deploy-seg button').forEach((x) => x.classList.remove('on'));
+  b.classList.add('on');
+  _deployFilter = b.dataset.f;
+  _renderDeploy();
+});
+
+async function runDeploy(mode) {
+  const full = mode === 'full';
+  const out = document.getElementById('deploy-out');
+  const tb = document.querySelector('#deploy-table tbody');
+  out.textContent = full ? 'Running FULL gateway test (spends a few tokens)…' : 'Testing System-section APIs…';
+  tb.innerHTML = '';
+  document.getElementById('deploy-summary').textContent = 'running…';
+  try {
+    const r = await fetch('/v1/control/deploy-test?full=' + full + '&scope=' + (full ? 'quick' : mode), {method: 'POST'});
+    const d = await r.json();
+    if (!r.ok) { out.textContent = '❌ ' + (d.detail || JSON.stringify(d)); return; }
+    _deployRows = d.results || [];
+    document.getElementById('deploy-filters').hidden = false;
+    _renderDeploy();
+    const s = d.summary || {};
+    document.getElementById('deploy-summary').textContent =
+      `${s.WORKING || 0} ok · ${s.FAILED || 0} failed · ${s.UNKEYED || 0} unkeyed · ${s.SKIPPED || 0} skipped`;
+    const n = s.FAILED || 0;
+    out.innerHTML = n
+      ? `<b style="color:var(--red)">${n} check${n === 1 ? '' : 's'} need attention</b> — filtered to the top of the table. Most are expired credentials that need a new key pasted on the Connections page.`
+      : (full ? 'Full test done — every keyed integration is green.' : 'System test done — Full test probes the whole gateway.');
+    if (window.toast) toast(`Deploy test: ${s.WORKING || 0} ok, ${n} failed`, n ? 'err' : 'ok');
+  } catch (e) { out.textContent = '❌ ' + e.message; }
+}
+async function loadPolicy() {
+  const tb = document.querySelector('#policy-table tbody');
+  try {
+    const d = await fetch('/v1/policy').then(r => r.json());
+    const _sig = JSON.stringify(d);
+    if (loadPolicy._s === _sig) return;
+    loadPolicy._s = _sig;
+    document.getElementById('policy-mode').textContent = d.dry_run ? 'DRY-RUN (report only)' : 'ENFORCING';
+    tb.innerHTML = '';
+    (d.rules || []).forEach(r => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="prov">${r.id || ''}</td><td class="err-msg">${JSON.stringify(r.when || {})}</td>` +
+        `<td>${r.action || ''}</td><td>${r.enforce ? 'yes' : 'no'}</td>`;
+      tb.appendChild(tr);
+    });
+  } catch (e) { tb.innerHTML = `<tr><td colspan="4">policy load failed: ${e.message}</td></tr>`; }
+}
+async function loadMemory() {
+  const tb = document.querySelector('#memory-table tbody');
+  try {
+    const d = await fetch('/v1/memory/stats').then(r => r.json());
+    const _sig = JSON.stringify(d);
+    if (loadMemory._s === _sig) return;
+    loadMemory._s = _sig;
+    const rows = [['legacy', d.legacy || {}]];
+    Object.keys(d.drawers || {}).sort().forEach(k => rows.push([k, d.drawers[k]]));
+    const total = rows.reduce((n, [, s]) => n + (s.items || 0), 0);
+    document.getElementById('mem-summary').textContent = `${total} records`;
+    tb.innerHTML = '';
+    rows.forEach(([name, s]) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="prov">${name}</td><td>${s.items || 0}</td>` +
+        `<td>${s.index_size || 0}</td><td>${s.index_dim == null ? '—' : s.index_dim}</td>`;
+      tb.appendChild(tr);
+    });
+  } catch (e) { tb.innerHTML = `<tr><td colspan="4">memory load failed: ${e.message}</td></tr>`; }
+}
+async function loadSpend() {
+  const tb = document.querySelector('#spend-table tbody');
+  try {
+    const d = await fetch('/v1/spend').then(r => r.json());
+    const _sig = JSON.stringify([d.totals, (d.rows || []).length]);
+    if (loadSpend._s === _sig) return;
+    loadSpend._s = _sig;
+    const t = d.totals || {};
+    document.getElementById('spend-summary').textContent =
+      `${t.calls || 0} calls · $${t.dollars || 0}${d.over_cap ? ' · OVER CAP' : ''}`;
+    tb.innerHTML = '';
+    (d.rows || []).slice(0, 30).forEach(r => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="prov">${r.agent || ''}</td><td>${r.provider || ''}</td>` +
+        `<td>${r.calls || 0}</td><td>${r.in_tok || 0}</td><td>${r.out_tok || 0}</td>` +
+        `<td>$${r.dollars || 0}</td>`;
+      tb.appendChild(tr);
+    });
+    if (!(d.rows || []).length) tb.innerHTML = '<tr><td colspan="6">no spend recorded today</td></tr>';
+  } catch (e) { tb.innerHTML = `<tr><td colspan="6">spend load failed: ${e.message}</td></tr>`; }
+}
+async function loadCost() {
+  const el = document.getElementById('cost-out');
+  el.textContent = 'loading cost…';
+  try {
+    const r = await fetch('/v1/cost/by_agent');
+    const d = await r.json();
+    const rows = [];
+    if (d && typeof d === 'object') {
+      for (const ag of Object.keys(d)) {
+        if (Array.isArray(d[ag])) {
+          for (const row of d[ag]) {
+            rows.push({agent: row.agent || ag, provider: row.provider || '', calls: row.calls || 0,
+              in_tok: row.in_tok || 0, out_tok: row.out_tok || 0, dollars: Number(row.dollars || 0)});
+          }
+        }
+      }
+    }
+    if (!rows.length) { el.textContent = 'no cost rows yet'; return; }
+    const fmt$ = (v) => '$' + Number(v || 0).toFixed(4);
+    el.innerHTML = rows.slice(0, 20).map(x =>
+      `${x.agent}/${x.provider}: ${x.calls} calls · in=${x.in_tok} out=${x.out_tok} · ${fmt$(x.dollars)}`).join('<br>');
+  } catch (e) { el.textContent = 'cost failed: ' + e.message; }
+}
+async function runTTS() {
+  const out = document.getElementById('voice-out');
+  out.textContent = '⏳ synthesising…';
+  try {
+    const text = document.getElementById('voice-text').value;
+    const r = await fetch('/v1/tts', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})});
+    if (!r.ok) { out.textContent = '❌ ' + (await r.text()).slice(0, 200); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    out.innerHTML = '';
+    const a = document.createElement('audio');
+    a.controls = true; a.src = url;
+    out.appendChild(a);
+  } catch (e) { out.textContent = '❌ ' + e.message; }
+}
+document.getElementById('port-badge').textContent = 'port ' + location.port;
+loadPools(); loadPolicy(); loadMemory(); loadSpend();
+setInterval(() => { loadPolicy(); loadMemory(); loadSpend(); }, 15000);
+</script>
+<script src="/static/gateway.js"></script>
+</body>
+</html>

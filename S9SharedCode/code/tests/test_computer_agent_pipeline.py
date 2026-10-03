@@ -131,6 +131,22 @@ class CalculatorSimDaemon:
 @pytest.fixture
 def fake_daemon(monkeypatch):
     d = FakeDaemon()
+    # ORDER-INDEPENDENCE FIX: this suite previously passed only when run
+    # AFTER test_computer_use_new.py, whose setup_method leaks
+    # COMPUTER_USE_ENABLED=true into os.environ. SafetyGates reads that var
+    # at construction, so running this file alone left the engine reporting
+    # "Computer-use is disabled". Set the env here and reset the shared
+    # gates so every test is self-sufficient regardless of file order.
+    monkeypatch.setenv("COMPUTER_USE_ENABLED", "true")
+    monkeypatch.setenv("COMPUTER_USE_MODE", "live")
+    # Mock check_permissions to return all-ok (avoids real screenshot capture).
+    # Must patch in engine module since it imports check_permissions at load time.
+    import computer_use.engine as E
+    monkeypatch.setattr(E, "check_permissions", lambda: E.safety.permissions.PermissionReport(
+        binary_present=True, daemon_running=True, ax_ok=True,
+        screenshot_ok=True, elevated=False, platform="win32", apps=[]))
+    import computer_use.safety
+    computer_use.safety.reset_shared_gates()
     # Patch the module the engine actually imports: computer_use.daemon
     import computer_use.daemon as cd
     monkeypatch.setattr(cd, "ensure_daemon", lambda *a, **k: True)
@@ -225,6 +241,16 @@ async def test_pipeline_calculator_click_arithmetic(monkeypatch):
     the calculator via button clicks with a fresh snapshot per click and a
     'c' keypress to clear prior session state.
     """
+    # Enable computer-use and mock permissions
+    monkeypatch.setenv("COMPUTER_USE_ENABLED", "true")
+    monkeypatch.setenv("COMPUTER_USE_MODE", "live")
+    import computer_use.safety
+    computer_use.safety.reset_shared_gates()
+    import computer_use.engine as E
+    monkeypatch.setattr(E, "check_permissions", lambda: E.safety.permissions.PermissionReport(
+        binary_present=True, daemon_running=True, ax_ok=True,
+        screenshot_ok=True, elevated=False, platform="win32", apps=[]))
+
     import computer_use.daemon as cd
     sim = CalculatorSimDaemon()
     monkeypatch.setattr(cd, "ensure_daemon", lambda *a, **k: True)
@@ -241,11 +267,17 @@ async def test_pipeline_calculator_click_arithmetic(monkeypatch):
     assert res.output.get("layer") == "L2a", res.output
     # The simulated display must show the correct product.
     assert "132678" in (res.output.get("result", {}).get("display") or ""), res.output
-    # Verify the engine issued a 'c' clear + clicks (not type_text of '*').
+    # CONTRACT (aligned with deterministic._calc_plan): the clear is a CLICK
+    # on the Clear button (fallback index 22), not a 'c' keypress — blind
+    # keyboard input does not reach Calculator reliably. So: 9 clicks total
+    # (clear + 2,3,4,*,5,6,7,=) and NO type_text of the raw expression.
     tools = [c[0] for c in sim.calls]
-    assert "press_key" in tools  # the 'c' clear
-    # 8 clicks: 2,3,4,*,5,6,7,= (the clear is a keypress, not a click).
-    assert tools.count("click") == 8, tools
+    assert "press_key" not in tools or all(
+        c[1].get("key") != "c" for c in sim.calls if c[0] == "press_key")
+    # 9 clicks: clear@22, then 2,3,4,*,5,6,7,=
+    click_indices = [c[1].get("element_index") for c in sim.calls if c[0] == "click"]
+    assert click_indices[0] == 22, f"first click must be Clear(22): {click_indices}"
+    assert len(click_indices) == 9, click_indices
     # No type_text of the raw expression (the old broken path).
     typed = [c[1].get("text") for c in sim.calls if c[0] == "type_text"]
     assert not any("*" in t for t in typed), f"typed '*' instead of clicking: {typed}"

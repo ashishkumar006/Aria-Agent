@@ -1,7 +1,7 @@
 """Capability-aware router. Same RPM/RPD bookkeeping as V1, but now it can
 skip providers that lack a requested capability (tools/reasoning/structured/caching)."""
 from __future__ import annotations
-import time, asyncio
+import time
 from collections import deque, defaultdict
 
 
@@ -34,6 +34,34 @@ def resolve(name):
     if not name:
         return None
     return SHORTCUTS.get(name.lower())
+
+
+def limits_for(name):
+    """Rate limits for a pool member. Key-pool siblings (`gemini-2`, …)
+    share their canonical provider's limits; unknown names raise KeyError
+    just like a direct LIMITS lookup would."""
+    if name in LIMITS:
+        return LIMITS[name]
+    import re as _re
+    m = _re.fullmatch(r"(.+)-(\d+)", name or "")
+    if m and m.group(1) in LIMITS:
+        return LIMITS[m.group(1)]
+    raise KeyError(name)
+
+
+def expand_order(order, providers):
+    """Insert key-pool siblings right after their canonical member:
+    order [gemini, groq] with members {gemini, gemini-2, groq} →
+    [gemini, gemini-2, groq]. Unknown names pass through (Router filters
+    them against the live pool), order otherwise preserved."""
+    expanded = []
+    for name in order:
+        expanded.append(name)
+        i = 2
+        while f"{name}-{i}" in providers:
+            expanded.append(f"{name}-{i}")
+            i += 1
+    return expanded
 
 
 class RateState:
@@ -120,18 +148,29 @@ class Router:
         self.providers = providers
         self.order = [p for p in order if p in providers]
         self.state = defaultdict(RateState)
-        self.lock = asyncio.Lock()
 
     def candidates(self, override=None):
         if override:
             r = resolve(override)
-            return [r] if r and r in self.providers else []
+            if r and r in self.providers:
+                return [r]
+            # Direct pool-member pin, incl. key-pool siblings (gemini-2, …).
+            if override in self.providers:
+                return [override]
+            return []
         return list(self.order)
 
     def pick(self, est_tokens, candidates, required_caps: list[str] | None = None):
+        """Choose the least-recently-loaded usable candidate (fewest calls
+        in the last minute, then longest idle) instead of strict priority
+        order — concurrent calls spread across providers in parallel
+        rather than queueing on provider #1 until it cools down.
+        Capability, max_ctx and RPM/RPD/TPM guards are unchanged; error
+        failover in main.py stays sequential (racing would pay N× cost)."""
         attempts = []
+        usable = []
         for name in candidates:
-            limits = LIMITS[name]
+            limits = limits_for(name)
             prov = self.providers[name]
             caps = getattr(prov, "capabilities", {})
             if required_caps:
@@ -144,14 +183,19 @@ class Router:
                 continue
             ok, why = self.state[name].can_use(limits, est_tokens)
             if ok:
-                return name, attempts
-            attempts.append({"provider": name, "reason": why})
-        return None, attempts
+                usable.append(name)
+            else:
+                attempts.append({"provider": name, "reason": why})
+        if not usable:
+            return None, attempts
+        best = min(usable, key=lambda n: (len(self.state[n].calls_minute),
+                                          self.state[n].last_call))
+        return best, attempts
 
     def all_status(self):
         out = {}
         for name in self.providers:
-            out[name] = self.state[name].snapshot(LIMITS[name])
+            out[name] = self.state[name].snapshot(limits_for(name))
             out[name]["model"] = self.providers[name].model
             out[name]["capabilities"] = getattr(self.providers[name], "capabilities", {})
         return out
@@ -163,7 +207,10 @@ class Router:
 # with worker quotas (provider keys are shared but providers meter per-model).
 # -----------------------------------------------------------------------------
 
-DEFAULT_ROUTER_ORDER = ["cerebras", "groq", "nvidia", "github", "kilo"]
+# NOTE: "kilo" intentionally absent — build_router_providers() wires only
+# cerebras/groq/nvidia/github (per-model metered keys), so any name here
+# without a builder is silently filtered by the Router constructor.
+DEFAULT_ROUTER_ORDER = ["cerebras", "groq", "nvidia", "github"]
 
 
 class RouterPool:
@@ -176,26 +223,13 @@ class RouterPool:
         self.providers = providers
         self.order = [p for p in order if p in providers]
         self.state = defaultdict(RateState)
-        self.lock = asyncio.Lock()
 
     def candidates(self):
         return list(self.order)
 
-    def pick(self, est_tokens=400):
-        """Pick first available router provider. Caps require nothing — router
-        LLMs only need to emit one word, no tools/reasoning/structured needed."""
-        attempts = []
-        for name in self.candidates():
-            limits = LIMITS[name]
-            ok, why = self.state[name].can_use(limits, est_tokens)
-            if ok:
-                return name, attempts
-            attempts.append({"provider": name, "reason": why})
-        return None, attempts
-
     def all_status(self):
         out = {}
         for name in self.providers:
-            out[name] = self.state[name].snapshot(LIMITS[name])
+            out[name] = self.state[name].snapshot(limits_for(name))
             out[name]["model"] = self.providers[name].model
         return out

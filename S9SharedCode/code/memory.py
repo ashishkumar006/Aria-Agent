@@ -1,133 +1,83 @@
-"""Memory: a typed service with four kinds.
+"""Memory: thin client over the gateway memory service.
 
-Session 7 adds vector retrieval on top of the Session 6 service. Reads go
-through FAISS first (cosine similarity over the `embedding` field). When
-the vector path returns nothing, the read falls back to the S6 keyword
-overlap. Writes embed the descriptor at insert time for items of kind
-`fact`, `preference`, and `tool_outcome`. Scratchpad items skip embedding.
+All durable state, the FAISS indexes, the embed calls and the retrieval
+strategy live on llm_gatewayV9 (``memory/`` + ``memory_api.py``). This
+module keeps only what belongs to the agent:
 
-The classifying write for ambiguous free-form content still uses one
-gateway chat call routed `auto_route="memory"`. The embedding call is a
-separate gateway endpoint, `POST /v1/embed`, exposed by `gateway.embed()`.
+- the LLM classifier prompt for ambiguous free-form writes (fast-moving
+  retrieval strategy — prompt wording, not infrastructure);
+- the deterministic keyword extractor used when the classifier is down;
+- typed forwarding of ``read`` / ``remember`` / ``record_outcome`` /
+  ``add_fact`` / ``clear`` / ``list_recent`` to ``/v1/memory/*``.
 
-Three honest design choices flagged in the Session 7 notes:
-  1. Vector retrieval only. Hybrid retrieval with RRF arrives in a future
-     session.
-  2. Sliding-window chunking inside `index_document` is heuristic.
-     Semantic chunking arrives in Session 8.
-  3. The embedding model is fixed at the gateway level. Switching it
-     invalidates every FAISS index already built. Treat the model as a
-     project-level constant.
+Phase 1 (seven drawers): every write declares its principal role and the
+call path sets it honestly — ``remember`` (classified) → ``agent``,
+``record_outcome`` (deterministic tool result) → ``runtime`` (fixed
+server-side), ``add_fact`` (indexer path) → ``indexer``. The gateway
+enforces the per-drawer writer map fail-closed.
+
+Public signatures are unchanged from the flat era, plus an optional
+``session_id`` on every call and an optional ``drawers`` scope on reads.
+
+Failure contract: ``read`` is fail-soft (gateway down → ``[]`` with a
+log line; session start must never die). Writes raise on transport
+failure so callers decide — ``flow._safe_remember`` already swallows and
+logs, MCP tools surface the error to the model honestly.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import re
 from pathlib import Path
 
+import httpx
 from pydantic import BaseModel, Field
 
-from gateway import LLM, embed as _gateway_embed, ensure_gateway
-from schemas import MemoryItem, ToolCall, new_id
-from vector_index import VectorIndex
+from gateway import LLM, GATEWAY_URL, ensure_gateway, _client
+from schemas import MemoryItem, ToolCall
 
 STATE_PATH = Path(__file__).parent / "state" / "memory.json"
-STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+"""Legacy path. The store moved to the gateway; this constant is kept so
+old diagnostics fail with a clear message instead of an ImportError. It
+is NOT read or written anymore."""
 
-# Kinds for which an embedding is computed at write time. Scratchpad items
-# are run-scoped and skip the vector path.
-_EMBEDDABLE_KINDS = {"fact", "preference", "tool_outcome"}
-
-
-# ── persistence ─────────────────────────────────────────────────────────────
-
-def _load() -> list[MemoryItem]:
-    if not STATE_PATH.exists():
-        return []
-    text = STATE_PATH.read_text()
-    if not text.strip():
-        # Empty file (e.g. truncated by an interrupted run) — treat as no
-        # memory rather than crashing every downstream read.
-        return []
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError:
-        # Corrupt file — don't let it kill the run; start fresh.
-        return []
-    if not isinstance(raw, list):
-        return []
-    return [MemoryItem.model_validate(r) for r in raw]
+# Mirror of the gateway plane's SESSION_DRAWERS (memory/plane.py): the
+# drawer set for session-start recall. Working notes are run-scoped by
+# definition, so a new run recalls everything else. Duplicated (not
+# fetched) so session start never depends on an extra round-trip.
+SESSION_DRAWERS = ["policy", "fact", "playbook", "document", "episode",
+                   "legacy"]
 
 
-def _save(items: list[MemoryItem]) -> None:
-    STATE_PATH.write_text(
-        json.dumps([i.model_dump(mode="json") for i in items], indent=2)
-    )
+def _base() -> str:
+    return os.environ.get("LLM_GATEWAY_V9_URL", GATEWAY_URL).rstrip("/")
 
 
-# ── vector index ────────────────────────────────────────────────────────────
-
-# Module-level cache of the FAISS index. Re-loading the index from disk on
-# every read/write was the dominant fixed cost of the memory path (measured
-# 258ms mean / 1.2s worst case per call). We cache one VectorIndex per
-# process and only reload when the on-disk file is newer than the cached
-# copy (mtime check) — this keeps us consistent with writes made by the
-# MCP subprocess, which runs in a separate Python process and persists to
-# the same files. The main orchestrator process only reads memory once at
-# session start, so a stale cache can never affect retrieval results; the
-# mtime guard is belt-and-suspenders for any future re-read.
-_INDEX_CACHE: dict[str, tuple[float, "VectorIndex"]] = {}
+def _post(path: str, body: dict, timeout: float = 60.0) -> dict:
+    ensure_gateway()
+    r = _client().post(f"{_base()}{path}", json=body, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 
-def _index() -> VectorIndex:
-    """Return a cached FAISS index, reloading only when the disk file changed.
-
-    On cold start (no index files on disk) the index is rebuilt from items
-    already persisted in `memory.json`.
-    """
-    store_dir = STATE_PATH.parent
-    faiss_path = store_dir / "index.faiss"
-    try:
-        mtime = faiss_path.stat().st_mtime if faiss_path.exists() else -1.0
-    except OSError:
-        mtime = -1.0
-    cached = _INDEX_CACHE.get(str(store_dir))
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    idx = VectorIndex(store_dir)
-    if idx.size == 0:
-        for item in _load():
-            if item.embedding is not None:
-                idx.add(item.id, item.embedding)
-        if idx.size > 0:
-            idx.persist()
-    _INDEX_CACHE[str(store_dir)] = (mtime, idx)
-    return idx
+def _get(path: str, params: dict | None = None,
+         timeout: float = 30.0) -> dict:
+    ensure_gateway()
+    r = _client().get(f"{_base()}{path}", params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 
-def _invalidate_index_cache() -> None:
-    """Drop the cached index so the next `_index()` reloads from disk.
-
-    Called after a write that persists to disk, so a later reload (e.g. if
-    the mtime guard misses a same-second write) starts fresh. The in-process
-    cached object is still mutated in place by `_persist_item`, so normal
-    same-process reads stay correct without a reload."""
-    _INDEX_CACHE.pop(str(STATE_PATH.parent), None)
+def _delete(path: str, params: dict | None = None,
+            timeout: float = 30.0) -> dict:
+    ensure_gateway()
+    r = _client().delete(f"{_base()}{path}", params=params or {}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 
-def _try_embed(text: str, task_type: str) -> list[float] | None:
-    """Compute an embedding via the gateway. Returns None if the gateway is
-    unavailable. The caller decides whether to persist a non-embedded item."""
-    try:
-        resp = _gateway_embed(text, task_type=task_type)
-        return list(resp["embedding"])
-    except Exception as e:
-        print(f"[memory] embedding failed ({e!r}); item written without vector")
-        return None
-
-
-# ── keyword search (Session 6 path, used as fallback) ───────────────────────
+# ── keyword extraction (classifier-fallback only) ─────────────────────────
 
 _STOPWORDS = {
     "the", "is", "a", "an", "of", "to", "and", "or", "in", "on", "for", "at",
@@ -143,66 +93,7 @@ def _tokens(text: str) -> set[str]:
     }
 
 
-def _keyword_search(
-    query: str,
-    history: list[dict] | None,
-    *,
-    kinds: list[str] | None,
-    top_k: int,
-) -> list[MemoryItem]:
-    items = _load()
-    if kinds:
-        items = [i for i in items if i.kind in kinds]
-    qtoks = _tokens(query)
-    if history:
-        for h in history[-3:]:
-            qtoks |= _tokens(json.dumps(h, default=str))
-    scored: list[tuple[int, MemoryItem]] = []
-    for item in items:
-        itoks = {w.lower() for w in item.keywords} | _tokens(item.descriptor)
-        score = len(qtoks & itoks)
-        if score > 0:
-            scored.append((score, item))
-    scored.sort(key=lambda x: -x[0])
-    return [i for _, i in scored[:top_k]]
-
-
-# ── vector search (the new S7 path) ─────────────────────────────────────────
-
-def _vector_search(
-    query: str,
-    *,
-    kinds: list[str] | None,
-    top_k: int,
-) -> list[MemoryItem]:
-    # Skip the embedding call entirely when the index has no vectors yet.
-    # On a cold session (no indexed items) the embed would just return
-    # nothing anyway, but it costs a full round-trip to the embedder
-    # (measured ~2.8s to Ollama). The keyword fallback in `read()` still
-    # runs, so retrieval behaviour is unchanged — only the wasted embed
-    # (and its latency) is removed.
-    idx = _index()
-    if idx.size == 0:
-        return []
-    qvec = _try_embed(query, task_type="retrieval_query")
-    if qvec is None:
-        return []
-    hits = idx.search(qvec, k=top_k * 2 if kinds else top_k)
-    if not hits:
-        return []
-    by_id: dict[str, MemoryItem] = {item.id: item for item in _load()}
-    out: list[MemoryItem] = []
-    for item_id, _score in hits:
-        item = by_id.get(item_id)
-        if item is None:
-            continue
-        if kinds and item.kind not in kinds:
-            continue
-        out.append(item)
-        if len(out) >= top_k:
-            break
-    return out
-
+# ── reads ─────────────────────────────────────────────────────────────────
 
 def read(
     query: str,
@@ -210,15 +101,149 @@ def read(
     *,
     kinds: list[str] | None = None,
     top_k: int = 8,
+    session_id: str | None = None,
+    drawers: list[str] | None = None,
+    include_stale: bool = False,
+    doc_ids: set[str] | None = None,
 ) -> list[MemoryItem]:
-    """Vector first, keyword as fallback when vector returns nothing."""
-    vec_hits = _vector_search(query, kinds=kinds, top_k=top_k)
-    if vec_hits:
-        return vec_hits
-    return _keyword_search(query, history, kinds=kinds, top_k=top_k)
+    """Drawer-aware recall (gateway), legacy merged in. Gateway-side each
+    store fuses vector + keyword hits with RRF. Fail-soft: any
+    transport failure returns ``[]`` so session start never dies."""
+    try:
+        data = _post("/v1/memory/search", {
+            "query": query, "history": history,
+            "kinds": kinds, "top_k": top_k, "session_id": session_id,
+            "drawers": drawers, "include_stale": include_stale,
+            # Omitted means no filtering; an empty list means "no documents",
+            # which is what a disabled document or a conversation with
+            # documents turned off must produce.
+            **({"doc_ids": sorted(doc_ids)} if doc_ids is not None else {}),
+        })
+        return [MemoryItem.model_validate(r) for r in data.get("items", [])]
+    except Exception as e:
+        # Fail-soft by design: recall runs at session start and must never
+        # kill a run because the gateway is briefly down. This is the one
+        # place where "cannot tell" and "no matches" are genuinely the same
+        # thing to the caller. list_recent does NOT fail soft, because a
+        # dashboard that renders an empty list on failure is a lie.
+        print(f"[memory.read] gateway unreachable ({e!r}); continuing without hits")
+        return []
 
 
-# ── writes ──────────────────────────────────────────────────────────────────
+class MemoryBackendError(RuntimeError):
+    """The memory backend could not answer. Distinct from "no results": a
+    caller that treats these the same will show an empty Memory panel and the
+    user will conclude their memory was deleted.
+
+    ``status_code`` carries the gateway's own status when there was one, so a
+    client error (400 for an unknown kind) is not re-reported as a gateway
+    fault. 0 means "no usable status" (transport failure)."""
+
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def list_recent(limit: int = 50,
+                session_id: str | None = None,
+                drawers: list[str] | None = None,
+                kinds: list[str] | None = None,
+                hide_superseded: bool = False) -> list[MemoryItem]:
+    """Newest-first items for the dashboard Memory panel.
+
+    `kinds` filters the agent-facing vocabulary (fact / preference /
+    tool_outcome / scratchpad) as opposed to `drawers`, which filters the
+    cabinet. Both are needed because `preference` records live in the `fact`
+    drawer, so a drawer filter cannot isolate them.
+
+    Raises MemoryBackendError on transport/backend failure. It used to
+    fail-soft to `[]`, which is what made a gateway 400 (an unknown kind) or
+    500 render as an empty list -- indistinguishable from "you have no
+    memories". Callers that genuinely must not fail (recall at session start)
+    should catch this explicitly.
+    """
+    try:
+        params: dict = {"limit": limit}
+        if session_id:
+            params["session_id"] = session_id
+        if drawers:
+            params["drawers"] = ",".join(drawers)
+        if kinds:
+            params["kinds"] = ",".join(kinds)
+        if hide_superseded:
+            params["hide_superseded"] = "true"
+
+        data = _get("/v1/memory", params)
+        return [MemoryItem.model_validate(r) for r in data.get("items", [])]
+    except Exception as e:
+        print(f"[memory] list failed ({e!r})")
+        code = getattr(getattr(e, "response", None), "status_code", 0) or 0
+        raise MemoryBackendError(str(e), status_code=code) from e
+
+
+def policies(limit: int = 50) -> list[MemoryItem]:
+    """Active policy records (revoked ones hidden). Injected into EVERY
+    skill prompt with no exclusions. Fail-soft — a policy outage must
+    never block a run, but it is loud about it."""
+    # A policy outage must never block a run, so this one stays fail-soft.
+    try:
+        return list_recent(limit=limit, drawers=["policy"],
+                           hide_superseded=True)
+    except MemoryBackendError as e:
+        print(f"[memory] policy list unavailable ({e})")
+        return []
+
+
+def episodes(session_id: str | None = None,
+             limit: int = 50) -> list[MemoryItem]:
+    """Run history without vector work (Phase 4 drawers). Fail-soft."""
+    try:
+        params: dict = {"limit": limit}
+        if session_id:
+            params["session_id"] = session_id
+        data = _get("/v1/memory/episodes", params)
+        return [MemoryItem.model_validate(r) for r in data.get("items", [])]
+    except Exception as e:
+        print(f"[memory] episodes failed ({e!r})")
+        return []
+
+
+def propose_playbook(
+    descriptor: str,
+    *,
+    procedure: dict | None = None,
+    evidence_ids: list[str] | None = None,
+    source: str,
+    run_id: str,
+) -> MemoryItem:
+    """Phase A consolidation: propose a reusable procedure. Agent-writable
+    working record; promotion needs a separate system/operator approval —
+    the model can never self-promote."""
+    data = _post("/v1/memory/playbook/propose", {
+        "descriptor": descriptor, "procedure": procedure or {},
+        "evidence_ids": evidence_ids or [],
+        "source": source, "run_id": run_id,
+        "principal_role": "agent",
+    })
+    return MemoryItem.model_validate(data["item"])
+
+
+def approve_playbook(
+    proposal_id: str,
+    *,
+    run_id: str,
+    principal_role: str = "agent",
+) -> MemoryItem:
+    """Promote a proposal to a playbook record. System/operator only
+    gateway-side (fail-closed); the default agent role is denied."""
+    data = _post("/v1/memory/playbook/approve", {
+        "proposal_id": proposal_id, "run_id": run_id,
+        "principal_role": principal_role,
+    })
+    return MemoryItem.model_validate(data["item"])
+
+
+# ── writes ────────────────────────────────────────────────────────────────
 
 class _Classification(BaseModel):
     """What the LLM classifier returns for an ambiguous free-form write."""
@@ -229,45 +254,154 @@ class _Classification(BaseModel):
     value: dict = Field(default_factory=dict)
 
 
-def _persist_item(item: MemoryItem) -> MemoryItem:
-    """Append `item` to the JSON store and, if it has an embedding, to the
-    FAISS index. Returns the same item for caller convenience."""
-    items = _load()
-    items.append(item)
-    _save(items)
-    if item.embedding is not None and item.kind in _EMBEDDABLE_KINDS:
-        idx = _index()
-        idx.add(item.id, item.embedding)
-        idx.persist()
-        # The cached index object was mutated in place above, so same-process
-        # reads stay correct; bump the mtime key so a future reload (or the
-        # MCP subprocess's own cache) sees the new file.
-        _invalidate_index_cache()
-    return item
-
-
 def _fallback_remember(
     raw_text: str, *, source: str, run_id: str, goal_id: str | None,
+    session_id: str | None = None,
 ) -> MemoryItem:
     """Deterministic write when the classifier LLM is unavailable.
     Keyword extraction is naive (top word tokens); kind defaults to fact.
-    The embedding is still attempted; if it fails the item persists without
-    a vector and stays reachable through the keyword fallback."""
+    Embedding still happens — gateway-side."""
     toks = list(_tokens(raw_text))[:10]
-    descriptor = raw_text[:200]
-    embedding = _try_embed(descriptor, task_type="retrieval_document")
-    item = MemoryItem(
-        id=new_id("mem"),
-        kind="fact",
-        keywords=toks,
-        descriptor=descriptor,
-        value={"raw": raw_text},
-        embedding=embedding,
-        source=source,
-        run_id=run_id,
-        goal_id=goal_id,
-    )
-    return _persist_item(item)
+    data = _post("/v1/memory/remember", {
+        "kind": "fact", "descriptor": raw_text[:200], "keywords": toks,
+        "value": {"raw": raw_text}, "source": source, "run_id": run_id,
+        "goal_id": goal_id, "session_id": session_id,
+        "principal_role": "agent",
+    })
+    return MemoryItem.model_validate(data["item"])
+
+
+def remember_preference(
+    descriptor: str,
+    *,
+    keywords: list[str] | None = None,
+    value: dict | None = None,
+    source: str = "agent",
+    run_id: str = "chat",
+    session_id: str | None = None,
+    supersedes: str | None = None,
+) -> MemoryItem:
+    """Explicit-kind preference write — no LLM classifier.
+
+    `remember()` runs free-form text through a classifier that decides the
+    kind. That is right for a whole user query and wrong for a preference the
+    agent has already identified: a classifier asked to label "prefers
+    metric units, no imperial" can just as easily return `fact`, and a
+    preference stored as a fact is invisible to the preference view and does
+    not read back as a standing instruction.
+
+    This path names the kind itself. Zero model calls, one round-trip, and
+    the descriptor is written exactly as the agent phrased it.
+
+    `supersedes` retires an earlier preference id, so a changed preference
+    replaces rather than accumulates ("now prefers X" after "prefers Y").
+    """
+    if not (descriptor or "").strip():
+        raise ValueError("preference descriptor required")
+    payload = {
+        "kind": "preference",
+        "descriptor": descriptor.strip()[:400],
+        "keywords": [str(k)[:60] for k in (keywords or [])][:12],
+        "value": value or {"statement": descriptor.strip()[:400]},
+        "source": source,
+        "run_id": run_id,
+        "goal_id": None,
+        "session_id": session_id,
+        "supersedes": supersedes,
+    }
+    return MemoryItem.model_validate(_post("/v1/memory/remember", payload)["item"])
+
+
+# ── deterministic preference capture ────────────────────────────────────────
+# The MCP tool exists and works, but measured live: a natural
+# "from now on always give me the publication date and never use emoji" got a
+# correct acknowledgement and stored NOTHING, because the model chose not to
+# call the tool. That is the same failure mode as the tool-outcome loop, and
+# the same fix: do not depend on the model remembering to do bookkeeping.
+#
+# These patterns are deliberately narrow. A loose detector would file half
+# the user's requests as standing instructions, which is worse than missing
+# some — a wrong preference actively misinforms every later run.
+_PREF_PATTERNS = (
+    r"\bfrom now on\b",
+    r"\bgoing forward\b",
+    r"\bfrom henceforth\b",
+    r"\bi (?:always|never|prefer|like|want|hate|need) (?:to |you to |my )?\w+",
+    r"\bi'?d rather\b",
+    r"\bplease always\b",
+    r"\balways (?:give|show|use|include|put|return|format|answer|use)\b",
+    r"\bnever use\b",
+    r"\bdo not ever\b",
+    r"\bdon'?t ever\b",
+    r"\bnever send\b",
+    r"\bnever (?:include|show|add|create|send|reply)\b",
+    r"\bstop (?:using|doing|sending|showing)\b",
+    r"\bno more (?:of )?\w+",
+    r"\bby default,? (?:use|show|give|return|assume)\b",
+    r"\bkeep (?:doing|using) \w+",
+    r"\bdefault to\b",
+)
+_PREF_RE = re.compile("|".join(_PREF_PATTERNS), re.IGNORECASE)
+# Asking about preferences is not stating one.
+_PREF_META_RE = re.compile(
+    r"^\s*(what|which|do you know|list|show|tell)\b.*\b"
+    r"(prefer|preference|memory|remember about me)\b|\?",
+    re.IGNORECASE)
+# Reported speech is not a statement by the user. "The user asked me to always
+# use tabs" is the agent talking about someone else, and filing that as the
+# user's standing rule would be flatly wrong.
+_PREF_THIRD_PARTY_RE = re.compile(
+    r"\b(the user|our user|the customer|they (?:said|asked|prefer)|"
+    r"he (?:said|asked|prefer)|she (?:said|asked|prefer)|"
+    r"asked me to|the doc(?:ument|umentation) says)\b",
+    re.IGNORECASE)
+_PREF_MAX_CHARS = 400
+
+
+def detect_preference(text: str) -> str | None:
+    """Return the preference to store, or None.
+
+    Conservative by design: only a clear, first-person, standing statement
+    counts. A question, a hypothetical, reported speech, or a one-off
+    instruction about the current task must not become a durable rule.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > _PREF_MAX_CHARS:
+        return None
+    if _PREF_META_RE.search(t):
+        return None
+    if _PREF_THIRD_PARTY_RE.search(t):
+        return None
+    if not _PREF_RE.search(t):
+        return None
+    # A bare statement, not a task. "Always give me the date" is a standing
+    # rule; "always check the docs first and then write the migration" is a
+    # one-off instruction to this turn.
+    statement = t.rstrip(" .!?")
+    if len(statement.split()) > 60:
+        return None
+    return statement[:_PREF_MAX_CHARS]
+
+
+def capture_preference_from_turn(text: str, *, source: str = "chat",
+                                 run_id: str = "chat",
+                                 session_id: str | None = None) -> str | None:
+    """Detect and store a preference in one step. Returns the new id, or None.
+
+    Fail-soft and quiet: a memory write must never break a chat turn, and a
+    miss is a normal outcome, not an error worth logging loudly.
+    """
+    try:
+        stmt = detect_preference(text)
+        if not stmt:
+            return None
+        item = remember_preference(stmt, keywords=_tokens(stmt) or None,
+                                  source=source, run_id=run_id,
+                                  session_id=session_id)
+        return item.id
+    except Exception as e:
+        print(f"[memory.preference] capture skipped: {type(e).__name__}: {e}")
+        return None
 
 
 def remember(
@@ -276,17 +410,22 @@ def remember(
     source: str,
     run_id: str,
     goal_id: str | None = None,
+    session_id: str | None = None,
+    drawer: str | None = None,
 ) -> MemoryItem:
     """LLM-classified write for ambiguous content (user input, free-form
-    observation). One classifier call plus one embed call. If the
-    classifier fails, the deterministic fallback handles the write."""
+    observation). One classifier call; the gateway embeds + persists. If
+    the classifier fails, the deterministic fallback handles the write.
+    ``drawer`` overrides kind→drawer routing (dashboard policy editor);
+    permission is enforced gateway-side."""
     ensure_gateway()
     schema = _Classification.model_json_schema()
     try:
         reply = _llm_classify(raw_text, schema)
     except Exception as e:
         print(f"[memory.remember] classifier failed ({e!r}); falling back to fact-write")
-        return _fallback_remember(raw_text, source=source, run_id=run_id, goal_id=goal_id)
+        return _fallback_remember(raw_text, source=source, run_id=run_id,
+                                  goal_id=goal_id, session_id=session_id)
 
     parsed = reply.get("parsed") or {}
     # NOTES_RUNS §6 (2): the classifier at temp=1.0 sometimes returns an
@@ -304,22 +443,14 @@ def remember(
         "value": parsed_value,
     })
 
-    embedding: list[float] | None = None
-    if c.kind in _EMBEDDABLE_KINDS:
-        embedding = _try_embed(c.descriptor, task_type="retrieval_document")
-
-    item = MemoryItem(
-        id=new_id("mem"),
-        kind=c.kind,  # type: ignore[arg-type]
-        keywords=[k.lower() for k in c.keywords],
-        descriptor=c.descriptor,
-        value=c.value,
-        embedding=embedding,
-        source=source,
-        run_id=run_id,
-        goal_id=goal_id,
-    )
-    return _persist_item(item)
+    data = _post("/v1/memory/remember", {
+        "kind": c.kind, "descriptor": c.descriptor,
+        "keywords": [k.lower() for k in c.keywords], "value": c.value,
+        "source": source, "run_id": run_id, "goal_id": goal_id,
+        "session_id": session_id, "principal_role": "agent",
+        "drawer": drawer,
+    })
+    return MemoryItem.model_validate(data["item"])
 
 
 def _llm_classify(raw_text: str, schema: dict) -> dict:
@@ -352,6 +483,28 @@ def _llm_classify(raw_text: str, schema: dict) -> dict:
     )
 
 
+def write_policy(
+    text: str,
+    *,
+    supersedes: str | None = None,
+    source: str = "dashboard",
+    run_id: str,
+) -> MemoryItem:
+    """Operator policy write (Phase 3 drawers). No LLM classifier — the
+    operator's rule is deliberate, so kind is fact-by-construction and the
+    principal is operator. With ``supersedes``, the old rule drops out of
+    behavior injection (search) while staying visible for review (list)."""
+    data = _post("/v1/memory/remember", {
+        "kind": "fact", "descriptor": text[:500],
+        "keywords": list(_tokens(text))[:10],
+        "value": {"raw": text}, "source": source, "run_id": run_id,
+        "goal_id": None, "session_id": None,
+        "drawer": "policy", "principal_role": "operator",
+        "supersedes": supersedes,
+    })
+    return MemoryItem.model_validate(data["item"])
+
+
 def record_outcome(
     *,
     tool_call: ToolCall,
@@ -359,43 +512,17 @@ def record_outcome(
     artifact_id: str | None,
     run_id: str,
     goal_id: str | None,
+    session_id: str | None = None,
 ) -> MemoryItem:
     """Zero-LLM-classify write for a deterministic tool outcome. Kind is
-    `tool_outcome` by construction. Embedding is computed from the
-    descriptor so the outcome remains retrievable by semantic similarity."""
-    arg_words = []
-    for v in tool_call.arguments.values():
-        if isinstance(v, str):
-            arg_words += _tokens(v)
-        elif isinstance(v, (int, float)):
-            arg_words.append(str(v))
-    keywords = list({tool_call.name.lower(), *arg_words})[:10]
-
-    descriptor = f"{tool_call.name}({json.dumps(tool_call.arguments)[:80]}) -> "
-    if artifact_id:
-        descriptor += f"artifact {artifact_id}"
-    else:
-        descriptor += result_text[:120].replace("\n", " ")
-
-    embedding = _try_embed(descriptor, task_type="retrieval_document")
-
-    item = MemoryItem(
-        id=new_id("mem"),
-        kind="tool_outcome",
-        keywords=keywords,
-        descriptor=descriptor,
-        value={
-            "tool": tool_call.name,
-            "arguments": tool_call.arguments,
-            "result_preview": result_text[:400],
-        },
-        artifact_id=artifact_id,
-        embedding=embedding,
-        source="action",
-        run_id=run_id,
-        goal_id=goal_id,
-    )
-    return _persist_item(item)
+    `tool_outcome` by construction; descriptor/keywords are built
+    gateway-side so every writer shares one construction rule."""
+    data = _post("/v1/memory/record_outcome", {
+        "tool": tool_call.name, "arguments": tool_call.arguments,
+        "result_text": result_text, "artifact_id": artifact_id,
+        "run_id": run_id, "goal_id": goal_id, "session_id": session_id,
+    })
+    return MemoryItem.model_validate(data["item"])
 
 
 def add_fact(
@@ -406,27 +533,35 @@ def add_fact(
     source: str,
     run_id: str,
     goal_id: str | None = None,
+    session_id: str | None = None,
+    doc: dict | None = None,
 ) -> MemoryItem:
     """Direct fact write used by document-indexing tools. Skips the LLM
-    classifier (kind is known) but still embeds the descriptor."""
-    embedding = _try_embed(descriptor, task_type="retrieval_document")
-    item = MemoryItem(
-        id=new_id("mem"),
-        kind="fact",
-        keywords=list({k.lower() for k in (keywords or list(_tokens(descriptor))[:10])}),
-        descriptor=descriptor,
-        value=value or {},
-        embedding=embedding,
-        source=source,
-        run_id=run_id,
-        goal_id=goal_id,
-    )
-    return _persist_item(item)
+    classifier (kind is known); the gateway still embeds the descriptor.
+    Principal is ``indexer`` (chunk payloads route to the document drawer,
+    plain facts to the fact drawer). ``doc`` carries the Phase 5 span
+    ({doc_id, version, chunk_index, total_chunks})."""
+    data = _post("/v1/memory/remember", {
+        "kind": "fact", "descriptor": descriptor,
+        "keywords": keywords or [], "value": value or {},
+        "source": source, "run_id": run_id, "goal_id": goal_id,
+        "session_id": session_id, "principal_role": "indexer",
+        "doc": doc,
+    })
+    return MemoryItem.model_validate(data["item"])
 
 
-def clear() -> None:
-    """Wipe persistent memory and the vector index. Useful between
-    assignment attempts."""
-    if STATE_PATH.exists():
-        STATE_PATH.unlink()
-    VectorIndex(STATE_PATH.parent).clear()
+def clear(session_id: str | None = None,
+          drawers: list[str] | None = None,
+          older_than: str | None = None) -> None:
+    """Wipe queryable memory (globally, one session's items, one drawer
+    subset, and/or only records older than an ISO timestamp — the run-end
+    working purge passes all three)."""
+    params: dict = {}
+    if session_id:
+        params["session_id"] = session_id
+    if drawers:
+        params["drawers"] = ",".join(drawers)
+    if older_than:
+        params["older_than"] = older_than
+    _delete("/v1/memory", params or None)

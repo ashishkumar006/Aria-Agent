@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script type="speculationrules">
+{"prefetch":[{"source":"document","where":{"href_matches":"/*"},"eagerness":"moderate"}]}
+</script>
+<title>Aria · Chat</title>
+<link rel="stylesheet" href="/console.css">
+<link rel="stylesheet" href="/shared.css">
+</head>
+<body>
+<aside class="rail">
+  <div class="rail-brand"><span class="bolt"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></span><span class="lbl">Aria</span></div>
+  <div class="rail-group">Core</div>
+  <a href="/console" class="rail-item active"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span><span class="lbl">Chat</span></a>
+  <a href="/runs" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m10 8 6 4-6 4V8z"/></svg></span><span class="lbl">Runs</span></a>
+  <a href="/memory" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg></span><span class="lbl">Memory</span></a>
+  <a href="/research" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></span><span class="lbl">Research</span></a>
+  <div class="rail-group">Automate</div>
+  <a href="/scheduler" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span><span class="lbl">Scheduler</span></a>
+  <a href="/skills" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg></span><span class="lbl">Skills</span></a>
+  <div class="rail-group">Insight</div>
+  <a href="/apps" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span class="lbl">Apps</span></a>
+  <a href="/ledger" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M7 14l4-4 3 3 5-6"/></svg></span><span class="lbl">Ledger</span></a>
+  <a href="/mission" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6M12 19h8"/></svg></span><span class="lbl">Console</span></a>
+  <div class="rail-group">System</div>
+  <a href="/settings" class="rail-item"><span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 6h-7M10 6H3M21 12h-9M8 12H3M21 18h-5M12 18H3"/><circle cx="12" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg></span><span class="lbl">Settings</span></a>
+  <div class="rail-foot"><span id="health-dot" class="dot r"></span><span class="txt" id="health-text">connecting…</span></div>
+</aside>
+<div class="ctx">
+  <div class="ctx-head"><span>Conversations</span><span id="conv-count" class="badge">—</span></div>
+  <div class="ctx-search"><input type="text" id="conv-search" placeholder="Filter…" autocomplete="off"></div>
+  <div class="ctx-list" id="convs"></div>
+  <div class="props" id="props">
+    <div class="ph"><span>Thread</span></div>
+    <div class="k">SESSION</div><div class="val" id="p-sid">—</div>
+    <div class="k">COST</div><div class="val plain" id="p-cost">—</div>
+  </div>
+</div>
+<div class="page">
+  <div class="topbar">
+    <div class="crumb">✦ Aria <span class="sep">/</span> <span class="dim" id="crumb-name">Chat</span></div>
+    <div class="spacer"></div>
+    <span class="badge" id="cost-badge">—</span>
+    <span class="badge" id="gw-badge"><span class="dot r" id="gw-dot"></span><span id="gw-text">gateway…</span></span>
+    <button class="icon-btn" onclick="refreshConvs()" title="Refresh conversations">⟳</button>
+    <button class="icon-btn" onclick="newChat()" title="New chat">＋</button>
+  </div>
+  <main class="canvas" id="canvas">
+    <div id="thread">
+      <div class="msg agent" id="welcome">
+        <div class="who">Aria</div>
+        <div class="bubble"><p>Ask anything — I remember this conversation. For deep research with a visible pipeline, use <a href="/research">Research</a>.</p></div>
+      </div>
+    </div>
+  </main>
+  <div class="composer">
+    <div class="wrap">
+      <textarea id="composer" placeholder="Message Aria… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+      <button id="send-btn" class="primary" onclick="send()">Send</button>
+    </div>
+  </div>
+  <footer>runs land in <a href="/runs">runs</a> · gateway <a href="http://localhost:8109/">:8109</a></footer>
+</div>
+<script src="/console.js"></script>
+</body>
+</html>

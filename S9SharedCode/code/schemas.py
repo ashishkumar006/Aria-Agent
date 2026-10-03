@@ -3,7 +3,8 @@
 One small file, read top-to-bottom. Every other module imports from here, so
 the boundary between layers is a Pydantic model rather than a free-form dict.
 
-Session 7 adds one optional field on `MemoryItem`: `embedding`. Items of
+Session 7 added one optional field on `MemoryItem` (`embedding`), still
+current in Session 9. Items of
 kind `fact`, `preference`, and `tool_outcome` carry a vector embedding
 written by Memory at insert time. The embedding underlies FAISS vector
 search. Items of kind `scratchpad` are run-scoped and skip embedding.
@@ -45,6 +46,12 @@ class MemoryItem(BaseModel):
     goal_id: str | None = None
     confidence: float = 1.0
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Phase 3 drawers (gateway records): drawer provenance + correction
+    # link. Optional so every existing constructor keeps working; the
+    # dashboard uses them for drawer badges and revoked-rule display.
+    drawer: str | None = None
+    session_id: str | None = None
+    superseded_by: str | None = None
 
 
 # ── Artifacts ───────────────────────────────────────────────────────────────

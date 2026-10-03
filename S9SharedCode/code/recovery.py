@@ -22,16 +22,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-RecoveryReason = Literal["transient", "validation_error", "upstream_failure"]
+RecoveryReason = Literal[
+    "transient", "validation_error", "upstream_failure", "environmental"]
 RecoveryAction = Literal["skip", "replan", "critic_fail"]
 
 
-def classify_failure(error_text: str) -> RecoveryReason:
+def classify_failure(error_text: str, error_code: str | None = None) -> RecoveryReason:
+    # Structured codes win over text heuristics: gateway_blocked (CAPTCHA /
+    # login wall) must route around via replan, never be mistaken for a
+    # transient gateway blip.
+    if (error_code or "").lower() == "gateway_blocked":
+        return "upstream_failure"
     e = (error_text or "").lower()
     if not e:
         return "upstream_failure"
+    if "gateway_blocked" in e:
+        return "upstream_failure"
     if "malformed" in e or "validationerror" in e or "validation error" in e:
         return "validation_error"
+    # F7 FIX: environmental failures are DETERMINISTIC — retrying or
+    # re-planning cannot fix them (sandbox timeout on the same code, a
+    # missing daemon, an approval gate). They must be skipped outright.
+    environmental_markers = (
+        "[deterministic-timeout]",
+        "permission denied",
+        "requires your approval",
+        "approval required",
+        "computer-use is disabled",
+        "daemon unavailable",
+        "daemon-error",
+        "no suitable target app",
+        "screenshot capture failed",
+        "cua-driver",
+    )
+    if any(m in e for m in environmental_markers):
+        return "environmental"
     transient_markers = (
         "503", "502", "504",
         "timeout", "timed out",
@@ -56,6 +81,7 @@ def plan_recovery(
     failed_skill: str,
     error_text: str,
     failed_node_id: str,
+    error_code: str | None = None,
 ) -> RecoveryDecision:
     """Decide what to do with a node failure that is NOT a critic-verdict
     failure. The critic-fail path is handled separately in the Executor
@@ -64,12 +90,20 @@ def plan_recovery(
     purely-local predicate.
 
     Decision table (all coverage):
+      reason=environmental                      → skip (deterministic; retry/replan can't help)
       reason=transient                          → skip (gateway already retried)
       reason=validation_error                   → skip (prompt bug, not runtime)
       reason=upstream_failure, failed=planner   → skip (would loop on Planner errors)
       reason=upstream_failure, failed=other     → replan
     """
-    reason = classify_failure(error_text)
+    reason = classify_failure(error_text, error_code)
+    if (error_code or "").lower() == "gateway_blocked" and "gateway_blocked" not in (error_text or "").lower():
+        error_text = f"gateway_blocked [{error_code}]: {error_text}"
+    if reason == "environmental":
+        return RecoveryDecision(
+            action="skip", reason=reason,
+            note="environmental failure (deterministic); retrying cannot fix it",
+        )
     if reason == "transient":
         return RecoveryDecision(
             action="skip", reason=reason,

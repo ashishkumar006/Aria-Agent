@@ -10,7 +10,7 @@
 > weather), and the layered **computer-use** desktop agent built on
 > `cua-driver`. For the computer-use-only deep-dive, see
 > `COMPUTER_USE_ARCHITECTURE.md`; for the build/run plan see
-> `COMPUTER_USE_PLAN.md`.
+> `archive/root_scratch/COMPUTER_USE_PLAN.md` (archived session plan).
 
 ---
 
@@ -24,7 +24,7 @@ project3/
 │   ├── flow.py               # Executor().run(query) — async orchestration.
 │   ├── skills.py             # Skill registry + _TOOL_CATALOG (schemas the model sees).
 │   ├── agent_server.py       # FastAPI web server (port 8500) + SSE chat + TTS.
-│   ├── mcp_server.py         # MCP tool surface (stdio) — 21 tools, incl. Tier-1.
+│   ├── mcp_server.py         # MCP tool surface (stdio) — 37 tools, incl. Tier-1.
 │   ├── gateway.py            # V9 client wrapper (LLM / embed / ensure_gateway).
 │   ├── action.py             # Action-skill helper (integration confirmations).
 │   ├── computer_use/         # Layered computer-use package (see §6).
@@ -98,8 +98,8 @@ mcp_runner.run_with_tools()  ── spawns ──▶  mcp_server.py (stdio, 1 se
         ▼
 mcp_server tool fn  ── returns ──▶  result fed back to model until final text
 ```
-Names absent from `_TOOL_CATALOG` are silently dropped, so the catalog is
-the single source of truth for what the model may call.
+Names absent from `_TOOL_CATALOG` warn loudly and are skipped, so the
+catalog stays the single source of truth for what the model may call.
 
 ---
 
@@ -120,7 +120,8 @@ the single source of truth for what the model may call.
 All integrations are **fail-soft**: if a credential env var is unset the
 tool returns `{"ok": false, "error": "… not set"}` instead of raising, so
 the agent can tell the user what to configure. Credentials come from
-`S9SharedCode/code/.env` (see `.env.example`).
+`llm_gatewayV9/.env`; the agent env holds only URLs and flags, no secrets
+(see `S9SharedCode/code/.env.example`, which is secret-free by design).
 
 | Tool | Purpose | Required env var(s) |
 |---|---|---|
@@ -132,18 +133,18 @@ the agent can tell the user what to configure. Credentials come from
 | `slack_message` | Post to a Slack channel via Bot API | `SLACK_BOT_TOKEN` |
 | `notion_query` | Notion REST: pages / databases / append | `NOTION_TOKEN` |
 | `create_calendar_event` | Google Calendar event via REST | `GOOGLE_CALENDAR_TOKEN` |
-| `get_weather` | Current weather (Open-Meteo, no key) | — |
 | `web_search` / `fetch_url` | Tavily (primary) + DDG fallback / crawl4ai | `TAVILY_API_KEY` |
 | `get_time` / `currency_convert` | Timezone / FX (frankfurter.dev) | — |
 | `search_knowledge` | FAISS vector search over indexed Memory | — |
 | `computer_action` | Gated computer-use (see §6) | `COMPUTER_USE_ENABLED` |
 
-### 5.1 Gmail OAuth (passwordless email)
+### 5.1 Gmail OAuth (passwordless email, gateway-owned)
 `send_email` and `gmail_query` use the **Gmail API** with an OAuth2 Bearer
-token — no SMTP server, no app password. The one-time consent flow
-(`gmail_oauth_setup.py`) opens a browser, captures the redirect at
-`http://localhost:8080`, exchanges `code` for `access_token` +
-`refresh_token`, and writes both to `.env`. The access token expires ~1h;
+token — no SMTP server, no app password. Tokens live in
+`llm_gatewayV9/.env`; the agent holds none. The one-time consent flow
+(`llm_gatewayV9/gmail_oauth_setup.py`) opens a browser, captures the
+redirect at `http://localhost:8080`, exchanges `code` for `access_token` +
+`refresh_token`, and writes both to the gateway `.env`. The access token expires ~1h;
 `gmail_refresh_token()` exchanges the long-lived refresh token for a fresh
 access token and rewrites `GMAIL_TOKEN` automatically. `send_email` builds
 an RFC822 message, base64url-encodes it, and POSTs to
@@ -168,9 +169,9 @@ perception-driven cascade.
 | File | Responsibility |
 |---|---|
 | `daemon.py` | cua-driver process lifecycle, JSON-RPC-over-pipe wrapper, `capabilities()` probe. Exceptions: `DaemonError`, `PreconditionError`, `PermissionsError`. |
-| `safety.py` | `SafetyGates` — enabled / mode (dry-run\|live) / allow-deny / approval store / audit log. |
-| `layers.py` | The five build-on-top layers: A goal decomposition, B perception interpretation, C action sequencing (scan-act-verify), D error recovery, E vision fallback. |
-| `prompts.py` | System + user prompts for the LLM judgment calls (a11y + vision). |
+| `safety/gates.py` (+`permissions.py`) | `SafetyGates` — enabled / mode (dry-run\|live) / allow-deny / approval store / audit log. |
+| `layers/` (7 modules: deterministic, extract, goal, perception, recovery, sequencing, vision) | The build-on-top layers: A goal decomposition, B perception interpretation, C action sequencing (scan-act-verify), D error recovery, E vision fallback. |
+| `prompts/__init__.py` | System + user prompts for the LLM judgment calls (a11y + vision). |
 | `engine.py` | `ComputerUseSkill` — the L0→L3 cascade + scan-act-verify loop. |
 | `__init__.py` | Public exports **and** the backward-compatible `ComputerUse` / `get_computer_use()` shim so the MCP tool + web endpoints keep working. |
 

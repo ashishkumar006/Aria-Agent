@@ -1,0 +1,1618 @@
+﻿FFFFFFFFFFFF........................................FF.F................ [ 23%]
+.......................ssssss..........FFFFFFFFFsssssssssssF.sssssssFFFF [ 46%]
+ssssssssssss..................F..F........FFF....F...FFFF.FFFFFF........ [ 70%]
+..F....FFF..FF.......................................................... [ 93%]
+....................                                                     [100%]
+================================== FAILURES ===================================
+________________________________ test_full_dag ________________________________
+
+    def test_full_dag():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1"}},
+                {"skill": "formatter", "inputs": ["n:r1"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        SCENARIO["researcher"] = {"text": "Paris is the capital of France."}
+        SCENARIO["formatter"] = {"text": "Paris is the capital of France."}
+        ans = run("Tell me about France's capital.", "L0-ea02")
+>       assert "Paris" in ans, ans
+E       AssertionError: 
+E       assert 'Paris' in ''
+
+tests\battle_test.py:98: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea02  -  query: Tell me about France's capital.
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+___________________________ test_malformed_planner ____________________________
+
+    def test_malformed_planner():
+        setup()
+        SCENARIO["planner"] = {"rejected": ["{'skill': 'formatter' BAD SPEC}"]}
+        ans = run("do something weird", "L0-ea05")
+        # Planner failure is terminal ù answer is empty string, but the run must
+        # not crash or hang.
+        assert isinstance(ans, str), ans
+>       assert skills_called()[0] == "planner"
+               ^^^^^^^^^^^^^^^^^^
+E       IndexError: list index out of range
+
+tests\battle_test.py:110: IndexError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea05  -  query: do something weird
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+________________________________ test_node_cap ________________________________
+
+    def test_node_cap():
+        setup()
+        nodes = [
+            {"skill": "researcher", "inputs": ["USER_QUERY"],
+             "metadata": {"label": f"w{i}"}}
+            for i in range(70)
+        ]
+        SCENARIO["planner"] = {"nodes": nodes}
+        SCENARIO["researcher"] = {"text": "x"}
+        ans = run("spawn many workers", "L0-ea06")
+>       assert isinstance(ans, str) and ans, ans
+E       AssertionError: 
+E       assert (True and '')
+E        +  where True = isinstance('', str)
+
+tests\battle_test.py:124: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea06  -  query: spawn many workers
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+____________________________ test_browser_extract _____________________________
+
+    def test_browser_extract():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "browser", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "b1", "url": "https://example.com"}},
+                {"skill": "formatter", "inputs": ["n:b1"]},
+            ]
+        }
+        SCENARIO["browser"] = {"path": "extract", "text": "Example Domain"}
+        SCENARIO["formatter"] = {"text": "Example Domain"}
+        run("summarise example.com", "L0-eb01")
+>       assert last_output("browser")["path"] == "extract"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tests\battle_test.py:142: TypeError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-eb01  -  query: summarise example.com
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_____________________________ test_browser_vision _____________________________
+
+    def test_browser_vision():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "browser", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "b1", "force_path": "vision"}},
+                {"skill": "formatter", "inputs": ["n:b1"]},
+            ]
+        }
+        SCENARIO["browser"] = {"path": "vision", "text": "clicked"}
+        SCENARIO["formatter"] = {"text": "clicked"}
+        run("click the red circle", "L0-eb03")
+>       assert last_output("browser")["path"] == "vision"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tests\battle_test.py:159: TypeError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-eb03  -  query: click the red circle
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+________________________________ test_fan_out _________________________________
+
+    def test_fan_out():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1", "question": "Q1"}},
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r2", "question": "Q2"}},
+                {"skill": "formatter", "inputs": ["n:r1", "n:r2"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        SCENARIO["researcher"] = {"text": "r1-result"}
+        SCENARIO["formatter"] = {"text": "f1-result"}
+        ans = run("compare London and Berlin populations", "L0-fan1")
+        called = skills_called()
+>       assert called.count("researcher") == 2, called
+E       AssertionError: []
+E       assert 0 == 2
+E        +  where 0 = <built-in method count of list object at 0x000002242BA11600>('researcher')
+E        +    where <built-in method count of list object at 0x000002242BA11600> = [].count
+
+tests\battle_test.py:179: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-fan1  -  query: compare London and Berlin populations
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+___________________________ test_critic_autoinsert ____________________________
+
+    def test_critic_autoinsert():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "distiller", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "d1"}},
+                {"skill": "formatter", "inputs": ["n:d1"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        # distiller is `critic: true`, so after it succeeds the orchestrator
+        # auto-inserts a Critic between distiller and formatter.
+        SCENARIO["distiller"] = [
+            {"text": "draft", "success": True},
+            {"text": "final", "success": True},
+        ]
+        SCENARIO["critic"] = {"text": "pass"}
+        ans = run("Write a haiku about cats.", "L0-critic1")
+        called = skills_called()
+>       assert "critic" in called, called
+E       AssertionError: []
+E       assert 'critic' in []
+
+tests\battle_test.py:203: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-critic1  -  query: Write a haiku about cats.
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_________________________ test_recovery_after_failure _________________________
+
+    def test_recovery_after_failure():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1"}},
+                {"skill": "formatter", "inputs": ["n:r1"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        SCENARIO["researcher"] = [
+            {"text": "", "success": False, "error": "timeout"},
+            {"text": "recovered", "success": True},
+        ]
+        SCENARIO["formatter"] = {"text": "recovered answer"}
+        ans = run("research something flaky", "L0-rec1")
+>       assert "recovered" in ans, ans
+E       AssertionError: 
+E       assert 'recovered' in ''
+
+tests\battle_test.py:224: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-rec1  -  query: research something flaky
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_______________________ test_computer_skill_dispatched ________________________
+
+    def test_computer_skill_dispatched():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "computer", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "c1"}},
+                {"skill": "formatter", "inputs": ["n:c1"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        SCENARIO["computer"] = {"layer": "l2a", "text": "42"}
+        SCENARIO["formatter"] = {"text": "42"}
+        run("compute 2+2", "L0-comp1")
+        called = skills_called()
+>       assert "computer" in called, called
+E       AssertionError: []
+E       assert 'computer' in []
+
+tests\battle_test.py:244: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-comp1  -  query: compute 2+2
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+______________________________ test_action_skill ______________________________
+
+    def test_action_skill():
+        setup()
+        SCENARIO["planner"] = {
+            "nodes": [
+                {"skill": "action", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "a1"}},
+                {"skill": "formatter", "inputs": ["n:a1"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        SCENARIO["action"] = {"text": "ok", "ok": True}
+        SCENARIO["formatter"] = {"text": "done"}
+        run("send telegram hello", "L0-act1")
+>       assert "action" in skills_called()
+E       AssertionError: assert 'action' in []
+E        +  where [] = skills_called()
+
+tests\battle_test.py:262: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-act1  -  query: send telegram hello
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+___________________________ test_mcp_tool_catalogue ___________________________
+
+    def test_mcp_tool_catalogue():
+        setup()
+        import asyncio
+        import mcp_server as mcp_mod
+        tools = asyncio.run(mcp_mod.mcp.list_tools())
+        names = {t.name for t in tools}
+>       assert len(tools) == 22, f"expected 22 tools, got {len(tools)}"
+E       AssertionError: expected 22 tools, got 25
+E       assert 25 == 22
+E        +  where 25 = len([Tool(name='web_search', title=None, description='Search the web (Tavily primary, DDG fallback). Hard-capped at 5 resu...ist_dirArguments', 'type': 'object'}, outputSchema=None, icons=None, annotations=None, meta=None, execution=None), ...])
+
+tests\battle_test.py:272: AssertionError
+________________________ test_toggle_off_runs_full_dag ________________________
+
+    def test_toggle_off_runs_full_dag():
+        setup()
+        prev = skills.PLANNER_SHORTCIRCUIT
+        skills.PLANNER_SHORTCIRCUIT = False
+        try:
+            SCENARIO["planner"] = {
+                "nodes": [{"skill": "formatter", "inputs": ["USER_QUERY"]}]
+            }
+            SCENARIO["formatter"] = {"text": "Paris is the capital."}
+            ans = run("capital of France?", "L0-ea07")
+>           assert "Paris" in ans, ans
+E           AssertionError: 
+E           assert 'Paris' in ''
+
+tests\battle_test.py:289: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea07  -  query: capital of France?
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+___________________ test_pipeline_calculator_deterministic ____________________
+
+calc_daemon = <test_computer_agent_pipeline.CalculatorSimDaemon object at 0x000002243E7A0B50>
+
+    @pytest.mark.asyncio
+    async def test_pipeline_calculator_deterministic(calc_daemon):
+        """Calculator goal should resolve via L2a deterministic (zero LLM)."""
+        import skills
+        sk = _make_skill()
+>       res, rendered = await skills.run_skill(
+            sk, "n1", _graph_nodes("compute 234 * 567", app="calculator"),
+            session_id="s8-test", query="compute 234 * 567", failure_report=None,
+        )
+E       TypeError: fake_run_skill() got an unexpected keyword argument 'failure_report'
+
+tests\test_computer_agent_pipeline.py:189: TypeError
+_______________________ test_pipeline_read_document_l1 ________________________
+
+fake_daemon = <test_computer_agent_pipeline.FakeDaemon object at 0x000002242BA48C10>
+
+    @pytest.mark.asyncio
+    async def test_pipeline_read_document_l1(fake_daemon):
+        """A 'what does this say' goal should short-circuit at L1 extract."""
+        import skills
+        sk = _make_skill()
+>       res, rendered = await skills.run_skill(
+            sk, "n1", _graph_nodes("what does this document say", app="notepad"),
+            session_id="s8-test", query="what does this document say", failure_report=None,
+        )
+E       TypeError: fake_run_skill() got an unexpected keyword argument 'failure_report'
+
+tests\test_computer_agent_pipeline.py:212: TypeError
+__________________ test_pipeline_calculator_click_arithmetic __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002242BA5E3D0>
+
+    @pytest.mark.asyncio
+    async def test_pipeline_calculator_click_arithmetic(monkeypatch):
+        """REGRESSION: calculator must click buttons (not type '*'), clearing
+        stale state, and re-fetch snapshots before each click.
+    
+        Reproduces the bug where 'compute 234 * 567' opened Calculator but left
+        the display at 0 (type_text refused when snapshot_id present without
+        element_index, and typed '*' arrived as the wrong glyph). The fix drives
+        the calculator via button clicks with a fresh snapshot per click and a
+        'c' keypress to clear prior session state.
+        """
+        import computer_use.daemon as cd
+        sim = CalculatorSimDaemon()
+        monkeypatch.setattr(cd, "ensure_daemon", lambda *a, **k: True)
+        monkeypatch.setattr(cd, "call", sim.call)
+        monkeypatch.setattr(cd, "capabilities", lambda: {"daemon_running": True, "ax_ok": True})
+    
+        import skills
+        sk = _make_skill()
+>       res, _ = await skills.run_skill(
+            sk, "n1", _graph_nodes("compute 234 * 567", app="calculator"),
+            session_id="s8-test", query="compute 234 * 567", failure_report=None,
+        )
+E       TypeError: fake_run_skill() got an unexpected keyword argument 'failure_report'
+
+tests\test_computer_agent_pipeline.py:260: TypeError
+____________________ test_ea01_simple_query_shortcircuits _____________________
+
+deterministic = {'planner': {'answer': 'The capital of France is Paris.'}}
+
+    def test_ea01_simple_query_shortcircuits(deterministic):
+        deterministic["planner"] = {"answer": "The capital of France is Paris."}
+        ans = run_executor("What is the capital of France?", "L0-ea01")
+>       assert "Paris" in ans
+E       AssertionError: assert 'Paris' in ''
+
+tests\test_e2e_phase1_l0.py:20: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea01  -  query: What is the capital of France?
+==============================================================================
+[turnlog] 2 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+______________________ test_ea02_complex_query_full_dag _______________________
+
+deterministic = {'formatter': {'text': 'Paris is the capital of France.'}, 'planner': {'nodes': [{'inputs': ['USER_QUERY'], 'metadata'...:r1'], 'metadata': {'label': 'f1'}, 'skill': 'formatter'}]}, 'researcher': {'text': 'Paris is the capital of France.'}}
+
+    def test_ea02_complex_query_full_dag(deterministic):
+        deterministic["planner"] = {
+            "nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1"}},
+                {"skill": "formatter", "inputs": ["n:r1"],
+                 "metadata": {"label": "f1"}},
+            ]
+        }
+        deterministic["researcher"] = {"text": "Paris is the capital of France."}
+        deterministic["formatter"] = {"text": "Paris is the capital of France."}
+        ans = run_executor("Tell me about France's capital.", "L0-ea02")
+>       assert "Paris" in ans
+E       AssertionError: assert 'Paris' in ''
+
+tests\test_e2e_phase1_l0.py:36: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea02  -  query: Tell me about France's capital.
+==============================================================================
+[turnlog] 3 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+__________________ test_ea05_malformed_planner_json_graceful __________________
+
+deterministic = {'planner': {'rejected': ["{'skill': 'formatter' BAD SPEC}"]}}
+
+    def test_ea05_malformed_planner_json_graceful(deterministic):
+        deterministic["planner"] = {"rejected": ["{'skill': 'formatter' BAD SPEC}"]}
+        ans = run_executor("do something weird", "L0-ea05")
+        # Must terminate cleanly (no crash / no hang) and yield a string answer.
+        assert isinstance(ans, str)
+>       assert skills_called()[0] == "planner"
+               ^^^^^^^^^^^^^^^^^^
+E       IndexError: list index out of range
+
+tests\test_e2e_phase1_l0.py:45: IndexError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea05  -  query: do something weird
+==============================================================================
+[turnlog] 3 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_____________________ test_ea06_node_cap_no_infinite_loop _____________________
+
+deterministic = {'planner': {'nodes': [{'inputs': ['USER_QUERY'], 'metadata': {'label': 'w0'}, 'skill': 'researcher'}, {'inputs': ['US...'}, {'inputs': ['USER_QUERY'], 'metadata': {'label': 'w5'}, 'skill': 'researcher'}, ...]}, 'researcher': {'text': 'x'}}
+
+    def test_ea06_node_cap_no_infinite_loop(deterministic):
+        # A planner that emits 70 nodes must be capped at MAX_NODES (60).
+        nodes = [
+            {"skill": "researcher", "inputs": ["USER_QUERY"],
+             "metadata": {"label": f"w{i}"}}
+            for i in range(70)
+        ]
+        deterministic["planner"] = {"nodes": nodes}
+        deterministic["researcher"] = {"text": "x"}
+        ans = run_executor("spawn many workers", "L0-ea06")
+        assert isinstance(ans, str)
+        # Planner + capped workers; never more than 60 executed nodes.
+        assert len(skills_called()) <= 60, len(skills_called())
+>       assert skills_called()[0] == "planner"
+               ^^^^^^^^^^^^^^^^^^
+E       IndexError: list index out of range
+
+tests\test_e2e_phase1_l0.py:61: IndexError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea06  -  query: spawn many workers
+==============================================================================
+[turnlog] 3 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_____________________ test_ea07_toggle_off_runs_full_dag ______________________
+
+deterministic = {'formatter': {'text': 'Paris is the capital.'}, 'planner': {'nodes': [{'inputs': ['USER_QUERY'], 'skill': 'formatter'}]}}
+
+    def test_ea07_toggle_off_runs_full_dag(deterministic):
+        import skills as _skills
+        prev = _skills.PLANNER_SHORTCIRCUIT
+        _skills.PLANNER_SHORTCIRCUIT = False
+        try:
+            deterministic["planner"] = {
+                "nodes": [{"skill": "formatter", "inputs": ["USER_QUERY"]}]
+            }
+            deterministic["formatter"] = {"text": "Paris is the capital."}
+            # Even a trivial query must now go through the formatter (no shortcut).
+            ans = run_executor("capital of France?", "L0-ea07")
+>           assert "Paris" in ans
+E           AssertionError: assert 'Paris' in ''
+
+tests\test_e2e_phase1_l0.py:75: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea07  -  query: capital of France?
+==============================================================================
+[turnlog] 3 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_______________________ test_eb01_browser_extract_path ________________________
+
+deterministic = {'browser': {'path': 'extract', 'text': 'Example Domain'}, 'formatter': {'text': 'Example Domain'}, 'planner': {'nodes...ata': {'label': 'b1', 'url': 'https://example.com'}, 'skill': 'browser'}, {'inputs': ['n:b1'], 'skill': 'formatter'}]}}
+
+    def test_eb01_browser_extract_path(deterministic):
+        deterministic["planner"] = {
+            "nodes": [
+                {"skill": "browser", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "b1", "url": "https://example.com"}},
+                {"skill": "formatter", "inputs": ["n:b1"]},
+            ]
+        }
+        deterministic["browser"] = {"path": "extract", "text": "Example Domain"}
+        deterministic["formatter"] = {"text": "Example Domain"}
+        ans = run_executor("summarise example.com", "L0-eb01")
+>       assert last_output("browser")["path"] == "extract"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tests\test_e2e_phase1_l0.py:93: TypeError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-eb01  -  query: summarise example.com
+==============================================================================
+[turnlog] 3 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_________________________ test_eb02_browser_a11y_path _________________________
+
+deterministic = {'browser': {'path': 'a11y', 'text': 'driven the UI'}, 'formatter': {'text': 'driven the UI'}, 'planner': {'nodes': [{...ta': {'label': 'b1', 'url': 'https://hf.co/models'}, 'skill': 'browser'}, {'inputs': ['n:b1'], 'skill': 'formatter'}]}}
+
+    def test_eb02_browser_a11y_path(deterministic):
+        deterministic["planner"] = {
+            "nodes": [
+                {"skill": "browser", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "b1", "url": "https://hf.co/models"}},
+                {"skill": "formatter", "inputs": ["n:b1"]},
+            ]
+        }
+        deterministic["browser"] = {"path": "a11y", "text": "driven the UI"}
+        deterministic["formatter"] = {"text": "driven the UI"}
+        run_executor("use HF filters", "L0-eb02")
+>       assert last_output("browser")["path"] == "a11y"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tests\test_e2e_phase1_l0.py:108: TypeError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-eb02  -  query: use HF filters
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+________________________ test_eb03_browser_vision_path ________________________
+
+deterministic = {'browser': {'path': 'vision', 'text': 'clicked the circle'}, 'formatter': {'text': 'clicked the circle'}, 'planner': ...'metadata': {'force_path': 'vision', 'label': 'b1'}, 'skill': 'browser'}, {'inputs': ['n:b1'], 'skill': 'formatter'}]}}
+
+    def test_eb03_browser_vision_path(deterministic):
+        deterministic["planner"] = {
+            "nodes": [
+                {"skill": "browser", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "b1", "force_path": "vision"}},
+                {"skill": "formatter", "inputs": ["n:b1"]},
+            ]
+        }
+        deterministic["browser"] = {"path": "vision", "text": "clicked the circle"}
+        deterministic["formatter"] = {"text": "clicked the circle"}
+        run_executor("click the red circle", "L0-eb03")
+>       assert last_output("browser")["path"] == "vision"
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: 'NoneType' object is not subscriptable
+
+tests\test_e2e_phase1_l0.py:122: TypeError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-eb03  -  query: click the red circle
+==============================================================================
+[turnlog] 3 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+________________________ test_ee01_mcp_tool_catalogue _________________________
+
+    def test_ee01_mcp_tool_catalogue():
+        import asyncio
+        import mcp_server as mcp_mod
+        tools = asyncio.run(mcp_mod.mcp.list_tools())
+        names = {t.name for t in tools}
+        # Documented 22-tool catalogue.
+>       assert len(tools) == 22, f"expected 22 tools, got {len(tools)}"
+E       AssertionError: expected 22 tools, got 25
+E       assert 25 == 22
+E        +  where 25 = len([Tool(name='web_search', title=None, description='Search the web (Tavily primary, DDG fallback). Hard-capped at 5 resu...ist_dirArguments', 'type': 'object'}, outputSchema=None, icons=None, annotations=None, meta=None, execution=None), ...])
+
+tests\test_e2e_phase1_l0.py:132: AssertionError
+_____________________ test_eb04_gateway_blocked_recovery ______________________
+
+deterministic = {'browser': {'error': 'gateway_blocked (captcha) detected after JS render', 'success': False}, 'formatter': {'text': '...ill': 'researcher'}, {'inputs': ['n:r1'], 'skill': 'formatter'}]}], 'researcher': {'text': 'The site blocked access.'}}
+
+    def test_eb04_gateway_blocked_recovery(deterministic):
+        # Seed plan: browser + formatter. Recovery plan: researcher + formatter.
+        deterministic["planner"] = [
+            {"nodes": [
+                {"skill": "browser", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "b1"}},
+                {"skill": "formatter", "inputs": ["n:b1"]},
+            ]},
+            {"nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1"}},
+                {"skill": "formatter", "inputs": ["n:r1"]},
+            ]},
+        ]
+        deterministic["browser"] = {
+            "success": False,
+            "error": "gateway_blocked (captcha) detected after JS render",
+        }
+        deterministic["researcher"] = {"text": "The site blocked access."}
+        deterministic["formatter"] = {
+            "text": "I was unable to retrieve the page due to a gateway block."}
+        ans = run_executor("go to a blocked site", "L0-eb04")
+        assert isinstance(ans, str)
+        called = skills_called()
+>       assert "browser" in called
+E       AssertionError: assert 'browser' in []
+
+tests\test_e2e_phase3_safety.py:62: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-eb04  -  query: go to a blocked site
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+______________________ test_er01_transient_503_recovery _______________________
+
+deterministic = {'formatter': {'text': 'final answer'}, 'planner': [{'nodes': [{'inputs': ['USER_QUERY'], 'metadata': {'label': 'r1'},...formatter'}]}], 'researcher': [{'error': '503 transient gateway error', 'success': False}, {'text': 'recovered data'}]}
+
+    def test_er01_transient_503_recovery(deterministic):
+        deterministic["planner"] = [
+            {"nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1"}},
+                {"skill": "formatter", "inputs": ["n:r1"]}]},
+            {"nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r2"}},
+                {"skill": "formatter", "inputs": ["n:r2"]}]},
+        ]
+        # First researcher attempt fails (transient); recovery attempt succeeds.
+        deterministic["researcher"] = [
+            {"success": False, "error": "503 transient gateway error"},
+            {"text": "recovered data"},
+        ]
+        deterministic["formatter"] = {"text": "final answer"}
+        ans = run_executor("research with a transient failure", "L0-er01")
+        assert isinstance(ans, str)
+        called = skills_called()
+>       assert called.count("researcher") >= 2, called
+E       AssertionError: []
+E       assert 0 >= 2
+E        +  where 0 = <built-in method count of list object at 0x000002243E878E00>('researcher')
+E        +    where <built-in method count of list object at 0x000002243E878E00> = [].count
+
+tests\test_e2e_phase4_resilience.py:58: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-er01  -  query: research with a transient failure
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+___________________ test_er02_upstream_failure_route_around ___________________
+
+deterministic = {'formatter': {'text': 'final answer'}, 'planner': [{'nodes': [{'inputs': ['USER_QUERY'], 'metadata': {'label': 'r1'},...er': {'error': 'upstream_failure: connection refused', 'success': False}, 'retriever': {'text': 'found via retrieval'}}
+
+    def test_er02_upstream_failure_route_around(deterministic):
+        deterministic["planner"] = [
+            {"nodes": [
+                {"skill": "researcher", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "r1"}},
+                {"skill": "formatter", "inputs": ["n:r1"]}]},
+            {"nodes": [
+                {"skill": "retriever", "inputs": ["USER_QUERY"],
+                 "metadata": {"label": "v1"}},
+                {"skill": "formatter", "inputs": ["n:v1"]}]},
+        ]
+        deterministic["researcher"] = {
+            "success": False, "error": "upstream_failure: connection refused"}
+        deterministic["retriever"] = {"text": "found via retrieval"}
+        deterministic["formatter"] = {"text": "final answer"}
+        ans = run_executor("route around a broken tool", "L0-er02")
+        assert isinstance(ans, str)
+        called = skills_called()
+        # Recovery chose a DIFFERENT tool (route-around), not a blind retry.
+>       assert "retriever" in called, called
+E       AssertionError: []
+E       assert 'retriever' in []
+
+tests\test_e2e_phase4_resilience.py:81: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-er02  -  query: route around a broken tool
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+__________________ test_er04_planner_failure_no_replan_loop ___________________
+
+deterministic = {'planner': {'rejected': ["{'skill':'formatter' BAD}"]}}
+
+    def test_er04_planner_failure_no_replan_loop(deterministic):
+        # A failing planner must not trigger an infinite recovery replan loop.
+        deterministic["planner"] = {"rejected": ["{'skill':'formatter' BAD}"]}
+        ans = run_executor("broken planner input", "L0-er04")
+        assert isinstance(ans, str)
+        # Exactly one planner invocation ù recovery correctly skipped re-planning
+        # the planner itself.
+>       assert skills_called().count("planner") == 1, skills_called()
+E       AssertionError: []
+E       assert 0 == 1
+E        +  where 0 = <built-in method count of list object at 0x000002243E898880>('planner')
+E        +    where <built-in method count of list object at 0x000002243E898880> = [].count
+E        +      where [] = skills_called()
+
+tests\test_e2e_phase4_resilience.py:92: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-er04  -  query: broken planner input
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_________________________ test_er05_critic_node_runs __________________________
+
+deterministic = {'critic': {'text': 'verdict: consistent'}, 'formatter': {'text': 'final answer'}, 'planner': {'nodes': [{'inputs': ['...{'label': 'c1'}, 'skill': 'critic'}, {'inputs': ['n:c1'], 'skill': 'formatter'}]}, 'researcher': {'text': 'some data'}}
+
+    def test_er05_critic_node_runs(deterministic):
+        deterministic["planner"] = {"nodes": [
+            {"skill": "researcher", "inputs": ["USER_QUERY"],
+             "metadata": {"label": "r1"}},
+            {"skill": "critic", "inputs": ["n:r1"], "metadata": {"label": "c1"}},
+            {"skill": "formatter", "inputs": ["n:c1"]},
+        ]}
+        deterministic["researcher"] = {"text": "some data"}
+        deterministic["critic"] = {"text": "verdict: consistent"}
+        deterministic["formatter"] = {"text": "final answer"}
+        ans = run_executor("run with a critic", "L0-er05")
+        assert isinstance(ans, str)
+        called = skills_called()
+>       assert "critic" in called and "formatter" in called, called
+E       AssertionError: []
+E       assert ('critic' in [])
+
+tests\test_e2e_phase4_resilience.py:108: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-er05  -  query: run with a critic
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+______________ TestGatedTools.test_search_knowledge_empty_index _______________
+
+self = <test_mcp_tools.TestGatedTools object at 0x000002242B831A10>
+
+    def test_search_knowledge_empty_index(self):
+>       r = mcp.search_knowledge("anything", k=3)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_mcp_tools.py:206: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+query = 'anything', k = 3
+
+    @mcp.tool()
+    def search_knowledge(query: str, k: int = 5) -> list[dict]:
+        """Vector search over indexed `fact` chunks. Returns up to k ranked chunks with provenance. Call this rather than re-fetching URLs or re-reading source files whenever Memory already contains indexed chunks for the topic ù that is the whole point of having indexed the corpus. Example: search_knowledge("authentication flow", 5)."""
+>       items = _memory.read(query, kinds=["fact"], top_k=k)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: setup.<locals>.<lambda>() got an unexpected keyword argument 'kinds'
+
+mcp_server.py:628: TypeError
+______________ TestPersistence.test_memory_json_survives_reload _______________
+
+self = <test_memory_comprehensive.TestPersistence object at 0x000002242B833990>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_memory_json_survives_relo0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243F7C3C40>
+
+    def test_memory_json_survives_reload(self, tmp_memory, mock_embed):
+        """Memory persists across process restarts."""
+        import memory as mem
+    
+        # Write
+        item = mem.remember("persistent fact", source="test", run_id="r1")
+        item_id = item.id
+    
+        # Clear cache to simulate restart
+        mem._INDEX_CACHE.clear()
+    
+        # Read back
+        hits = mem.read("persistent fact")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:133: AssertionError
+______________ TestReadPaths.test_vector_search_returns_similar _______________
+
+self = <test_memory_comprehensive.TestReadPaths object at 0x000002242B84EC10>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_vector_search_returns_sim0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF85620>
+
+    def test_vector_search_returns_similar(self, tmp_memory, mock_embed):
+        """Vector search returns semantically similar items."""
+        import memory as mem
+    
+        # Write some facts
+        mem.remember("Python is a programming language", source="test", run_id="r1")
+        mem.remember("JavaScript is used for web development", source="test", run_id="r1")
+        mem.remember("The weather in London is rainy", source="test", run_id="r1")
+    
+        # Search for programming-related content
+        hits = mem.read("programming languages", top_k=3)
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:271: AssertionError
+_____________ TestReadPaths.test_keyword_fallback_when_no_vectors _____________
+
+self = <test_memory_comprehensive.TestReadPaths object at 0x000002242B84F210>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_keyword_fallback_when_no_0/state')
+
+    def test_keyword_fallback_when_no_vectors(self, tmp_memory):
+        """Keyword search works when FAISS index is empty."""
+        import memory as mem
+    
+        # Write without embedding (no mock_embed)
+        item = mem.add_fact(
+            descriptor="Machine learning is a subset of AI",
+            source="test",
+            run_id="r1"
+        )
+        # Manually persist without embedding
+        mem._persist_item(item)
+    
+        # Clear index to force keyword fallback
+        mem._INDEX_CACHE.clear()
+    
+        hits = mem.read("machine learning")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:294: AssertionError
+___________________ TestReadPaths.test_read_filters_by_kind ___________________
+
+self = <test_memory_comprehensive.TestReadPaths object at 0x000002242B84F550>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_read_filters_by_kind0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243F7C3C40>
+
+    def test_read_filters_by_kind(self, tmp_memory, mock_embed):
+        """read() can filter by memory kind."""
+        import memory as mem
+        from schemas import ToolCall
+    
+        mem.remember("user likes pizza", source="test", run_id="r1")
+    
+        tc = ToolCall(name="get_time", arguments={"timezone": "UTC"})
+        mem.record_outcome(
+            tool_call=tc,
+            result_text="12:00",
+            artifact_id=None,
+            run_id="r1",
+            goal_id="g1"
+        )
+    
+        # Filter for facts only
+>       facts = mem.read("pizza", kinds=["fact"])
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: setup.<locals>.<lambda>() got an unexpected keyword argument 'kinds'
+
+tests\test_memory_comprehensive.py:313: TypeError
+_____________________ TestVectorIndex.test_add_and_search _____________________
+
+self = <test_memory_comprehensive.TestVectorIndex object at 0x000002242B851350>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_add_and_search0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF851C0>
+
+    def test_add_and_search(self, tmp_memory, mock_embed):
+        """Vectors can be added and searched."""
+        import memory as mem
+    
+        mem.remember("apple fruit", source="test", run_id="r1")
+        mem.remember("banana fruit", source="test", run_id="r1")
+        mem.remember("car vehicle", source="test", run_id="r1")
+    
+        hits = mem.read("fruit", top_k=2)
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:401: AssertionError
+_____________ TestMCPTools.test_search_knowledge_returns_results ______________
+
+self = <test_memory_comprehensive.TestMCPTools object at 0x000002242B852F90>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_search_knowledge_returns_0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF85300>
+
+    def test_search_knowledge_returns_results(self, tmp_memory, mock_embed):
+        """search_knowledge returns vector search results."""
+        import memory as mem
+        from mcp_server import search_knowledge
+    
+        # Write some indexed content
+        mem.remember("Python programming tutorial", source="test", run_id="r1")
+        mem.remember("JavaScript web development", source="test", run_id="r1")
+    
+        # Search
+>       results = search_knowledge("python tutorial", k=2)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_memory_comprehensive.py:479: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+query = 'python tutorial', k = 2
+
+    @mcp.tool()
+    def search_knowledge(query: str, k: int = 5) -> list[dict]:
+        """Vector search over indexed `fact` chunks. Returns up to k ranked chunks with provenance. Call this rather than re-fetching URLs or re-reading source files whenever Memory already contains indexed chunks for the topic ù that is the whole point of having indexed the corpus. Example: search_knowledge("authentication flow", 5)."""
+>       items = _memory.read(query, kinds=["fact"], top_k=k)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: setup.<locals>.<lambda>() got an unexpected keyword argument 'kinds'
+
+mcp_server.py:628: TypeError
+_________ TestOrchestratorIntegration.test_session_start_reads_memory _________
+
+self = <test_memory_comprehensive.TestOrchestratorIntegration object at 0x000002242B853850>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_session_start_reads_memor0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF85580>
+
+    def test_session_start_reads_memory(self, tmp_memory, mock_embed):
+        """Orchestrator reads memory at session start."""
+        import memory as mem
+    
+        # Pre-populate memory
+        mem.remember("User prefers concise answers", source="user_query", run_id="r1")
+    
+        # Simulate session start read
+        hits = mem.read("user preferences")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:499: AssertionError
+___________ TestOrchestratorIntegration.test_memory_hits_in_prompt ____________
+
+self = <test_memory_comprehensive.TestOrchestratorIntegration object at 0x000002242B853F10>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_memory_hits_in_prompt0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF84540>
+
+    def test_memory_hits_in_prompt(self, tmp_memory, mock_embed):
+        """Memory hits are injected into skill prompts."""
+        import memory as mem
+        from skills import _format_memory_hits
+    
+        mem.remember("Python is great for data science", source="test", run_id="r1")
+        hits = mem.read("python data science")
+    
+        formatted = _format_memory_hits(hits)
+>       assert "python" in formatted.lower()
+E       AssertionError: assert 'python' in ''
+E        +  where '' = <built-in method lower of str object at 0x00007FFD669BB6E0>()
+E        +    where <built-in method lower of str object at 0x00007FFD669BB6E0> = ''.lower
+
+tests\test_memory_comprehensive.py:510: AssertionError
+_________ TestOrchestratorIntegration.test_cross_run_memory_persists __________
+
+self = <test_memory_comprehensive.TestOrchestratorIntegration object at 0x000002242B85C610>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_cross_run_memory_persists0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF84F40>
+
+    def test_cross_run_memory_persists(self, tmp_memory, mock_embed):
+        """Memory persists across different runs."""
+        import memory as mem
+    
+        # Run 1
+        mem.remember("Run 1 fact", source="test", run_id="run-1")
+    
+        # Run 2 should see Run 1's memory
+        hits = mem.read("Run 1 fact")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:522: AssertionError
+_____________________ TestEdgeCases.test_unicode_content ______________________
+
+self = <test_memory_comprehensive.TestEdgeCases object at 0x000002242B84FF50>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_unicode_content0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF859E0>
+
+    def test_unicode_content(self, tmp_memory, mock_embed):
+        """Unicode content is handled correctly."""
+        import memory as mem
+    
+        item = mem.remember("\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8 \u4e2d\u6587\u6d4b\u8bd5 \ud55c\uad6d\uc5b4", source="test", run_id="r1")
+    
+        assert item.id is not None
+        # Verify it can be retrieved
+        hits = mem.read("\u65e5\u672c\u8a9e")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:550: AssertionError
+____________________ TestEdgeCases.test_special_characters ____________________
+
+self = <test_memory_comprehensive.TestEdgeCases object at 0x000002242B85C150>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_special_characters0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF86520>
+
+    def test_special_characters(self, tmp_memory, mock_embed):
+        """Special characters in content don't break anything."""
+        import memory as mem
+    
+        special = "test <script>alert('xss')</test> & \"quotes\" 'apostrophes'"
+        item = mem.remember(special, source="test", run_id="r1")
+    
+        assert item.id is not None
+        hits = mem.read("script")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:561: AssertionError
+____________________ TestEdgeCases.test_duplicate_content _____________________
+
+self = <test_memory_comprehensive.TestEdgeCases object at 0x000002242B85CF10>
+tmp_memory = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_duplicate_content0/state')
+mock_embed = <function mock_embed.<locals>.fake_embed at 0x000002243EF865C0>
+
+    def test_duplicate_content(self, tmp_memory, mock_embed):
+        """Duplicate content creates separate entries."""
+        import memory as mem
+    
+        mem.remember("duplicate fact", source="test", run_id="r1")
+        mem.remember("duplicate fact", source="test", run_id="r1")
+    
+        hits = mem.read("duplicate fact")
+>       assert len(hits) >= 2
+E       assert 0 >= 2
+E        +  where 0 = len([])
+
+tests\test_memory_comprehensive.py:571: AssertionError
+__________ TestMemoryContinuity.test_turn_b_recalls_fact_from_turn_a __________
+
+self = <test_memory_continuity.TestMemoryContinuity object at 0x000002242B85E490>
+tmp_path = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_turn_b_recalls_fact_from_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002243EF1A450>
+
+    def test_turn_b_recalls_fact_from_turn_a(self, tmp_path, monkeypatch):
+        """Turn A stores a preference; turn B asks for it and gets it back.
+    
+        This is the core 'agent memory' contract: the orchestrator reads
+        memory at session start and injects hits into every skill prompt.
+        """
+        import memory as mem
+    
+        # Isolate memory to a temp dir.
+        mem.STATE_PATH = tmp_path / "memory.json"
+        mem._INDEX_CACHE.clear()
+    
+        # Seed a fact that turn B will need.
+        mem.remember(
+            "User's favourite city is Seville.",
+            source="user_query", run_id="t-mem-1",
+        )
+    
+        # Turn A: the agent stores the fact (already done above). Now turn B
+        # asks for it. We mock the LLM so the planner/formatter just echo
+        # back what they see in the prompt.
+        script = {
+            "planner": {
+                "nodes": [
+                    {"skill": "formatter", "inputs": ["USER_QUERY"], "metadata": {}},
+                ],
+            },
+            "formatter": {
+                "final_answer": (
+                    "Based on what I know, your favourite city is Seville."
+                ),
+            },
+        }
+        answer, fake = _run(
+            "What is my favourite city?",
+            script,
+            session_id="t-mem-1",
+        )
+        # The formatter's answer must mention Seville.
+>       assert "seville" in answer.lower(), f"memory fact not recalled: {answer!r}"
+E       AssertionError: memory fact not recalled: ''
+E       assert 'seville' in ''
+E        +  where '' = <built-in method lower of str object at 0x00007FFD669BB6E0>()
+E        +    where <built-in method lower of str object at 0x00007FFD669BB6E0> = ''.lower
+
+tests\test_memory_continuity.py:124: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-mem-1  -  query: What is my favourite city?
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[memory.remember] identity-bearing query; writing synchronously
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_________ TestMemoryContinuity.test_memory_hits_visible_to_researcher _________
+
+self = <test_memory_continuity.TestMemoryContinuity object at 0x000002242B85E910>
+tmp_path = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_memory_hits_visible_to_re0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002243EAFF4D0>
+
+    def test_memory_hits_visible_to_researcher(self, tmp_path, monkeypatch):
+        """Memory hits must appear in a researcher's prompt, not just the
+        formatter's."""
+        import memory as mem
+    
+        mem.STATE_PATH = tmp_path / "memory.json"
+        mem._INDEX_CACHE.clear()
+        mem.remember(
+            "Python 3.12 was released in October 2023.",
+            source="user_query", run_id="t-mem-2",
+        )
+    
+        script = {
+            "planner": {
+                "nodes": [
+                    {"skill": "researcher", "inputs": ["USER_QUERY"], "metadata": {}},
+                    {"skill": "formatter", "inputs": ["n:1"], "metadata": {}},
+                ],
+            },
+            "researcher": {"final_answer": "research result"},
+            "formatter": {"final_answer": "formatted answer"},
+        }
+        answer, fake = _run(
+            "When was Python 3.12 released?",
+            script,
+            session_id="t-mem-2",
+        )
+        researcher_prompts = [c[1] for c in _fake_run_with_tools.calls if c[0] == "researcher"]
+>       assert researcher_prompts, "researcher was never called"
+E       AssertionError: researcher was never called
+E       assert []
+
+tests\test_memory_continuity.py:162: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-mem-2  -  query: When was Python 3.12 released?
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+__________ TestMemoryContinuity.test_empty_memory_does_not_break_run __________
+
+self = <test_memory_continuity.TestMemoryContinuity object at 0x000002242B85EFD0>
+tmp_path = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-61/test_empty_memory_does_not_bre0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002243EBC9550>
+
+    def test_empty_memory_does_not_break_run(self, tmp_path, monkeypatch):
+        """When memory is empty, the orchestrator must still complete."""
+        import memory as mem
+    
+        mem.STATE_PATH = tmp_path / "memory.json"
+        mem._INDEX_CACHE.clear()
+        # Don't write anything ù empty memory.
+    
+        script = {
+            "planner": {
+                "nodes": [
+                    {"skill": "formatter", "inputs": ["USER_QUERY"], "metadata": {}},
+                ],
+            },
+            "formatter": {"final_answer": "No memory, but answer."},
+        }
+        answer, _ = _run("hi", script, session_id="t-mem-3")
+>       assert answer.strip() == "No memory, but answer."
+E       AssertionError: assert '' == 'No memory, but answer.'
+E         
+E         - No memory, but answer.
+
+tests\test_memory_continuity.py:184: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-mem-3  -  query: hi
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+____________ TestRead.test_read_routes_to_keyword_when_no_vectors _____________
+
+self = <test_memory_service.TestRead object at 0x000002242B874B90>
+
+    def test_read_routes_to_keyword_when_no_vectors(self):
+        """With no embeddings in the index, read() uses keyword fallback."""
+        _remember("Seville is famous for tapas.")
+        hits = memory_svc.read("Seville food")
+>       assert len(hits) >= 1
+E       assert 0 >= 1
+E        +  where 0 = len([])
+
+tests\test_memory_service.py:144: AssertionError
+_______________________ test_minimal_planner_formatter ________________________
+
+    def test_minimal_planner_formatter():
+        script = {
+            "planner": _planner_reply([
+                {"skill": "formatter", "inputs": ["USER_QUERY"], "metadata": {}},
+            ]),
+            "formatter": {"final_answer": "Hello! Nice to meet you."},
+        }
+        answer, _ = _run("hi", script)
+>       assert answer.strip() == "Hello! Nice to meet you."
+E       AssertionError: assert '' == 'Hello! Nice to meet you.'
+E         
+E         - Hello! Nice to meet you.
+
+tests\test_orchestrator_integration.py:93: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: hi
+==============================================================================
+[turnlog] 5 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+________________________ test_fanout_three_researchers ________________________
+
+    def test_fanout_three_researchers():
+        # Planner emits 3 researcher siblings, each scoped by metadata.question,
+        # then a single formatter that consumes all three.
+        script = {
+            "planner": _planner_reply([
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r1", "question": "population of London"}},
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r2", "question": "population of Paris"}},
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r3", "question": "population of Berlin"}},
+                {"skill": "formatter", "inputs": ["n:r1", "n:r2", "n:r3"], "metadata": {}},
+            ]),
+            "researcher": {"final_answer": "research result"},
+            "formatter": {"final_answer": "London, Paris and Berlin compared."},
+        }
+        answer, fake = _run("Compare populations of London, Paris, Berlin", script)
+>       assert "compared" in answer
+E       AssertionError: assert 'compared' in ''
+
+tests\test_orchestrator_integration.py:112: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: Compare populations of London, Paris, Berlin
+==============================================================================
+[turnlog] 6 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_________________ test_recovery_retries_then_skips_transient __________________
+
+    def test_recovery_retries_then_skips_transient():
+        """A researcher that fails with a 503 is re-run once (retry), and if it
+        still fails it is skipped ù the run still completes with a formatter
+        answer rather than crashing."""
+        state = {"attempts": 0}
+    
+        class _FlakyLLM(_FakeLLM):
+            def chat(self, prompt=None, *, messages=None, system=None, agent=None,
+                     session=None, **kw):
+                skill = agent or "formatter"
+                if skill == "researcher":
+                    state["attempts"] += 1
+                    if state["attempts"] <= 1:
+                        # Simulate a transient gateway 503 ù the node fails and the
+                        # orchestrator retries it once before skipping.
+                        raise RuntimeError(
+                            "exception: HTTPStatusError: Server error "
+                            "'503 Service Unavailable'")
+                return super().chat(prompt, messages=messages, system=system,
+                                    agent=agent, session=session, **kw)
+    
+        script = {
+            "planner": _planner_reply([
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r1", "question": "x"}},
+                {"skill": "formatter", "inputs": ["n:r1"], "metadata": {}},
+            ]),
+            "researcher": {"final_answer": "recovered research"},
+            "formatter": {"final_answer": "Final after recovery."},
+        }
+        answer, _ = _run("do research", script, session_id="t-rec-1", llm_cls=_FlakyLLM)
+>       assert "Final after recovery" in answer
+E       AssertionError: assert 'Final after recovery' in ''
+
+tests\test_orchestrator_integration.py:152: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-rec-1  -  query: do research
+==============================================================================
+[turnlog] 1 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+___________________ test_planner_short_circuit_single_call ____________________
+
+    def test_planner_short_circuit_single_call():
+        """When the planner emits a direct `answer` with no successors, the
+        executor returns it immediately (one LLM call, no formatter)."""
+        script = {
+            "planner": _planner_reply(None, answer="The capital of France is Paris."),
+        }
+        answer, fake = _run("capital of France?", script)
+>       assert answer.strip() == "The capital of France is Paris."
+E       AssertionError: assert '' == 'The capital ...nce is Paris.'
+E         
+E         - The capital of France is Paris.
+
+tests\test_orchestrator_integration.py:218: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: capital of France?
+==============================================================================
+[turnlog] 8 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+_________________ test_critic_auto_inserted_for_critic_skill __________________
+
+    def test_critic_auto_inserted_for_critic_skill():
+        """A `critic:true` skill (distiller) gets a Critic node gating its outgoing
+        edge to the formatter. We assert the run still completes and that a
+        critic node was executed (its `verdict: pass` lets the child run)."""
+        script = {
+            "planner": _planner_reply([
+                {"skill": "distiller", "inputs": ["USER_QUERY"], "metadata": {}},
+                {"skill": "formatter", "inputs": ["n:distiller"], "metadata": {}},
+            ]),
+            "distiller": {"final_answer": "extracted fields"},
+            # Critic must return verdict:pass so the formatter child runs.
+            "critic": {"verdict": "pass", "rationale": "looks good"},
+            "formatter": {"final_answer": "Final formatted answer."},
+        }
+        answer, fake = _run("extract something", script)
+>       assert "Final formatted answer" in answer
+E       AssertionError: assert 'Final formatted answer' in ''
+
+tests\test_orchestrator_integration.py:243: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: extract something
+==============================================================================
+[turnlog] 8 prior turn(s) loaded for this conversation
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+
+============================== warnings summary ===============================
+.venv\Lib\site-packages\fastapi\testclient.py:1
+  C:\Users\AISHWARYA\Downloads\project3\S9SharedCode\code\.venv\Lib\site-packages\fastapi\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/battle_test.py::test_full_dag - AssertionError: 
+FAILED tests/battle_test.py::test_malformed_planner - IndexError: list index ...
+FAILED tests/battle_test.py::test_node_cap - AssertionError: 
+FAILED tests/battle_test.py::test_browser_extract - TypeError: 'NoneType' obj...
+FAILED tests/battle_test.py::test_browser_vision - TypeError: 'NoneType' obje...
+FAILED tests/battle_test.py::test_fan_out - AssertionError: []
+FAILED tests/battle_test.py::test_critic_autoinsert - AssertionError: []
+FAILED tests/battle_test.py::test_recovery_after_failure - AssertionError: 
+FAILED tests/battle_test.py::test_computer_skill_dispatched - AssertionError: []
+FAILED tests/battle_test.py::test_action_skill - AssertionError: assert 'acti...
+FAILED tests/battle_test.py::test_mcp_tool_catalogue - AssertionError: expect...
+FAILED tests/battle_test.py::test_toggle_off_runs_full_dag - AssertionError: 
+FAILED tests/test_computer_agent_pipeline.py::test_pipeline_calculator_deterministic
+FAILED tests/test_computer_agent_pipeline.py::test_pipeline_read_document_l1
+FAILED tests/test_computer_agent_pipeline.py::test_pipeline_calculator_click_arithmetic
+FAILED tests/test_e2e_phase1_l0.py::test_ea01_simple_query_shortcircuits - As...
+FAILED tests/test_e2e_phase1_l0.py::test_ea02_complex_query_full_dag - Assert...
+FAILED tests/test_e2e_phase1_l0.py::test_ea05_malformed_planner_json_graceful
+FAILED tests/test_e2e_phase1_l0.py::test_ea06_node_cap_no_infinite_loop - Ind...
+FAILED tests/test_e2e_phase1_l0.py::test_ea07_toggle_off_runs_full_dag - Asse...
+FAILED tests/test_e2e_phase1_l0.py::test_eb01_browser_extract_path - TypeErro...
+FAILED tests/test_e2e_phase1_l0.py::test_eb02_browser_a11y_path - TypeError: ...
+FAILED tests/test_e2e_phase1_l0.py::test_eb03_browser_vision_path - TypeError...
+FAILED tests/test_e2e_phase1_l0.py::test_ee01_mcp_tool_catalogue - AssertionE...
+FAILED tests/test_e2e_phase3_safety.py::test_eb04_gateway_blocked_recovery - ...
+FAILED tests/test_e2e_phase4_resilience.py::test_er01_transient_503_recovery
+FAILED tests/test_e2e_phase4_resilience.py::test_er02_upstream_failure_route_around
+FAILED tests/test_e2e_phase4_resilience.py::test_er04_planner_failure_no_replan_loop
+FAILED tests/test_e2e_phase4_resilience.py::test_er05_critic_node_runs - Asse...
+FAILED tests/test_mcp_tools.py::TestGatedTools::test_search_knowledge_empty_index
+FAILED tests/test_memory_comprehensive.py::TestPersistence::test_memory_json_survives_reload
+FAILED tests/test_memory_comprehensive.py::TestReadPaths::test_vector_search_returns_similar
+FAILED tests/test_memory_comprehensive.py::TestReadPaths::test_keyword_fallback_when_no_vectors
+FAILED tests/test_memory_comprehensive.py::TestReadPaths::test_read_filters_by_kind
+FAILED tests/test_memory_comprehensive.py::TestVectorIndex::test_add_and_search
+FAILED tests/test_memory_comprehensive.py::TestMCPTools::test_search_knowledge_returns_results
+FAILED tests/test_memory_comprehensive.py::TestOrchestratorIntegration::test_session_start_reads_memory
+FAILED tests/test_memory_comprehensive.py::TestOrchestratorIntegration::test_memory_hits_in_prompt
+FAILED tests/test_memory_comprehensive.py::TestOrchestratorIntegration::test_cross_run_memory_persists
+FAILED tests/test_memory_comprehensive.py::TestEdgeCases::test_unicode_content
+FAILED tests/test_memory_comprehensive.py::TestEdgeCases::test_special_characters
+FAILED tests/test_memory_comprehensive.py::TestEdgeCases::test_duplicate_content
+FAILED tests/test_memory_continuity.py::TestMemoryContinuity::test_turn_b_recalls_fact_from_turn_a
+FAILED tests/test_memory_continuity.py::TestMemoryContinuity::test_memory_hits_visible_to_researcher
+FAILED tests/test_memory_continuity.py::TestMemoryContinuity::test_empty_memory_does_not_break_run
+FAILED tests/test_memory_service.py::TestRead::test_read_routes_to_keyword_when_no_vectors
+FAILED tests/test_orchestrator_integration.py::test_minimal_planner_formatter
+FAILED tests/test_orchestrator_integration.py::test_fanout_three_researchers
+FAILED tests/test_orchestrator_integration.py::test_recovery_retries_then_skips_transient
+FAILED tests/test_orchestrator_integration.py::test_planner_short_circuit_single_call
+FAILED tests/test_orchestrator_integration.py::test_critic_auto_inserted_for_critic_skill
+51 failed, 221 passed, 36 skipped, 1 deselected, 1 warning in 1402.09s (0:23:22)
+
+==============================================================================
+session s8-49564c80  -  query: ping
+==============================================================================
+[n:1] planner            failed   (0.0s)  err=exception: TypeError: fake_run_skill() got an unexpected keyword argument 'prior
+  -> n:1 failed (upstream_failure, skill=planner): planner-itself failure; not re-planning a planner
+
+==============================================================================
+FINAL: 
+==============================================================================
+

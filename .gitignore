@@ -34,8 +34,20 @@ Thumbs.db
 
 # ── Logs / temp ──────────────────────────────────────────────────────────
 *.log
+*.err
+*.out
 tmp/
 .cache/
 
 # ── Archive (debug scripts, test dumps — not part of the deliverable) ─────
 archive/
+
+# ── JS build outputs / dependencies (covered per-package too; belt first) ──
+node_modules/
+dist/
+build/
+
+# Operational databases (live ledger � never source control)
+*.db
+*.db-wal
+*.db-shm

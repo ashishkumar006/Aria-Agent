@@ -1,4 +1,6 @@
 """Pydantic v2 request/response models for llm_gatewayV9."""
+from __future__ import annotations
+
 from typing import Any, Literal, Optional, Union
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -83,10 +85,26 @@ class RouterDecision(BaseModel):
 class EmbedRequest(BaseModel):
     """Request for POST /v1/embed. The model is fixed per deployment (see
     README); only the text, task type, and an optional explicit provider
-    are caller-controlled."""
+    are caller-controlled. agent/session tag the call for the cost ledger
+    (previously embeds were always NULL-agent and invisible in by_agent)."""
     text: str
     task_type: Literal["retrieval_document", "retrieval_query"] = "retrieval_document"
     provider: Optional[str] = None  # "ollama" | configured fallback name
+    agent: Optional[str] = None
+    session: Optional[str] = None
+
+
+class EmbedBatchRequest(BaseModel):
+    """Batch embed. `batch_size` defaults to the deployment's
+    DOCUMENT_EMBED_BATCH (16) and is clamped to the max (32); the server
+    splits the request into windows of that size."""
+    texts: list[str] = Field(min_length=1)
+    task_type: Literal["retrieval_document", "retrieval_query"] = \
+        "retrieval_document"
+    batch_size: Optional[int] = None
+    provider: Optional[str] = None
+    agent: Optional[str] = None
+    session: Optional[str] = None
 
 
 class EmbedResponse(BaseModel):

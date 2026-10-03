@@ -1,0 +1,379 @@
+﻿F..........FFFFF..FFFFF                                                  [100%]
+================================== FAILURES ===================================
+______________________________ test_shortcircuit ______________________________
+
+    def test_shortcircuit():
+        setup()
+        SCENARIO["planner"] = {"answer": "The capital of France is Paris."}
+        ans = run("What is the capital of France?", "L0-ea01")
+>       assert "Paris" in ans, ans
+E       AssertionError: {"rationale": "plan", "nodes": []}
+E       assert 'Paris' in '{"rationale": "plan", "nodes": []}'
+
+tests\battle_test.py:80: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session L0-ea01  -  query: What is the capital of France?
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+___________________________ test_mcp_tool_catalogue ___________________________
+
+    def test_mcp_tool_catalogue():
+        setup()
+        import asyncio
+        import mcp_server as mcp_mod
+        tools = asyncio.run(mcp_mod.mcp.list_tools())
+        names = {t.name for t in tools}
+>       assert len(tools) == 22, f"expected 22 tools, got {len(tools)}"
+E       AssertionError: expected 22 tools, got 21
+E       assert 21 == 22
+E        +  where 21 = len([Tool(name='web_search', title=None, description='Search the web (Tavily primary, DDG fallback). Hard-capped at 5 resu...ist_dirArguments', 'type': 'object'}, outputSchema=None, icons=None, annotations=None, meta=None, execution=None), ...])
+
+tests\battle_test.py:272: AssertionError
+________________________ test_toggle_off_runs_full_dag ________________________
+
+    def test_toggle_off_runs_full_dag():
+        setup()
+>       prev = skills.PLANNER_SHORTCIRCUIT
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: module 'skills' has no attribute 'PLANNER_SHORTCIRCUIT'
+
+tests\battle_test.py:281: AttributeError
+_______________________ test_minimal_planner_formatter ________________________
+
+    def test_minimal_planner_formatter():
+        script = {
+            "planner": _planner_reply([
+                {"skill": "formatter", "inputs": ["USER_QUERY"], "metadata": {}},
+            ]),
+            "formatter": {"final_answer": "Hello! Nice to meet you."},
+        }
+        answer, _ = _run("hi", script)
+>       assert answer.strip() == "Hello! Nice to meet you."
+E       assert '{"rationale"... "nodes": []}' == 'Hello! Nice to meet you.'
+E         
+E         - Hello! Nice to meet you.
+E         + {"rationale": "plan", "nodes": []}
+
+tests\test_orchestrator_integration.py:93: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: hi
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+________________________ test_fanout_three_researchers ________________________
+
+    def test_fanout_three_researchers():
+        # Planner emits 3 researcher siblings, each scoped by metadata.question,
+        # then a single formatter that consumes all three.
+        script = {
+            "planner": _planner_reply([
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r1", "question": "population of London"}},
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r2", "question": "population of Paris"}},
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r3", "question": "population of Berlin"}},
+                {"skill": "formatter", "inputs": ["n:r1", "n:r2", "n:r3"], "metadata": {}},
+            ]),
+            "researcher": {"final_answer": "research result"},
+            "formatter": {"final_answer": "London, Paris and Berlin compared."},
+        }
+        answer, fake = _run("Compare populations of London, Paris, Berlin", script)
+>       assert "compared" in answer
+E       assert 'compared' in '{"rationale": "plan", "nodes": []}'
+
+tests\test_orchestrator_integration.py:112: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: Compare populations of London, Paris, Berlin
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+_________________ test_recovery_retries_then_skips_transient __________________
+
+    def test_recovery_retries_then_skips_transient():
+        """A researcher that fails with a 503 is re-run once (retry), and if it
+        still fails it is skipped ù the run still completes with a formatter
+        answer rather than crashing."""
+        state = {"attempts": 0}
+    
+        class _FlakyLLM(_FakeLLM):
+            def chat(self, prompt=None, *, messages=None, system=None, agent=None,
+                     session=None, **kw):
+                skill = agent or "formatter"
+                if skill == "researcher":
+                    state["attempts"] += 1
+                    if state["attempts"] <= 1:
+                        # Simulate a transient gateway 503 ù the node fails and the
+                        # orchestrator retries it once before skipping.
+                        raise RuntimeError(
+                            "exception: HTTPStatusError: Server error "
+                            "'503 Service Unavailable'")
+                return super().chat(prompt, messages=messages, system=system,
+                                    agent=agent, session=session, **kw)
+    
+        script = {
+            "planner": _planner_reply([
+                {"skill": "researcher", "inputs": [], "metadata": {"label": "r1", "question": "x"}},
+                {"skill": "formatter", "inputs": ["n:r1"], "metadata": {}},
+            ]),
+            "researcher": {"final_answer": "recovered research"},
+            "formatter": {"final_answer": "Final after recovery."},
+        }
+        answer, _ = _run("do research", script, session_id="t-rec-1", llm_cls=_FlakyLLM)
+>       assert "Final after recovery" in answer
+E       assert 'Final after recovery' in '{"rationale": "plan", "nodes": []}'
+
+tests\test_orchestrator_integration.py:152: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-rec-1  -  query: do research
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+___________________ test_planner_short_circuit_single_call ____________________
+
+    def test_planner_short_circuit_single_call():
+        """When the planner emits a direct `answer` with no successors, the
+        executor returns it immediately (one LLM call, no formatter)."""
+        script = {
+            "planner": _planner_reply(None, answer="The capital of France is Paris."),
+        }
+        answer, fake = _run("capital of France?", script)
+>       assert answer.strip() == "The capital of France is Paris."
+E       assert '{"rationale"... "nodes": []}' == 'The capital ...nce is Paris.'
+E         
+E         - The capital of France is Paris.
+E         + {"rationale": "plan", "nodes": []}
+
+tests\test_orchestrator_integration.py:218: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: capital of France?
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+_________________ test_critic_auto_inserted_for_critic_skill __________________
+
+    def test_critic_auto_inserted_for_critic_skill():
+        """A `critic:true` skill (distiller) gets a Critic node gating its outgoing
+        edge to the formatter. We assert the run still completes and that a
+        critic node was executed (its `verdict: pass` lets the child run)."""
+        script = {
+            "planner": _planner_reply([
+                {"skill": "distiller", "inputs": ["USER_QUERY"], "metadata": {}},
+                {"skill": "formatter", "inputs": ["n:distiller"], "metadata": {}},
+            ]),
+            "distiller": {"final_answer": "extracted fields"},
+            # Critic must return verdict:pass so the formatter child runs.
+            "critic": {"verdict": "pass", "rationale": "looks good"},
+            "formatter": {"final_answer": "Final formatted answer."},
+        }
+        answer, fake = _run("extract something", script)
+>       assert "Final formatted answer" in answer
+E       assert 'Final formatted answer' in '{"rationale": "plan", "nodes": []}'
+
+tests\test_orchestrator_integration.py:243: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-orch-1  -  query: extract something
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+__________ TestMemoryContinuity.test_turn_b_recalls_fact_from_turn_a __________
+
+self = <test_memory_continuity.TestMemoryContinuity object at 0x000001E0A1152AD0>
+tmp_path = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-63/test_turn_b_recalls_fact_from_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001E0A1B658D0>
+
+    def test_turn_b_recalls_fact_from_turn_a(self, tmp_path, monkeypatch):
+        """Turn A stores a preference; turn B asks for it and gets it back.
+    
+        This is the core 'agent memory' contract: the orchestrator reads
+        memory at session start and injects hits into every skill prompt.
+        """
+        import memory as mem
+    
+        # Isolate memory to a temp dir.
+        mem.STATE_PATH = tmp_path / "memory.json"
+        mem._INDEX_CACHE.clear()
+    
+        # Seed a fact that turn B will need.
+        mem.remember(
+            "User's favourite city is Seville.",
+            source="user_query", run_id="t-mem-1",
+        )
+    
+        # Turn A: the agent stores the fact (already done above). Now turn B
+        # asks for it. We mock the LLM so the planner/formatter just echo
+        # back what they see in the prompt.
+        script = {
+            "planner": {
+                "nodes": [
+                    {"skill": "formatter", "inputs": ["USER_QUERY"], "metadata": {}},
+                ],
+            },
+            "formatter": {
+                "final_answer": (
+                    "Based on what I know, your favourite city is Seville."
+                ),
+            },
+        }
+        answer, fake = _run(
+            "What is my favourite city?",
+            script,
+            session_id="t-mem-1",
+        )
+        # The formatter's answer must mention Seville.
+>       assert "seville" in answer.lower(), f"memory fact not recalled: {answer!r}"
+E       AssertionError: memory fact not recalled: '{"rationale": "plan", "nodes": []}'
+E       assert 'seville' in '{"rationale": "plan", "nodes": []}'
+E        +  where '{"rationale": "plan", "nodes": []}' = <built-in method lower of str object at 0x000001E0A1CE6FD0>()
+E        +    where <built-in method lower of str object at 0x000001E0A1CE6FD0> = '{"rationale": "plan", "nodes": []}'.lower
+
+tests\test_memory_continuity.py:124: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-mem-1  -  query: What is my favourite city?
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+_________ TestMemoryContinuity.test_memory_hits_visible_to_researcher _________
+
+self = <test_memory_continuity.TestMemoryContinuity object at 0x000001E0A1153190>
+tmp_path = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-63/test_memory_hits_visible_to_re0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001E0A1B64FD0>
+
+    def test_memory_hits_visible_to_researcher(self, tmp_path, monkeypatch):
+        """Memory hits must appear in a researcher's prompt, not just the
+        formatter's."""
+        import memory as mem
+    
+        mem.STATE_PATH = tmp_path / "memory.json"
+        mem._INDEX_CACHE.clear()
+        mem.remember(
+            "Python 3.12 was released in October 2023.",
+            source="user_query", run_id="t-mem-2",
+        )
+    
+        script = {
+            "planner": {
+                "nodes": [
+                    {"skill": "researcher", "inputs": ["USER_QUERY"], "metadata": {}},
+                    {"skill": "formatter", "inputs": ["n:1"], "metadata": {}},
+                ],
+            },
+            "researcher": {"final_answer": "research result"},
+            "formatter": {"final_answer": "formatted answer"},
+        }
+        answer, fake = _run(
+            "When was Python 3.12 released?",
+            script,
+            session_id="t-mem-2",
+        )
+        researcher_prompts = [c[1] for c in _fake_run_with_tools.calls if c[0] == "researcher"]
+>       assert researcher_prompts, "researcher was never called"
+E       AssertionError: researcher was never called
+E       assert []
+
+tests\test_memory_continuity.py:162: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-mem-2  -  query: When was Python 3.12 released?
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+__________ TestMemoryContinuity.test_empty_memory_does_not_break_run __________
+
+self = <test_memory_continuity.TestMemoryContinuity object at 0x000001E0A1153850>
+tmp_path = WindowsPath('C:/Users/AISHWARYA/AppData/Local/Temp/pytest-of-AISHWARYA/pytest-63/test_empty_memory_does_not_bre0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001E0A1CE2A10>
+
+    def test_empty_memory_does_not_break_run(self, tmp_path, monkeypatch):
+        """When memory is empty, the orchestrator must still complete."""
+        import memory as mem
+    
+        mem.STATE_PATH = tmp_path / "memory.json"
+        mem._INDEX_CACHE.clear()
+        # Don't write anything ù empty memory.
+    
+        script = {
+            "planner": {
+                "nodes": [
+                    {"skill": "formatter", "inputs": ["USER_QUERY"], "metadata": {}},
+                ],
+            },
+            "formatter": {"final_answer": "No memory, but answer."},
+        }
+        answer, _ = _run("hi", script, session_id="t-mem-3")
+>       assert answer.strip() == "No memory, but answer."
+E       assert '{"rationale"... "nodes": []}' == 'No memory, but answer.'
+E         
+E         - No memory, but answer.
+E         + {"rationale": "plan", "nodes": []}
+
+tests\test_memory_continuity.py:184: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+==============================================================================
+session t-mem-3  -  query: hi
+==============================================================================
+[n:1] planner            complete (0.0s)
+
+==============================================================================
+FINAL: {"rationale": "plan", "nodes": []}
+==============================================================================
+
+=========================== short test summary info ===========================
+FAILED tests/battle_test.py::test_shortcircuit - AssertionError: {"rationale"...
+FAILED tests/battle_test.py::test_mcp_tool_catalogue - AssertionError: expect...
+FAILED tests/battle_test.py::test_toggle_off_runs_full_dag - AttributeError: ...
+FAILED tests/test_orchestrator_integration.py::test_minimal_planner_formatter
+FAILED tests/test_orchestrator_integration.py::test_fanout_three_researchers
+FAILED tests/test_orchestrator_integration.py::test_recovery_retries_then_skips_transient
+FAILED tests/test_orchestrator_integration.py::test_planner_short_circuit_single_call
+FAILED tests/test_orchestrator_integration.py::test_critic_auto_inserted_for_critic_skill
+FAILED tests/test_memory_continuity.py::TestMemoryContinuity::test_turn_b_recalls_fact_from_turn_a
+FAILED tests/test_memory_continuity.py::TestMemoryContinuity::test_memory_hits_visible_to_researcher
+FAILED tests/test_memory_continuity.py::TestMemoryContinuity::test_empty_memory_does_not_break_run
+11 failed, 12 passed in 65.26s (0:01:05)

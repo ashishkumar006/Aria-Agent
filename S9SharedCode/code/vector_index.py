@@ -24,10 +24,11 @@ import numpy as np
 
 try:
     import faiss  # type: ignore[import-untyped]
-except ImportError as e:
-    raise SystemExit(
-        "faiss-cpu is required for S7. Run: uv add faiss-cpu"
-    ) from e
+except ImportError:
+    # Degrade, don't die: importing this module must never kill the agent.
+    # Memory falls back to keyword search; VectorIndex raises a catchable
+    # RuntimeError only if actually instantiated without faiss.
+    faiss = None  # type: ignore[assignment]
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -48,6 +49,11 @@ class VectorIndex:
     """
 
     def __init__(self, store_dir: Path):
+        if faiss is None:
+            raise RuntimeError(
+                "faiss-cpu is not installed; vector search is unavailable "
+                "(keyword fallback still works). Run: uv add faiss-cpu"
+            )
         self.store_dir = Path(store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.store_dir / "index.faiss"
@@ -62,14 +68,14 @@ class VectorIndex:
     def _load(self) -> None:
         if self.index_path.exists() and self.ids_path.exists():
             self._index = faiss.read_index(str(self.index_path))
-            self._ids = json.loads(self.ids_path.read_text())
+            self._ids = json.loads(self.ids_path.read_text(encoding="utf-8-sig"))
             self._dim = self._index.d
 
     def persist(self) -> None:
         if self._index is None:
             return
         faiss.write_index(self._index, str(self.index_path))
-        self.ids_path.write_text(json.dumps(self._ids))
+        self.ids_path.write_text(json.dumps(self._ids), encoding="utf-8")
 
     def clear(self) -> None:
         self._index = None

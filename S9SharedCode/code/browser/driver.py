@@ -156,13 +156,25 @@ class DriverResult:
     success: bool
     note: str
     steps: list[StepRecord] = field(default_factory=list)
+    # Structured gateway-block signal. Set True when a CAPTCHA / Cloudflare /
+    # login-wall marker is detected after JS render. Replaces the previous
+    # dynamic-attribute hack (out.gateway_blocked = True).
+    gateway_blocked: bool = False
+    final_url: str | None = None
+    extracted: str | None = None
+    turns: int = 0
+    actions: list[dict] = field(default_factory=list)
 
 
 # ─── action dispatcher (shared) ──────────────────────────────────────────────
 async def _dispatch(action: dict, page: Page, snap: PageSnapshot) -> str:
     t = action.get("type", "")
     if t == "click":
-        el = snap.by_id(int(action.get("mark", -1)))
+        try:
+            mark = int(action.get("mark", -1))
+        except (TypeError, ValueError):
+            return f"error: invalid mark {action.get('mark')!r}"
+        el = snap.by_id(mark)
         if not el:
             return f"error: no element with mark {action.get('mark')!r}"
         await page.mouse.click(el.cx, el.cy)
@@ -173,7 +185,7 @@ async def _dispatch(action: dict, page: Page, snap: PageSnapshot) -> str:
             return f"error: no element with mark {action.get('mark')!r}"
         await page.mouse.click(el.cx, el.cy)
         if action.get("clear", True):
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press("ControlOrMeta+A")
             await page.keyboard.press("Delete")
         await page.keyboard.type(str(action.get("value", "")))
         return "ok"
@@ -200,7 +212,13 @@ async def _dispatch(action: dict, page: Page, snap: PageSnapshot) -> str:
         await page.mouse.up()
         return "ok"
     if t == "wait":
-        await asyncio.sleep(float(action.get("seconds", 0.5)))
+        # Clamp LLM-controlled sleep to avoid a 1000s DoS hanging the run.
+        try:
+            secs = float(action.get("seconds", 0.5))
+        except (TypeError, ValueError):
+            secs = 0.5
+        secs = max(0.0, min(secs, 5.0))
+        await asyncio.sleep(secs)
         return "ok"
     if t == "done":
         return "ok"
@@ -227,10 +245,12 @@ class BaseDriver:
         recent = self.steps[-5:]
         lines = []
         for s in recent:
-            acts = ", ".join(
-                f"{a['type']}({a.get('mark') or a.get('value', '')})"
-                for a in s.actions[:3]
-            )
+            def _label(a: dict) -> str:
+                mark = a.get("mark")
+                if mark is not None:
+                    return f"{a.get('type', '?')}({mark})"
+                return f"{a.get('type', '?')}({a.get('value', '')})"
+            acts = ", ".join(_label(a) for a in s.actions[:3])
             lines.append(f"turn {s.turn}: {acts} → {s.outcome}")
         return "\n".join(lines)
 
@@ -244,7 +264,7 @@ class BaseDriver:
 
         if not parsed:
             rec = StepRecord(turn, "", [],
-                             f"error: parsed output missing; raw={result.text[:120]!r}",
+                             f"error: parsed output missing; raw={result.text[:500]!r}",
                              result.provider, result.model, result.latency_ms,
                              result.input_tokens, result.output_tokens)
             self.steps.append(rec)
@@ -285,7 +305,13 @@ class BaseDriver:
         for turn in range(1, self.config.max_steps + 1):
             done, success, note = await self.step(turn)
             last = self.steps[-1]
-            if "error" in last.outcome:
+            # Failure detector: outcome segments starting with "error" only,
+            # not any note merely containing the substring "error".
+            is_err = any(
+                seg.strip().lower().startswith("error")
+                for seg in last.outcome.split("|")
+            )
+            if is_err:
                 failures += 1
                 if failures >= self.config.max_failures:
                     return DriverResult(False, f"giveup after {failures} consecutive failures",
@@ -320,6 +346,7 @@ class SetOfMarksDriver(BaseDriver):
 
         prompt = (
             f"GOAL: {self.config.goal}\n\n"
+            f"PAGE URL: {self.page.url}\n"
             f"VIEWPORT: {snap.viewport_w}x{snap.viewport_h} (CSS px, dpr={snap.dpr})\n"
             f"INTERACTIVE ELEMENTS ({len(snap.elements)}):\n{snap.legend()}\n\n"
             f"RECENT ACTIONS:\n{self._history_text()}\n\n"

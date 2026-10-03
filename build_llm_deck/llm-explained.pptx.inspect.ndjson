@@ -1,0 +1,176 @@
+{"kind":"deck","id":"pr/mzkox0","name":"Deck"}
+{"kind":"layout","layoutId":"c440033a-0f58-4f0a-b252-e43c4a69d08d","name":"Master","type":"master"}
+{"kind":"layout","layoutId":"918f5fc4-8e06-4056-9f35-e8842cbded19","name":"Title Slide","type":"title"}
+{"kind":"slide","id":"sl/ynld3g","slide":1,"title":"A FRIENDLY GUIDE","textShapes":3}
+{"kind":"textbox","id":"sh/t0jy90v6","slide":1,"name":"kicker","text":"A FRIENDLY GUIDE","textPreview":"A FRIENDLY GUIDE","textChars":16,"textLines":1,"bbox":[96,200,1088,30]}
+{"kind":"textbox","id":"sh/6d8zy5wf","slide":1,"name":"title","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[96,240,1088,160]}
+{"kind":"textbox","id":"sh/7ehg7ad0","slide":1,"name":"sub","text":"From raw text to fluent language — the ideas behind the models powering today's AI.","textPreview":"From raw text to fluent language — the ideas behind the models powering today's AI.","textChars":83,"textLines":1,"bbox":[96,430,900,60]}
+{"kind":"notes","id":"nt/ynld3g","slide":1,"text":""}
+{"kind":"slide","id":"sl/9ebv5o","slide":2,"title":"THE BIG PICTURE","textShapes":8}
+{"kind":"shape","id":"sh/krqx47ah","slide":2,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/jqhwv29c","slide":2,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/yp8f2xsr","slide":2,"name":"eyebrow","text":"THE BIG PICTURE","textPreview":"THE BIG PICTURE","textChars":15,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/tgjy1cre","slide":2,"name":"title","text":"An LLM is a next-word prediction machine","textPreview":"An LLM is a next-word prediction machine","textChars":40,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/8faxs7at","slide":2,"name":"subtitle","text":"Trained on vast text, it learns patterns of language so well that it can continue any prompt with plausible, useful text.","textPreview":"Trained on vast text, it learns patterns of language so well that it can continue any prompt with plausible, useful text.","textChars":121,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/7e1gz298","slide":2,"name":"c1","bbox":[96,400,320,160]}
+{"kind":"textbox","id":"sh/6tsf6xsn","slide":2,"name":"c1-t","text":"Reads a prompt\n(\"The capital of France is\")","textPreview":"Reads a prompt | (\"The capital of France is\")","textChars":43,"textLines":2,"bbox":[96,400,320,160]}
+{"kind":"shape","id":"sh/9kfepsbu","slide":2,"name":"a1","bbox":[432,472,90,16]}
+{"kind":"shape","id":"sh/oj6xwnap","slide":2,"name":"c2","bbox":[548,400,320,160]}
+{"kind":"textbox","id":"sh/ads7uls7","slide":2,"name":"c2-t","text":"Predicts the most likely next token","textPreview":"Predicts the most likely next token","textChars":35,"textLines":1,"bbox":[548,400,320,160]}
+{"kind":"shape","id":"sh/ve18369s","slide":2,"name":"a2","bbox":[884,472,90,16]}
+{"kind":"shape","id":"sh/wfapwbqd","slide":2,"name":"c3","bbox":[1000,400,184,160]}
+{"kind":"textbox","id":"sh/xg3q5gri","slide":2,"name":"c3-t","text":"Repeats,\nbuilding a reply","textPreview":"Repeats, | building a reply","textChars":25,"textLines":2,"bbox":[1000,400,184,160]}
+{"kind":"textbox","id":"sh/ihc7yl83","slide":2,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/jil87q9o","slide":2,"name":"pagenum","text":"2","textPreview":"2","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/9ebv5o","slide":2,"text":""}
+{"kind":"slide","id":"sl/61ga9c","slide":3,"title":"UNIT OF LANGUAGE","textShapes":12}
+{"kind":"shape","id":"sh/h4va1wzy","slide":3,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/uh4r6h07","slide":3,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/vidszmhs","slide":3,"name":"eyebrow","text":"UNIT OF LANGUAGE","textPreview":"UNIT OF LANGUAGE","textChars":16,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/8f2947i1","slide":3,"name":"title","text":"Models think in tokens, not letters","textPreview":"Models think in tokens, not letters","textChars":35,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/tgvaxcjm","slide":3,"name":"subtitle","text":"Text is split into tokens — word pieces, characters, or syllables. The model processes and predicts tokens, not raw characters.","textPreview":"Text is split into tokens — word pieces, characters, or syllables. The model processes and predicts tokens, not raw characters.","textChars":127,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"textbox","id":"sh/6dkr2x0b","slide":3,"name":"src","text":"Input:  \"Hello, world!\"","textPreview":"Input:  \"Hello, world!\"","textChars":23,"textLines":1,"bbox":[96,380,1088,30]}
+{"kind":"shape","id":"sh/7etsv21w","slide":3,"name":"tk0","bbox":[96,430,150,64]}
+{"kind":"textbox","id":"sh/sb6tgbil","slide":3,"name":"tk0-t","text":"Hello","textPreview":"Hello","textChars":5,"textLines":1,"bbox":[96,430,150,64]}
+{"kind":"shape","id":"sh/dcfa9gz6","slide":3,"name":"tk1","bbox":[262,430,150,64]}
+{"kind":"textbox","id":"sh/lgzitgr6","slide":3,"name":"tk1-t","text":",","textPreview":",","textChars":1,"textLines":1,"bbox":[262,430,150,64]}
+{"kind":"shape","id":"sh/kfq1kbal","slide":3,"name":"tk2","bbox":[428,430,150,64]}
+{"kind":"textbox","id":"sh/jeh0r690","slide":3,"name":"tk2-t","text":" world","textPreview":"world","textChars":6,"textLines":1,"bbox":[428,430,150,64]}
+{"kind":"shape","id":"sh/yd8jilsf","slide":3,"name":"tk3","bbox":[594,430,150,64]}
+{"kind":"textbox","id":"sh/xcfipgru","slide":3,"name":"tk3-t","text":"!","textPreview":"!","textChars":1,"textLines":1,"bbox":[594,430,150,64]}
+{"kind":"shape","id":"sh/wb61gbap","slide":3,"name":"tk4","bbox":[760,430,260,64]}
+{"kind":"textbox","id":"sh/bax0n694","slide":3,"name":"tk4-t","text":" (3 tokens in GPT-4)","textPreview":"(3 tokens in GPT-4)","textChars":20,"textLines":1,"bbox":[760,430,260,64]}
+{"kind":"textbox","id":"sh/a9oje1sj","slide":3,"name":"note","text":"One token ≈ 4 characters of English on average. Longer prompts and answers simply mean more tokens to process.","textPreview":"One token ≈ 4 characters of English on average. Longer prompts and answers simply mean more tokens to process.","textChars":110,"textLines":1,"bbox":[96,540,1088,60]}
+{"kind":"textbox","id":"sh/h8j210re","slide":3,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/g7a1svat","slide":3,"name":"pagenum","text":"3","textPreview":"3","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/61ga9c","slide":3,"text":""}
+{"kind":"slide","id":"sl/bc3arx","slide":4,"title":"LEARNING","textShapes":13}
+{"kind":"shape","id":"sh/18z6tszy","slide":4,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/u587ydgn","slide":4,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/f6horih8","slide":4,"name":"eyebrow","text":"LEARNING","textPreview":"LEARNING","textChars":8,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/obap4nyp","slide":4,"name":"title","text":"Pre-training learns by filling in the blanks","textPreview":"Pre-training learns by filling in the blanks","textChars":44,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/pcj6xsza","slide":4,"name":"subtitle","text":"Feed the model huge text, hide some words, and train it to predict them. Over billions of examples it absorbs grammar, facts, and reasoning patterns.","textPreview":"Feed the model huge text, hide some words, and train it to predict them. Over billions of examples it absorbs grammar, facts, and reasoni...","textChars":149,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/29872xgj","slide":4,"name":"b1. Massive text","bbox":[96,400,220,130]}
+{"kind":"textbox","id":"sh/3a1ovih4","slide":4,"name":"b1. Massive text-t","text":"1. Massive text","textPreview":"1. Massive text","textChars":15,"textLines":1,"bbox":[96,400,220,130]}
+{"kind":"textbox","id":"sh/kf65s3yl","slide":4,"name":"bt1. Massive text","text":"Books, articles, code, and web text","textPreview":"Books, articles, code, and web text","textChars":35,"textLines":1,"bbox":[336,424,820,90]}
+{"kind":"shape","id":"sh/5gf6l8z6","slide":4,"name":"b2. Mask / shift","bbox":[96,550,220,130]}
+{"kind":"textbox","id":"sh/9grmtgvm","slide":4,"name":"b2. Mask / shift-t","text":"2. Mask / shift","textPreview":"2. Mask / shift","textChars":15,"textLines":1,"bbox":[96,550,220,130]}
+{"kind":"textbox","id":"sh/8fi5kbu1","slide":4,"name":"bt2. Mask / shift","text":"Hide a token; ask the model to predict it","textPreview":"Hide a token; ask the model to predict it","textChars":41,"textLines":1,"bbox":[336,574,820,90]}
+{"kind":"shape","id":"sh/ne94rqdg","slide":4,"name":"b3. Measure error","bbox":[96,700,220,130]}
+{"kind":"textbox","id":"sh/mdg3ilwv","slide":4,"name":"b3. Measure error-t","text":"3. Measure error","textPreview":"3. Measure error","textChars":16,"textLines":1,"bbox":[96,700,220,130]}
+{"kind":"textbox","id":"sh/xkrmx0vi","slide":4,"name":"bt3. Measure error","text":"Compare guess to the real token","textPreview":"Compare guess to the real token","textChars":31,"textLines":1,"bbox":[336,724,820,90]}
+{"kind":"shape","id":"sh/wji5ovud","slide":4,"name":"b4. Adjust weights","bbox":[96,850,220,130]}
+{"kind":"textbox","id":"sh/vi94vqds","slide":4,"name":"b4. Adjust weights-t","text":"4. Adjust weights","textPreview":"4. Adjust weights","textChars":17,"textLines":1,"bbox":[96,850,220,130]}
+{"kind":"textbox","id":"sh/ah0nmlc7","slide":4,"name":"bt4. Adjust weights","text":"Tune the network to reduce mistakes","textPreview":"Tune the network to reduce mistakes","textChars":35,"textLines":1,"bbox":[336,874,820,90]}
+{"kind":"textbox","id":"sh/58bm10vu","slide":4,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/k725svu9","slide":4,"name":"pagenum","text":"4","textPreview":"4","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/bc3arx","slide":4,"text":""}
+{"kind":"slide","id":"sl/2gkc59","slide":5,"title":"THE ENGINE","textShapes":9}
+{"kind":"shape","id":"sh/nm14ry1k","slide":5,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/8na5k325","slide":5,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/9ojmt8jq","slide":5,"name":"eyebrow","text":"THE ENGINE","textPreview":"THE ENGINE","textChars":10,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/apsnmdkv","slide":5,"name":"title","text":"Transformers read everything at once with attention","textPreview":"Transformers read everything at once with attention","textChars":51,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/val4vi1g","slide":5,"name":"subtitle","text":"The breakthrough is self-attention: every token looks at every other token to decide what matters, capturing long-range meaning in parallel.","textPreview":"The breakthrough is self-attention: every token looks at every other token to decide what matters, capturing long-range meaning in parallel.","textChars":140,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/wbu5on21","slide":5,"name":"p","bbox":[96,410,360,170]}
+{"kind":"textbox","id":"sh/xc3mx8jm","slide":5,"name":"p-t","text":"Input tokens\nenter the model together","textPreview":"Input tokens | enter the model together","textChars":37,"textLines":2,"bbox":[96,410,360,170]}
+{"kind":"shape","id":"sh/idcnqd07","slide":5,"name":"att","bbox":[520,410,280,170]}
+{"kind":"textbox","id":"sh/jelozi1s","slide":5,"name":"att-t","text":"Self-attention\nweights each token's\nrelation to the others","textPreview":"Self-attention | weights each token's | relation to the others","textChars":58,"textLines":3,"bbox":[520,410,280,170]}
+{"kind":"shape","id":"sh/nmhcfml4","slide":5,"name":"out","bbox":[888,410,296,170]}
+{"kind":"textbox","id":"sh/ml8b6hkj","slide":5,"name":"out-t","text":"Rich context-aware\nrepresentations","textPreview":"Rich context-aware | representations","textChars":34,"textLines":2,"bbox":[888,410,296,170]}
+{"kind":"shape","id":"sh/98zuhw3u","slide":5,"name":"ar1","bbox":[464,488,48,16]}
+{"kind":"shape","id":"sh/87qt8r2p","slide":5,"name":"ar2","bbox":[832,488,48,16]}
+{"kind":"textbox","id":"sh/zixsbmls","slide":5,"name":"cap","text":"Stacked attention layers build deeper understanding, which is why modern LLMs are built from many transformer blocks.","textPreview":"Stacked attention layers build deeper understanding, which is why modern LLMs are built from many transformer blocks.","textChars":117,"textLines":1,"bbox":[96,600,1088,40]}
+{"kind":"textbox","id":"sh/yhob2h47","slide":5,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/lkzudc3y","slide":5,"name":"pagenum","text":"5","textPreview":"5","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/2gkc59","slide":5,"text":""}
+{"kind":"slide","id":"sl/31wmud","slide":6,"title":"WHY BIG","textShapes":8}
+{"kind":"shape","id":"sh/tknuhs3m","slide":6,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/6hcv6dkb","slide":6,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/7ilcfilw","slide":6,"name":"eyebrow","text":"WHY BIG","textPreview":"WHY BIG","textChars":7,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/kfud4325","slide":6,"name":"title","text":"Scale is a quiet superpower","textPreview":"Scale is a quiet superpower","textChars":27,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/lg3ud83q","slide":6,"name":"subtitle","text":"More parameters and more data unlock surprising abilities. Capabilities often improve smoothly as models grow — a property called emergent behavior.","textPreview":"More parameters and more data unlock surprising abilities. Capabilities often improve smoothly as models grow — a property called emergen...","textChars":148,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/ydcv2tkz","slide":6,"name":"s1","bbox":[96,410,340,180]}
+{"kind":"textbox","id":"sh/jelcbylk","slide":6,"name":"s1-t","text":"Parameters\n\nBillions of knobs the model tunes while learning","textPreview":"Parameters |  | Billions of knobs the model tunes while learning","textChars":60,"textLines":3,"bbox":[96,410,340,180]}
+{"kind":"shape","id":"sh/4bydg729","slide":6,"name":"s2","bbox":[470,410,340,180]}
+{"kind":"textbox","id":"sh/pc7epc3u","slide":6,"name":"s2-t","text":"Training data\n\nTrillions of tokens of text and code","textPreview":"Training data |  | Trillions of tokens of text and code","textChars":51,"textLines":3,"bbox":[470,410,340,180]}
+{"kind":"shape","id":"sh/tozihgzm","slide":6,"name":"s3","bbox":[844,410,340,180]}
+{"kind":"textbox","id":"sh/snqh8bi1","slide":6,"name":"s3-t","text":"Compute\n\nMassive GPU time to train the weights","textPreview":"Compute |  | Massive GPU time to train the weights","textChars":46,"textLines":3,"bbox":[844,410,340,180]}
+{"kind":"textbox","id":"sh/7mh0f6hg","slide":6,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/6loz610v","slide":6,"name":"pagenum","text":"6","textPreview":"6","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/31wmud","slide":6,"text":""}
+{"kind":"slide","id":"sl/va95fo","slide":7,"title":"POLISHING","textShapes":13}
+{"kind":"shape","id":"sh/mxofaxkv","slide":7,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/9kfy5c3m","slide":7,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/8j6xc721","slide":7,"name":"eyebrow","text":"POLISHING","textPreview":"POLISHING","textChars":9,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/zuxgz2lk","slide":7,"name":"title","text":"Fine-tuning teaches helpful, safer behavior","textPreview":"Fine-tuning teaches helpful, safer behavior","textChars":43,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/yt4f6xkz","slide":7,"name":"subtitle","text":"After pre-training, models are aligned using human feedback (RLHF): people rank answers, and the model learns to prefer the most useful, harmless responses.","textPreview":"After pre-training, models are aligned using human feedback (RLHF): people rank answers, and the model learns to prefer the most useful, ...","textChars":156,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/lwfy1s3q","slide":7,"name":"f0","bbox":[96,420,250,150]}
+{"kind":"textbox","id":"sh/0v6x8n25","slide":7,"name":"f0-t","text":"Base model","textPreview":"Base model","textChars":10,"textLines":1,"bbox":[96,420,250,150]}
+{"kind":"textbox","id":"sh/bqdgvil8","slide":7,"name":"ft0","text":"Predicts text, but not yet steerable","textPreview":"Predicts text, but not yet steerable","textChars":36,"textLines":1,"bbox":[96,580,250,70]}
+{"kind":"shape","id":"sh/qp4f2dk3","slide":7,"name":"fa0","bbox":[350,483,30,14]}
+{"kind":"shape","id":"sh/cf6d4z2h","slide":7,"name":"f1","bbox":[382,420,250,150]}
+{"kind":"textbox","id":"sh/dgfex4j2","slide":7,"name":"f1-t","text":"Human / AI feedback","textPreview":"Human / AI feedback","textChars":19,"textLines":1,"bbox":[382,420,250,150]}
+{"kind":"textbox","id":"sh/qdov29kr","slide":7,"name":"ft1","text":"Rank which answers are best","textPreview":"Rank which answers are best","textChars":27,"textLines":1,"bbox":[382,580,250,70]}
+{"kind":"shape","id":"sh/rexwvu1w","slide":7,"name":"fa1","bbox":[636,483,30,14]}
+{"kind":"shape","id":"sh/4bmd0z2l","slide":7,"name":"f2","bbox":[668,420,250,150]}
+{"kind":"textbox","id":"sh/pcfet4j6","slide":7,"name":"f2-t","text":"Reward model","textPreview":"Reward model","textChars":12,"textLines":1,"bbox":[668,420,250,150]}
+{"kind":"textbox","id":"sh/294vypkf","slide":7,"name":"ft2","text":"Learns your preferences","textPreview":"Learns your preferences","textChars":23,"textLines":1,"bbox":[668,580,250,70]}
+{"kind":"shape","id":"sh/3adwru10","slide":7,"name":"fa2","bbox":[922,483,30,14]}
+{"kind":"shape","id":"sh/o7qxcj2p","slide":7,"name":"f3","bbox":[954,420,250,150]}
+{"kind":"textbox","id":"sh/98ze5oja","slide":7,"name":"f3-t","text":"Aligned assistant","textPreview":"Aligned assistant","textChars":17,"textLines":1,"bbox":[954,420,250,150]}
+{"kind":"textbox","id":"sh/xcbm9k72","slide":7,"name":"ft3","text":"Gives helpful, safer replies","textPreview":"Gives helpful, safer replies","textChars":28,"textLines":1,"bbox":[954,580,250,70]}
+{"kind":"textbox","id":"sh/wb250zqx","slide":7,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/bqt47upc","slide":7,"name":"pagenum","text":"7","textPreview":"7","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/va95fo","slide":7,"text":""}
+{"kind":"slide","id":"sl/xomt2a","slide":8,"title":"GENERATING TEXT","textShapes":11}
+{"kind":"shape","id":"sh/9c3upczq","slide":8,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/mpsbexgf","slide":8,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/nqlcn2h0","slide":8,"name":"eyebrow","text":"GENERATING TEXT","textPreview":"GENERATING TEXT","textChars":15,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/0natcny9","slide":8,"name":"title","text":"Inference produces one token at a time","textPreview":"Inference produces one token at a time","textChars":38,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/1ojulszu","slide":8,"name":"subtitle","text":"At reply time the model guesses the next token, appends it, and repeats — sampling among likely options so answers vary while staying on topic.","textPreview":"At reply time the model guesses the next token, appends it, and repeats — sampling among likely options so answers vary while staying on ...","textChars":143,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"textbox","id":"sh/elsbaxg3","slide":8,"name":"seqlbl","text":"Prompt → token → append → repeat","textPreview":"Prompt → token → append → repeat","textChars":32,"textLines":1,"bbox":[96,380,1088,30]}
+{"kind":"shape","id":"sh/zm1sj2ho","slide":8,"name":"sq0","bbox":[96,430,130,70]}
+{"kind":"textbox","id":"sh/kjetoryd","slide":8,"name":"sq0-t","text":"The","textPreview":"The","textChars":3,"textLines":1,"bbox":[96,430,130,70]}
+{"kind":"shape","id":"sh/lknuxwzy","slide":8,"name":"sqa0","bbox":[228,458,26,12]}
+{"kind":"shape","id":"sh/187ydcz6","slide":8,"name":"sq1","bbox":[254,430,130,70]}
+{"kind":"textbox","id":"sh/07yhkri1","slide":8,"name":"sq1-t","text":"cat","textPreview":"cat","textChars":3,"textLines":1,"bbox":[254,430,130,70]}
+{"kind":"shape","id":"sh/f65grmhg","slide":8,"name":"sqa1","bbox":[386,458,26,12]}
+{"kind":"shape","id":"sh/e5wfih0v","slide":8,"name":"sq2","bbox":[412,430,130,70]}
+{"kind":"textbox","id":"sh/d4nypcza","slide":8,"name":"sq2-t","text":"sat","textPreview":"sat","textChars":3,"textLines":1,"bbox":[412,430,130,70]}
+{"kind":"shape","id":"sh/s3exg7ip","slide":8,"name":"sqa2","bbox":[544,458,26,12]}
+{"kind":"shape","id":"sh/r25gn2h4","slide":8,"name":"sq3","bbox":[570,430,130,70]}
+{"kind":"textbox","id":"sh/qhwfex0j","slide":8,"name":"sq3-t","text":"on","textPreview":"on","textChars":2,"textLines":1,"bbox":[570,430,130,70]}
+{"kind":"textbox","id":"sh/x0rylwze","slide":8,"name":"next","text":"Next predicted token: \" the \"  →  then \" mat \"  →  ... until a stop signal ends the reply.","textPreview":"Next predicted token: \" the \"  →  then \" mat \"  →  ... until a stop signal ends the reply.","textChars":90,"textLines":1,"bbox":[96,540,1088,40]}
+{"kind":"textbox","id":"sh/czihsbit","slide":8,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/gfa94zah","slide":8,"name":"pagenum","text":"8","textPreview":"8","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/xomt2a","slide":8,"text":""}
+{"kind":"slide","id":"sl/v3vhs0","slide":9,"title":"MEMORY","textShapes":7}
+{"kind":"shape","id":"sh/kbqlcru9","slide":9,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/zah4jmdo","slide":9,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/y983ahc3","slide":9,"name":"eyebrow","text":"MEMORY","textPreview":"MEMORY","textChars":6,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/90jmpwvq","slide":9,"name":"title","text":"The context window is its working memory","textPreview":"The context window is its working memory","textChars":40,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/8zalgbu5","slide":9,"name":"subtitle","text":"A model only 'sees' the tokens in its context window (prompt + reply). Anything beyond it is forgotten, which is why long chats summarize or lose earlier details.","textPreview":"A model only 'sees' the tokens in its context window (prompt + reply). Anything beyond it is forgotten, which is why long chats summarize...","textChars":162,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/7y14n6dk","slide":9,"name":"win","bbox":[96,410,1088,90]}
+{"kind":"textbox","id":"sh/md83e1cz","slide":9,"name":"wint","text":"Context window  =  system + prompt + conversation + reply   (e.g. 8K–200K+ tokens)","textPreview":"Context window  =  system + prompt + conversation + reply   (e.g. 8K–200K+ tokens)","textChars":82,"textLines":1,"bbox":[96,432,1088,50]}
+{"kind":"textbox","id":"sh/p4fmdcvm","slide":9,"name":"cap","text":"More tokens cost more compute, so longer context is powerful but not free. Retrieval and summarization help stretch what fits.","textPreview":"More tokens cost more compute, so longer context is powerful but not free. Retrieval and summarization help stretch what fits.","textChars":126,"textLines":1,"bbox":[96,530,1088,60]}
+{"kind":"textbox","id":"sh/o36l47u1","slide":9,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/udsrq5wb","slide":9,"name":"pagenum","text":"9","textPreview":"9","textChars":1,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/v3vhs0","slide":9,"text":""}
+{"kind":"slide","id":"sl/pt575g","slide":10,"title":"BALANCED VIEW","textShapes":7}
+{"kind":"shape","id":"sh/m5kfy9c3","slide":10,"name":"bar","bbox":[72,64,96,10]}
+{"kind":"shape","id":"sh/98bytobe","slide":10,"name":"accentbar","bbox":[72,64,64,8]}
+{"kind":"textbox","id":"sh/872h0ju9","slide":10,"name":"eyebrow","text":"BALANCED VIEW","textPreview":"BALANCED VIEW","textChars":13,"textLines":1,"bbox":[72,96,1136,28]}
+{"kind":"textbox","id":"sh/zitgnutc","slide":10,"name":"title","text":"Impressive, but not a source of truth","textPreview":"Impressive, but not a source of truth","textChars":37,"textLines":1,"bbox":[72,132,1136,120]}
+{"kind":"textbox","id":"sh/yh0fupcr","slide":10,"name":"subtitle","text":"LLMs are fluent pattern engines. They reason well on familiar patterns yet can confidently state things that are wrong.","textPreview":"LLMs are fluent pattern engines. They reason well on familiar patterns yet can confidently state things that are wrong.","textChars":119,"textLines":1,"bbox":[72,270,1000,80]}
+{"kind":"shape","id":"sh/lkbyp4bi","slide":10,"name":"good","bbox":[96,400,520,230]}
+{"kind":"textbox","id":"sh/kj2xwzux","slide":10,"name":"good-t","text":"Strengths\n\n• Summarize, draft, and explain\n• Translate and code across languages\n• Adapt to many tasks from one prompt","textPreview":"Strengths |  | • Summarize, draft, and explain | • Translate and code across languages | • Adapt to many tasks from one prompt","textChars":118,"textLines":5,"bbox":[96,400,520,230]}
+{"kind":"shape","id":"sh/jedgzytw","slide":10,"name":"lim","bbox":[664,400,520,230]}
+{"kind":"textbox","id":"sh/id4z6tcb","slide":10,"name":"lim-t","text":"Limitations\n\n• No real-world experience or live facts\n• Can hallucinate or guess\n• Biased by training data; no true understanding","textPreview":"Limitations |  | • No real-world experience or live facts | • Can hallucinate or guess | • Biased by training data; no true understanding","textChars":129,"textLines":5,"bbox":[664,400,520,230]}
+{"kind":"textbox","id":"sh/cnmtonyp","slide":10,"name":"foot","text":"How Large Language Models Work","textPreview":"How Large Language Models Work","textChars":30,"textLines":1,"bbox":[72,684,600,24]}
+{"kind":"textbox","id":"sh/dovuxsza","slide":10,"name":"pagenum","text":"10","textPreview":"10","textChars":2,"textLines":1,"bbox":[1180,684,28,24]}
+{"kind":"notes","id":"nt/pt575g","slide":10,"text":""}
+{"kind":"slide","id":"sl/12byfu","slide":11,"title":"TAKEAWAYS","textShapes":3}
+{"kind":"textbox","id":"sh/vep0fy1w","slide":11,"name":"k","text":"TAKEAWAYS","textPreview":"TAKEAWAYS","textChars":9,"textLines":1,"bbox":[96,150,1088,30]}
+{"kind":"textbox","id":"sh/wzy1o3ih","slide":11,"name":"t","text":"What to remember","textPreview":"What to remember","textChars":16,"textLines":1,"bbox":[96,190,1088,80]}
+{"kind":"textbox","id":"sh/h07ih8j2","slide":11,"name":"pts","text":"• An LLM predicts the next token from what came before.\n• It works in tokens, learned through large-scale pre-training.\n• Transformers + attention let it understand context at scale.\n• Fine-tuning aligns it to be helpful and safer.\n• It's a powerful language engine — verify its facts.","textPreview":"• An LLM predicts the next token from what came before. | • It works in tokens, learned through large-scale pre-training. | • Transformer...","textChars":285,"textLines":5,"bbox":[96,300,1088,300]}
+{"kind":"notes","id":"nt/12byfu","slide":11,"text":""}

@@ -114,9 +114,18 @@ _fake_judge_chat.n = 0
 
 
 def test_engine_prefers_l2b_when_ax_present():
+    import os
+    os.environ["COMPUTER_USE_ENABLED"] = "true"
+    os.environ["COMPUTER_USE_MODE"] = "live"
+    import computer_use.safety
+    computer_use.safety.reset_shared_gates()
+    # Mock check_permissions to avoid real screenshot capture
+    import computer_use.engine as E
+    E.check_permissions = lambda: E.safety.permissions.PermissionReport(
+        binary_present=True, daemon_running=True, ax_ok=True,
+        screenshot_ok=True, elevated=False, platform="win32", apps=[])
     tree = "\n".join(f'[{i}] Button "b{i}"' for i in range(10))
     fd = _FakeDaemon(tree)
-    import computer_use.engine as E
     orig = E.daemon.call
     E.daemon.call = fd
     try:

@@ -23,12 +23,34 @@ from pathlib import Path
 import httpx
 
 GATEWAY_V9_DIR = Path(__file__).resolve().parents[2] / "llm_gatewayV9"
-GATEWAY_URL = "http://localhost:8109"
+# 127.0.0.1, NOT "localhost". On this box `localhost` resolves to ::1 first
+# and the gateway binds IPv4 only, so every call paid a refused IPv6 connect
+# before falling back — measured 2591ms via httpx against 1034ms for the
+# literal address. On a memory-panel request that is paid twice (liveness
+# probe + the real call).
+GATEWAY_URL = "http://127.0.0.1:8109"
+
+# One pooled, keep-alive client for the whole process. `httpx.get(...)` builds
+# a Client per call, which constructs an SSL context and re-reads the CA
+# bundle each time — ~1s of pure setup on this machine, on top of a fresh TCP
+# handshake. Measured: 1034ms for a pooled-client request against ~10ms from
+# a client that already had a connection.
+_CLIENT: "httpx.Client | None" = None
+
+
+def _client() -> "httpx.Client":
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = httpx.Client(timeout=30.0, follow_redirects=True,
+                               limits=httpx.Limits(max_keepalive_connections=4,
+                                                   max_connections=16))
+    return _CLIENT
 
 
 def _is_up() -> bool:
     try:
-        httpx.get(f"{GATEWAY_URL}/v1/routers", timeout=2.0)
+        r = _client().get(f"{GATEWAY_URL}/v1/routers", timeout=2.0)
+        r.raise_for_status()
         return True
     except Exception:
         return False
@@ -116,10 +138,13 @@ class _RoutedLLM:
         )
 
     def vision(self, image, prompt, *, system=None, provider: str = None,
-               model: str = None, max_tokens=800, temperature=0.0,
+               model: str = None, max_tokens=800, temperature: float = 0.0,
                agent=None, session=None, response_format=None) -> dict:
         # The V9 client exposes vision via /v1/vision; let the gateway route
         # it naturally unless the caller pinned provider/model.
+        # VisionRequest has `schema`/`schema_name` (NOT `response_format`),
+        # so translate a json_schema response_format instead of sending a
+        # key the server silently drops.
         provider = provider or _DEFAULT_PROVIDER
         model = model or _DEFAULT_MODEL
         body = {
@@ -129,8 +154,12 @@ class _RoutedLLM:
         }
         if system:
             body["system"] = system
-        if response_format:
-            body["response_format"] = response_format
+        if isinstance(response_format, dict):
+            _rf_schema = (response_format.get("schema")
+                          or (response_format.get("json_schema") or {}).get("schema"))
+            if _rf_schema:
+                body["schema"] = _rf_schema
+                body["schema_name"] = response_format.get("name", "out")
         import httpx as _httpx
         r = _httpx.post(f"{self._raw.base_url}/v1/vision", json=body,
                         timeout=self._raw.timeout)
@@ -138,8 +167,9 @@ class _RoutedLLM:
         return r.json()
 
     def embed(self, text: str, task_type: str = "retrieval_document",
-              provider: str = None) -> dict:
-        return self._raw.embed(text, task_type=task_type, provider=provider)
+              provider: str = None, agent: str = None, session: str = None) -> dict:
+        return self._raw.embed(text, task_type=task_type, provider=provider,
+                               agent=agent, session=session)
 
     def chat_batch(self, calls: list[dict], max_concurrency: int = 4) -> list[dict]:
         # Do not pin provider/model on batched calls — let the gateway route
@@ -153,18 +183,19 @@ class _RoutedLLM:
     def capabilities(self):
         return self._raw.capabilities()
 
-    def cost_by_agent(self, session=None) -> dict:
-        return self._raw.cost_by_agent(session=session)
+    def cost_by_agent(self, session=None, agent=None) -> dict:
+        return self._raw.cost_by_agent(session=session, agent=agent)
 
 
 # Public handle used across S9: `from gateway import LLM; LLM().chat(...)`.
 LLM = _RoutedLLM
 
 
-def embed(text: str, task_type: str = "retrieval_document") -> dict:
+def embed(text: str, task_type: str = "retrieval_document",
+          agent: str | None = None, session: str | None = None) -> dict:
     """Compute an embedding for `text` via the gateway's embed endpoint."""
     ensure_gateway()
-    return LLM().embed(text, task_type=task_type)
+    return LLM().embed(text, task_type=task_type, agent=agent, session=session)
 
 
 __all__ = ["ensure_gateway", "LLM", "GATEWAY_URL", "GATEWAY_V9_DIR", "embed"]

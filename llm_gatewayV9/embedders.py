@@ -147,6 +147,36 @@ class OllamaEmbedder(EmbeddingProvider):
             raise EmbedderError(f"ollama returned no embedding: {str(d)[:200]}")
         return {"embedding": vec, "model": self.model, "dim": len(vec)}
 
+    async def embed_batch(self, texts: list[str],
+                          task_type: TaskType) -> dict:
+        """Several texts in ONE round trip, via Ollama's array endpoint.
+
+        `/api/embed` (plural `input`) rather than `/api/embeddings` (singular
+        `prompt`): measured at ~3.2 chunks/s for a batch of 16 against
+        ~0.45/s one call at a time. The whole point is amortising the request
+        overhead, so this deliberately sends one request for the whole window.
+        """
+        prefix = "search_query: " if task_type == "retrieval_query" else "search_document: "
+        body = {"model": self.model,
+                "input": [prefix + t for t in texts],
+                "keep_alive": -1}
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post(f"{self.base_url}/api/embed", json=body)
+        if r.status_code != 200:
+            raise EmbedderError(f"ollama HTTP {r.status_code}: {r.text[:200]}",
+                                status=r.status_code)
+        d = r.json()
+        vecs = d.get("embeddings")
+        if vecs is None:
+            # Older Ollama builds only have the singular endpoint.
+            raise EmbedderError("this ollama build has no /api/embed array "
+                                "endpoint", status=501)
+        if len(vecs) != len(texts):
+            raise EmbedderError(
+                f"ollama returned {len(vecs)} embeddings for {len(texts)} inputs")
+        dim = len(vecs[0]) if vecs else 0
+        return {"embeddings": vecs, "model": self.model, "dim": dim}
+
 
 def build_embedders() -> tuple[list[EmbeddingProvider], list[str]]:
     """Return (ordered list of available embedders, ordered list of names).
@@ -225,3 +255,47 @@ async def embed_with_failover(
         f"all embedders unavailable. attempts={attempts}. last_error={last_err}",
         status=503,
     )
+
+
+async def embed_batch_with_failover(
+    embedders: list[EmbeddingProvider],
+    texts: list[str],
+    task_type: TaskType,
+    explicit: str | None = None,
+) -> dict:
+    """Batch version of `embed_with_failover`.
+
+    A provider without `embed_batch` (or one whose Ollama lacks the array
+    endpoint) is skipped rather than failing the request, so the caller can
+    fall back to single embedding. Same rules as the scalar version: an
+    `explicit` provider is never silently swapped.
+    """
+    candidates = embedders
+    if explicit:
+        candidates = [e for e in embedders if e.name == explicit]
+        if not candidates:
+            raise EmbedderError(f"unknown embedder '{explicit}'", status=400)
+    last_err: Exception | None = None
+    t0 = time.time()
+    for e in candidates:
+        if not hasattr(e, "embed_batch"):
+            continue
+        ok, why = e.state.can_use()
+        if not ok:
+            if explicit:
+                raise EmbedderError(f"{e.name} unavailable: {why}", status=429)
+            continue
+        try:
+            out = await e.embed_batch(texts, task_type)
+            e.state.record()
+            out["latency_ms"] = int((time.time() - t0) * 1000)
+            return out
+        except Exception as exc:
+            last_err = exc
+            e.state.mark_failure(str(exc)[:200])
+            if explicit:
+                raise
+    if last_err is not None and explicit:
+        raise last_err
+    raise EmbedderError(
+        f"no embedder supports batch embedding: {last_err}", status=501)

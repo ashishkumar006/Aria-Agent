@@ -1,4 +1,4 @@
-"""Python client for LLM Gateway V8. Adds agent/session tagging, a
+"""Python client for LLM Gateway V9. Adds agent/session tagging, a
 batch endpoint, and exposes the gateway's `retries` count in the response.
 
 V8 behaviour summary (caller-visible):
@@ -14,6 +14,8 @@ V8 behaviour summary (caller-visible):
     HTTP round-trip; the gateway dispatches them with bounded
     parallelism so the rate-limit ladder is enforced centrally.
 """
+from __future__ import annotations
+
 import os
 import httpx
 from typing import Any, Optional
@@ -38,11 +40,12 @@ class LLM:
              response_format: Any = None,
              auto_route: Optional[str] = None,
              agent: Optional[str] = None,
-             session: Optional[str] = None) -> dict:
+             session: Optional[str] = None,
+             stream: bool = False) -> dict:
         body = {
             "prompt": prompt, "messages": messages, "system": system,
             "provider": provider, "model": model,
-            "max_tokens": max_tokens, "temperature": temperature, "stream": False,
+            "max_tokens": max_tokens, "temperature": temperature, "stream": stream,
             "tools": tools, "tool_choice": tool_choice,
             "cache_system": cache_system, "reasoning": reasoning,
             "response_format": response_format,
@@ -53,6 +56,45 @@ class LLM:
         r = httpx.post(f"{self.base_url}/v1/chat", json=body, timeout=self.timeout)
         r.raise_for_status()
         return r.json()
+
+    def vision(self, image: str, prompt: str, *,
+               system: str = None, schema: dict = None,
+               schema_name: str = "out",
+               provider: str = None, model: str = None,
+               max_tokens: int = 1024, temperature: float = 0.0,
+               agent: str = None, session: str = None) -> dict:
+        """Single-image call via POST /v1/vision (data: URL or http URL)."""
+        body: dict[str, Any] = {
+            "image": image, "prompt": prompt, "system": system,
+            "schema": schema, "schema_name": schema_name,
+            "provider": provider, "model": model,
+            "max_tokens": max_tokens, "temperature": temperature,
+            "agent": agent, "session": session,
+        }
+        body = {k: v for k, v in body.items() if v is not None}
+        r = httpx.post(f"{self.base_url}/v1/vision", json=body, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def stream(self, prompt: str = None, **kw):
+        """Yield text deltas from POST /v1/chat with stream=True.
+
+        Caller-visible events from the gateway are `delta` (text),
+        `tool_call_delta`, `done` and `error` frames.
+        """
+        import json as _json
+        body = {"prompt": prompt, "stream": True}
+        body.update({k: v for k, v in kw.items() if v is not None})
+        with httpx.stream("POST", f"{self.base_url}/v1/chat", json=body,
+                          timeout=self.timeout) as r:
+            r.raise_for_status()
+            buf = ""
+            for chunk in r.iter_text():
+                buf += chunk
+                while "\n\n" in buf:
+                    frame, buf = buf.split("\n\n", 1)
+                    if frame.startswith("data: "):
+                        yield _json.loads(frame[6:])
 
     def chat_batch(self, calls: list[dict], max_concurrency: int = 4) -> list[dict]:
         """Submit N chat requests to the gateway in a single round-trip.
@@ -67,19 +109,30 @@ class LLM:
     def capabilities(self):
         return httpx.get(f"{self.base_url}/v1/capabilities", timeout=30).json()
 
-    def cost_by_agent(self, session: Optional[str] = None) -> dict:
-        params = {"session": session} if session else {}
+    def cost_by_agent(self, session: Optional[str] = None,
+                      agent: Optional[str] = None) -> dict:
+        params: dict[str, str] = {}
+        if session:
+            params["session"] = session
+        if agent:
+            params["agent"] = agent
         r = httpx.get(f"{self.base_url}/v1/cost/by_agent", params=params, timeout=30)
         r.raise_for_status()
         return r.json()
 
     def embed(self, text: str,
               task_type: str = "retrieval_document",
-              provider: Optional[str] = None) -> dict:
+              provider: Optional[str] = None,
+              agent: Optional[str] = None,
+              session: Optional[str] = None) -> dict:
         """Returns {provider, model, embedding, dim, latency_ms, attempted}."""
         body = {"text": text, "task_type": task_type}
         if provider:
             body["provider"] = provider
+        if agent:
+            body["agent"] = agent
+        if session:
+            body["session"] = session
         r = httpx.post(f"{self.base_url}/v1/embed", json=body, timeout=self.timeout)
         r.raise_for_status()
         return r.json()

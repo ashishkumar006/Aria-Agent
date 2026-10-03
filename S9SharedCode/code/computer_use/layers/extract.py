@@ -77,7 +77,9 @@ def read_document_text(pid: int, window_id, *, timeout: float = 20.0) -> str | N
             args["snapshot_id"] = snap
         call("click", args, timeout=15)
         time.sleep(0.3)
-        # Select all + copy.
+        # Select all + copy. Foreground chords are window-scoped and need no
+        # snapshot_id — and reusing the pre-click snapshot risks refusal
+        # after the click expired it, so it is deliberately omitted here.
         call("press_key", {"pid": pid, "window_id": window_id, "key": "a",
                            "modifiers": ["ctrl"], "delivery_mode": "foreground"},
              timeout=15)

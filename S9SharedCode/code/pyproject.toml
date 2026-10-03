@@ -1,7 +1,7 @@
 [project]
 name = "eagv3-s9"
 version = "0.1.0"
-description = "EAGV3 Session 9 agent: S8 growing-graph runtime + Browser skill (extract/a11y/vision cascade)."
+description = "EAGV3 Session 9 agent: growing-graph orchestrator (planner/skills/formatter) + Browser skill + gated computer-use + Tier-1 integrations (Gmail/GitHub/Slack/Notion/Telegram) over the V9 LLM gateway."
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]",
@@ -22,15 +22,16 @@ dependencies = [
     "lxml>=5.2",
     "lxml-html-clean>=0.1",
     # General-agent web UI (agent_server.py + web/).
+    # NOTE: voice models (kokoro-onnx/soundfile/faster-whisper) live on the
+    # gateway now (/v1/tts, /v1/stt) — the agent proxies, so they are NOT
+    # agent deps anymore.
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "kokoro-onnx>=0.5.0",
-    "soundfile>=0.14.0",
     "cua-driver>=0.19.3",
-    "faster-whisper>=1.2.1",
     "apscheduler>=3.11.3",
-    "opentelemetry-api>=1.44.0",
-    "opentelemetry-sdk>=1.44.0",
+    "prefab-cloud-python>=0.12.1",
+    "prefab-ui",
+    "pypdf>=6.19.0",
 ]
 
 [dependency-groups]
