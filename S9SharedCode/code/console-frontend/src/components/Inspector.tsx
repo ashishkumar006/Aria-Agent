@@ -43,7 +43,10 @@ export default function Inspector({
       (v) => { if (live) setD(v); },
       (e) => { if (live) setErr(String(e.message || e)); },
     );
-    api.feedbackGet(nid).then(
+    /* Scope the vote lookup to THIS session: node ids are
+       per-run counters, so an unscoped read would show a vote
+       cast on the same index in a different run. */
+    api.feedbackGet(nid, sid).then(
       (v) => { if (live && (v.vote === 1 || v.vote === -1)) setVote(v.vote); },
       () => {},
     );

@@ -94,6 +94,17 @@ def step_started(step_name: str) -> dict[str, Any]:
     return {**_base("STEP_STARTED"), "stepName": step_name}
 
 
+def step_finished(step_name: str) -> dict[str, Any]:
+    """Pair for `step_started`.
+
+    AG-UI pairs these - a client that renders progress from STEP_STARTED has
+    nothing to remove the step on, so a started-without-finished stream leaves
+    a spinner running forever. The encoder previously had no constructor for
+    it at all, and the one emit site sent STEP_STARTED and never closed it.
+    """
+    return {**_base("STEP_FINISHED"), "stepName": step_name}
+
+
 def text_start(message_id: str, role: str = "assistant") -> dict[str, Any]:
     return {**_base("TEXT_MESSAGE_START"), "messageId": message_id, "role": role}
 
@@ -194,7 +205,7 @@ def capabilities(*, streaming: bool = True, tools: list[str] | None = None,
             "websocket": False,
             "http_binary": False,
             "resumable": False,
-            "push_notifications": False,
+            "pushNotifications": False,
         },
         "tools": {
             "toolCalling": bool(tools),
@@ -206,11 +217,11 @@ def capabilities(*, streaming: bool = True, tools: list[str] | None = None,
             "agentState": False,
             "messagePersistence": message_persistence,
         },
-        "multi_agent": {"delegation": False, "subAgents": False},
+        "multiAgent": {"delegation": False, "subAgents": False},
         "reasoning": {"reasoning": False},
         "multimodal": {"input": False, "output": False},
         "execution": {"codeExecution": False},
-        "human_in_the_loop": {"approvalRequests": False},
+        "humanInTheLoop": {"approvalRequests": False},
     }
     return caps
 
@@ -247,12 +258,30 @@ def parse_request(body: Any) -> dict[str, Any]:
 
     thread = body.get("threadId") or body.get("thread_id") or \
         body.get("conversation_id") or body.get("conversationId")
+    # A non-string id (a number from LLM-generated JSON) used to
+    # raise AttributeError on `.strip()` — a bare 500. Coerce
+    # scalars, refuse everything else.
+    if thread is not None and not isinstance(thread, str):
+        if isinstance(thread, (int, float)) and not isinstance(thread, bool):
+            thread = str(thread)
+        else:
+            raise AguiRequestError("thread_id must be a string")
     thread = (thread or "").strip() or None
 
-    run_id = (body.get("runId") or body.get("run_id") or "").strip() or None
+    run_id = body.get("runId") or body.get("run_id") or ""
+    if not isinstance(run_id, str):
+        if isinstance(run_id, (int, float)) and not isinstance(run_id, bool):
+            run_id = str(run_id)
+        else:
+            raise AguiRequestError("run_id must be a string")
+    run_id = run_id.strip() or None
 
     raw_messages = body.get("messages")
-    query = (body.get("query") or body.get("q") or "").strip() if isinstance(body, dict) else ""
+    raw_query = body.get("query") or body.get("q") or ""
+    if not isinstance(raw_query, str):
+        raw_query = str(raw_query)
+    explicit_query = raw_query.strip()
+    query = explicit_query
 
     messages: list[dict] = []
     if isinstance(raw_messages, list):
@@ -280,7 +309,13 @@ def parse_request(body: Any) -> dict[str, Any]:
             else:
                 text = "" if content_val is None else str(content_val)
             messages.append({"role": role, "content": text})
-            if not query and role == "user":
+            if role == "user" and not explicit_query and text.strip():
+                # No explicit top-level query: the turn to
+                # answer is the transcript's LAST user message.
+                # Taking the first made a multi-turn transcript
+                # answer its opening message. An EMPTY last
+                # user message must not clear an earlier one —
+                # the last NON-EMPTY user message is the ask.
                 query = text.strip()
 
     if not query:
@@ -314,6 +349,11 @@ def parse_request(body: Any) -> dict[str, Any]:
         "messages": messages,
         "tool_names": tool_names,
         "state": state or {},
+        # True when the query was derived from the caller's own
+        # transcript rather than sent as a top-level field. The
+        # endpoint must not append it to the history again, or
+        # the turn reaches the model twice ("hello", "hello").
+        "query_from_messages": not explicit_query and bool(messages),
     }
 
 

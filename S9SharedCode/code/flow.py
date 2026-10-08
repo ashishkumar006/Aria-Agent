@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ import memory as memory_svc
 import turnlog
 from gateway import ensure_gateway
 from persistence import SessionStore
+from skills import ROOT as _SROOT
 from recovery import handle_critic_verdict, plan_recovery
 from schemas import AgentResult, NodeState
 from skills import SkillRegistry, run_skill
@@ -53,11 +55,16 @@ MAX_FANOUT = 4
 # fetch. That is the cheap, safe half of the problem; the expensive half
 # (hard cancellation) is deliberately not attempted here.
 NODE_BUDGET_S: dict[str, float] = {
-    "researcher": 90.0,   # three parallel fetches plus a synthesis
+    "researcher": 150.0,  # parallel fetches plus a multi-page write-up
     "browser": 120.0,     # a real page interaction is legitimately slow
     "action": 60.0,       # one round trip to a third-party API
     "planner": 30.0,      # it emits a small JSON graph, nothing more
-    "formatter": 45.0,
+    # A long-form answer is a long generation: ~12k tokens of prose takes
+    # well over a minute and a half, and this note TELLS the model to
+    # stop searching and synthesise. At 45s the Formatter crossed its
+    # warn ratio on nearly every research run, so the note was actively
+    # pressuring the one node whose whole job is a thorough report.
+    "formatter": 240.0,
     "default": 90.0,
 }
 BUDGET_WARN_RATIO = 0.7
@@ -254,6 +261,129 @@ class Graph:
         return added
 
 
+# The skills that gather evidence. An authoring node that reaches the renderer
+# without one of these upstream is writing from the model's memory.
+_RESEARCH_SKILLS = ("retriever", "researcher", "browser", "distiller",
+                    "summariser")
+_AUTHORING_SKILLS = ("author", "deck")
+
+
+def _fallback_facets(query: str) -> list[str]:
+    """Facets to research when the planner wrote no research_plan.
+
+    Deliberately more than one. A single worker asked for "everything about X"
+    returns one pass of the obvious material - which is the failure the
+    Research section's fan-out exists to prevent, so the fallback must not
+    reintroduce it.
+    """
+    import re as _re
+    q = " ".join(str(query or "").split())
+    # Strip the authoring instruction so the worker is asked to RESEARCH a
+    # subject, not to obey an order. "write a 6 page report on the Bluebook"
+    # becomes "the Bluebook", and each facet then reads as a research
+    # question rather than a task list.
+    q = _re.sub(r"(?i)^\s*(please\s+)?(can you\s+)?"
+                r"(write|create|make|build|generate|draft|produce|prepare|"
+                r"give me|turn)\b[^.?]*?\b(about|on|regarding|covering|for|of)\s+",
+                "", q, count=1)
+    q = q.strip(" ?.!") or "the subject of the requested document"
+    return [
+        f"{q}: what it is, how it works, and the current state of it",
+        f"{q}: specific evidence, figures, examples and primary sources",
+        f"{q}: limitations, disagreements, edge cases and open questions",
+    ]
+
+
+def ensure_authoring_research(graph: Graph, query: str) -> list[str]:
+    """Make an authoring plan research the way a Research question does.
+
+    The Authoring section is a Research request with a document at the end of
+    it. A real run of "write me a report on X" planned as
+    `planner -> author -> formatter`: the author node saw only USER_QUERY,
+    called no retrieval, and wrote the document from the model's own memory.
+    That is precisely the failure the Research pipeline exists to prevent.
+
+    Prompting the planner is not enough on its own - it is a model, and this
+    shape is the path of least resistance. So the structure is enforced here:
+    any author/deck node with no evidence-gathering ancestor gets a
+    `retriever` and a small fan-out of `researcher` nodes spliced above it,
+    and its inputs are rewired to read them.
+
+    Returns the ids added, for logging and tests.
+    """
+    added: list[str] = []
+    for nid in list(graph.g.nodes):
+        if graph.g.nodes[nid]["skill"] not in _AUTHORING_SKILLS:
+            continue
+        # Does anything upstream already gather evidence? Walk the ancestors.
+        seen: set[str] = set()
+        stack = list(graph.g.predecessors(nid))
+        grounded = False
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if graph.g.nodes[cur]["skill"] in _RESEARCH_SKILLS:
+                grounded = True
+                break
+            stack.extend(graph.g.predecessors(cur))
+        if grounded:
+            continue
+
+        old_inputs = list(graph.g.nodes[nid].get("inputs") or [])
+        # A retriever first: the user's own uploads are the highest-quality
+        # source available and cost one call.
+        ret = graph.add_node("retriever", inputs=["USER_QUERY"])
+        added.append(ret)
+        edges: list[tuple[str, str]] = []
+
+        # Facets come from the planner's own research_plan when it wrote one,
+        # so the rewrite reinforces the plan instead of inventing a new topic.
+        facets: list[str] = []
+        try:
+            for _pnid in graph.g.nodes:
+                if graph.g.nodes[_pnid]["skill"] != "planner":
+                    continue
+                _res = (graph.g.nodes[_pnid].get("result") or {})
+                _rp = ((_res.get("output") or {}) if isinstance(_res, dict)
+                       else {}).get("research_plan")
+                if isinstance(_rp, dict):
+                    facets = [str(f) for f in (_rp.get("facets") or []) if f]
+        except Exception:
+            facets = []
+        facets = facets[:MAX_FANOUT] or _fallback_facets(query)
+
+        workers: list[str] = []
+        for i, facet in enumerate(facets):
+            w = graph.add_node("researcher", inputs=[ret],
+                               metadata={"question": facet,
+                                         "label": f"research{i + 1}"})
+            workers.append(w)
+            added.append(w)
+            edges.append((ret, w))
+
+        # The author node reads every worker. It keeps USER_QUERY so it still
+        # knows the shape the user asked for, and the retriever so the user's
+        # own uploads stay in view.
+        for old in old_inputs:
+            if old == "USER_QUERY" and "USER_QUERY" not in graph.g.nodes[nid]["inputs"]:
+                graph.g.nodes[nid]["inputs"].append(old)
+        for w in workers:
+            if w not in graph.g.nodes[nid]["inputs"]:
+                graph.g.nodes[nid]["inputs"].append(w)
+        if ret not in graph.g.nodes[nid]["inputs"]:
+            graph.g.nodes[nid]["inputs"].insert(0, ret)
+        for a, b in edges:
+            graph.g.add_edge(a, b)
+        for w in workers:
+            graph.g.add_edge(w, nid)
+        graph.g.add_edge(ret, nid)
+        print(f"[flow] authoring without research: added retriever + "
+              f"{len(workers)} researcher node(s) above {nid}")
+    return added
+
+
 def _safe_remember(query: str, sid: str) -> None:
     """Best-effort memory write for the user query, safe to run on a daemon
     thread off the critical path. Any failure is logged and swallowed so a
@@ -267,6 +397,44 @@ def _safe_remember(query: str, sid: str) -> None:
                              session_id=sid)
     except Exception as e:  # pragma: no cover - deferred write must not crash
         print(f"[memory.remember] skipped: {e!r}")
+
+
+# Files the run rendered (author/deck call render_document). Reported in the
+# stream's `done` event so the console can build download cards WITHOUT
+# parsing the answer text: the formatter legitimately rewrites the receipt
+# as prose, and any handle in it was not reliably preserved.
+_DOCUMENT_INTENT_RE = re.compile(
+    r"create a document|produce a (pdf|pptx|docx|xlsx|word|excel|deck)"
+    r"|make a (pdf|pptx|docx|xlsx)|render a (pdf|pptx|docx|xlsx)",
+    re.I)
+
+
+def take_produced_files(session_id: str) -> list[dict]:
+    """Read this session's rendered-file sidecar. Never raises."""
+    try:
+        if (not session_id or session_id.startswith(".")
+                or "/" in session_id or "\\" in session_id):
+            return []
+        p = _SROOT / "state" / "sessions" / session_id / "produced_files.json"
+        if not p.exists():
+            return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        out = []
+        for e in data:
+            if not isinstance(e, dict):
+                continue
+            art = e.get("artifact")
+            if not (isinstance(art, str) and art.startswith("art:")):
+                continue
+            out.append({"artifact": art,
+                        "filename": str(e.get("filename") or "document"),
+                        "format": str(e.get("format") or "").lower(),
+                        "skill": str(e.get("skill") or "")})
+        return out
+    except Exception:
+        return []
 
 
 # F10 FIX (cross-session memory contamination): best-effort append of the
@@ -317,8 +485,9 @@ class Executor:
         self.registry = registry or SkillRegistry()
 
     async def run(self, query: str, *, session_id: str | None = None,
-                  resume: bool = False,
-                  should_cancel: Callable[[], bool] | None = None) -> str:
+                     resume: bool = False,
+                     doc_setup: dict | None = None,
+                     should_cancel: Callable[[], bool] | None = None) -> str:
         sid = session_id or f"s8-{uuid.uuid4().hex[:8]}"
         store = SessionStore(sid)
         run_start_iso = datetime.now(timezone.utc).isoformat()
@@ -398,8 +567,6 @@ class Executor:
         executed_count = 0
         # Cap on recovery replans per failed node so a persistently broken
         # provider (e.g. empty/503 responses) can't spin the run forever.
-        recovery_attempts: dict[str, int] = {}
-        MAX_RECOVERY_ATTEMPTS = 2
         # Per-target cap for critic-fail recovery; see P1 #5 fix below.
         recovered_branches: dict[str, bool] = {}
         # NOTES_RUNS round-3 review #5: when the cap fires, the branch is
@@ -411,6 +578,20 @@ class Executor:
         # note above can tell the model it is running late. Populated as
         # nodes complete.
         spent_by_skill: dict[str, float] = {}
+        # Recovery is capped per NODE and per RUN. The per-node cap alone
+        # never fired for a persistently failing skill: every recovery
+        # re-plans a FRESH node (n:5, n:8, n:11, ...) with a new id, so each
+        # attempt started its own count at zero. One authoring run reached 37
+        # author attempts and ~778k input tokens before the node cap stopped
+        # it. A skill that keeps failing will not succeed on the fifth try
+        # with the same inputs, so it is bounded per SKILL as well.
+        recovery_attempts: dict[str, int] = {}
+        MAX_RECOVERY_ATTEMPTS = 2
+        skill_failures: dict[str, int] = {}
+        exhausted_skills: set[str] = set()
+        MAX_SKILL_FAILURES = 3
+        recovery_rounds = 0
+        MAX_RECOVERY_ROUNDS = 8
 
         while True:
             # Operator cancel (POST /api/chat/cancel): checked BETWEEN
@@ -472,7 +653,8 @@ class Executor:
                 self._run_one(nid, graph, sid, query, store, memory_hits,
                               prior_turns, policy_notes,
                               _budget_note(graph.g.nodes[nid]["skill"],
-                                           spent_by_skill))
+                                           spent_by_skill),
+                              doc_setup)
                 for nid in batch],
                                             return_exceptions=True)
 
@@ -529,6 +711,14 @@ class Executor:
                                   f"answer, no downstream nodes")
                             continue
                     graph.extend_from(nid, result, registry=self.registry)
+                    # Authoring gets the Research chain, enforced rather than
+                    # requested: see ensure_authoring_research. Runs after
+                    # extend_from so the planner's nodes exist, and only for
+                    # the planner so it cannot be applied twice.
+                    if graph.g.nodes[nid]["skill"] == "planner":
+                        _added = ensure_authoring_research(graph, query)
+                        if _added:
+                            store.write_graph(graph.g)
                     if graph.g.nodes[nid]["skill"] == "formatter":
                         fa = result.output.get("final_answer")
                         if isinstance(fa, str) and fa.strip():
@@ -557,6 +747,8 @@ class Executor:
                                 print(f"[{nid}] research plan not stored: {e!r}")
                 else:
                     failed_skill = graph.g.nodes[nid]["skill"]
+                    skill_failures[failed_skill] = (
+                        skill_failures.get(failed_skill, 0) + 1)
                     decision = plan_recovery(
                         failed_skill=failed_skill,
                         error_text=result.error or "",
@@ -585,6 +777,28 @@ class Executor:
                     # action == "replan" — but cap repeated replans so a
                     # persistently failing provider can't loop forever.
                     recovery_attempts[nid] = recovery_attempts.get(nid, 0) + 1
+                    recovery_rounds += 1
+                    # A skill that has failed this many times in one run is not
+                    # going to succeed on the fifth attempt with the same
+                    # inputs. Stop retrying it: skip the node, release its
+                    # subtree so the formatter can still produce an honest
+                    # answer, and let the run end.
+                    if (skill_failures.get(failed_skill, 0) >= MAX_SKILL_FAILURES
+                            or recovery_rounds > MAX_RECOVERY_ROUNDS):
+                        exhausted_skills.add(failed_skill)
+                        why = (f"{failed_skill} failed "
+                               f"{skill_failures.get(failed_skill, 0)}x in this "
+                               f"run; not retrying")
+                        print(f"  -> {nid} skipped ({why})")
+                        graph.mark(nid, "skipped", error=why)
+                        store.write_node(NodeState(
+                            node_id=nid, skill=failed_skill, status="skipped",
+                            inputs=graph.g.nodes[nid]["inputs"],
+                            result=result, prompt_sent=prompt,
+                            started_at=time.time() - result.elapsed_s,
+                            completed_at=time.time(),
+                        ))
+                        continue
                     if recovery_attempts[nid] > MAX_RECOVERY_ATTEMPTS:
                         print(f"  -> {nid} failed ({decision.reason}, "
                               f"skill={failed_skill}): recovery cap "
@@ -649,7 +863,14 @@ class Executor:
                 # Prefer a human-readable field over a raw JSON dump — the
                 # planner short-circuit path exists precisely so raw dicts
                 # never leak to the user.
-                for key in ("final_answer", "answer", "text", "content"):
+                #
+                # `summary` is in this list because the authoring skills
+                # (author/deck) return {filename, format, artifact, sections,
+                # summary} and nothing else — the run rendered a real PDF and
+                # then reported "the author step finished but returned no
+                # readable answer; raw output follows". Any skill whose
+                # answer field is not one of the four legacy names hit this.
+                for key in ("final_answer", "answer", "summary", "text", "content"):
                     val = out.get(key) if isinstance(out, dict) else None
                     if isinstance(val, str) and val.strip():
                         formatter_answer = val.strip()
@@ -667,11 +888,23 @@ class Executor:
                 # user-visible answer. Report "no answer" instead and let the
                 # caller state that the run was stopped.
                 if should_cancel is None or not should_cancel():
-                    formatter_answer = (
-                        f"(the {fallback_skill} step finished but returned no "
-                        f"readable answer; raw output follows) "
-                        + json.dumps(fallback_output)[:1500]
-                    )
+                    # A rendered document must be named even when no
+                    # formatter ran: the file IS the deliverable and the
+                    # user cannot find it without the filename.
+                    if isinstance(fallback_output, dict) \
+                            and isinstance(fallback_output.get("artifact"), str) \
+                            and fallback_output["artifact"].startswith("art:"):
+                        formatter_answer = (
+                            f"Created {fallback_output.get('filename') or 'the document'}"
+                            f" ({fallback_output.get('format') or 'file'}). "
+                            f"Download it from the file list."
+                        )
+                    else:
+                        formatter_answer = (
+                            f"(the {fallback_skill} step finished but returned no "
+                            f"readable answer; raw output follows) "
+                            + json.dumps(fallback_output)[:1500]
+                        )
 
         if critic_fail_cap_hit:
             # Loud surface — see review round-3 #5. Without this the cap
@@ -683,6 +916,151 @@ class Executor:
                   f"The final answer reflects missing data from these "
                   f"branches because the Critic rejected the re-planned "
                   f"output too.")
+        # A rendered file IS the deliverable, and it is already in the file
+        # list. The answer should be a receipt, not the document: the
+        # sectioned formatter is handed the author's `sections` (the body it
+        # just rendered) and, being sectioned, wrote the receipt once per
+        # section and pasted the whole document into the chat after it.
+        # Replacing the answer with a canonical receipt is deterministic and
+        # keeps the transcript readable.
+        failed: list[str] = []
+        for nid in list(graph.g.nodes):
+            d = graph.g.nodes[nid]
+            res = d.get("result")
+            if isinstance(res, AgentResult) and not res.success:
+                failed.append(f"{d.get('skill', '?')}: "
+                              f"{str(res.error or 'failed')[:120]}")
+                continue
+            # A node the recovery planner ABANDONED is a hole in the evidence,
+            # and it looked like a clean run. Observed live: a researcher
+            # skipped on a provider 503, the formatter wrote a shorter report
+            # from the survivors, and the user was shown a confident answer
+            # with nothing marking the missing facet. `res` is None for these,
+            # so the loop above never saw them.
+            #
+            # NOT a deliberate stop: the user pressing Stop also leaves nodes
+            # skipped, and telling someone who cancelled that their answer is
+            # incomplete would blame them for their own cancellation.
+            status = str(d.get("status") or "").lower()
+            if status in ("skipped", "abandoned") and not (
+                    should_cancel is not None and should_cancel()):
+                failed.append(f"{d.get('skill', '?')}: {status} "
+                              f"(this part of the question went unanswered)")
+        produced: list[dict] = []
+        for nid in list(graph.g.nodes):
+            res = graph.g.nodes[nid].get("result")
+            out = res.output if isinstance(res, AgentResult) else None
+            if not isinstance(out, dict):
+                continue
+            # `produced` is written by skills.py straight from the
+            # render_document return value. The model's own `artifact` field is
+            # untrusted: a node that never called the renderer reported
+            # {"artifact": "art:doc-gen-pipeline"} and the receipt announced a
+            # PDF that did not exist and could not be downloaded. Only the
+            # tool's record may produce a download link.
+            real = out.get("produced")
+            if isinstance(real, list) and real:
+                skill_name = graph.g.nodes[nid].get("skill", "")
+                for f in real:
+                    if not isinstance(f, dict):
+                        continue
+                    art = f.get("artifact")
+                    if not (isinstance(art, str)
+                            and re.fullmatch(r"art:[0-9a-fA-F]{16}", art)):
+                        continue
+                    produced.append({"artifact": art,
+                                     "filename": f.get("filename") or "",
+                                     "format": (f.get("format") or "").lower(),
+                                     "skill": skill_name,
+                                     "bytes": f.get("bytes"),
+                                     "stats": f.get("stats") or {}})
+                continue
+            # No tool record. The model's own `artifact` field is NOT evidence
+            # that anything was rendered - a live run produced a list of
+            # "art:dummy", "art:generated_document" and "art:mock-placeholder"
+            # in produced_files.json, every one invented by a model that never
+            # called the renderer, each one a dead download button. Only an id
+            # that the artifact store can actually resolve may be listed.
+            art = out.get("artifact")
+            if (isinstance(art, str) and art.startswith("art:")
+                    and re.fullmatch(r"art:[0-9a-fA-F]{16}", art)):
+                try:
+                    import artifacts as _arts
+                    _arts.get_bytes(art)      # raises if not stored
+                except Exception:
+                    print(f"  -> dropping unresolvable artifact {art} "
+                          f"reported by {graph.g.nodes[nid].get('skill')}")
+                    continue
+                produced.append({"artifact": art,
+                                 "filename": out.get("filename") or "",
+                                 "format": (out.get("format") or "").lower(),
+                                 "skill": graph.g.nodes[nid].get("skill", "")})
+        if produced:
+            try:
+                import json as _json
+                _p = store.graph_path.parent / "produced_files.json"
+                _tmp = _p.with_suffix(".json.tmp")
+                _tmp.write_text(_json.dumps(produced, indent=2),
+                                encoding="utf-8")
+                _tmp.replace(_p)
+            except Exception:
+                pass
+            lines = []
+            for p in produced:
+                name = p.get("filename") or p["artifact"]
+                kind = (p.get("format") or "file").upper()
+                lines.append(f"- **{name}** ({kind})")
+                # The delivered size, from the renderer. This is the only
+                # honest measure of whether the document is long enough -
+                # the model cannot be asked, it can only be measured.
+                st = p.get("stats") or {}
+                if st.get("words"):
+                    lines.append(f"  - {int(st['words']):,} words"
+                                 + (f", {st['sections']} sections"
+                                    if st.get("sections") else ""))
+            plural = "s" if len(produced) > 1 else ""
+            them = "them" if len(produced) > 1 else "it"
+            formatter_answer = (
+                f"Created {len(produced)} document{plural}.\n\n"
+                + "\n".join(lines)
+                + f"\n\nDownload {them} from the file list above.")
+        elif failed:
+            # A failed node must not be hidden, but it must not veto the
+            # answer either: the orchestrator recovers by retrying and then
+            # skipping a transient branch, and those runs DO have a real
+            # answer ("recovered...", "final after skip"). So note the
+            # failures rather than replacing the reply - and only when there
+            # is nothing to keep.
+            # Say what is missing in the reader's terms, not just the node's
+            # status: "researcher: skipped" tells an operator nothing, while
+            # "this part of the question went unanswered" tells a reader why
+            # the report is shorter than they expected.
+            _note = ("\n\n---\n\n**This answer is incomplete.** "
+                     + "; ".join(failed)
+                     + ". Treat the missing parts as unknown rather than "
+                       "settled - the run log has the full detail.")
+            formatter_answer = ((formatter_answer or "").rstrip() + _note
+                                if (formatter_answer or "").strip()
+                                else ("I could not finish this request."
+                                      + _note))
+
+        # A run that WAS asked for a file and produced none must never look
+        # like a success. The planner can short-circuit on `{"answer": ...}`
+        # with no successors, and a stored memory preference
+        # ("[preference] reply with only OK instead of creating documents")
+        # was enough to turn a PDF request into a two-character answer with no
+        # file, no error, and a `done.` status. The console now also flags
+        # this, but the receipt is the last place it can be caught.
+        if not produced and _DOCUMENT_INTENT_RE.search(query or ""):
+            formatter_answer = (
+                "I could not produce the document you asked for.\n\n"
+                + (f"The agent answered instead: "
+                   f"\"{(formatter_answer or '').strip()[:160]}\"\n\n"
+                   if (formatter_answer or "").strip() else "")
+                + "Nothing was written to a file. The run log has the detail; "
+                  "if this repeats, a stored preference may be overriding the "
+                  "request.")
+
         print(f"\n{'=' * 78}\nFINAL: {formatter_answer or ''}\n{'=' * 78}\n")
         # F10 FIX: persist the completed turn so the NEXT turn in this
         # conversation has an authoritative record of what was asked and
@@ -700,11 +1078,12 @@ class Executor:
         return formatter_answer or ""
 
     async def _run_one(self, nid: str, graph: Graph, sid: str, query: str,
-                        store: SessionStore, memory_hits: list,
-                        prior_turns: list | None = None,
-                        policy_notes: list | None = None,
-                        budget_note: str = "",
-                        ) -> tuple[str, AgentResult, str]:
+        store: SessionStore, memory_hits: list,
+        prior_turns: list | None = None,
+        policy_notes: list | None = None,
+        budget_note: str = "",
+        doc_setup: dict | None = None,
+        ) -> tuple[str, AgentResult, str]:
         skill_name = graph.g.nodes[nid]["skill"]
         skill = self.registry.get(skill_name)
         fr = graph.g.nodes[nid].get("metadata", {}).get("failure_report")
@@ -716,6 +1095,7 @@ class Executor:
                                               memory_hits=memory_hits,
                                               prior_turns=prior_turns,
                                               policy_notes=policy_notes,
+                                              doc_setup=doc_setup,
                                               budget_note=budget_note)
         except Exception as e:  # pragma: no cover - dispatcher fault path
             result = AgentResult(success=False, agent_name=skill_name,

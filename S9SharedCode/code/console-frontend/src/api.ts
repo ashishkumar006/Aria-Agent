@@ -83,7 +83,17 @@ export interface SessionSummary {
   /** The user's own question, extracted server-side from the skill prompt
       that wraps it. `query` is still that whole prompt, so titles used to
       read "You are a research agent..."; prefer this. */
-  topic?: string;
+     topic?: string;
+     /** 'authoring' = this run rendered a document; 'research' = it did not.
+         Both kinds live in the same session store, so without this the
+         Authoring run appeared in the Research sidebar and neither view could
+         tell its own history from the other's.
+         Named `run_kind`, not `kind`: in the Authoring sidebar `kind` already
+         means the FILE FORMAT (pdf/pptx/docx/xlsx). */
+     run_kind?: 'authoring' | 'research';
+     /* Did this run actually write a file? Named `has_files` because the
+        authoring sidebar already uses `files` for the file LIST. */
+     has_files?: boolean;
   nodes?: number;
   skills?: string[];
   updated_ago?: number;
@@ -111,6 +121,22 @@ export interface McpStats {
     cooldown_s: number;
     last_error: string;
   } | null;
+}
+
+/** What a produced document actually contains, read back from its bytes.
+ *  `warnings` names anything the user would otherwise only find out after
+ *  downloading — an empty workbook, a deck of blank slides, a 57-word PDF. */
+export interface DocPreview {
+  kind: 'pdf' | 'pptx' | 'docx' | 'xlsx' | 'unknown';
+  title?: string;
+  subtitle?: string;
+  size_bytes?: number;
+  warnings?: string[];
+  slides?: { n: number; title: string; bullets: string[]; notes: string; empty: boolean }[];
+  pages?: { n: number; text: string; chars: number }[];
+  sheets?: { name: string; rows: string[][]; empty: boolean }[];
+  paragraphs?: string[];
+  tables?: string[][][];
 }
 
 export interface RunRow extends SessionSummary {}
@@ -261,6 +287,19 @@ export interface SkillRow {
   dollars?: number;
 }
 
+/** One skill's node reliability: how many nodes it ran, how many failed,
+ *  and why. `fail_pct` is against THAT SKILL's node count, which is the number
+ *  a reader can act on - "author failed 38% of its nodes" is a defect;
+ *  "4 nodes failed overall" is not. */
+export interface NodeHealthRow {
+  skill: string;
+  nodes: number;
+  failed: number;
+  skipped: number;
+  fail_pct: number;
+  reasons: { reason: string; count: number; pct_of_failures: number }[];
+}
+
 export interface TurnRow {
   ts?: number;
   query?: string;
@@ -326,7 +365,27 @@ const LAUNCH_TOKEN: string = (() => {
 
 export function hasLaunchToken(): boolean { return LAUNCH_TOKEN !== ''; }
 
-function headers(extra?: Record<string, string>): Record<string, string> {
+/* ── AG-UI ────────────────────────────────────────────────────────────────
+   The subset this client consumes. Deliberately not the full 31-event
+   vocabulary: these are the frames the Apps refresh emits, and a type that
+   enumerated everything would claim coverage the client does not have. */
+export interface AguiEvent {
+  type: string;
+  timestamp?: number;
+  threadId?: string;
+  runId?: string;
+  stepName?: string;
+  messageId?: string;
+  activityType?: string;
+  content?: { text?: string };
+  result?: { app_id?: string; count?: number; error?: string | null };
+  message?: string;
+}
+
+/** Auth headers for a direct `fetch`. Exported because some downloads are
+ *  blob fetches rather than JSON calls (a file route needs the token, and an
+ *  <a href> navigation cannot send it). */
+export function headers(extra?: Record<string, string>): Record<string, string> {
   const h: Record<string, string> = { ...(extra || {}) };
   const t = getToken();
   if (t) h.Authorization = `Bearer ${t}`;
@@ -393,6 +452,15 @@ export interface FlagRow {
   default: unknown;
   source: 'prefab' | 'override' | 'default';
   description?: string;
+}
+
+export interface A2uiProps { [k: string]: unknown }
+export interface A2uiComponent { id: string; component: string; props: A2uiProps }
+export interface A2uiSurface {
+  surfaceId: string;
+  catalogId: string;
+  rootComponent: string;
+  components: A2uiComponent[];
 }
 
 export interface TrackerApp {
@@ -464,8 +532,34 @@ async function* sseFrames(r: Response, signal?: AbortSignal): AsyncGenerator<Rec
 
 export const api = {
   health: () => j<{ agent: string; gateway_up: boolean }>('/api/health'),
-  chatThreads: (limit = 50) =>
-    j<{ threads: ChatThread[] }>(`/api/chat/threads?limit=${limit}`),
+  /* ── document authoring (PDF / PPTX / DOCX / XLSX) ──
+     The gateway owns the generators; these two routes proxy them so the
+     console never holds the gateway token. `docgen` returns the BLOB (it
+     is a file download, not JSON), so it cannot use the `j` helper. */
+  docgenSchema: () => j<{ spec: Record<string, unknown>; limits: Record<string, number> }>(
+    '/api/docgen/formats'),
+  docgen: async (format: string, spec: unknown): Promise<{ blob: Blob; filename: string }> => {
+    const r = await fetch('/api/docgen', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers() },
+      body: JSON.stringify({ format, spec }),
+    });
+    if (!r.ok) {
+      let msg = `${r.status}`;
+      try {
+        const b = await r.json();
+        msg = String(b?.error || msg);
+      } catch { /* not JSON: keep the status */ }
+      throw new Error(msg);
+    }
+    const cd = r.headers.get('content-disposition') || '';
+    const m = /filename="?([^";]+)"?/i.exec(cd);
+    return { blob: await r.blob(), filename: m ? m[1] : `document.${format}` };
+  },
+  chatThreads: (limit = 50, offset = 0) =>
+    j<{ threads: ChatThread[]; total: number; has_more: boolean }>(
+      `/api/chat/threads?limit=${limit}&offset=${offset}`,
+    ),
   chatThread: (cid: string) =>
     j<{ conversation_id: string; title: string; messages: { role: string; content: string }[] }>(
       `/api/chat/threads/${encodeURIComponent(cid)}`,
@@ -495,8 +589,16 @@ export const api = {
       `/api/cost${conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : ''}`,
     ),
   bySkill: (conversationId?: string) =>
-    j<{ rows?: SkillRow[]; turns?: TurnRow[]; totals?: { dollars?: number; calls?: number; skills?: number } }>(
+    j<{ rows?: SkillRow[]; turns?: TurnRow[]; totals?: { dollars?: number; calls?: number; skills?: number }; unknown_conversation?: boolean }>(
       `/api/cost/by_skill${conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : ''}`,
+    ),
+  nodeHealth: (conversationId?: string) =>
+    j<{
+      sessions: number;
+      rows: NodeHealthRow[];
+      totals: { nodes: number; failed: number; fail_pct: number };
+    }>(
+      `/api/nodes/health?limit=200${conversationId ? `&conversation_id=${encodeURIComponent(conversationId)}` : ''}`,
     ),
   scheduleList: () => j<{ schedules?: ScheduleJob[] | Record<string, ScheduleJob> }>('/api/schedule'),
   scheduleCreate: (query: string, when: string) =>
@@ -506,7 +608,8 @@ export const api = {
   scheduleDelete: (id: string) =>
     j<{ status: string }>(`/api/schedule/${encodeURIComponent(id)}?hard=true`, { method: 'DELETE' }),
   tools: () => j<{ tools: ToolSpec[] }>('/api/tools'),
-  toolsGuard: () => j<{ disabled: string[] }>('/api/config/tools'),
+  toolsGuard: () =>
+    j<{ disabled: string[] | null; error?: string }>('/api/config/tools'),
   setTool: (tool: string, enabled: boolean) =>
     pj<{ disabled?: string[]; error?: string }>('/api/config/tools', { tool, enabled }),
   flags: () =>
@@ -529,6 +632,46 @@ export const api = {
     j<{ deleted?: string; apps?: TrackerApp[] }>(`/api/apps/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+  /** One tracker app as a validated A2UI surface.
+      A peer of the prefab render, not a replacement: prefab stays available and
+      is still the offline-capable option. Built server-side and
+      deterministically - a table of known rows has nothing for a model to
+      resolve, so there is no generation step and nothing to hallucinate. */
+  appSurface: (id: string) =>
+    j<{ surface: A2uiSurface; notes?: string[] }>(
+      `/api/apps/${encodeURIComponent(id)}/a2ui`,
+    ),
+  /** Refresh with live progress, as an AG-UI event stream.
+      `POST /refresh` is one blocking call that fetches a third-party feed, so
+      on a slow source the board showed nothing until it returned. This yields
+      the typed frames instead, which is what lets the UI name the phase it is
+      in and close it when the run ends.
+
+      fetch + ReadableStream, never EventSource: EventSource cannot set the
+      X-Aria-Token header, so every frame would 401. `sseFrames` is
+      protocol-agnostic, so this is the same reader the chat streams use. */
+  async *trackerRefreshStream(id: string, signal?: AbortSignal): AsyncGenerator<AguiEvent> {
+    const r = await fetch(`/api/apps/${encodeURIComponent(id)}/refresh/stream`, {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: '{}',
+      signal,
+    });
+    if (!r.ok) throw new Error(await reason(r));
+    if (!r.body) throw new Error('empty response body');
+    let sawTerminal = false;
+    for await (const f of sseFrames(r, signal)) {
+      if (f.type === 'RUN_FINISHED' || f.type === 'RUN_ERROR') sawTerminal = true;
+      /* Frames arrive as `Record<string, unknown>`; the cast names the subset
+         this client reads. Every field is optional because a server may add an
+         event type we do not model yet - reading `type` off an unknown frame
+         must not throw. */
+      yield f as unknown as AguiEvent;
+    }
+    if (!sawTerminal && !signal?.aborted) {
+      throw new Error('refresh stream ended before the run finished');
+    }
+  },
   /** Prefab render pre-check. The iframe itself cannot send the bearer
       token or report failures, so this probe (same URL, authed headers)
       decides whether to mount it — and surfaces the server's error text
@@ -541,6 +684,17 @@ export const api = {
     const text = r.ok ? '' : (await r.text()).slice(0, 200);
     return { ok: r.ok, status: r.status, text };
   },
+  /** Short-lived signed pass for the prefab iframe. The iframe is
+      a browser navigation and cannot send the X-Aria-Token header,
+      so the view 403'd inside its own frame. Fetch the pass through
+      this authenticated call and mount the iframe with
+      `?t=<sig>&exp=<exp>` — the server re-verifies the HMAC inside
+      the auth middleware. An empty token means auth is disabled and
+      the iframe loads bare. */
+  prefabToken: (id: string) =>
+    j<{ token: string; exp: number }>(
+      `/api/apps/${encodeURIComponent(id)}/prefab-token`,
+    ),
   memory: (params: URLSearchParams, signal?: AbortSignal) =>
     j<{ items?: MemItem[]; error?: string }>(`/api/memory?${params}`, { signal }),
   remember: (body: Record<string, unknown>) =>
@@ -548,7 +702,7 @@ export const api = {
   /* `confirm=wipe` is required server-side: an unscoped DELETE /api/memory
      deletes every drawer, so the intent has to be explicit. */
   wipeMemory: (sessionId: string) =>
-    j<Record<string, unknown>>(
+    j<{ status?: string; result?: Record<string, number> }>(
       `/api/memory?session_id=${encodeURIComponent(sessionId)}&confirm=wipe`,
       { method: 'DELETE' }),
   /* Delete exactly one memory row. Distinct from wipeMemory, which clears every
@@ -576,6 +730,16 @@ export const api = {
   documentDetail: (id: string) =>
     j<{ document?: DocItem; error?: string }>(
       `/api/documents/${encodeURIComponent(id)}`),
+  /** Raw upload bytes for the inline preview. Not `j`: the body is
+      the file itself, not JSON, and the browser's native viewer
+      needs the blob. */
+  documentContent: async (id: string): Promise<Blob> => {
+    const r = await fetch(
+      `/api/documents/${encodeURIComponent(id)}/content`,
+      { headers: headers() });
+    if (!r.ok) throw new Error(await reason(r));
+    return r.blob();
+  },
   uploadDocument: (file: File) => {
     const fd = new FormData();
     fd.append('file', file, file.name);
@@ -621,15 +785,26 @@ export const api = {
     j<{ matches?: CodeMatch[]; count?: number; truncated?: boolean }>(
       `/api/code/search?q=${encodeURIComponent(q)}&limit=${limit}`,
       signal ? { signal } : undefined),
+  /* NOT wrapped in safe(). Every failure came back as null, so a 413 "file too
+     large", a 415 "not UTF-8 text", a 403 "outside the allowed roots" and a
+     dead gateway were all the same dead end to the user: "cannot open
+     <path>". The server already sends a readable reason; let it through. */
   codeFile: (path: string, signal?: AbortSignal) =>
-    safe(j<CodeFile>(`/api/code/file?path=${encodeURIComponent(path)}`,
-      signal ? { signal } : undefined)),
+    j<CodeFile>(`/api/code/file?path=${encodeURIComponent(path)}`,
+      signal ? { signal } : undefined),
   adopt: (sessionId: string) =>
     pj<{ conversation_id?: string; error?: string }>('/api/conversations/adopt', {
       session_id: sessionId,
     }),
-  feedbackGet: (nodeId: string) =>
-    j<{ vote: number }>(`/api/feedback?node_id=${encodeURIComponent(nodeId)}`),
+  /** Node ids are per-run counters (n:1, n:2 …), so a node_id-only
+      lookup returns the latest vote cast on that index in ANY run —
+      a thumbs-down on yesterday's n:3 would color today's n:3.
+      Always pass the session id to scope the read. */
+  feedbackGet: (nodeId: string, sessionId?: string) =>
+    j<{ vote: number }>(
+      `/api/feedback?node_id=${encodeURIComponent(nodeId)}` +
+      `${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ''}`,
+    ),
   /** `skill` is sent so votes can be rolled up per skill. Without it the
       server can only group by node id, and a rollup over pruned runs loses
       the attribution entirely. */
@@ -649,12 +824,32 @@ export const api = {
       `found:false` simply means nothing was running for that id. */
   cancelRun: (ids: { conversation_id?: string; session_id?: string }) =>
     pj<{ status: string; found: boolean; cancelled: number }>('/api/chat/cancel', ids),
+  /** Structured contents of a rendered document: slide cards for a deck,
+   *  page cards for a PDF, a grid for a workbook, paragraphs for a .docx.
+   *  Read from the artifact that was ACTUALLY produced - the run's own
+   *  `sections`/`slides` metadata is model-written and has shipped decks
+   *  whose slides did not exist in the file. */
+  artifactPreview: (artifactId: string) =>
+    j<DocPreview>(`/api/artifact/${encodeURIComponent(artifactId)}/preview`),
+  /** What a run has produced so far. This is how the Authoring view
+   *  reattaches to a run the user walked away from: the run keeps executing
+   *  server-side after the stream closes, so on return we poll this instead
+   *  of having lost the deliverable entirely. */
+  runProduced: (sid: string) =>
+    j<{
+      session_id: string;
+      files: { artifact: string; filename: string; format: string; skill: string }[];
+      answer: string;
+      live: boolean;
+      nodes: { id: string; skill: string; status: string }[];
+    }>(`/api/sessions/${encodeURIComponent(sid)}/produced`),
   safe,
   /** POST /api/chat as an async generator of SSE events.
       Pass an AbortSignal to cancel mid-run (the generator closes the
       reader and stops — callers must also stop their graph polling). */
-  async *chat(query: string, conversationId?: string, signal?: AbortSignal,
-              opts?: { research?: boolean; idempotencyKey?: string }): AsyncGenerator<ChatEvent> {
+async *chat(query: string, conversationId?: string, signal?: AbortSignal,
+               opts?: { research?: boolean; idempotencyKey?: string;
+                        docSetup?: Record<string, unknown> }): AsyncGenerator<ChatEvent> {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
@@ -666,6 +861,9 @@ export const api = {
         // instead of paying for a second identical one.
         research: opts?.research || undefined,
         idempotency_key: opts?.idempotencyKey,
+        /* The setup panel is applied to the render server-side, not merely
+           described in the prompt - see _clean_doc_setup. */
+        doc_setup: opts?.docSetup,
       }),
       signal,
     });
@@ -702,14 +900,50 @@ export const api = {
   },
 };
 
+/** Build the research brief for a depth.
+ *
+ * The depth used to be a polite sentence inside the query ("Keep it
+ * tight…", "Be thorough…"), which the Planner simply overrode: measured
+ * over three runs of the same topic, quick/standard/deep ALL produced
+ * `research_plan.depth = "deep"`, and "quick" produced the LONGEST answer
+ * (7,071 words) because it fanned out to 4 researchers. The button was
+ * decorative.
+ *
+ * Depth is now a HARD budget the Planner is told to respect, with the
+ * worker count spelled out, because that is the only lever that
+ * actually changed the output.
+ */
+const DEPTH_SPEC: Record<string, { workers: number; shape: string }> = {
+  quick: {
+    workers: 1,
+    shape: 'QUICK — this is a single lookup. Emit EXACTLY ONE researcher node '
+      + '(no facets beyond one) and one formatter. One search, one fetch. The '
+      + 'answer must stay a short paragraph plus sources — under ~400 words.',
+  },
+  standard: {
+    workers: 3,
+    shape: 'STANDARD — emit AT MOST 3 researcher nodes (one per facet) and one '
+      + 'formatter. A structured report: Executive Summary, Key Findings, '
+      + 'Sources. Roughly 1,500-2,500 words.',
+  },
+  deep: {
+    workers: 6,
+    shape: 'DEEP — emit as many researcher nodes as the question genuinely needs '
+      + '(up to 6), each scoped to its own facet, and one formatter. Cover '
+      + 'competing views, risks and unknowns, not just the headline. '
+      + 'Several pages is correct here.',
+  },
+};
+
 export function briefFor(topic: string, depth: string): string {
-  const shape =
-    depth === 'quick'
-      ? 'Keep it tight: a short summary with the key points and main sources. One pass only.'
-      : depth === 'deep'
-        ? 'Be thorough: Executive Summary, Key Findings (with evidence), Competing Views, Risks & Unknowns, and a Sources section. Retrieve broadly before concluding.'
-        : 'A structured report: Executive Summary, Key Findings, and Sources. Retrieve before concluding.';
-  return `You are a research agent. Research this topic and deliver a final report as Markdown.\n\nTopic: ${topic}\n\n${shape}\n\nUse web search, memory and any files available. The final message must be the complete report.`;
+  const spec = DEPTH_SPEC[depth] || DEPTH_SPEC.standard;
+  return `You are a research agent. Research this topic and deliver a final report as Markdown.\n\n`
+    + `Topic: ${topic}\n\n`
+    + `RESEARCH DEPTH: ${depth.toUpperCase()}\n`
+    + `${spec.shape}\n\n`
+    + `The depth is a hard budget, not a hint: set research_plan.depth to "${depth}" `
+    + `and do not exceed ${spec.workers} researcher node(s). Use web search, memory `
+    + `and any files available. The final message must be the complete report.`;
 }
 
 export function displayTopic(s: SessionSummary): string {
@@ -727,11 +961,19 @@ export function ago(updatedAgo?: number): string {
 }
 
 export function fmtFire(ts?: number): string {
-  if (!ts) return '—';
+  /* Guard the magnitude too. `if (!ts)` let a stored `when` of
+     9999999999999999999 through: `new Date(NaN)` printed "Invalid Date" and
+     `Math.round(NaN/1440)` rendered "in 115740740740720030d". A fire time
+     further than a year out is corrupt data, not a schedule. */
+  if (!ts || !Number.isFinite(ts) || Math.abs(ts) > 4e9) return '-';
   const d = new Date(ts * 1000);
+  if (Number.isNaN(d.getTime())) return '-';
   const diff = ts * 1000 - Date.now();
   const when = d.toLocaleString();
   if (diff <= 0) return `${when} (due)`;
+  /* Sub-minute granularity is accepted by the scheduler, so `in 20s` used to
+     floor to the nonsense "in 0m". Show seconds below a minute. */
+  if (diff < 60000) return `${when} (in ${Math.max(1, Math.round(diff / 1000))}s)`;
   const m = Math.round(diff / 60000);
   const rel = m < 60 ? `in ${m}m` : m < 1440 ? `in ${Math.round(m / 60)}h` : `in ${Math.round(m / 1440)}d`;
   return `${when} (${rel})`;

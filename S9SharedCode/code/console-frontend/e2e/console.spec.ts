@@ -349,12 +349,20 @@ test('code is syntax highlighted, not flat monospace', async ({ page }) => {
     }
     return [...set];
   });
-  /* flow.py has keywords, builtins, strings, comments and numbers, so all of
+/* flow.py has keywords, builtins, strings, comments and numbers, so all of
      these token classes must be present. One flat colour means the highlighter
-     is not running at all. */
-  for (const cls of ['text-purple-300', 'text-sky-300', 'text-amber-300', 'text-zinc-500']) {
-    expect(kinds, `no ${cls} tokens rendered`).toContain(cls);
-  }
+     is not running at all.
+     The comment token is `text-zinc-muted`, not `text-zinc-500`: the theme's
+     own index.css records that zinc-500 is ~3.9:1 on these panels, which fails
+     WCAG AA at 12.5px, and introduces --color-zinc-muted (5.6:1) to replace
+     it. Comments are the most-read token class in the editor, so this one
+     matters more than the others. */
+    for (const cls of ['text-purple-300', 'text-sky-300', 'text-amber-300', 'text-zinc-muted']) {
+      expect(kinds, `no ${cls} tokens rendered`).toContain(cls);
+    }
+    /* Guard the regression directly: the failing-AA tiers must not come back. */
+    expect(kinds, 'comment tokens are back on a WCAG-failing colour')
+      .not.toContain('text-zinc-500');
 });
 
 /* ── Phase 4: real diagnostics ─────────────────────────────────────────────

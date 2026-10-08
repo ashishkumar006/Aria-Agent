@@ -20,10 +20,15 @@ sys.path.insert(0, str(ROOT))
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _write_turn_costs(session_id: str, entries: list[dict], cost_dir: Path | None = None) -> None:
-    """Write a fake turn_costs.json for a session."""
+    """Write a fake turn_costs.json for a session — through the
+    same path resolver the production writer uses, so the reader
+    finds it (lightweight threads live under threads/, graph
+    sessions under sessions/)."""
     import agent_server as ag
-    base = cost_dir or ag._TURN_COST_DIR
-    p = base / session_id / "turn_costs.json"
+    if cost_dir is not None:
+        p = cost_dir / session_id / "turn_costs.json"
+    else:
+        p = ag._turn_cost_path(session_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
@@ -84,7 +89,8 @@ class TestTurnCostLedger:
 
     def test_corrupt_ledger_returns_empty(self, tmp_path, monkeypatch):
         """A corrupt turn_costs.json must not crash the cost endpoint."""
-        sid = "t-cost-corrupt"
+        # s8-* so the ledger lands under sessions/ like a real run's.
+        sid = "s8-cost-corrupt"
         p = tmp_path / "sessions" / sid / "turn_costs.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("{not valid json", encoding="utf-8")
@@ -125,7 +131,9 @@ class TestCostEndpoint:
             ], cost_dir=tmp_path)
 
         # Mock resolve_session to return our fixed session ids.
-        with mock.patch.object(ag, "resolve_session", lambda cid: f"s8-{cid}"):
+        with mock.patch.object(
+                ag, "resolve_session",
+                lambda cid, create=True: f"s8-{cid}"):
             # conversation_id "aaa" → session s8-aaa
             r_a = asyncio.run(cost_dashboard(conversation_id="aaa"))
             assert r_a["totals"]["dollars"] == pytest.approx(0.1)
@@ -147,7 +155,9 @@ class TestCostEndpoint:
         import agent_server as ag
         monkeypatch.setattr(ag, "_TURN_COST_DIR", tmp_path)
 
-        with mock.patch.object(ag, "resolve_session", return_value="s8-empty"):
+        with mock.patch.object(
+                ag, "resolve_session",
+                return_value="s8-empty"):
             r = asyncio.run(cost_dashboard(conversation_id="empty"))
             assert "rows" in r
             assert "totals" in r

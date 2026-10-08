@@ -3,7 +3,7 @@ import { memo, useEffect, useState, type ReactNode } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import {
   Zap, MessageSquare, Play, Database, Search, CalendarDays, Package,
-  LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2,
+  LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2, FileOutput,
 } from 'lucide-react';
 import { api, CONF } from '../api';
 
@@ -38,6 +38,7 @@ const RAIL: { group: string; items: { to: string; label: string; icon: ReactNode
     { to: '/scheduler', label: 'Scheduler', icon: <CalendarDays size={16} /> },
     { to: '/skills', label: 'Skills', icon: <Package size={16} /> },
     { to: '/code', label: 'Code', icon: <Code2 size={16} /> },
+    { to: '/authoring', label: 'Authoring', icon: <FileOutput size={16} /> },
   ]},
   { group: 'Insight', items: [
     { to: '/apps', label: 'Apps', icon: <LayoutGrid size={16} /> },
@@ -122,6 +123,13 @@ export const Rail = memo(function Rail() {
 });
 
 export const TopBar = memo(function TopBar({ crumb, children }: { crumb: string; children?: ReactNode }) {
+  /* Every view renders a TopBar, so this is the one place that can give each
+     route an identity. `document.title` was the static "Aria · Research" on
+     all fifteen routes, so a screen reader, a bookmark and the browser tab
+     history could not tell you where you were. */
+  useEffect(() => {
+    document.title = `Aria · ${crumb}`;
+  }, [crumb]);
   return (
     /* The control cluster used to be a bare `flex-1` spacer plus siblings, so
        a wide pill row (status + Download + Copy) pushed the header past the
@@ -207,3 +215,23 @@ export const Pill = memo(function Pill({ tone, children }: { tone: 'ok' | 'err' 
     </span>
   );
 });
+
+/* First focusable element on every page: a keyboard or screen-reader
+   user can jump straight to the view content instead of tabbing
+   through the rail and the topbar on all twelve sections. The
+   target is the <main id="main"> each view renders; focusing it
+   directly keeps the SPA router out of the hash. */
+export function SkipLink() {
+  return (
+    <a
+      href="#main"
+      onClick={(e) => {
+        e.preventDefault();
+        document.getElementById('main')?.focus();
+      }}
+      className="sr-only z-[100] focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:rounded-md focus:bg-accent focus:px-3 focus:py-2 focus:text-[12px] focus:font-bold focus:text-[#0b0b0e] focus:outline-none"
+    >
+      Skip to main content
+    </a>
+  );
+}

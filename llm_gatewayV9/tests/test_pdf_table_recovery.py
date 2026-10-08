@@ -169,8 +169,9 @@ def test_parse_pdf_reports_when_tables_cannot_be_recovered(monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", blocked)
-    blocks, warnings = P._pdf_table_blocks(b"%PDF-1.4 fake")
+    blocks, table_pages, warnings = P._pdf_table_blocks(b"%PDF-1.4 fake")
     assert blocks == []
+    assert table_pages == set()
     assert warnings and "pdfplumber" in warnings[0]
 
 
@@ -195,9 +196,9 @@ def test_parse_pdf_keeps_flat_text_when_no_table_is_found(monkeypatch):
 
 
 def test_parse_pdf_prefers_tables_and_flags_that_it_did(monkeypatch):
-    """When tables are recovered the flat pass is skipped: otherwise every
-    cell is indexed twice and retrieval returns the same text from two
-    differently-shaped chunks."""
+    """When tables are recovered the flat pass is skipped for THOSE
+    PAGES: otherwise every cell is indexed twice and retrieval returns
+    the same text from two differently-shaped chunks."""
     calls = {"n": 0}
 
     class _Page:
@@ -218,9 +219,9 @@ def test_parse_pdf_prefers_tables_and_flags_that_it_did(monkeypatch):
                         lambda data: ([P.Block(kind="table",
                                                header=["Day", "Dish"],
                                                rows=[["Monday", "Khichdi"]],
-                                               page=1)], []))
+                                               page=1)], {1}, []))
     res = P.parse("menu.pdf", b"%PDF-1.4 fake")
-    assert res.meta.get("table_only") is True
+    assert res.meta.get("table_pages") == [1]
     assert res.meta.get("tables") == 1
     assert calls["n"] == 0, "flat extraction ran despite tables being found"
     assert res.blocks[0].kind == "table"

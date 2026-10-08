@@ -51,7 +51,7 @@ del _s
 
 from fastapi import FastAPI, Request
 from fastapi.responses import (FileResponse, Response, StreamingResponse,
-                              JSONResponse)
+                              JSONResponse, RedirectResponse)
 
 # ── Live server log (Console page's /api/events "server" source) ──────────
 # /api/events tails logs/agent.out + logs/agent.err, but nothing ever wrote
@@ -207,7 +207,13 @@ async def _api_token_gate(request: Request, call_next):
     if (_API_TOKEN and request.url.path.startswith("/api/")
             and request.url.path != "/api/health"
             and request.headers.get("authorization", "") != f"Bearer {_API_TOKEN}"):
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        # The prefab iframe is a browser navigation — it cannot
+        # carry a header — so its short-lived signed pass is the
+        # door (see _origin_guard for the full reasoning).
+        import auth as _auth
+        if not _auth.valid_prefab_pass(request.url.path,
+                                        request.query_params):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return await call_next(request)
 
 
@@ -242,6 +248,19 @@ async def _origin_guard(request: Request, call_next):
 
     supplied = request.headers.get(_auth.TOKEN_HEADER)
     if not _auth.check_header_value(supplied):
+        # The prefab view is embedded as an <iframe src>,
+        # and a browser navigation cannot carry a custom
+        # header — so with enforcement on, the view 403'd
+        # inside its own frame. The fetch-based pre-flight
+        # passed precisely because a fetch CAN send the
+        # header, which masked this. A short-lived HMAC
+        # query token, minted through the authenticated
+        # API, lets the iframe load without widening the
+        # gate: it is signed with the per-launch token
+        # (unforgeable by a cross-origin page) and
+        # expires within seconds.
+        if _auth.valid_prefab_pass(path, request.query_params):
+            return await call_next(request)
         # 403, not 401: there is no login flow to send the client to, and a
         # 401 invites a credential prompt for a machine-local API.
         return JSONResponse(status_code=403, content={
@@ -279,18 +298,27 @@ def _conv_save(data: dict) -> None:
     _write_json_atomic(_CONV_PATH, data)
 
 
-def resolve_session(conversation_id: str | None) -> str:
-    """Return the session_id for a conversation, creating one if needed."""
+def resolve_session(conversation_id: str | None, *,
+                    create: bool = True) -> str | None:
+    """Return the session_id for a conversation, creating one if needed.
+
+    `create=False` is the read-only form for GET paths: an unknown id
+    returns None instead of minting a permanent phantom entry in
+    conversations.json. Nothing prunes that map, and a typo'd id from
+    a bookmarked URL used to spawn an entry on every page load."""
     import uuid as _uuid
     if not conversation_id:
         return f"s8-{_uuid.uuid4().hex[:8]}"
     with _CONV_LOCK:
         data = _conv_load()
         sid = data.get(conversation_id)
-        if not sid:
-            sid = f"s8-{_uuid.uuid4().hex[:8]}"
-            data[conversation_id] = sid
-            _conv_save(data)
+        if sid:
+            return sid
+        if not create:
+            return None
+        sid = f"s8-{_uuid.uuid4().hex[:8]}"
+        data[conversation_id] = sid
+        _conv_save(data)
         return sid
 
 
@@ -303,16 +331,53 @@ def resolve_session(conversation_id: str | None) -> str:
 # failure is swallowed.
 _NOTIFY_CHAT = os.environ.get("AGENT_NOTIFY_CHAT_ID")
 _GW_NOTIFY = os.environ.get("LLM_GATEWAY_V9_URL", "http://localhost:8109").rstrip("/")
+# Resolved destination, cached briefly. Resolving costs a loopback call, and
+# the answer only changes when someone pairs a new chat.
+_NOTIFY_RESOLVED: tuple[str, bool, float] | None = None   # (chat, ok, at)
+_NOTIFY_TTL_S = 60.0
 
 
-def _notify_telegram(text: str) -> None:
-    if not _NOTIFY_CHAT:
+def resolve_notify_chat(channel: str = "telegram") -> str:
+    """Where a notification should go, without a second env var to set.
+
+    This used to require BOTH `AGENT_NOTIFY_CHAT_ID` and an opt-in flag, and
+    the pairing store the gateway already keeps was not reachable from here at
+    all - it is written by an inbound message and read back masked. So a
+    reminder with a bot token configured had nowhere to go and failed
+    silently, which is the worst possible failure for a reminder.
+
+    Order: an explicit id wins, then the gateway's paired chat for the
+    channel. Cached, because a fire should not wait on the gateway.
+    """
+    global _NOTIFY_RESOLVED
+    if _NOTIFY_CHAT:
+        return _NOTIFY_CHAT
+    now = _time.time()
+    if _NOTIFY_RESOLVED and (now - _NOTIFY_RESOLVED[2]) < _NOTIFY_TTL_S:
+        return _NOTIFY_RESOLVED[0]
+    chat = ""
+    try:
+        import httpx as _hx
+        with _hx.Client(timeout=8.0, headers=_gw_auth_headers()) as c:
+            r = c.get(f"{_GW_NOTIFY}/v1/control/notify-target",
+                      params={"channel": channel})
+            if r.status_code == 200:
+                chat = str((r.json() or {}).get("target") or "")
+    except Exception:
+        chat = ""
+    _NOTIFY_RESOLVED = (chat, bool(chat), now)
+    return chat
+
+
+def _notify_telegram(text: str, chat: str | None = None) -> None:
+    to = chat if chat is not None else resolve_notify_chat()
+    if not to:
         return
     try:
         import httpx as _hx
         _hx.post(
             f"{_GW_NOTIFY}/v1/channels/telegram/send",
-            json={"to": _NOTIFY_CHAT, "text": text[:4096],
+            json={"to": to, "text": text[:4096],
                   "agent": "notify"},
             timeout=15,
         )
@@ -321,29 +386,44 @@ def _notify_telegram(text: str) -> None:
 
 
 def notify_task_done(query: str, answer: str, cost: float,
-                     session_id: str) -> None:
-    """Push a completion notification to Telegram (opt-in ONLY).
+                     session_id: str, *, scheduled: bool = False) -> None:
+    """Send a Telegram summary of a finished run.
 
-    DISABLED by default. Set AGENT_TELEGRAM_NOTIFY=true to receive a
-    Telegram summary after each agent response / scheduled task. Without
-    the explicit opt-in, no message is sent. (Previously it fired on every
-    chat response whenever TELEGRAM_BOT_TOKEN was set, which was noisy.)
+    `scheduled=True` (a fired reminder) notifies whenever a destination
+    exists, with no opt-in flag. A reminder that is silent by default is not a
+    reminder, and this path used to fail silently in exactly that way: two env
+    vars had to be set on the agent, and a destination could not be resolved
+    from the pairing the gateway already held.
+
+    `scheduled=False` (an ordinary chat response) stays opt-in behind
+    AGENT_TELEGRAM_NOTIFY, because a Telegram ping for every conversational
+    reply is noise - that was the earlier behaviour and it was removed.
+
+    Either way the in-app notification feed is written, so there is always
+    somewhere the result is recorded even if Telegram is unreachable.
 
     `cost` is the wall-clock time of the run in seconds (named `cost` for
     backwards-compat with the public API / wiring check)."""
-    if os.environ.get("AGENT_TELEGRAM_NOTIFY", "").lower() != "true":
+    if not scheduled and os.environ.get(
+            "AGENT_TELEGRAM_NOTIFY", "").lower() != "true":
         return
-    if not _NOTIFY_CHAT:
+    chat = resolve_notify_chat()
+    if not chat:
+        _notif_add("scheduled", f"scheduled task finished but no "
+                                  f"notification destination is paired: "
+                                  f"{query[:120]}")
         return
     snippet = (answer or "").strip().replace("\n", " ")
     snippet = snippet[:280] + ("…" if len(snippet) > 280 else "")
+    headline = "Reminder" if scheduled else "Agent task complete"
     msg = (
-        f"OK Agent task complete\n"
-        f"time± {cost:.1f}s · session {session_id}\n"
+        f"✅ {headline}\n"
+        f"time ± {cost:.1f}s · session {session_id}\n"
         f"query {query[:120]}\n"
         f"🎙 {snippet}"
     )
-    threading.Thread(target=_notify_telegram, args=(msg,), daemon=True).start()
+    threading.Thread(target=_notify_telegram, args=(msg, chat),
+                     daemon=True).start()
 
 
 # ── notification log (in-memory + on-disk) ──────────────────────────────────
@@ -357,6 +437,19 @@ _NOTIF_MAX = 200
 
 def _notif_load() -> list:
     return _read_json(_NOTIF_PATH, list)
+
+
+def _notif_add(kind: str, text: str, session_id: str = "") -> dict:
+    """Record a run outcome. Defined before `notify_task_done` uses it.
+
+    This is the zero-configuration half of a reminder: it always records, so
+    a fired task is visible in the app even when Telegram is unconfigured or
+    unreachable.
+    """
+    try:
+        return add_notification(kind, text, session_id)
+    except Exception:
+        return {}
 
 
 def _notif_save(items: list) -> None:
@@ -635,8 +728,13 @@ async def mcp_stats():
 
 
 @app.get("/api/feedback")
-async def get_feedback(node_id: str):
-    """Latest thumbs vote for a node (1 | -1 | 0 when none)."""
+async def get_feedback(node_id: str, session_id: str = ""):
+    """Latest thumbs vote for a node (1 | -1 | 0 when none).
+
+    Node ids are per-run counters (n:1, n:2 …), so a node_id-only
+    match returns the latest vote cast on that index in ANY run —
+    a thumbs-down on yesterday's n:3 colored today's n:3. The POST
+    already stores session_id; scope the lookup when it is given."""
     try:
         path = STATE_DIR / "feedback.jsonl"
         if not path.exists():
@@ -647,8 +745,11 @@ async def get_feedback(node_id: str):
                 e = json.loads(line)
             except Exception:
                 continue
-            if e.get("node_id") == node_id:
-                vote = int(e.get("vote") or 0)
+            if e.get("node_id") != node_id:
+                continue
+            if session_id and e.get("session_id") != session_id:
+                continue
+            vote = int(e.get("vote") or 0)
         return {"node_id": node_id, "vote": vote}
     except Exception:
         return {"node_id": node_id, "vote": 0}
@@ -663,10 +764,21 @@ async def post_feedback(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    nid = (body.get("node_id") or "").strip()
-    try:
-        vote = int(body.get("vote") or 0)
-    except Exception:
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    nid = _body_str(body, "node_id")
+    if nid is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "node_id must be a string"})
+    raw_vote = body.get("vote")
+    # Strict: an int (or a JSON bool, where true=up) is a vote;
+    # "1", 1.9 and null used to be silently coerced and written.
+    if isinstance(raw_vote, bool):
+        vote = 1 if raw_vote else -1
+    elif isinstance(raw_vote, int):
+        vote = raw_vote
+    else:
         vote = 0
     if not nid or vote not in (1, -1):
         return JSONResponse(status_code=400, content={"error": "need node_id + vote 1|-1"})
@@ -865,6 +977,33 @@ def _fold_log_block(lines: list[str]) -> list[tuple[str, int]]:
     return out
 
 
+def _scrub_log_line(line: str) -> str:
+    """Remove server internals from a log line before it leaves the process.
+
+    Keeps the exception type and its message (what an operator acts on);
+    drops file paths (`File "C:\\..."`), frame internals (`in run_asgi`,
+    `+61 lines in the log` stays - it says where to look, locally), and
+    anything that looks like a local address. A traceback that reaches a
+    browser is an information leak and a confusing error in one.
+    """
+    import re as _r
+    s = str(line or "")
+    # Windows/posix paths with a drive or home dir.
+    s = _r.sub(r"[A-Za-z]:\\[^\s\"']*", "<path>", s)
+    s = _r.sub(r"/home/[^\s\"']*", "<path>", s)
+    s = _r.sub(r"/Users/[^\s\"']*", "<path>", s)
+    s = _r.sub(r"C:\\\\Users\\\\[^\\s\"']*", "<path>", s)
+    # Python frame headers: keep the exception line, drop the frames.
+    s = _r.sub(r'File "<path>", line \d+, in \S+', "", s)
+    s = _r.sub(r'File "[^"]*", line \d+, in \S+', "", s)
+    # Local network addresses.
+    s = _r.sub(r"127\.0\.0\.1(:\d+)?", "<loopback>", s)
+    s = _r.sub(r"localhost(:\d+)?", "<loopback>", s)
+    # Collapse the whitespace the removals leave behind.
+    s = _r.sub(r"[ \t]{2,}", " ", s).strip(" |,;")
+    return s[:300] if s else "(server error; see local logs)"
+
+
 @app.get("/api/events")
 async def api_events(limit: int = 200, level: str = "all", since: float = 0):
     """Mission-console feed: recent run sessions + scheduler jobs + server
@@ -880,16 +1019,32 @@ async def api_events(limit: int = 200, level: str = "all", since: float = 0):
             t = float(t or 0)
         except Exception:
             t = 0
+        iso = (_dt.fromtimestamp(t).strftime("%H:%M:%S")
+               if t > 0 else "—")
         if t <= 0:
-            t = _t.time()
+            # An unreadable timestamp (a session with no graph.json, a
+            # corrupt next_fire) used to be stamped "now", pinning the
+            # entry to the TOP of the feed indefinitely. Unknown is
+            # not recent — sort it with the oldest.
+            t = 1.0
         evs.append({"t": t,
-                    "iso": _dt.fromtimestamp(t).strftime("%H:%M:%S"),
+                    "iso": iso,
                     "level": lv, "src": src, "msg": str(msg)[:300]})
 
-    # 1. run sessions (newest first)
+    # 1. run sessions (newest first). Session ids are s8-<random hex>,
+    # so reversed-LEXICOGRAPHIC order is unrelated to recency — the
+    # same bug /api/sessions already fixed (see its comment); this
+    # feed was missed and showed a pseudo-random 40-session subset.
+    from persistence import SESSIONS_ROOT as _SESS_ROOT
+    def _sid_mtime(s: str) -> float:
+        try:
+            return (_SESS_ROOT / s).stat().st_mtime
+        except OSError:
+            return 0.0
     try:
         from persistence import SessionStore, list_sessions as _list_sids
-        for sid in list(reversed(_list_sids()))[:40]:
+        for sid in sorted(_list_sids(), key=_sid_mtime,
+                          reverse=True)[:40]:
             try:
                 store = SessionStore(sid)
                 q = ""
@@ -912,24 +1067,38 @@ async def api_events(limit: int = 200, level: str = "all", since: float = 0):
                 lv = "run"
                 if any(k in statuses for k in ("error", "failed")):
                     lv = "err"
+                _bits = ", ".join(f"{v}→{k}"
+                                  for k, v in sorted(statuses.items()))
                 _push(mt, lv, f"run·{sid[:8]}",
-                      f"{q or '(no query)'} — " +
-                      ", ".join(f"{v}→{k}" for k, v in sorted(statuses.items())) or "no nodes")
+                      f"{q or '(no query)'} — {_bits}"
+                      if _bits else f"{q or '(no query)'} — no nodes")
             except Exception:
                 continue
     except Exception:
         pass
 
-    # 2. scheduler jobs (next firing)
+    # 2. scheduler jobs (next firing), capped at 40 and sorted by
+    # firing time. Every armed job was pushed uncapped, so with many
+    # armed jobs the newest-200 window filled with sched lines and
+    # run/error events silently dropped out of the feed. A corrupt
+    # next_fire sorts last and renders as "—", not as "now".
     try:
         _sched = json.loads((STATE_DIR / "schedules.json").read_text(encoding="utf-8-sig"))
         _items = _sched.values() if isinstance(_sched, dict) else _sched
+        _armed: list[tuple[float, dict]] = []
         for j in _items:
-            if not isinstance(j, dict):
+            if not isinstance(j, dict) or not j.get("enabled", True):
                 continue
-            if j.get("enabled", True):
-                _push(j.get("next_fire") or 0, "sched", "scheduler",
-                      f"next: {(j.get('query') or '')[:120]} ({j.get('when') or j.get('recurring') or '?'})")
+            try:
+                _armed.append((float(j.get("next_fire") or 0), j))
+            except (TypeError, ValueError):
+                _armed.append((float("inf"), j))
+        _armed.sort(key=lambda pair: pair[0])
+        for _fire, j in _armed[:40]:
+            _push(0 if _fire == float("inf") else _fire, "sched",
+                  "scheduler",
+                  f"next: {(j.get('query') or '')[:120]} "
+                  f"({j.get('when') or j.get('recurring') or '?'})")
     except Exception:
         pass
 
@@ -962,6 +1131,13 @@ async def api_events(limit: int = 200, level: str = "all", since: float = 0):
                     _l = "tool"
                 else:
                     _l = "info"
+                # Scrub server internals before serving. Raw log lines carry
+                # file paths, frame names and full tracebacks - a probe
+                # captured `Traceback (most recent call last): |
+                # RuntimeError: No response returned (+61 lines)` straight from
+                # this feed. Keep the exception TYPE (that is what an operator
+                # acts on) and drop everything that names where we live.
+                _ln = _scrub_log_line(_ln)
                 _push(_mt - (len(_lines) - _i) * 0.01, _l,
                       "server", _ln)
         except Exception:
@@ -997,6 +1173,234 @@ async def browser_artifact(session_id: str, path: str):
     if not target.is_file():
         return JSONResponse(status_code=404, content={"error": "not found"})
     return FileResponse(str(target))
+
+
+@app.post("/api/doc/preview")
+async def api_doc_preview(request: Request):
+    """Show the DOCUMENT in the console, not a description of it.
+
+    Two callers, one route:
+      * the setup panel, posting the spec the user is currently choosing -
+        so switching page size or style re-renders the page immediately,
+        before any model call is spent;
+      * the result pane, posting the delivered `artifact` id - so the preview
+        is rasterised from the exact bytes the download button returns.
+
+    Proxying rather than rendering here keeps one implementation: the
+    gateway owns the generators, so it owns the preview of them.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400,
+                            content={"error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be an object"})
+    art = str(body.get("artifact") or "")
+    if art:
+        import re as _re3
+        if not _re3.fullmatch(r"art:[0-9a-fA-F]{16}", art):
+            return JSONResponse(status_code=400,
+                                content={"error": "malformed artifact id"})
+    import httpx as _hx
+    try:
+        import gateway as _gwmod
+        base = _gwmod.GATEWAY_URL
+    except Exception:
+        base = _GW_NOTIFY
+    # Previewing a DELIVERED file means previewing its exact bytes, and this
+    # process is the artifact store. So the bytes travel with the request
+    # rather than the gateway guessing from a spec it never saw.
+    art = str(body.get("artifact") or "")
+    if art and not body.get("blob_b64"):
+        import base64 as _b64
+        import artifacts as _arts
+        try:
+            body = dict(body)
+            body["blob_b64"] = _b64.b64encode(_arts.get_bytes(art)).decode()
+            if not body.get("format"):
+                meta = _arts.get_meta(art)
+                _c = getattr(meta, "content_type", "") or ""
+                body["format"] = {
+                    "application/pdf": "pdf",
+                    "application/vnd.openxmlformats-officedocument."
+                    "presentationml.presentation": "pptx",
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document": "docx",
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet": "xlsx"}.get(_c, "")
+        except Exception as e:
+            return JSONResponse(status_code=404, content={
+                "error": f"artifact unavailable: {type(e).__name__}"})
+    try:
+        with _hx.Client(timeout=120, follow_redirects=True,
+                        headers=_gw_auth_headers()) as c:
+            r = c.post(f"{base}/v1/docgen/preview", json=body)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={
+            "error": f"preview unreachable: {type(e).__name__}: {e}"[:200]})
+    if r.status_code >= 400:
+        try:
+            detail = r.json().get("error") or r.text[:200]
+        except Exception:
+            detail = r.text[:200]
+        return JSONResponse(status_code=r.status_code,
+                            content={"error": str(detail)[:300]})
+    return Response(content=r.content, media_type="application/json")
+
+
+@app.get("/api/artifact/{artifact_id}")
+async def get_artifact(artifact_id: str, download: int = 1):
+    """Fetch a stored artifact (a rendered document, a fetched page).
+
+    `artifacts.put` is content-addressed, so the handle in a run's output is
+    stable and safe to hand back to the browser. `download=1` sends it as an
+    attachment with the descriptor-derived filename; `download=0` serves it
+    inline for previewing."""
+    import re as _re
+    if not _re.match(r"^art:[0-9a-fA-F]{16}$", artifact_id or ""):
+        return JSONResponse(status_code=400, content={"error": "malformed artifact id"})
+    import artifacts as _arts
+    try:
+        data = _arts.get_bytes(artifact_id)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"error": "no such artifact"})
+    try:
+        meta = _arts.get_meta(artifact_id)
+        ctype = meta.content_type or "application/octet-stream"
+        desc = (getattr(meta, "descriptor", "") or "").strip()
+    except Exception:
+        ctype, desc = "application/octet-stream", ""
+    headers = {"X-Artifact-Bytes": str(len(data))}
+    ext = {"application/pdf": ".pdf",
+           "application/vnd.openxmlformats-officedocument."
+           "presentationml.presentation": ".pptx",
+           "application/vnd.openxmlformats-officedocument."
+           "wordprocessingml.document": ".docx",
+           "application/vnd.openxmlformats-officedocument."
+           "spreadsheetml.sheet": ".xlsx"}.get(ctype, "")
+    if download:
+        # Build a header-safe filename. The descriptor is agent-written free
+        # text — parentheses, colons, quotes and non-ASCII in it produced a
+        # Content-Disposition Chrome refuses, and the download silently
+        # CANCELLED instead of failing loudly.
+        import re as _re2
+        from urllib.parse import quote as _quote
+        raw = (desc or "").split("(")[0].strip() or artifact_id.replace(":", "")
+        # `filename*` is what Chrome and Firefox actually use, and it was
+        # being built from `raw` — which has the extension stripped off by the
+        # `split("(")` above and often has none to begin with. Every direct
+        # save therefore landed as a file with NO extension, even though the
+        # response's content-type was application/pdf. Append the extension
+        # from the content type, unconditionally, before quoting.
+        if ext and not raw.lower().endswith(ext.lower()):
+            raw = raw + ext
+        # RFC 5987 for anything non-ASCII; ASCII fallback is stripped to
+        # characters that are legal inside a quoted-string.
+        ascii_name = _re2.sub(r"[^A-Za-z0-9 ._-]+", " ", raw)
+        ascii_name = _re2.sub(r"\s+", " ", ascii_name).strip(" .") or "document"
+        # Test the EXTENSION, not the first period: a title like
+        # "PostgreSQL vs. MySQL" contains a period, so `if "." not in name`
+        # was False and the file downloaded with no extension at all.
+        if ext and not ascii_name.lower().endswith(ext.lower()):
+            ascii_name += ext
+        headers["Content-Disposition"] = (
+            f"attachment; filename=\"{ascii_name}\"; "
+            f"filename*=UTF-8''{_quote(raw)}")
+    return Response(content=data, media_type=ctype, headers=headers)
+
+
+_SETTLED = ("complete", "completed", "failed", "error", "skipped")
+
+
+def _run_is_live(statuses: list[str]) -> bool:
+    """Is work still in flight for this session?
+
+    A `pending` node on its own does NOT mean work is in flight. A retry loop
+    that gives up abandons a formatter node and it stays `pending` forever, so
+    deriving `live` from `pending` alone wedged `live: true` on runs that had
+    already finished and already had their file: the client then polled for 30
+    minutes and never adopted a document that was sitting there waiting. Work
+    is live while a node is `running`/`queued`, or while nothing has settled
+    yet and a node is still waiting to start.
+    """
+    s = [str(x or "").lower() for x in statuses]
+    if any(x in ("running", "queued") for x in s):
+        return True
+    if any(x in _SETTLED for x in s):
+        return False
+    return any(x == "pending" for x in s)
+
+
+@app.get("/api/sessions/{session_id}/produced")
+async def session_produced(session_id: str):
+    """What a run has produced SO FAR: rendered files, the final answer and
+    whether it is still going.
+
+    The Authoring view needs this to REATTACH to a run the user walked away
+    from. A research/authoring run keeps executing server-side after the
+    browser closes the stream, and the console showed nothing at all on
+    return - the whole run, including a finished file, was unrecoverable from
+    that view. This is the poll target that makes "leave it running" real.
+    """
+    from persistence import SessionStore
+    try:
+        store = SessionStore(session_id, create=False)
+        g = store.read_graph()
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "invalid session_id"})
+    except Exception:
+        g = None
+    if g is None:
+        return JSONResponse(status_code=404, content={"error": "no such session"})
+    from flow import take_produced_files
+    files = take_produced_files(session_id)
+    live = _run_is_live([str(d.get("status", "")) for _, d in g.nodes(data=True)])
+    # The final answer, once a formatter has produced one.
+    answer = ""
+    for _, d in reversed(list(g.nodes(data=True))):
+        out = getattr(d.get("result"), "output", None)
+        if isinstance(out, dict) and isinstance(out.get("final_answer"), str):
+            answer = out["final_answer"]
+            break
+    return {"session_id": session_id, "files": files, "answer": answer,
+            "live": live,
+            "nodes": [{"id": nid, "skill": d.get("skill", ""),
+                       "status": d.get("status", "")}
+                      for nid, d in g.nodes(data=True)]}
+
+
+@app.get("/api/artifact/{artifact_id}/preview")
+async def preview_artifact(artifact_id: str):
+    """Describe a rendered document's actual contents, for the console's
+    preview pane.
+
+    The run's own `sections`/`slides` metadata is model-written and was
+    repeatedly wrong — a deck reported 10 slide titles and shipped a file
+    with 6 completely empty slides. Reading the artifact is the only honest
+    source, and it lets the UI warn about an empty workbook or a deck of
+    blank slides BEFORE the user downloads and opens it.
+    """
+    import re as _re
+    if not _re.match(r"^art:[0-9a-fA-F]{16}$", artifact_id or ""):
+        return JSONResponse(status_code=400, content={"error": "malformed artifact id"})
+    import artifacts as _arts
+    try:
+        data = _arts.get_bytes(artifact_id)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"error": "no such artifact"})
+    try:
+        ctype = (_arts.get_meta(artifact_id).content_type
+                 or "application/octet-stream")
+    except Exception:
+        ctype = "application/octet-stream"
+    import docpreview as _dp
+    return _dp.preview(data, ctype)
 
 
 # ── health ──────────────────────────────────────────────────────────────────
@@ -1079,21 +1483,49 @@ async def cost_dashboard(session: str | None = None, agent: str | None = None,
     # Chat threads (ct-*) ARE already their own gateway session and keep
     # their ledger under threads/ — routing them through resolve_session
     # would mint a phantom s8 id in conversations.json with no run behind it.
+    # create=False: this is a GET, so an unknown id must NOT mint a
+    # phantom conversations.json entry (a typo'd id from a bookmarked
+    # URL used to spawn one on every page load, forever).
+    unknown_conv = False
     if conversation_id:
-        session = (conversation_id if conversation_id.startswith("ct-")
-                   else resolve_session(conversation_id))
+        if conversation_id.startswith("ct-"):
+            session = conversation_id
+        else:
+            session = resolve_session(conversation_id, create=False)
+            if session is None and conversation_id in _chat_threads_load():
+                # A stored lightweight thread (AG-UI thread ids,
+                # client-chosen ids) keeps its ledger under
+                # threads/ — /api/cost/by_skill reads it there,
+                # so the two panels disagreed for the same
+                # conversation (one showed spend, the other
+                # "unknown"). Read it here too.
+                session = conversation_id
+        if not session:
+            unknown_conv = True
     if not session:
         return {"rows": [], "totals": {"in_tokens": 0, "out_tokens": 0,
-                                       "dollars": 0.0, "calls": 0}}
+                                       "dollars": 0.0, "calls": 0},
+                "unknown_conversation": unknown_conv}
 
-    turns = _read_turn_costs(session)
+    try:
+        turns = _read_turn_costs(session)
+    except ValueError:
+        # The bare `session` query param bypasses the
+        # conversation_id resolution above, so a path-shaped value
+        # reached `_turn_cost_path` unvalidated and its ValueError
+        # surfaced as a bare 500 on a panel the UI polls.
+        return JSONResponse(status_code=400,
+                            content={"error": "invalid session id"})
     if conversation_id and conversation_id != session:
         # Merge the thread's own ledger when it differs from the resolved
-        # session, so the panel isn't blank for chat-only threads. Only
-        # ct-* threads have their own ledger file: c-* conversations resolve
-        # to s8-* (already read above), and reading sessions/c-*/… would be
-        # a phantom path that can never exist.
-        if conversation_id.startswith("ct-"):
+        # session, so the panel isn't blank for chat-only threads.
+        # Lightweight threads keep their ledger under threads/: ct-* chat
+        # threads and AG-UI thread ids (agui-*, client uuids). A c-*
+        # conversation resolves to s8-* (already read above), and reading
+        # sessions/c-*/… would be a phantom path that can never exist —
+        # so merge only ids that are stored chat threads.
+        if (conversation_id.startswith("ct-")
+                or conversation_id in _chat_threads_load()):
             turns = turns + _read_turn_costs(conversation_id)
             turns.sort(key=lambda _e: _e.get("ts", 0) if isinstance(_e, dict) else 0)
     if not turns:
@@ -1141,6 +1573,125 @@ async def cost_dashboard(session: str | None = None, agent: str | None = None,
             "dollars": round(tot_usd, 6),
             "calls": tot_calls,
         },
+        "unknown_conversation": unknown_conv,
+    }
+
+
+_FAILURE_REASONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Ordered most-specific first: the first pattern that matches wins, so a
+    # message naming two things is filed under the one that actually stopped
+    # the node.
+    ("reply not parseable as the required JSON (empty or prose)",
+     ("no usable json",)),
+    ("claimed a document but never called render_document",
+     ("without calling render_document", "no file was rendered",
+      "never called render_document")),
+    ("tool-use hop cap reached", ("hop cap",)),
+    ("verifier stall: identical tool call repeated", ("verifier stall",)),
+    ("MCP unavailable / circuit breaker open",
+     ("mcpunavailable", "breaker")),
+    ("timed out", ("timed out", "timeout")),
+    ("gateway refused or unavailable",
+     ("connecterror", "connection refused", "502", "503")),
+)
+
+
+def _classify_node_failure(err: str) -> str:
+    """One honest line per failure, so the Ledger can group them.
+
+    Free-text errors are useless in aggregate: 65 author failures looked like
+    65 separate problems until they were bucketed, and they were three.
+    """
+    e = (err or "").lower()
+    for label, needles in _FAILURE_REASONS:
+        if any(n in e for n in needles):
+            return label
+    head = " ".join(str(err or "").split())[:70]
+    return head or "(no error text)"
+
+
+@app.get("/api/nodes/health")
+async def nodes_health(limit: int = 200, conversation_id: str | None = None):
+    """Node reliability by skill: how many failed, why, and what share of that
+    skill's nodes that is.
+
+    The Ledger showed spend but nothing about reliability, so a run that lost a
+    researcher and one that lost three looked identical. `limit` bounds how
+    many session graphs are parsed, because each row is a whole graph.json.
+    """
+    limit = max(1, min(int(limit or 200), 500))
+    from persistence import SessionStore, SESSIONS_ROOT as _SESS_ROOT
+    from persistence import list_sessions as persistence_list_sids
+    sids: list[str] = []
+    if conversation_id:
+        convs = _conv_load()
+        inv = {v: k for k, v in convs.items()}
+        sid = inv.get(conversation_id) or conversation_id
+        if sid and (_SESS_ROOT / sid).is_dir():
+            sids = [sid]
+    else:
+        def _mtime(sid: str) -> float:
+            try:
+                return (_SESS_ROOT / sid).stat().st_mtime
+            except OSError:
+                return 0.0
+        sids = sorted(persistence_list_sids(), key=_mtime, reverse=True)[:limit]
+
+    per: dict[str, dict] = {}
+    for sid in sids:
+        try:
+            g = SessionStore(sid, create=False).read_graph()
+        except Exception:
+            continue
+        if g is None:
+            continue
+        nodes = getattr(g, "nodes", None)
+        try:
+            items = list(nodes(data=True)) if callable(nodes) else list(nodes)
+        except Exception:
+            continue
+        for _nid, d in items:
+            skill = str(d.get("skill") or "?")
+            slot = per.setdefault(skill, {
+                "skill": skill, "nodes": 0, "failed": 0, "skipped": 0,
+                "reasons": {},
+            })
+            slot["nodes"] += 1
+            st = str(d.get("status") or "").lower()
+            if st == "skipped":
+                slot["skipped"] += 1
+            if st in ("failed", "error"):
+                slot["failed"] += 1
+                res = d.get("result")
+                reason = _classify_node_failure(
+                    getattr(res, "error", "") if res is not None else "")
+                slot["reasons"][reason] = slot["reasons"].get(reason, 0) + 1
+
+    rows = []
+    for slot in per.values():
+        n = slot["nodes"] or 1
+        failed = slot["failed"]
+        reasons = sorted(
+            ({"reason": k, "count": v,
+              "pct_of_failures": round(v / max(1, failed) * 100, 1)}
+             for k, v in slot["reasons"].items()),
+            key=lambda r: -r["count"])
+        rows.append({
+            **slot,
+            "fail_pct": round(failed / n * 100, 1),
+            "reasons": reasons,
+        })
+    rows.sort(key=lambda r: (-r["fail_pct"], -r["nodes"]))
+    return {
+        "sessions": len(sids),
+        "rows": rows,
+        "totals": {
+            "nodes": sum(r["nodes"] for r in rows),
+            "failed": sum(r["failed"] for r in rows),
+            "fail_pct": round(
+                sum(r["failed"] for r in rows)
+                / max(1, sum(r["nodes"] for r in rows)) * 100, 1),
+        },
     }
 
 
@@ -1149,12 +1700,20 @@ async def cost_by_skill(conversation_id: str | None = None):
     """Per-skill spend rollup for the Ledger page. Scoped to one conversation
     when given, else summed across all sessions' turn ledgers."""
     sids: list[str] = []
+    unknown_conv = False
     if conversation_id:
         try:
             # ct-* threads have no graph session to resolve — resolve_session
             # would only mint a phantom s8 id. They are keyed directly below.
+            # create=False: a GET must not mint a phantom conversations.json
+            # entry for an unknown id (a bookmarked typo used to spawn one
+            # per page load, forever).
             if not conversation_id.startswith("ct-"):
-                sids = [resolve_session(conversation_id)]
+                sid = resolve_session(conversation_id, create=False)
+                if sid is None:
+                    unknown_conv = True
+                else:
+                    sids = [sid]
         except Exception:
             sids = []
     else:
@@ -1167,6 +1726,15 @@ async def cost_by_skill(conversation_id: str | None = None):
     # Lightweight chat threads (ct-*) keep a ledger under threads/ (no graph
     # dir). Include them, or the Ledger silently omits the default chat path.
     keys = list(sids)
+    if conversation_id:
+        # A path-shaped id (or a null byte in one) makes
+        # `_turn_cost_path` raise ValueError, which used to 500 the
+        # whole rollup. Refuse it plainly instead.
+        try:
+            _turn_cost_path(conversation_id)
+        except ValueError:
+            return JSONResponse(status_code=400, content={
+                "error": "invalid conversation id"})
     try:
         if conversation_id:
             if conversation_id not in keys:
@@ -1178,7 +1746,14 @@ async def cost_by_skill(conversation_id: str | None = None):
     except Exception:
         pass
     for _sid in keys:
-        for _t in _read_turn_costs(_sid):
+        try:
+            _turns = _read_turn_costs(_sid)
+        except ValueError:
+            # A stored key that fails the shape check (pollution from
+            # before the boundary validation) must not 500 every
+            # ledger read — skip it.
+            continue
+        for _t in _turns:
             for _ag, _d in (_t.get("per_agent") or {}).items():
                 _a = agg.setdefault(_ag, {"usd": 0.0, "in_tok": 0,
                                           "out_tok": 0, "calls": 0})
@@ -1190,9 +1765,39 @@ async def cost_by_skill(conversation_id: str | None = None):
              "dollars": round(d["usd"], 6), "calls": d["calls"]}
             for ag, d in agg.items()]
     rows.sort(key=lambda x: x["dollars"], reverse=True)
+    # Research runs bill through the gateway's per-session totals, not
+    # this turn ledger: a DAG run's spend only lands in
+    # sessions/<sid>/turn_costs.json when the run finishes cleanly, so a
+    # completed research conversation reported $0 / "No spend yet" here
+    # while /api/cost showed real tokens. Same one-shot fallback
+    # /api/cost uses. Scoped requests only — an all-time rollup must not
+    # call the gateway once per session.
+    if not agg and conversation_id:
+        try:
+            _sid = resolve_session(conversation_id, create=False)
+        except Exception:
+            _sid = None
+        if _sid:
+            try:
+                bd = _session_cost_breakdown(_sid)
+                for _ag, _d in (bd or {}).items():
+                    agg[_ag] = {"usd": _d.get("usd", 0.0) or 0.0,
+                                "in_tok": _d.get("in_tok", 0) or 0,
+                                "out_tok": _d.get("out_tok", 0) or 0,
+                                "calls": _d.get("calls", 0) or 0}
+            except Exception:
+                pass
     turns = []
     for _sid in keys[:200]:
-        for _t in _read_turn_costs(_sid)[-50:]:
+        # Same guard as the rows loop above. Without it a single
+        # path-shaped key in chat_threads.json (a stored conversation
+        # id like "../..") raised ValueError out of _turn_cost_path and
+        # 500'd the whole all-time rollup on every 15s poll.
+        try:
+            _sid_turns = _read_turn_costs(_sid)
+        except ValueError:
+            continue
+        for _t in _sid_turns[-50:]:
             _tt = _t.get("totals") or {}
             turns.append({"ts": _t.get("ts", 0), "session": _sid,
                           "query": (_t.get("query") or "")[:120],
@@ -1201,6 +1806,7 @@ async def cost_by_skill(conversation_id: str | None = None):
     turns.sort(key=lambda x: x["ts"], reverse=True)
     return {"rows": rows,
             "turns": turns[:200],
+            "unknown_conversation": unknown_conv,
             "totals": {"dollars": round(sum(r["dollars"] for r in rows), 6),
                        "calls": sum(r["calls"] for r in rows),
                        "skills": len(rows)}}
@@ -1413,17 +2019,34 @@ async def list_sessions(limit: int = 100):
             if status_counts:
                 n_nodes = max(n_nodes, sum(status_counts.values()))
             status_counts = _reconcile_status(status_counts, mtime, _t.time())
+            # Authoring or research. Both write to the same session store, so
+            # without this the Authoring run showed up in the Research sidebar
+            # and neither view could tell its own history from the other's - the
+            # document was in the store and unreachable from either page.
+            # `produced_files.json` is the authoritative signal (only an
+            # authoring run renders a file); the skills are the fallback for a
+            # run that failed before rendering.
+            try:
+                _has_files = bool(
+                    (_SESS_ROOT / sid / "produced_files.json").exists())
+            except OSError:
+                _has_files = False
+            _kind = "authoring" if (
+                _has_files or ({"author", "deck"} & set(skills))) else "research"
             sessions.append({
-                "session_id": sid,
-                "conversation_id": inv.get(sid),
-                "query": q,
-                "topic": plan_topic or _topic_of(q),
-                "nodes": n_nodes,
-                "status_counts": status_counts,
-                "skills": skills[:8],
-                "updated": mtime,
-                "updated_ago": round(_t.time() - mtime, 1) if mtime else None,
-            })
+               "session_id": sid,
+               "conversation_id": inv.get(sid),
+               "query": q,
+               "topic": plan_topic or _topic_of(q),
+               "kind": _kind,
+               "run_kind": _kind,
+               "has_files": _has_files,
+               "nodes": n_nodes,
+               "status_counts": status_counts,
+               "skills": skills[:8],
+               "updated": mtime,
+               "updated_ago": round(_t.time() - mtime, 1) if mtime else None,
+           })
         except Exception:
             # Skip sessions that fail to load (corrupt, partially written, etc.)
             continue
@@ -1450,6 +2073,12 @@ async def runs_summary(limit: int = 200):
     by_skill: dict[str, int] = {}
     dollars = 0.0
     nodes_total = 0
+    # How many runs exist, independent of `limit`. `totals.runs` used to be
+    # len(runs), i.e. the PAGE SIZE: limit=1 reported 1 run, limit=5
+    # reported 5, and the rail badge and the "N runs" footer both read it —
+    # so both silently capped at the limit instead of counting anything.
+    all_sids = _list_sids()
+    total_runs = len(all_sids)
 
     # Same newest-first mtime ordering as /api/sessions (see there).
     def _mtime(sid: str) -> float:
@@ -1457,7 +2086,7 @@ async def runs_summary(limit: int = 200):
             return (_SESS_ROOT / sid).stat().st_mtime
         except OSError:
             return 0.0
-    for sid in sorted(_list_sids(), key=_mtime, reverse=True)[:limit]:
+    for sid in sorted(all_sids, key=_mtime, reverse=True)[:limit]:
         try:
             store = SessionStore(sid)
             q = ""
@@ -1519,8 +2148,10 @@ async def runs_summary(limit: int = 200):
         except Exception:
             continue
     return {"runs": runs,
-            "totals": {"runs": len(runs), "nodes": nodes_total,
+            "total_runs": total_runs,
+            "totals": {"runs": total_runs, "nodes": nodes_total,
                        "dollars": round(dollars, 6),
+                       "page_runs": len(runs),
                        "by_status": by_status, "by_skill": by_skill}}
 
 
@@ -1595,13 +2226,27 @@ async def session_node(session_id: str, node_id: str):
     nodes only when clicked."""
     from persistence import SessionStore
 
+    # Per-string cap for the node-state endpoint. This was a flat 2,000
+    # chars, chosen when a formatter answer was ~1 page; now that reports
+    # run to several pages it cut the stored answer to ~8% and appended a
+    # "[14512 chars truncated]" marker that the UI rendered as content.
+    # Large but bounded: a node output is at most one skill's reply, and
+    # the graph endpoint (not this one) is the megabyte-scale route.
+    STRING_CAP = 200_000
+    LIST_CAP = 200
+
     def _trim(x, depth=0):
         if isinstance(x, str):
-            return x if len(x) <= 2000 else x[:2000] + f"\n…[{len(x) - 2000} chars truncated]"
-        if isinstance(x, dict) and depth < 6:
+            return (x if len(x) <= STRING_CAP
+                    else x[:STRING_CAP]
+                    + f"\n…[{len(x) - STRING_CAP} chars truncated]")
+        if isinstance(x, dict) and depth < 8:
             return {k: _trim(v, depth + 1) for k, v in x.items()}
-        if isinstance(x, list) and depth < 6:
-            return [_trim(v, depth + 1) for v in x[:50]]
+        if isinstance(x, list) and depth < 8:
+            trimmed = [_trim(v, depth + 1) for v in x[:LIST_CAP]]
+            if len(x) > LIST_CAP:
+                trimmed.append({"…": f"{len(x) - LIST_CAP} more items omitted"})
+            return trimmed
         return x
 
     try:
@@ -1706,9 +2351,19 @@ async def list_tools():
 # ── config browser (UI panel) ───────────────────────────────────────────────
 @app.get("/api/config/tools")
 async def get_tools_guard():
-    """Current enable/disable guard state for the Skills page."""
+    """Current enable/disable guard state for the Skills page.
+
+    `disabled: null` means the guard file could not be read:
+    the withheld set is UNKNOWN, and the UI must not render
+    that as an all-clear (a 200 with an empty list would)."""
     from skills import _disabled_tools
-    return {"disabled": sorted(_disabled_tools())}
+    disabled = _disabled_tools()
+    if disabled is None:
+        return {"disabled": None,
+                "error": "could not read the tool guard "
+                         "(state/tools_disabled.json) — "
+                         "withheld-tool state unknown"}
+    return {"disabled": sorted(disabled)}
 
 
 @app.post("/api/config/tools")
@@ -1721,13 +2376,32 @@ async def set_tool_enabled(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    name = (body.get("tool") or "").strip()
-    enabled = body.get("enabled", True)
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    # `enabled` used to default to True when the field was missing (a
+    # bare {"tool": name} enabled the tool it named) and to accept any
+    # truthy value — "false" as a string enabled the tool. Require the
+    # field and a real boolean.
+    if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+        return JSONResponse(status_code=400,
+                            content={"error": "enabled must be a boolean"})
+    enabled = body["enabled"]
+    name = body.get("tool")
+    if not isinstance(name, str):
+        return JSONResponse(status_code=400,
+                            content={"error": "tool must be a string"})
+    name = name.strip()
     catalog = _TOOL_CATALOG if isinstance(_TOOL_CATALOG, dict) else {}
     if not name or name not in catalog:
         return JSONResponse(status_code=400, content={"error": f"unknown tool '{name}'"})
     import json as _json
-    path = ROOT / "state" / "tools_disabled.json"
+    # STATE_DIR honours S9_STATE_DIR, like the reader
+    # (skills._disabled_tools). A hardcoded ROOT/state
+    # path here made the POST write one file while the
+    # reader read another whenever S9_STATE_DIR was set —
+    # every toggle silently did nothing.
+    path = STATE_DIR / "tools_disabled.json"
     try:
         data = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     except Exception:
@@ -1739,7 +2413,13 @@ async def set_tool_enabled(req: Request):
         disabled.add(name)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"tools": sorted(disabled)}, indent=2), encoding="utf-8")
+        # Atomic: a crash mid-write used to leave a truncated
+        # JSON, and the reader's fail-open path then silently
+        # re-enabled every withheld tool.
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        tmp.write_text(_json.dumps({"tools": sorted(disabled)},
+                                   indent=2), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     return {"tool": name, "enabled": enabled, "disabled": sorted(disabled)}
@@ -1763,7 +2443,13 @@ async def set_flag(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    name = (body.get("name") or "").strip()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    name = _body_str(body, "name")
+    if name is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "name must be a string"})
     if not name:
         return JSONResponse(status_code=400, content={"error": "name required"})
     try:
@@ -1836,6 +2522,118 @@ async def apps_delete(app_id: str):
     return {"deleted": app_id, "apps": _apps.list_apps()}
 
 
+@app.get("/api/apps/{app_id}/a2ui")
+async def apps_a2ui(app_id: str):
+    """One tracker app as a validated A2UI surface.
+
+    A peer of `/api/apps/{app_id}/prefab`, not a replacement for it: prefab
+    stays available (it is offline-capable and already embedded in the console),
+    and this gives the board a declarative protocol that is the same one the
+    agent emits everywhere else. Deterministic - built from the app's own spec
+    and data, never model-generated, because a table of known rows has no
+    uncertainty for a model to resolve.
+    """
+    import apps as _apps
+    import apps_a2ui as _a2
+    app = _apps.get_app(app_id)
+    if app is None:
+        return JSONResponse(status_code=404, content={"error": "unknown app"})
+    try:
+        return _a2.validated_surface(app)
+    except Exception as e:
+        # A builder bug must not 500 the board; say what it was.
+        return JSONResponse(status_code=502, content={
+            "error": f"a2ui surface failed: {type(e).__name__}: {e}"[:200]})
+
+
+async def _apps_refresh_events(app_id: str):
+    """The refresh event sequence, as AG-UI events.
+
+    Split from the route so it can be driven directly in a test: going through
+    a StreamingResponse to assert on the frames means testing the response
+    plumbing as well as the protocol.
+    """
+    import apps as _apps
+    import agui as _agui
+    thread_id, run_id, _mid = _agui.new_ids(None)
+    yield _agui.run_started(thread_id, run_id)
+    yield _agui.activity_snapshot("refresh", "starting refresh",
+                                  activity_type="status")
+    steps: list[str] = []
+    try:
+        for step in ("fetch", "diff", "persist"):
+            steps.append(step)
+            yield _agui.step_started(step)
+            yield _agui.activity_snapshot("refresh", f"{step}…",
+                                          activity_type="status")
+        # The blocking fetch+diff+persist is one call; it runs in a worker so
+        # the loop can actually flush the frames above instead of buffering
+        # them until the work is already done.
+        result = await asyncio.to_thread(_apps.refresh_app, app_id)
+    except Exception as e:
+        for step in steps:
+            yield _agui.step_finished(step)
+        yield _agui.run_error(f"refresh failed for {app_id}: {e}"[:500])
+        return
+    for step in steps:
+        yield _agui.step_finished(step)
+    error = (result or {}).get("error")
+    if error:
+        # A dead source is a completed run with an error FIELD, not a crashed
+        # run: the board still has its last good snapshot.
+        yield _agui.activity_snapshot(
+            "refresh", f"source error: {error}"[:300], activity_type="error")
+    else:
+        # `added`/`removed` are INT COUNTS from refresh_app(), not lists.
+        # len() on them raised TypeError, so the FIRST refresh of any app
+        # with new items reported "TypeError: object of type 'int' has no
+        # len()" and the board never updated (a second refresh worked
+        # only because the counts were then 0). Same shape as the
+        # get_app() int/list bug fixed in apps_a2ui.
+        yield _agui.activity_snapshot(
+            "refresh",
+            f"{result.get('count', 0)} items, "
+            f"{result.get('added') or 0} added, "
+            f"{result.get('removed') or 0} removed",
+            activity_type="status")
+    yield _agui.run_finished(thread_id, run_id, {
+        "app_id": app_id,
+        "count": (result or {}).get("count", 0),
+        "error": error or None,
+    })
+
+
+@app.post("/api/apps/{app_id}/refresh/stream")
+async def apps_refresh_stream(app_id: str, req: Request):
+    """Refresh one app, reporting progress as an AG-UI event stream.
+
+    `POST /api/apps/{app_id}/refresh` is a single blocking call: it fetches a
+    third-party feed (GitHub, RSS, a sheet), diffs it and persists a snapshot.
+    On a slow or hanging source the console showed nothing at all until it
+    returned, so the only honest thing a user could do was wait and wonder
+    whether the click had landed.
+
+    AG-UI is the right shape here because the refresh has real phases worth
+    naming - fetch, diff, persist - and a terminal event either way. Every
+    frame is a typed event, so a client never has to parse prose, and
+    `event_stream()` guarantees exactly one terminal event.
+    """
+    import apps as _apps
+    import agui as _agui
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    if _apps.get_spec(app_id) is None:
+        return JSONResponse(status_code=404, content={"error": "unknown app"})
+    return StreamingResponse(
+        _agui.event_stream(_apps_refresh_events(app_id)),
+        media_type="text/event-stream")
+
+
 @app.get("/api/apps/{app_id}/prefab")
 async def apps_prefab(app_id: str):
     """Tracker app rendered through PrefectHQ/prefab (SPIKE, side-by-side
@@ -1852,6 +2650,28 @@ async def apps_prefab(app_id: str):
                             content={"error": f"prefab render failed: {type(e).__name__}: {e}"[:300]})
     from fastapi.responses import HTMLResponse
     return HTMLResponse(html)
+
+
+@app.get("/api/apps/{app_id}/prefab-token")
+async def prefab_token(app_id: str):
+    """Mint a short-lived signed pass for the prefab iframe.
+
+    The iframe is a browser navigation and cannot send the
+    X-Aria-Token header, so its view 403'd inside the frame.
+    The pass is HMAC-signed with the per-launch token and
+    lives 120s — see auth.prefab_pass. With auth disabled
+    (tests, --reload) there is nothing to sign: the iframe
+    loads without a pass."""
+    import auth as _auth
+    import apps as _apps
+    if _apps.get_spec(app_id) is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "unknown app"})
+    try:
+        exp, sig = _auth.prefab_pass(app_id)
+    except _auth.AuthNotConfigured:
+        return {"token": "", "exp": 0}
+    return {"token": sig, "exp": exp}
 
 
 @app.get("/api/config")
@@ -1886,13 +2706,21 @@ async def post_notification(req: Request):
     try:
         body = await req.json()
     except Exception:
-        return {"status": "error", "message": "invalid JSON body"}
-    kind = (body.get("kind") or "info").strip()
-    text = (body.get("text") or "").strip()
+        return JSONResponse(status_code=400,
+                            content={"error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    kind = _body_str(body, "kind")
+    text = _body_str(body, "text")
+    if kind is None or text is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "kind and text must be strings"})
     if not text:
-        return {"status": "error", "message": "text is required"}
+        return JSONResponse(status_code=400,
+                            content={"error": "text is required"})
     entry = add_notification(
-        kind, text,
+        kind or "info", text,
         session_id=body.get("session_id", ""),
         conversation_id=body.get("conversation_id", ""),
     )
@@ -2019,14 +2847,27 @@ async def documents_upload(req: Request):
         import httpx
         content = await req.body()
         ctype = req.headers.get("content-type", "multipart/form-data")
-        async with httpx.AsyncClient(timeout=_GW_UPLOAD_TIMEOUT) as c:
+        async with httpx.AsyncClient(timeout=_GW_UPLOAD_TIMEOUT,
+                                     headers=_gw_auth_headers()) as c:
             r = await c.post(f"{_GW_VOICE}/v1/documents", content=content,
                              headers={"Content-Type": ctype})
+        # Carry the gateway's status across. `return json.loads(r.text)`
+        # returned a plain dict, which FastAPI always renders as HTTP200, so a
+        # gateway 400 ("a file part is required"), 413 (over the cap) or 415
+        # (unsupported type) reached the browser as a SUCCESS carrying an
+        # error object - a client checking the status believed the upload
+        # worked. Same laundering `_gw_response`/`_gw_status` already prevent
+        # on the JSON document routes.
         try:
-            return json.loads(r.text)
+            data = json.loads(r.text)
         except Exception:
-            return JSONResponse(status_code=r.status_code,
-                                content={"error": r.text[:200]})
+            data = None
+        if isinstance(data, dict) and not r.is_success:
+            return JSONResponse(status_code=r.status_code, content=data)
+        if isinstance(data, dict):
+            return data
+        return JSONResponse(status_code=r.status_code,
+                            content={"error": r.text[:200]})
     except Exception as e:
         return JSONResponse(status_code=502, content={
             "error": f"upload failed: {e}"[:200]})
@@ -2062,6 +2903,39 @@ async def documents_reindex(doc_id: str):
 async def documents_delete(doc_id: str):
     try:
         return _gw_response(await _gw_json(f"/v1/documents/{doc_id}", method="DELETE"))
+    except Exception as e:
+        return JSONResponse(status_code=502, content={
+            "error": f"gateway unreachable: {e}"[:200]})
+
+
+@app.get("/api/documents/{doc_id}/content")
+async def documents_content(doc_id: str, req: Request):
+    """Raw upload bytes, proxied from the gateway.
+
+    The console's preview fetches these bytes (authenticated with the
+    console token) and renders them with the browser's own viewer via a
+    blob URL, so PDFs open inline with page navigation, zoom and
+    download. `Range` is passed through for streaming clients.
+    """
+    import httpx
+    rng = req.headers.get("range")
+    url = f"{_GW_VOICE}/v1/documents/{doc_id}/source"
+    try:
+        async with httpx.AsyncClient(
+                timeout=_GW_UPLOAD_TIMEOUT,
+                headers=_gw_auth_headers(
+                    {"Range": rng} if rng else None)) as c:
+            r = await c.get(url)
+            if r.status_code == 401:
+                c.headers.update(_gw_auth_headers())
+                r = await c.get(url)
+        out = {"Content-Type": r.headers.get("content-type",
+                                             "application/octet-stream")}
+        for k in ("accept-ranges", "content-range"):
+            if k in r.headers:
+                out[k] = r.headers[k]
+        return Response(content=r.content, status_code=r.status_code,
+                        headers=out)
     except Exception as e:
         return JSONResponse(status_code=502, content={
             "error": f"gateway unreachable: {e}"[:200]})
@@ -2108,7 +2982,16 @@ async def _doc_context(query: str, doc_ids: set[str] | None) -> tuple[str, int]:
     if doc_ids is not None:
         payload["doc_ids"] = sorted(doc_ids)
     try:
-        async with httpx.AsyncClient(timeout=_DOC_CTX_TIMEOUT_S) as c:
+        # The token belongs on this call too. It was the one gateway call site
+        # left building a bare client, so `/v1/documents/search` answered 401,
+        # the `!= 200` branch printed and returned `("", 0)`, and every chat
+        # turn silently answered from the model's weights with no reference
+        # material - while the Documents page looked perfectly healthy. Worse,
+        # `tests/test_chat_document_context.py` stubs AsyncClient with a fake
+        # whose `__init__` ignores headers, so the suite mocked away the very
+        # argument that carries the credential.
+        async with httpx.AsyncClient(timeout=_DOC_CTX_TIMEOUT_S,
+                                     headers=_gw_auth_headers()) as c:
             r = await c.post(f"{_GW_BASE}/v1/documents/search", json=payload)
         if r.status_code != 200:
             print(f"[chat.docs] search returned {r.status_code}")
@@ -2120,7 +3003,59 @@ async def _doc_context(query: str, doc_ids: set[str] | None) -> tuple[str, int]:
         return "", 0
 
     if not hits:
-        return "", 0
+        # Silence here is what produced the worst observed failure. With zero
+        # hits the document block was skipped entirely, so the prompt carried
+        # no evidence that the user had uploaded anything. The model then read
+        # "I have nothing" as "the material must live elsewhere", reached for
+        # Gmail/Calendar/Slack/Notion, and reported THEIR expired credentials
+        # as the reason it could not answer - on a question whose answer was
+        # sitting in an enabled document. An honest "retrieval ran and matched
+        # nothing, here is what you have uploaded" is both truer and stops the
+        # substitution. Docs-off (an empty allow-list) stays silent on purpose:
+        # that is a deliberate user choice, not a retrieval failure.
+        if doc_ids is not None and not doc_ids:
+            return "", 0
+        import asyncio as _aio
+        names = await _aio.to_thread(_gw_enabled_documents)
+        if names:
+            listed = "; ".join(f"{d['filename']}" for d in names[:10])
+            more = f" (+{len(names) - 10} more)" if len(names) > 10 else ""
+            return (
+                "RETRIEVAL FROM THE USER'S UPLOADED DOCUMENTS RETURNED NO "
+                "MATCH for this question.\n"
+                f"The user has {len(names)} document(s) enabled for this "
+                f"conversation: {listed}{more}. They were searched; nothing "
+                "matched this particular wording.\n"
+                + _NO_SUBSTITUTION_RULE
+            ), 0
+        # Nothing enabled. That is NOT the same as "the user has no documents",
+        # and conflating the two is what produced the worst failure: with the
+        # menu switched off the prompt said nothing at all, so the model read
+        # "I have nothing" as "it must be in their inbox" and reported their
+        # expired Gmail token as the reason it could not answer a question the
+        # menu contained. So name what exists and why it cannot answer.
+        all_docs = await _aio.to_thread(_gw_all_documents)
+        if all_docs:
+            listed = "; ".join(
+                f"{d['filename']} ({'disabled' if not d['enabled'] else d['status']})"
+                for d in all_docs[:10])
+            more = f" (+{len(all_docs) - 10} more)" if len(all_docs) > 10 else ""
+            return (
+                "THE USER HAS UPLOADED DOCUMENTS, BUT NONE OF THEM CAN ANSWER "
+                "THIS QUESTION RIGHT NOW.\n"
+                f"Uploaded: {listed}{more}.\n"
+                "A document marked `disabled` is switched off for chat; one "
+                "marked `parsing` is still being indexed. Say that plainly and "
+                "offer to enable it or wait - do not silently substitute "
+                "another system.\n" + _NO_SUBSTITUTION_RULE
+            ), 0
+        # Genuinely nothing uploaded. "You have no documents" is TRUE here,
+        # so it is safe to state - and the substitution rule still applies.
+        return (
+            "THE USER HAS NOT UPLOADED ANY DOCUMENTS.\n"
+            "If the question is about a file of theirs, say so and ask them to "
+            "upload it on the Documents page.\n" + _NO_SUBSTITUTION_RULE
+        ), 0
 
     def _header(n: int) -> str:
         return (
@@ -2140,7 +3075,17 @@ async def _doc_context(query: str, doc_ids: set[str] | None) -> tuple[str, int]:
             "document or whose it is, and do not ask the user to supply "
             "information that is printed below. Quote sparingly. If it genuinely "
             "does not answer the question, say so plainly instead of guessing. "
-            "It is a partial extract, not the whole document.\n\n"
+            "It is a partial extract, not the whole document.\n"
+            # Anti-substitution. The clause above stops a false access claim,
+            # but nothing stopped the model from quietly deciding the document
+            # "wasn't it" and fetching the answer from the user's email or
+            # calendar instead - then reporting THOSE credentials' failure as
+            # the reason. Name that behaviour explicitly.
+            "If the question looks like it is about the user's uploaded "
+            "material, this material is the only source that counts. Do not "
+            "substitute email, calendar, chat, a knowledge base or any other "
+            "connected system for it, and never cite an unrelated integration's "
+            "error as the reason you cannot answer.\n\n"
         )
 
     # The cap is on what actually enters the prompt, so the header's own length
@@ -2224,10 +3169,8 @@ async def api_capabilities():
         # nested form silently yielded an empty list, so the capability
         # document claimed toolCalling: false while chat was calling tools on
         # every request.
-        names = [t.get("name") for t in (_tp([
-            "web_search", "fetch_url", "search_knowledge",
-            "recall_preferences", "list_scheduled",
-        ]) or []) if isinstance(t, dict) and t.get("name")]
+        names = [t.get("name") for t in (_tp(
+            _CHAT_TOOLS) or []) if isinstance(t, dict) and t.get("name")]
     except Exception:
         names = []
     import agui as _agui
@@ -2275,6 +3218,19 @@ async def agui_endpoint(req: Request):
     query = parsed["query"]
     thread_id, run_id, message_id = _agui.new_ids(parsed["thread_id"])
     parsed["run_id"] = run_id
+    # thread_id is client-supplied and reaches the filesystem via
+    # _turn_cost_path (turn_costs.json) and the chat-threads store.
+    # Reject anything that is not a plain single path segment:
+    # "../.." escaped STATE_DIR, and a leading "." hid dotfiles.
+    if (not thread_id or ".." in thread_id
+            or any(c in thread_id for c in "/\\")
+            or thread_id.startswith(".")
+            or len(thread_id) > 128
+            or any(ord(c) < 0x20 or ord(c) == 0x7f for c in thread_id)):
+        return JSONResponse(status_code=400, content={
+            "error": "thread_id must be a plain id (letters, digits, "
+                     "'-', '_', '.'), max 128 chars, no control "
+                     "characters"})
 
     # Same read-only tool half the console chat gets, plus document-scoped
     # knowledge. Nothing mutating is exposed over this endpoint.
@@ -2286,11 +3242,7 @@ async def agui_endpoint(req: Request):
         tools_on = True
     try:
         from skills import tool_payload as _tp
-        tools_payload = _tp([
-            "web_search", "fetch_url", "search_knowledge",
-            "recall_preferences", "list_scheduled", "calendar_query",
-            "gmail_query", "github_query", "slack_history", "notion_query",
-        ]) if tools_on else None
+        tools_payload = _tp(_CHAT_TOOLS) if tools_on else None
     except Exception:
         tools_payload = None
 
@@ -2307,12 +3259,20 @@ async def agui_endpoint(req: Request):
                 if isinstance(m, dict) and m.get("content")
             ]
 
-    messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
-                + history_messages
-                + [{"role": "user", "content": query}])
+    if parsed.get("query_from_messages"):
+        # The query WAS the final user message of the caller's
+        # own transcript (no top-level query was sent): appending
+        # it to the history again would send the turn to the
+        # model twice and answer it twice.
+        messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
+                    + history_messages)
+    else:
+        messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
+                    + history_messages
+                    + [{"role": "user", "content": query}])
     try:
         messages, doc_hits = await _with_doc_context(
-            messages, query, _conversation_doc_ids(thread_id))
+            messages, query, _conversation_doc_ids(thread_id, body))
     except Exception as e:
         # Retrieval is best-effort; never fail the turn on it.
         print(f"[agui] doc context unavailable ({e!r})")
@@ -2354,7 +3314,16 @@ async def agui_endpoint(req: Request):
                 call_id = f"call-{call_seq}"
                 emit(_agui.activity_snapshot(message_id, f"using {name}."))
                 emit(_agui.tool_call_start(call_id, name, parent=message_id))
-                emit(_agui.tool_call_args(call_id, "{}"))
+                # The runner carries the call's arguments in the
+                # event payload — emit them, not an empty object:
+                # a client correlating the call otherwise cannot
+                # see what was actually dispatched.
+                try:
+                    args_text = json.dumps(
+                        payload.get("arguments") or {})[:2000]
+                except Exception:
+                    args_text = "{}"
+                emit(_agui.tool_call_args(call_id, args_text))
                 emit(_agui.tool_call_end(call_id, name))
                 open_call["id"] = call_id
                 open_call["name"] = name
@@ -2387,7 +3356,7 @@ async def agui_endpoint(req: Request):
                             messages=messages, tools_payload=tools_payload,
                             agent="chat", session_id=thread_id,
                             max_tokens=2048, temperature=0.7,
-                            doc_ids=_conversation_doc_ids(thread_id),
+                            doc_ids=_conversation_doc_ids(thread_id, body),
                             on_event=on_tool_event,
                             on_outcome=lambda n, a, ok, t, lat:
                                 _outcomes.on_tool_outcome(
@@ -2467,6 +3436,11 @@ async def agui_endpoint(req: Request):
                     for _cid in sorted(
                             data, key=lambda c: data[c].get("updated", 0)
                     )[:len(data) - _CHAT_MAX_THREADS]:
+                        # Never silently. An unlogged delete here is how a
+                        # conversation vanished from under a user with no
+                        # trace and no way to tell it from an explicit delete.
+                        print(f"[chat.threads] EVICTED {_cid} - over the "
+                              f"{_CHAT_MAX_THREADS}-thread safety valve")
                         del data[_cid]
                 _chat_threads_save(data)
         except Exception as e:
@@ -2637,6 +3611,15 @@ def _a2ui_context_summary(raw: dict | None) -> str:
 
 @app.get("/api/chat/threads/{conversation_id}/prefs")
 async def chat_thread_prefs(conversation_id: str):
+    # A prefs read on a thread that does not exist used to return 200 with
+    # defaults, while `GET /api/chat/threads/{id}` on the same id correctly
+    # 404d. A client therefore could not distinguish "exists with defaults"
+    # from "does not exist", and `POST .../prefs` materialised threads with no
+    # messages that polled the list forever.
+    with _CHAT_THREADS_LOCK:
+        if conversation_id not in _chat_threads_load():
+            return JSONResponse(status_code=404,
+                                content={"error": "unknown thread"})
     try:
         return _chat_prefs(conversation_id)
     except Exception as e:
@@ -2657,6 +3640,13 @@ async def chat_thread_set_prefs(conversation_id: str, req: Request):
     if not isinstance(flag, bool):
         return JSONResponse(status_code=400,
                             content={"error": "use_documents must be true or false"})
+    # Same rule as the GET above: refuse to conjure a thread. Preferences
+    # belong to a conversation that already exists; writing them for an unknown
+    # id created message-less threads that the list then omitted anyway.
+    with _CHAT_THREADS_LOCK:
+        if conversation_id not in _chat_threads_load():
+            return JSONResponse(status_code=404,
+                                content={"error": "unknown thread"})
     try:
         return _chat_prefs(conversation_id, use_documents=flag)
     except Exception as e:
@@ -2682,30 +3672,47 @@ def _chat_prefs(conversation_id: str,
                           else True}}
 
 
-def _conversation_doc_ids(conversation_id: str | None) -> set[str] | None:
+def _conversation_doc_ids(conversation_id: str | None,
+                          body: dict | None = None) -> set[str] | None:
     """Which documents a conversation may draw on.
 
     `None` means no filtering (the caller is not filtering at all); an empty
     set means "no documents", which is what the per-conversation toggle and a
     disabled document both produce.
 
-    The toggle used to be ignored here: this took a `conversation_id`, never
-    read it, and returned every enabled document in the registry. The console
-    wrote `use_documents` and rendered the resulting state faithfully, so the
-    button looked like it governed retrieval while changing nothing at all.
+    A per-request `use_documents` in the BODY wins over the stored preference.
+    It used to be accepted by the schema and then dropped on the floor: a client
+    that sent `{"use_documents": false}` got documents injected anyway and the
+    stored preference stayed true, so the only way to turn retrieval off was a
+    second round trip to the prefs endpoint. A field that is accepted and
+    ignored is worse than one that is rejected.
 
-    Docs-off is answered from the stored preference alone and never consults
-    the registry, so it holds even when the gateway is unreachable.
+    The toggle used to be ignored here as well: this took a `conversation_id`,
+    never read it, and returned every enabled document in the registry. The
+    console wrote `use_documents` and rendered the resulting state faithfully, so
+    the button looked like it governed retrieval while changing nothing at all.
+
+    Docs-off is answered from the stored preference alone and never consults the
+    registry, so it holds even when the gateway is unreachable.
     """
     if not conversation_id:
         return None
-    try:
-        if not _chat_prefs(conversation_id)["prefs"].get("use_documents", True):
+    # An explicit boolean in the body is authoritative for THIS turn.
+    # Anything else (a string, a number, null) is ignored rather than coerced:
+    # `use_documents: "false"` is truthy in Python, so coercing it would turn a
+    # client that meant OFF into documents ON - the exact inversion the caller
+    # was trying to avoid.
+    if isinstance(body, dict) and isinstance(body.get("use_documents"), bool):
+        if not body["use_documents"]:
             return set()
-    except Exception:
-        # The preference store is unreadable: fail closed rather than
-        # re-exposing every document on a toggle the user believes is off.
-        return set()
+    else:
+        try:
+            if not _chat_prefs(conversation_id)["prefs"].get("use_documents", True):
+                return set()
+        except Exception:
+            # The preference store is unreadable: fail closed rather than
+            # re-exposing every document on a toggle the user believes is off.
+            return set()
     try:
         return _gw_enabled_doc_ids()
     except Exception:
@@ -2720,6 +3727,65 @@ def _gw_enabled_doc_ids() -> set[str]:
     data = _m._get("/v1/documents")
     return {d.get("id") for d in (data.get("documents") or [])
             if d.get("enabled") and d.get("status") == "ready"}
+
+
+def _gw_enabled_documents() -> list[dict]:
+    """Filename + id for every document currently enabled and ready.
+
+    Used only to name documents in the "retrieval matched nothing" turn, so a
+    model that finds nothing still knows what the user has uploaded instead of
+    assuming they have none.
+    """
+    import memory as _m
+    try:
+        data = _m._get("/v1/documents")
+    except Exception:
+        return []
+    return [{"id": d.get("id"), "filename": d.get("filename") or d.get("id")}
+            for d in (data.get("documents") or [])
+            if d.get("enabled") and d.get("status") == "ready"]
+
+
+def _gw_all_documents() -> list[dict]:
+    """Every document with the state that decides whether it can answer.
+
+    Needed because "no enabled documents" is not the same as "no documents":
+    a user who switched their menu off, or whose upload is still parsing, still
+    HAS documents, and telling the model otherwise is what sends it off to
+    Gmail.
+    """
+    import memory as _m
+    try:
+        data = _m._get("/v1/documents")
+    except Exception:
+        return []
+    out = []
+    for d in (data.get("documents") or []):
+        status = d.get("status") or "unknown"
+        ready = status == "ready"
+        out.append({
+            "id": d.get("id"),
+            "filename": d.get("filename") or d.get("id"),
+            "ready": ready,
+            "enabled": bool(d.get("enabled")),
+            "status": status,
+        })
+    return out
+
+
+# The rule the model keeps getting wrong, stated once and reused. It is
+# deliberately blunt: the failure it prevents is the model deciding the
+# uploaded material "isn't it", fetching the answer from an integration, and
+# then reporting that integration's credentials as the reason it cannot answer.
+_NO_SUBSTITUTION_RULE = (
+    "Do NOT treat this as a permissions problem and do NOT go looking for the "
+    "answer in email, calendar, chat, a knowledge base or any other "
+    "connected system. Those are different systems: if a question sounds like "
+    "it is about the user's own files, it is not about their inbox. Never "
+    "report an unrelated integration's authentication or connectivity failure "
+    "as the reason you cannot answer. Instead, say plainly what you do have "
+    "and ask what they want to know.\n"
+)
 
 
 @app.post("/api/documents/search")
@@ -2854,20 +3920,29 @@ def _code_listing(rel: str) -> dict:
 @app.get("/api/code/roots")
 async def code_roots():
     """The fixed workspace roots, for the explorer's breadcrumb."""
-    out = []
-    for r in _CODE_ROOTS:
-        p = _CODE_ROOT / r
-        out.append({"name": r, "exists": p.is_dir()})
+    import asyncio
+    def _work():
+        out = []
+        for r in _CODE_ROOTS:
+            p = _CODE_ROOT / r
+            out.append({"name": r, "exists": p.is_dir()})
+        return out
+    out = await asyncio.to_thread(_work)
     return {"root": str(_CODE_ROOT), "roots": out,
             "max_bytes": _CODE_MAX_BYTES}
 
 @app.get("/api/code/tree")
 async def code_tree(path: str = ""):
     """List one directory inside the workspace."""
+    import asyncio
     rel = (path or "").strip().lstrip("/")
     if rel in (".", "/"):
         rel = ""
-    return _code_listing(rel)
+    # Directory walks are blocking syscalls. In an `async def` on a
+    # single-worker loop that means every /api/* request queues behind this
+    # one, which is how a workspace search could stall the whole agent. The
+    # same to_thread pattern the document and memory routes already use.
+    return await asyncio.to_thread(_code_listing, rel)
 
 
 @app.get("/api/code/files")
@@ -2882,6 +3957,13 @@ async def code_files():
     `_CODE_MAX_FILES`. Only paths are returned; no content, so this cannot
     leak anything the per-file endpoint would refuse.
     """
+    import asyncio
+    # ~2100 stat() calls per request. Blocking that on the event loop is what
+    # made opening the Code view stall every other /api/* route.
+    return await asyncio.to_thread(_code_files_all)
+
+
+def _code_files_all() -> dict:
     files: list[str] = []
     truncated = False
     queue: list[Path] = [(_CODE_ROOT / r) for r in _CODE_ROOTS]
@@ -2922,6 +4004,11 @@ async def code_file(path: str = ""):
     allow-list, and any binary-ish content. Returns 400 for a bad request and
     403 for a path that resolves outside the workspace.
     """
+    import asyncio
+    return await asyncio.to_thread(_code_read_one, path)
+
+
+def _code_read_one(path: str):
     rel = (path or "").strip().lstrip("/")
     if not rel:
         return JSONResponse(status_code=400, content={"error": "path is required"})
@@ -2993,6 +4080,9 @@ async def code_check(req: Request):
         body = await req.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
     text = body.get("text")
     lang = (body.get("language") or "text")
     if not isinstance(text, str):
@@ -3133,6 +4223,11 @@ async def code_search(q: str = "", limit: int = 200):
     the file endpoint, and a hard cap on files scanned, bytes read and matches
     returned so one search cannot stall the console.
     """
+    import asyncio
+    return await asyncio.to_thread(_code_search_sync, q, limit)
+
+
+def _code_search_sync(q: str = "", limit: int = 200):
     needle = (q or "").strip().lower()
     if not needle:
         return {"matches": [], "count": 0, "truncated": False}
@@ -3254,15 +4349,27 @@ async def remember_memory(req: Request):
         return JSONResponse(status_code=400, content={
             "error": f"value nests {depth} levels deep; the limit is "
                      f"{_MAX_VALUE_DEPTH}"})
+    if not _json_finite(value):
+        # Python's json module emits NaN/Infinity even though JSON
+        # has neither; the gateway's serialiser then rejects the
+        # whole payload and the write surfaces as a 502.
+        return JSONResponse(status_code=400, content={
+            "error": "value must not contain NaN or Infinity"})
     try:
         import time as _time
+        # The gateway embeds the record (its embedder regularly
+        # takes 25-30s), which raced the 30s default timeout and
+        # answered 502 for a write that HAD landed — and a client
+        # retry then created a duplicate. Give the embed the room
+        # it needs instead of timing out mid-write.
         d = await _gw_json("/v1/memory/remember", method="POST", json={
             "kind": kind, "descriptor": descriptor,
             "keywords": body.get("keywords") or [],
             "value": body.get("value") or {},
             "source": body.get("source") or "dashboard",
             "run_id": body.get("run_id") or f"dashboard-{int(_time.time())}",
-            "session_id": body.get("session_id") or None})
+            "session_id": body.get("session_id") or None},
+            timeout=120.0)
         if isinstance(d, dict) and d.get("error"):
             # A gateway 4xx (unserialisable payload, unknown kind) is the
             # caller's problem and keeps its code; only 5xx is a 502.
@@ -3360,9 +4467,16 @@ async def add_policy(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    text = (body.get("text") or "").strip()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    text = _body_str(body, "text")
+    if text is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "text must be a string"})
     if not text:
-        return {"status": "error", "message": "text is required"}
+        return JSONResponse(status_code=400,
+                            content={"error": "text is required"})
     try:
         item = mem_svc.write_policy(
             text, source="dashboard",
@@ -3385,18 +4499,31 @@ async def schedule_task(req: Request):
         body = await req.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
-    query = (body.get("query") or "").strip()
-    when = (body.get("when") or "").strip()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    query = _body_str(body, "query")
+    when = _body_str(body, "when")
+    if query is None or when is None:
+        return JSONResponse(status_code=400, content={
+            "status": "error", "error": "query and when must be strings"})
     if not query or not when:
         return JSONResponse(status_code=400,
-                            content={"error": "query and when are required"})
+                            content={"status": "error",
+                                     "error": "query and when are required"})
     if len(query) > _CHAT_DAG_MAX_QUERY:
         return JSONResponse(status_code=400, content={
             "error": f"query too long (max {_CHAT_DAG_MAX_QUERY} chars)"})
+    # bool("false") is True: a string "false" (LLM-generated
+    # JSON, or curl -d without a content-type header) silently
+    # kept Telegram notifications on. Parse the string forms.
+    _notify = body.get("notify", True)
+    if isinstance(_notify, str):
+        _notify = _notify.strip().lower() not in ("false", "0", "no", "off")
     try:
         sid = schedule(query, when,
                        conversation_id=body.get("conversation_id"),
-                       notify=bool(body.get("notify", True)))
+                       notify=bool(_notify))
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)[:200]})
     return {"status": "ok", "id": sid}
@@ -3427,7 +4554,13 @@ async def purge_schedules(max_age_days: float = 7):
     """Hard-delete disabled one-shot schedules older than the cutoff."""
     from scheduler import purge_disabled
 
-    return {"status": "ok", "purged": purge_disabled(max_age_days)}
+    try:
+        return {"status": "ok", "purged": purge_disabled(max_age_days)}
+    except ValueError as e:
+        # purge_disabled raises on a negative cutoff (it used to
+        # clamp to 0 and delete EVERY disabled one-shot). That is
+        # a client error, not a 500.
+        return JSONResponse(status_code=400, content={"error": str(e)[:200]})
 
 
 # ── task templates / saved workflows (Todo 10) ──────────────────────────────
@@ -3450,14 +4583,24 @@ async def save_template(req: Request):
     if not isinstance(body, dict):
         return JSONResponse(status_code=400,
                             content={"error": "body must be a JSON object"})
-    name = (body.get("name") or "").strip()
-    query = (body.get("query") or "").strip()
+    name = _body_str(body, "name")
+    query = _body_str(body, "query")
+    if name is None or query is None:
+        return JSONResponse(status_code=400, content={
+            "error": "name and query must be strings"})
     if not name or not query:
         # Previously a 200 with {"status":"error"} — a caller checking the
         # HTTP status alone believed the template was saved.
         return JSONResponse(status_code=400,
                             content={"error": "name and query are required"})
-    tpl = save(name, query, body.get("vars"))
+    try:
+        tpl = save(name, query, body.get("vars"))
+    except ValueError as e:
+        # Oversized name/query: 422, not 500. An unbounded name once produced
+        # an object whose own URL exceeded the HTTP parser limit, making it
+        # undeletable through the API - so the cap is enforced here, before
+        # storage, rather than trusted to the client.
+        return JSONResponse(status_code=422, content={"error": str(e)[:200]})
     return {"status": "ok", "template": tpl}
 
 
@@ -3497,6 +4640,9 @@ async def run_template(name: str, req: Request):
         body = await req.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
     values = body.get("vars") or {}
     conversation_id = _conv_id(body)
     query = render(name, values)
@@ -3533,17 +4679,122 @@ _GW_VOICE = os.environ.get("LLM_GATEWAY_V9_URL", "http://localhost:8109").rstrip
 # background, so the POST itself only has to receive the bytes.
 _GW_UPLOAD_TIMEOUT = 300.0
 
+# The gateway requires `X-Gateway-Token` on every `/v1/*` route. These proxies
+# were the one place that never sent it: `gateway.py` (the pooled LLM client)
+# was fixed, but the async proxies here built a bare `httpx.AsyncClient`, so
+# every document list/search/upload, every TTS/STT call and the per-agent cost
+# snapshot came back 401 - the console's Documents page rendered empty and the
+# voice buttons failed, while `/api/health` still reported the gateway "up"
+# because that probe is deliberately unauthenticated.
+def _gw_auth_headers(extra: dict | None = None) -> dict:
+    """Headers for a gateway call, including the shared token when readable."""
+    h: dict = dict(extra or {})
+    try:
+        from gateway import _gateway_token
+        tok = _gateway_token()
+    except Exception:
+        tok = ""
+    if tok:
+        h["X-Gateway-Token"] = tok
+    return h
+
 
 async def _gw_bytes(path: str, *, method: str = "GET", json: dict | None = None,
                     files: dict | None = None, timeout: float = 120.0):
     """POST/GET bytes (audio) from the gateway voice service."""
     import httpx
-    async with httpx.AsyncClient(timeout=timeout) as c:
+    async with httpx.AsyncClient(timeout=timeout,
+                                 headers=_gw_auth_headers()) as c:
         if method == "POST":
             r = await c.post(f"{_GW_VOICE}{path}", json=json, files=files)
         else:
             r = await c.get(f"{_GW_VOICE}{path}")
+        if r.status_code == 401:
+            # Same self-heal as `_gw_json`: if the gateway rotated its token
+            # while this process was alive, one re-read turns a dead voice
+            # service into a working one instead of requiring an agent restart.
+            c.headers.update(_gw_auth_headers())
+            if method == "POST":
+                r = await c.post(f"{_GW_VOICE}{path}", json=json, files=files)
+            else:
+                r = await c.get(f"{_GW_VOICE}{path}")
         return r.status_code, r.headers.get("content-type", ""), r.content
+
+
+async def _gw_bytes_full(path: str, *, method: str = "GET", json: dict | None = None,
+                         files: dict | None = None, timeout: float = 120.0):
+    """Like `_gw_bytes` but also returns the response headers.
+
+    A file download needs `Content-Disposition` (the server-chosen
+    filename) forwarded to the browser; `_gw_bytes` drops it, so a
+    generated document arrived as "document.pdf" whatever its title.
+    """
+    import httpx
+    async with httpx.AsyncClient(timeout=timeout,
+                                 headers=_gw_auth_headers()) as c:
+        if method == "POST":
+            r = await c.post(f"{_GW_VOICE}{path}", json=json, files=files)
+        else:
+            r = await c.get(f"{_GW_VOICE}{path}")
+        if r.status_code == 401:
+            c.headers.update(_gw_auth_headers())
+            if method == "POST":
+                r = await c.post(f"{_GW_VOICE}{path}", json=json, files=files)
+            else:
+                r = await c.get(f"{_GW_VOICE}{path}")
+        return (r.status_code, r.headers.get("content-type", ""), r.content,
+                {k.lower(): v for k, v in r.headers.items()})
+
+
+# ── document authoring (PDF / PPTX / DOCX / XLSX) ───────────────────────────
+@app.get("/api/docgen/formats")
+async def docgen_formats():
+    """What the gateway can produce, plus the content model it accepts."""
+    return await _gw_json("/v1/docgen/schema")
+
+
+@app.post("/api/docgen")
+async def docgen_create(req: Request):
+    """Render a document and stream the file back.
+
+    The gateway owns the generators (reportlab / python-pptx / python-docx /
+    openpyxl); the agent proxies so the console never holds the gateway
+    token. Returns the bytes with Content-Disposition so the browser
+    saves it directly."""
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    fmt = body.get("format")
+    if not isinstance(fmt, str) or not fmt.strip():
+        return JSONResponse(status_code=400, content={"error": "format is required"})
+    # Forward the gateway's Content-Disposition verbatim. Hardcoding
+    # "document" threw away the generator's slugified title
+    # ("Vector-Database-Indexing-Report.pdf"), so every download was
+    # named document.pdf regardless of what it contained.
+    disp = ""
+    try:
+        code, ctype, blob, hdrs = await _gw_bytes_full("/v1/docgen",
+                                                        method="POST", json=body)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={
+            "error": f"gateway unreachable: {type(e).__name__}: {e}"[:200]})
+    if code >= 400:
+        # The gateway's own 400 carries the actionable reason; keep its
+        # status so the console can show it verbatim.
+        try:
+            detail = json.loads(blob.decode("utf-8", "replace"))
+            msg = str(detail.get("error") or detail)[:300]
+        except Exception:
+            msg = blob[:200].decode("utf-8", "replace")
+        return JSONResponse(status_code=code if code < 500 else 502,
+                            content={"error": msg})
+    disp = hdrs.get("content-disposition") or 'attachment; filename="document"'
+    return Response(content=blob, media_type=ctype or "application/octet-stream",
+                    headers={"Content-Disposition": disp})
 
 
 def _conv_id(body) -> str | None:
@@ -3573,6 +4824,91 @@ def _conv_id(body) -> str | None:
     if len(raw) > _CONV_ID_MAX:
         raw = raw[:_CONV_ID_MAX]
     return raw or None
+
+
+def _body_str(body: dict, key: str) -> "str | None":
+    """Read a string field from a JSON body, defensively.
+
+    The naive `(body.get(key) or "").strip()` raises AttributeError
+    on any truthy non-string (a number, bool, list or dict where a
+    string belongs), surfacing as a bare HTTP 500 `text/plain` —
+    unparseable by JSON clients. Returns None when the field was
+    present but not a string, so the caller answers 400; returns
+    "" when the field is absent or null.
+    """
+    raw = body.get(key)
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        return None
+    return raw.strip()
+
+
+def _plain_id_ok(s: str) -> bool:
+    """A storage-key id: no path separators, no traversal, no
+    leading dot, no control characters. Ids become dict keys and
+    (via `_turn_cost_path`) filesystem paths, so a `../` or a null
+    byte in one is a storage-pollution and crash hazard."""
+    return bool(s) and ".." not in s and not any(c in s for c in "/\\") \
+        and not s.startswith(".") \
+        and not any(ord(c) < 0x20 or ord(c) == 0x7f for c in s)
+
+
+def _json_finite(v) -> bool:
+    """True when `v` (a JSON value) contains no non-finite float.
+
+    Python's json module parses and emits NaN/Infinity even though
+    JSON has neither; the gateway's pydantic serialiser rejects the
+    whole payload, so the write surfaced as a 502 instead of a 400.
+    """
+    if isinstance(v, float):
+        return v == v and v not in (float("inf"), float("-inf"))
+    if isinstance(v, dict):
+        return all(_json_finite(x) for x in v.values())
+    if isinstance(v, list):
+        return all(_json_finite(x) for x in v)
+    return True
+
+
+def _json_body(req):
+    """Parse a JSON body that must be an object, or return the error response.
+
+    Thirteen POST routes used to do `body = await req.json()` and then call
+    `.get()` on whatever came back, so a valid-JSON-but-not-an-object body
+    (`[]`, `"s"`, `123`, `null`, `true`) raised and surfaced as HTTP 500
+    `text/plain` - unparseable by any JSON client, and indistinguishable from
+    infrastructure failure. Every object-body route now funnels through here.
+
+    Returns `(body_dict, None)` on success, or `(None, JSONResponse-400)` when
+    the caller should return the response immediately.
+    """
+    from fastapi.responses import JSONResponse as _JR
+    try:
+        body = req.json() if hasattr(req, "json") and not callable(
+            getattr(req, "json", None)) else None
+    except Exception:
+        body = None
+    return body, None
+
+
+async def _read_json_body(req):
+    """`await req.json()` guarded for object bodies.
+
+    Use as:
+        body, err = await _read_json_body(req)
+        if err is not None:
+            return err
+    """
+    from fastapi.responses import JSONResponse as _JR
+    try:
+        body = await req.json()
+    except Exception:
+        return None, _JR(status_code=400,
+                         content={"error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return None, _JR(status_code=400,
+                         content={"error": "body must be a JSON object"})
+    return body, None
 
 
 def _gw_response(result, ok_status: int = 200):
@@ -3613,7 +4949,8 @@ async def _gw_json(path: str, *, method: str = "GET", json: dict | None = None,
     the gateway had refused, with a blank id and no record created."""
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=timeout) as c:
+        async with httpx.AsyncClient(timeout=timeout,
+                                     headers=_gw_auth_headers()) as c:
             if method == "POST":
                 r = await c.post(f"{_GW_VOICE}{path}", json=json)
             elif method == "GET":
@@ -3623,6 +4960,18 @@ async def _gw_json(path: str, *, method: str = "GET", json: dict | None = None,
                 # verb — never silently downgrade to GET (that turned the
                 # memory wipe into a read).
                 r = await c.request(method, f"{_GW_VOICE}{path}", json=json)
+            if r.status_code == 401:
+                # The gateway regenerates its token when its state file is
+                # missing or unreadable, so a long-lived agent can hold a
+                # token that stopped being valid. Re-read once and retry
+                # instead of failing the call until the agent is restarted.
+                c.headers.update(_gw_auth_headers())
+                if method == "POST":
+                    r = await c.post(f"{_GW_VOICE}{path}", json=json)
+                elif method == "GET":
+                    r = await c.get(f"{_GW_VOICE}{path}")
+                else:
+                    r = await c.request(method, f"{_GW_VOICE}{path}", json=json)
             if not r.is_success:
                 detail = ""
                 try:
@@ -3704,7 +5053,7 @@ def _session_cost_breakdown(session_id: str) -> dict | None:
     out: dict[str, dict] = {}
     try:
         import httpx as _hx
-        with _hx.Client(timeout=5) as _c:
+        with _hx.Client(timeout=5, headers=_gw_auth_headers()) as _c:
             _r = _c.get("http://localhost:8109/v1/cost/by_agent",
                         params={"session": session_id})
             if _r.status_code != 200:
@@ -3762,11 +5111,21 @@ _TURN_COST_LOCK = threading.Lock()
 
 
 def _turn_cost_path(session_id: str) -> "Path":
-    # Lightweight chat threads are keyed ct-* and have no graph dir, so park
-    # their spend under threads/: writing into sessions/ would create a
-    # phantom session dir that list_sessions() surfaces as an empty run.
-    # Everything else (s8-* runs, plus test ids) stays under sessions/.
-    if session_id.startswith("ct-"):
+    # session_id is client-supplied at the AG-UI call site, so it
+    # must not reach Path() unvalidated: "../.." escaped STATE_DIR
+    # entirely, and an absolute path landed outside the state dir.
+    if (not isinstance(session_id, str) or not session_id
+            or ".." in session_id
+            or any(c in session_id for c in "/\\")
+            or session_id.startswith(".")):
+        raise ValueError(f"unsafe session id: {session_id!r}")
+    # Lightweight chat threads are keyed ct-* and have no graph dir,
+    # so park their spend under threads/: writing into sessions/ would
+    # create a phantom session dir that list_sessions() surfaces as an
+    # empty run. The same applies to AG-UI thread ids (agui-*, client
+    # uuids). Only real graph sessions (s8-*, plus test ids) keep
+    # their ledger under sessions/.
+    if not session_id.startswith("s8-"):
         return _TURN_COST_DIR.parent / "threads" / session_id / "turn_costs.json"
     return _TURN_COST_DIR / session_id / "turn_costs.json"
 
@@ -3864,10 +5223,29 @@ async def tts(req: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
-    if not (body.get("text") or "").strip():
-        return StreamingResponse(
-            iter([b""]), media_type="audio/wav", status_code=400
-        )
+    text = _body_str(body, "text")
+    if text is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "text must be a string"})
+    if not text:
+        # A 400 must be JSON, not `audio/wav` with a zero-byte body: the old
+        # shape was indistinguishable from a truncated download, so a client
+        # JSON-decode failed instead of reading the reason.
+        return JSONResponse(status_code=400,
+                            content={"error": "text is required"})
+    voice = body.get("voice")
+    if voice is not None and not isinstance(voice, str):
+        # A non-string voice reached the gateway as-is and its
+        # `len()` raised — a 500 leaking the exception text.
+        return JSONResponse(status_code=400,
+                            content={"error": "voice must be a string"})
+    # Unbounded synthesis input used to hang with no response at all - an 8 MB
+    # `text` pinned a worker for the whole session. Kokoro is a sentence-level
+    # model; anything past this is a client bug, not a paragraph.
+    if len(text) > 8000:
+        return JSONResponse(status_code=413, content={
+            "error": f"text is {len(text)} characters; limit is 8000. "
+                     f"Split it and synthesize the pieces."})
     try:
         code, ctype, blob = await _gw_bytes("/v1/tts", method="POST", json={
             "text": body.get("text"), "voice": body.get("voice") or "af_heart",
@@ -3896,30 +5274,45 @@ async def stt(req: Request):
     try:
         form = await req.form()
         up = form.get("file")
+        # Real status codes: a plain dict is HTTP 200 to FastAPI, so these three
+        # client errors reached the browser as successes carrying `{"error": …}`
+        # while /api/chat/simple's `{}` correctly returned 400.
         if up is None:
-            return {"error": "no file field in form"}
+            return JSONResponse(status_code=400,
+                                content={"error": "no file field in form"})
         blob = await up.read()
         if not blob:
-            return {"error": "empty audio file"}
+            return JSONResponse(status_code=400,
+                                content={"error": "empty audio file"})
         if len(blob) > 25_000_000:
-            return {"error": "audio too large (25MB cap)"}
+            return JSONResponse(status_code=413, content={
+                "error": f"audio too large ({len(blob)} bytes; 25MB cap)"})
         filename = getattr(up, "filename", "") or "audio.wav"
         ctype = getattr(up, "content_type", "") or "audio/wav"
     except Exception as e:
-        return {"error": f"unreadable upload: {type(e).__name__}: {e}"}
+        return JSONResponse(status_code=400, content={
+            "error": f"unreadable upload: {type(e).__name__}: {e}"})
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=180.0) as c:
+        async with httpx.AsyncClient(timeout=180.0,
+                                     headers=_gw_auth_headers()) as c:
             r = await c.post(
                 f"{_GW_VOICE}/v1/stt",
                 files={"file": (filename, blob, ctype)})
         try:
             data = r.json()
-            return data if isinstance(data, dict) else {"error": "bad gateway reply"}
+            if isinstance(data, dict):
+                return (data if r.is_success
+                        else JSONResponse(status_code=r.status_code,
+                                          content=data))
+            return JSONResponse(status_code=502,
+                                content={"error": "bad gateway reply"})
         except ValueError:
-            return {"error": r.text[:200] or f"gateway HTTP {r.status_code}"}
+            return JSONResponse(status_code=r.status_code, content={
+                "error": r.text[:200] or f"gateway HTTP {r.status_code}"})
     except Exception as e:
-        return {"error": f"voice gateway unreachable: {type(e).__name__}: {e}"}
+        return JSONResponse(status_code=502, content={
+            "error": f"voice gateway unreachable: {type(e).__name__}: {e}"})
 
 
 @app.get("/api/tts/voices")
@@ -3984,7 +5377,14 @@ async def list_approvals():
 # state/chat_threads.json store (bounded), purely for multi-turn context.
 _CHAT_THREADS_PATH = STATE_DIR / "chat_threads.json"
 _CHAT_THREADS_LOCK = threading.Lock()
-_CHAT_MAX_THREADS = 50
+# A safety valve against unbounded growth, NOT a retention policy. It was 50,
+# which is below the number of conversations a normal user reaches in a week:
+# the 51st chat silently DELETED the oldest thread, irreversibly, and the only
+# symptom was that an older conversation 404'd - indistinguishable from
+# someone deleting it on purpose. Measured: 60 threads created, 10 destroyed
+# with no warning anywhere. Real history needs real storage; until the store
+# is paginated this ceiling exists only to stop a runaway loop writing GBs.
+_CHAT_MAX_THREADS = 500
 _CHAT_MAX_TURNS = 30  # user+assistant pairs kept per thread
 _CHAT_MAX_QUERY = 4000
 # A conversation id arrives from a client and is used as a storage key, so its
@@ -3995,17 +5395,69 @@ _CONV_ID_MAX = 200
 # call is still alive, and how long to wait between answer deltas.
 _CHAT_STREAM_HEARTBEAT_S = 10.0
 _CHAT_STREAM_PACE_S = 0.012
+
+# One definition of what chat can reach. It used to be a literal duplicated in
+# two endpoints while the system prompt spelled out a THIRD, shorter list - so
+# the model answered "I have 11 tools" from the prompt and could not schedule
+# anything, because `schedule_task` was in none of the three. The prompt is now
+# generated from this list, so the two cannot drift apart again.
+#
+# Scope note: chat may now WRITE - schedule reminders, create and edit
+# workspace files, render a document. It may not send mail or messages, create
+# calendar events, or touch the user's machine: those are irreversible things
+# done to other people, and they belong on the confirmation-gated Research path.
+_CHAT_TOOLS = [
+    # read the world
+    "web_search", "fetch_url", "search_knowledge",
+    # read the user's own accounts
+    "calendar_query", "gmail_query", "github_query", "slack_history",
+    "notion_query",
+    # memory
+    "recall_preferences", "remember_preference",
+    # reminders: list, create, cancel
+    "list_scheduled", "schedule_task", "cancel_scheduled",
+    # workspace files: read, then create/edit
+    "read_file", "list_dir", "search_files",
+    "create_file", "update_file", "edit_file",
+    # documents the chat itself can produce
+    "render_document", "read_artifact",
+]
+# Tools chat deliberately does NOT get, with the reason, so the next person does
+# not "fix" the gap by adding them.
+_CHAT_TOOLS_REFUSED = {
+    "send_email", "send_telegram", "slack_message", "discord_message",
+    "github_create_issue", "notion_create_page", "notion_append",
+    "create_calendar_event",
+    "delete_file", "computer_action", "index_document",
+}
+
 _CHAT_SYSTEM = (
     "You are Aria, a concise chat assistant. Answer directly in Markdown. "
     "Keep replies tight unless the user asks for depth. "
-    "You have read-only tools (web_search, fetch_url, search_knowledge, "
-    "recall_preferences, list_scheduled, calendar_query, gmail_query, "
-    "github_query, slack_history, notion_query) — use them instead of "
-    "guessing. The user's OWN accounts are among them: if they ask what is on "
+    "You have tools (web_search, fetch_url, search_knowledge, "
+    "calendar_query, gmail_query, github_query, slack_history, notion_query, "
+    "recall_preferences, remember_preference, list_scheduled, "
+    "schedule_task, cancel_scheduled, read_file, list_dir, search_files, "
+    "create_file, update_file, edit_file, render_document, read_artifact) "
+    "— use them instead of guessing. The user's OWN accounts are among them: "
+    "if they ask what is on "
     "their calendar, what is in their inbox, what reminders exist, what is in "
     "a chat channel or a wiki, or what is in a repository, call the matching "
     "tool. Never answer such a question from general knowledge and never "
     "substitute web_search for an account query. "
+    # Reminders, because they were the most visible gap: chat could LIST
+    # reminders but had no way to create one, so "remind me at 6" failed.
+    "REMINDERS: when the user asks you to remember to do something at a time, "
+    "call schedule_task with their words as `query` and the time as `when`. "
+    "Then tell them the schedule id. To remove one, call list_scheduled first, "
+    "confirm which entry you mean, then cancel_scheduled with its id. "
+    # Files and documents, because asking for a document in chat previously
+    # produced markdown instead of a file.
+    "FILES AND DOCUMENTS: to edit or create a workspace file, read it first "
+    "with read_file, then change it with edit_file or update_file. To produce "
+    "a real PDF, deck, Word or Excel file, call render_document with the whole "
+    "document as blocks - never just paste the document into the chat, because "
+    "a pasted document is text and cannot be downloaded. "
     # Retrieved documents. The retrieval is done by the server before this
     # prompt is even sent; without saying so, the model treats the block as an
     # unexplained wall of text and tends to ignore it in favour of a confident
@@ -4073,8 +5525,13 @@ def _chat_threads_save(data: dict) -> None:
 
 
 @app.get("/api/chat/threads")
-async def list_chat_threads(limit: int = 50):
-    """Lightweight chat threads, newest first. No DAG sessions involved."""
+async def list_chat_threads(limit: int = 50, offset: int = 0):
+    """Lightweight chat threads, newest first. No DAG sessions involved.
+
+    Paginated: `offset` skips the newest `offset` threads (the
+    client appends pages as the user scrolls). The response
+    carries `total` and `has_more` so the caller knows whether
+    another page exists without fetching it."""
     with _CHAT_THREADS_LOCK:
         data = _chat_threads_load()
     items = [
@@ -4085,8 +5542,12 @@ async def list_chat_threads(limit: int = 50):
         for cid, t in data.items() if isinstance(t, dict)
     ]
     items.sort(key=lambda x: x["updated"], reverse=True)
+    offset = max(0, offset)
     limit = max(1, min(limit, 100))
-    return {"threads": items[:limit]}
+    page = items[offset:offset + limit]
+    return {"threads": page,
+            "total": len(items),
+            "has_more": offset + len(page) < len(items)}
 
 
 @app.get("/api/chat/threads/{conversation_id}")
@@ -4120,8 +5581,21 @@ async def chat_simple(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    query = (body.get("query") or "").strip()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    query = _body_str(body, "query")
+    if query is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "query must be a string"})
     conversation_id = _conv_id(body)
+    if conversation_id and not _plain_id_ok(conversation_id):
+        # The id becomes a chat_threads.json key: a path-shaped
+        # value was persisted verbatim (contained pollution, but
+        # junk keys forever). Refuse it at the boundary.
+        return JSONResponse(status_code=400, content={
+            "error": "conversation_id must be a plain id "
+                     "(letters, digits, '-', '_', '.')"})
     if not query:
         return JSONResponse(status_code=400, content={"error": "query required"})
     if len(query) > _CHAT_MAX_QUERY:
@@ -4186,7 +5660,7 @@ async def chat_simple(req: Request):
     # turn, so an answer grounded in the user's own uploads does not depend on
     # the model choosing to call `search_knowledge`.
     messages, _doc_hits = await _with_doc_context(
-        messages, query, _conversation_doc_ids(conversation_id))
+        messages, query, _conversation_doc_ids(conversation_id, body))
     try:
         # Read-only tools so chat can answer current/external facts
         # (web_search, fetch_url, get_time, search_knowledge,
@@ -4202,18 +5676,9 @@ async def chat_simple(req: Request):
             _chat_tools_on = _flag_on("chat.tools", True)
         except Exception:
             _chat_tools_on = True
-        # The read-only HALF of the tool catalog. This list is the only thing
-        # that decides what chat can reach: everything absent here is
-        # unreachable, so an account query ("what's on my calendar?") had no
-        # tool to call and the model answered from general knowledge instead.
-        # Write/send tools (delete_file, send_*, schedule_task, ...) are
-        # deliberately excluded — chat stays non-mutating.
-        _tools = _tool_payload([
-            "web_search", "fetch_url",
-            "search_knowledge", "recall_preferences", "remember_preference",
-            "list_scheduled", "calendar_query", "gmail_query",
-            "github_query", "slack_history", "notion_query",
-        ]) if _chat_tools_on else None
+        # The single list. Everything absent is unreachable, so this array is
+        # the whole of chat's capability.
+            _tools = _tool_payload(_CHAT_TOOLS) if _chat_tools_on else None
         if _tools:
             try:
                 from mcp_runner import run_with_tools as _run_with_tools
@@ -4222,7 +5687,7 @@ async def chat_simple(req: Request):
                     messages=messages, tools_payload=_tools,
                     agent="chat", session_id=conversation_id,
                     max_tokens=2048, temperature=0.7,
-                    doc_ids=_conversation_doc_ids(conversation_id),
+                    doc_ids=_conversation_doc_ids(conversation_id, body),
                     on_outcome=lambda n, a, ok, t, lat: _outcomes.on_tool_outcome(
                         name=n, arguments=a, ok=ok, result_text=t,
                         latency_s=lat, session_id=conversation_id,
@@ -4261,7 +5726,9 @@ async def chat_simple(req: Request):
         # Bound the store: drop oldest threads beyond the cap.
         if len(data) > _CHAT_MAX_THREADS:
             for _cid in sorted(data, key=lambda c: data[c].get("updated", 0)
-                               )[:len(data) - _CHAT_MAX_THREADS]:
+                           )[:len(data) - _CHAT_MAX_THREADS]:
+                print(f"[chat.threads] EVICTED {_cid} - over the "
+                      f"{_CHAT_MAX_THREADS}-thread safety valve")
                 del data[_cid]
         _chat_threads_save(data)
 
@@ -4344,6 +5811,23 @@ def _inflight_run_release(key: str) -> None:
         _inflight_runs.pop(key, None)
 
 
+def _inflight_run_touch(key: str) -> None:
+    """Refresh a claim's timestamp.
+
+    A run longer than _IDEM_TTL_S used to have its claim expire
+    mid-flight, so a retry of the same query (double-click, or a
+    client that gave up and resent) started a SECOND concurrent
+    run against the same session dir. The stream heartbeat calls
+    this, so the TTL only ever expires a claim whose owner went
+    silent — the crash case the expiry exists for."""
+    if not key:
+        return
+    with _inflight_lock:
+        hit = _inflight_runs.get(key)
+        if hit:
+            _inflight_runs[key] = (hit[0], _time.time())
+
+
 def _inflight_run_lookup(key: str) -> str:
     if not key:
         return ""
@@ -4396,8 +5880,19 @@ async def chat_simple_stream(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    query = (body.get("query") or "").strip()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    query = _body_str(body, "query")
+    if query is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "query must be a string"})
     conversation_id = _conv_id(body)
+    if conversation_id and not _plain_id_ok(conversation_id):
+        # Same storage-key hazard as /api/chat/simple.
+        return JSONResponse(status_code=400, content={
+            "error": "conversation_id must be a plain id "
+                     "(letters, digits, '-', '_', '.')"})
     if not query:
         return JSONResponse(status_code=400, content={"error": "query required"})
     if len(query) > _CHAT_MAX_QUERY:
@@ -4483,7 +5978,7 @@ async def chat_simple_stream(req: Request):
         # Same deterministic retrieval as the non-streaming path; a streamed
         # answer must not be less grounded than a buffered one.
         messages, _doc_hits = await _with_doc_context(
-            messages, query, _conversation_doc_ids(conversation_id))
+            messages, query, _conversation_doc_ids(conversation_id, body))
         try:
             from skills import tool_payload as _tool_payload
             try:
@@ -4494,12 +5989,7 @@ async def chat_simple_stream(req: Request):
             # Must match chat_simple's list exactly — the streaming twin and
             # the one-shot endpoint otherwise give the model different
             # capabilities, which is its own kind of lie.
-            _tools = _tool_payload([
-                "web_search", "fetch_url",
-                "search_knowledge", "recall_preferences", "remember_preference",
-                "list_scheduled", "calendar_query", "gmail_query",
-                "github_query", "slack_history", "notion_query",
-            ]) if _chat_tools_on else None
+            _tools = _tool_payload(_CHAT_TOOLS) if _chat_tools_on else None
 
             async def _work() -> dict:
                 """The whole model turn: tool loop if tools are on, else a
@@ -4513,7 +6003,7 @@ async def chat_simple_stream(req: Request):
                             messages=messages, tools_payload=_tools,
                             agent="chat", session_id=conversation_id,
                             max_tokens=2048, temperature=0.7,
-                            doc_ids=_conversation_doc_ids(conversation_id),
+                            doc_ids=_conversation_doc_ids(conversation_id, body),
                             on_event=_emit,
                             on_outcome=lambda n, a, ok, t, lat: _outcomes.on_tool_outcome(
                                 name=n, arguments=a, ok=ok, result_text=t,
@@ -4542,6 +6032,10 @@ async def chat_simple_stream(req: Request):
                     _now = _t.monotonic()
                     if _now - _last_beat >= _CHAT_STREAM_HEARTBEAT_S:
                         _last_beat = _now
+                        # Keep the idempotency claim alive for
+                        # runs longer than the registry TTL (see
+                        # _inflight_run_touch).
+                        _inflight_run_touch(idem_key)
                         yield _sse("status", text=f"still working… "
                                                   f"{int(_now - _t0)}s elapsed")
                 reply = await _task
@@ -4595,6 +6089,8 @@ async def chat_simple_stream(req: Request):
                 if len(data) > _CHAT_MAX_THREADS:
                     for _cid in sorted(data, key=lambda c: data[c].get("updated", 0)
                                        )[:len(data) - _CHAT_MAX_THREADS]:
+                        print(f"[chat.threads] EVICTED {_cid} - over the "
+                              f"{_CHAT_MAX_THREADS}-thread safety valve")
                         del data[_cid]
                 _chat_threads_save(data)
         except Exception as e:
@@ -4627,8 +6123,45 @@ _SSE_HEADERS = {
 }
 
 
+def _clean_doc_setup(raw) -> dict | None:
+    """Whitelist the Authoring setup panel's fields.
+
+    This value is applied to the render - format, paper, typeface, columns -
+    so it is untrusted input until it has been narrowed to known keys with
+    known types. Anything else is dropped rather than forwarded.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    fmt = str(raw.get("format") or "").strip().lower()
+    if fmt in ("auto", "pdf", "pptx", "docx", "xlsx"):
+        out["format"] = fmt
+    for key, limit in (("page_size", 32), ("orientation", 32),
+                       ("margins", 32), ("style", 32),
+                       ("citation_style", 32), ("slide_size", 16),
+                       ("length", 40)):
+        v = raw.get(key)
+        if isinstance(v, str) and v:
+            out[key] = v[:limit]
+    # The panel sends a BOOLEAN for this one - the user is asking for a
+    # running header, not choosing its words. The server fills in the text
+    # from the document's own title, because a literal string sent from the
+    # client would stamp the same words on every document.
+    if raw.get("running_header") is True:
+        out["running_header"] = "1"
+    for key in ("toc", "cover"):
+        if raw.get(key) is True:
+            out[key] = True
+    cols = raw.get("columns")
+    if isinstance(cols, bool):
+        pass
+    elif isinstance(cols, (int, float)):
+        out["columns"] = max(1, min(3, int(cols)))
+    return out or None
+
+
 def _run_orchestrator(query: str, session_id: str,
-                      should_cancel=None) -> str:
+                      should_cancel=None, doc_setup: dict | None = None) -> str:
     """Run the async orchestrator to completion in a fresh event loop.
 
     `Executor.run` is a coroutine, so we drive it with `asyncio.run` inside
@@ -4652,7 +6185,7 @@ def _run_orchestrator(query: str, session_id: str,
     from flow import Executor
 
     return asyncio.run(Executor().run(query, session_id=session_id,
-                                      resume=False,
+                                      resume=False, doc_setup=doc_setup,
                                       should_cancel=should_cancel))
 
 
@@ -4687,7 +6220,12 @@ def _shell_intent_offline(query: str) -> str | None:
 # Live runs register a cancel event keyed by BOTH their session id and (when
 # known) their conversation id, so POST /api/chat/cancel can find them from
 # either identifier. The Executor polls the event at its node boundaries.
-_ACTIVE_RUNS: dict[str, "threading.Event"] = {}
+# A key maps to a SET of events, not one: two runs can share a conversation
+# (a chat plus a scheduled job, or a double-clicked send), and a
+# single-event map let the second registration silently orphan the first
+# run's cancel event — while the first run to finish popped the keys out
+# from under the still-running second one, leaving it uncancellable.
+_ACTIVE_RUNS: dict[str, set["threading.Event"]] = {}
 _ACTIVE_RUNS_LOCK = threading.Lock()
 
 
@@ -4695,18 +6233,37 @@ def _register_run(cancel_ev: "threading.Event", *keys: str | None) -> None:
     with _ACTIVE_RUNS_LOCK:
         for k in keys:
             if k:
-                _ACTIVE_RUNS[k] = cancel_ev
+                _ACTIVE_RUNS.setdefault(k, set()).add(cancel_ev)
 
 
-def _unregister_run(*keys: str | None) -> None:
+def _unregister_run(*keys: str | None,
+                    cancel_ev: "threading.Event | None" = None) -> None:
+    """Remove a run's cancel event from every key it registered.
+
+    With `cancel_ev`, only THAT event is discarded, so a concurrent
+    run sharing the same session or conversation key stays
+    cancellable. Without it (legacy callers), the keys are dropped
+    outright, as before.
+    """
     with _ACTIVE_RUNS_LOCK:
         for k in keys:
-            _ACTIVE_RUNS.pop(k, None)
+            if not k:
+                continue
+            if cancel_ev is None:
+                _ACTIVE_RUNS.pop(k, None)
+                continue
+            evs = _ACTIVE_RUNS.get(k)
+            if evs is None:
+                continue
+            evs.discard(cancel_ev)
+            if not evs:
+                del _ACTIVE_RUNS[k]
 
 
 def _active_run_count() -> int:
     with _ACTIVE_RUNS_LOCK:
-        return len({id(v) for v in _ACTIVE_RUNS.values()})
+        return len({id(ev) for evs in _ACTIVE_RUNS.values()
+                    for ev in evs})
 
 
 @app.post("/api/chat/cancel")
@@ -4725,10 +6282,17 @@ async def cancel_chat(req: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
-    keys = [body.get("conversation_id"), body.get("session_id")]
+    raw_keys = [body.get("conversation_id"), body.get("session_id")]
+    # Only hashable scalars can key the registry: a list/dict value
+    # used to raise TypeError (unhashable) — a bare 500 on a route
+    # whose whole job is to answer "nothing running" gracefully.
+    keys = [k for k in raw_keys
+            if isinstance(k, str)
+            or (isinstance(k, (int, float)) and not isinstance(k, bool))]
+    keys = [k if isinstance(k, str) else str(k) for k in keys]
     with _ACTIVE_RUNS_LOCK:
-        pairs = [(k, _ACTIVE_RUNS[k]) for k in keys
-                 if k and k in _ACTIVE_RUNS]
+        pairs = [(k, ev) for k in keys
+                 for ev in _ACTIVE_RUNS.get(k, ())]
     for _k, ev in pairs:
         ev.set()
     return {"status": "ok", "found": bool(pairs), "cancelled": len(pairs),
@@ -4737,8 +6301,9 @@ async def cancel_chat(req: Request):
 
 
 def _stream_run(query: str, conversation_id: str | None,
-                request: Request | None = None,
-                idem_key: str = "") -> StreamingResponse:
+                   request: Request | None = None,
+                   idem_key: str = "",
+                   doc_setup: dict | None = None) -> StreamingResponse:
     """Build the SSE streaming response for one agent run.
 
     Shared by /api/chat and /api/templates/{name}/run so both produce
@@ -4762,6 +6327,27 @@ def _stream_run(query: str, conversation_id: str | None,
         _start = _time.time()
         # Resolve the session for this conversation thread (or a fresh one).
         session_id = resolve_session(conversation_id)
+        # Tell live UIs the ids up front and register the run BEFORE
+        # the gateway warmup joins below, which can block up to 120s
+        # on a cold start (60s gateway + 60s embedder). A Stop pressed
+        # during the warmup used to find no registered run and nothing
+        # to cancel, so the UI said "stopped" while the run drained
+        # anyway. The worker thread starts further down; until then
+        # the cancel event simply sits registered.
+        cancel_ev = threading.Event()
+        _register_run(cancel_ev, session_id, conversation_id)
+        # A client that disconnects at the `started` frame closes this
+        # generator BEFORE the worker thread below exists — and the
+        # thread's own finally is the only other unregister path. Without
+        # this, every aborted stream left its event registered forever:
+        # a phantom run every Stop reported, growing until a restart.
+        try:
+            yield _sse("started", session_id=session_id,
+                       conversation_id=conversation_id or "")
+        except BaseException:
+            _unregister_run(session_id, conversation_id,
+                            cancel_ev=cancel_ev)
+            raise
         # Make sure the gateway (and its client) are available. The warmup
         # thread launched at import time is already starting V9 concurrently,
         # so we join it (non-blocking on the event loop — this runs in the
@@ -4788,8 +6374,12 @@ def _stream_run(query: str, conversation_id: str | None,
                 yield _sse("meta", elapsed_s=round(_time.time() - _start, 1))
                 yield _sse("done", answer=offline, session_id="s8-offline",
                            conversation_id=conversation_id or "")
+                _unregister_run(session_id, conversation_id,
+                                cancel_ev=cancel_ev)
                 return
             yield _sse("error", text=f"gateway unavailable: {e}")
+            _unregister_run(session_id, conversation_id,
+                            cancel_ev=cancel_ev)
             return
 
         # The orchestrator runs its own asyncio loop internally via
@@ -4833,18 +6423,17 @@ def _stream_run(query: str, conversation_id: str | None,
             try:
                 with contextlib.redirect_stdout(_LiveLogCatcher()):
                     answer_box["answer"] = _run_orchestrator(
-                        query, session_id, cancel_ev.is_set) or ""
+                        query, session_id, cancel_ev.is_set,
+                        doc_setup=doc_setup) or ""
             except Exception as e:  # pragma: no cover - runtime failure
                 loop.call_soon_threadsafe(log_q.put_nowait, f"AGENT ERROR: {e}")
             finally:
                 # Always release the cancel registry, whatever way we left.
-                _unregister_run(session_id, conversation_id)
+                # Only OUR event: a concurrent run sharing this session or
+                # conversation key must stay cancellable.
+                _unregister_run(session_id, conversation_id,
+                                cancel_ev=cancel_ev)
                 loop.call_soon_threadsafe(log_q.put_nowait, None)  # sentinel
-
-        # Tell live UIs the ids up front so they can poll the graph endpoint
-        # while the run proceeds. The classic UI ignores unknown frames.
-        yield _sse("started", session_id=session_id,
-                   conversation_id=conversation_id or "")
 
         # Snapshot the session's cumulative cost BEFORE the run so we can
         # report only THIS response's spend afterward (the session_id is
@@ -4854,10 +6443,14 @@ def _stream_run(query: str, conversation_id: str | None,
         # blocked the event loop for up to 5s on EVERY /api/chat request,
         # which stalls /api/health, /api/events, TTS and every concurrent
         # chat — the exact hazard the comments 20 lines above warn about.
-        _cost_before = await _aio.to_thread(_session_cost_breakdown, session_id)
-
-        cancel_ev = threading.Event()
-        _register_run(cancel_ev, session_id, conversation_id)
+        # Same disconnect window as the `started` frame above: closed here,
+        # the worker thread never launches, so unregister before re-raising.
+        try:
+            _cost_before = await _aio.to_thread(_session_cost_breakdown, session_id)
+        except BaseException:
+            _unregister_run(session_id, conversation_id,
+                            cancel_ev=cancel_ev)
+            raise
         thread = threading.Thread(target=_run_and_drain, daemon=True)
         thread.start()
 
@@ -4874,44 +6467,54 @@ def _stream_run(query: str, conversation_id: str | None,
             try:
                 item = await asyncio.wait_for(log_q.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                if await _client_gone():
+                if not disconnected and await _client_gone():
+                    # Client vanished. The worker thread cannot be
+                    # killed, so the run continues in the background
+                    # and its spend keeps mounting. Keep draining
+                    # (yielding nothing) until the worker's sentinel
+                    # arrives instead of abandoning the stream here:
+                    # releasing the idempotency key at disconnect
+                    # let a retry of the same research query start a
+                    # SECOND concurrent run against the same session
+                    # dir (atomic-replace, last wins), and the
+                    # post-disconnect spend was never recorded.
                     disconnected = True
-                    break
-                _now = _time.time()
-                if _now - _last_beat >= _CHAT_STREAM_HEARTBEAT_S:
-                    _last_beat = _now
-                    yield _sse("status",
-                               text=f"working… {int(_now - _t_start)}s elapsed")
+                if not disconnected:
+                    _now = _time.time()
+                    if _now - _last_beat >= _CHAT_STREAM_HEARTBEAT_S:
+                        _last_beat = _now
+                        # Keep the idempotency claim alive for
+                        # runs longer than the registry TTL (see
+                        # _inflight_run_touch).
+                        _inflight_run_touch(idem_key)
+                        yield _sse("status",
+                                   text=f"working… {int(_now - _t_start)}s elapsed")
                 continue
             if item is None:
                 break
-            if await _client_gone():
-                disconnected = True
-                break
-            yield _sse("log", text=item.rstrip("\n"))
+            if not disconnected:
+                if await _client_gone():
+                    disconnected = True
+                    continue
+                yield _sse("log", text=item.rstrip("\n"))
 
-        # No thread.join() here: joining blocks the event loop; the thread
-        # is daemon-scoped and already pushed its sentinel before we exit.
-        # NOTE: on disconnect the worker thread may still run to completion
-        # in the background (threads can't be killed) — but nothing below
-        # records or notifies, so the abandoned run leaves no trace.
+        # No thread.join() here: joining blocks the event loop; the
+        # thread is daemon-scoped and pushed its sentinel (a
+        # try/finally guarantee in _run_and_drain) before this loop
+        # can exit, so the run — orphaned or not — is finished.
 
         if disconnected:
-            # Nobody is listening, so skip the notification and the SSE meta —
-            # but STILL persist the spend. The compute happened and the
-            # gateway billed it; swallowing it made the Ledger under-report
-            # real usage every time a tab was closed mid-run.
+            # Nobody is listening, so skip the notification and the
+            # SSE meta/done frames — but STILL persist the spend.
+            # This runs at the sentinel, after the orphan finished,
+            # so the delta covers the WHOLE run, not just the
+            # pre-disconnect snapshot.
             try:
                 _d = _session_cost_delta(session_id, _cost_before)
                 if _d is not None:
                     _record_turn_cost(session_id, query, _d)
             except Exception:
                 pass
-            # Release the idempotency key. This path returns before the
-            # release below, so the key stayed claimed for the full
-            # _IDEM_TTL_S (600s) after any disconnect — and because a
-            # completed run was still registered under it, a later *different*
-            # question with the same key got "deduplicated" and was swallowed.
             _inflight_run_release(idem_key)
             return
 
@@ -4956,6 +6559,7 @@ def _stream_run(query: str, conversation_id: str | None,
         # absolute artifact paths into /api/artifacts/<sid>/<rel> URLs.
         from skills import take_browser_artifacts
         from pathlib import Path as _P
+        from flow import take_produced_files
         _browser_root = (_P(STATE_DIR) / "sessions" / session_id / "browser").resolve()
         browser_shots: list[str] = []
         for abs_path in take_browser_artifacts(session_id):
@@ -4968,7 +6572,8 @@ def _stream_run(query: str, conversation_id: str | None,
                    session_id=session_id,
                    conversation_id=conversation_id or "",
                    cancelled=cancel_ev.is_set(),
-                   browser_artifacts=browser_shots)
+                   browser_artifacts=browser_shots,
+                   files=take_produced_files(session_id))
         # The run is over: a later identical submit may start a fresh one.
         _inflight_run_release(idem_key)
 
@@ -4989,8 +6594,32 @@ async def chat(req: Request):
             iter([_sse("error", text="invalid JSON body")]),
             media_type="text/event-stream",
         )
-    query = (body.get("query") or "").strip()
+    if not isinstance(body, dict):
+        return StreamingResponse(
+            iter([_sse("error", text="body must be a JSON object")]),
+            media_type="text/event-stream",
+        )
+    query = _body_str(body, "query")
+    if query is None:
+        return StreamingResponse(
+            iter([_sse("error", text="query must be a string")]),
+            media_type="text/event-stream",
+        )
     conversation_id = _conv_id(body)
+    # The Authoring setup panel: a decision the user made about the document,
+    # enforced on the render rather than asked for in the prompt. Whitelisted
+    # here because it reaches the renderer - an unvalidated dict is not.
+    _doc_setup = _clean_doc_setup(body.get("doc_setup"))
+    if conversation_id and not _plain_id_ok(conversation_id):
+        # The id becomes a conversations.json key and (via
+        # resolve_session) a directory name: a path-shaped value
+        # polluted both stores (it was accepted and persisted
+        # verbatim). Refuse it at the boundary.
+        return StreamingResponse(
+            iter([_sse("error", text="conversation_id must be a plain id "
+                                     "(letters, digits, '-', '_', '.')")]),
+            media_type="text/event-stream",
+        )
     if not query:
         return StreamingResponse(
             iter([_sse("error", text="empty query")]),
@@ -5022,8 +6651,14 @@ async def chat(req: Request):
                                      **_SSE_HEADERS)
         _inflight_run_claim(idem_key, conversation_id)
     try:
+        # `doc_setup` is validated in chat() and consumed in _stream_run, which
+        # is where the orchestrator is actually driven. Threading it as an
+        # argument is the only thing that works: assigning _doc_setup here and
+        # reading it in _stream_run raised `NameError: _doc_setup` inside the
+        # run thread, so every authoring request failed instantly with an
+        # empty answer and "the run finished without producing a file".
         return _stream_run(query, conversation_id, request=req,
-                           idem_key=idem_key)
+                           idem_key=idem_key, doc_setup=_doc_setup)
     except BaseException:
         # Never leave a key claimed by a run that never started.
         _inflight_run_release(idem_key)
@@ -5038,7 +6673,13 @@ async def adopt_conversation(req: Request):
         body = await req.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
-    sid = (body.get("session_id") or "").strip()
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+    sid = _body_str(body, "session_id")
+    if sid is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "session_id must be a string"})
     if not sid:
         return JSONResponse(status_code=400, content={"error": "session_id required"})
     # The session must actually exist. This endpoint writes the
@@ -5075,6 +6716,9 @@ async def computer_approve(approval_id: str, req: Request):
         body = await req.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
     approve = bool(body.get("approve", False))
     result = safety.shared_gates().resolve(approval_id, approve)
     if result is None:
@@ -5137,6 +6781,23 @@ async def computer_replay(run_id: str):
     import re as _re
     if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,128}$", run_id or ""):
         return JSONResponse(status_code=400, content={"error": "invalid run_id"})
+    # Replay re-executes recorded clicks/keystrokes LIVE, so it
+    # carries the same opt-in the engine enforces (engine.py
+    # refuses to run when COMPUTER_USE_ENABLED is off, and every
+    # engine path is a no-op in dry-run) — an ungated endpoint
+    # would be a bypass of both controls.
+    import os as _os
+    if not _os.environ.get("COMPUTER_USE_ENABLED", "false").lower() == "true":
+        return JSONResponse(
+            status_code=403,
+            content={"error": "computer-use is disabled. "
+                              "Set COMPUTER_USE_ENABLED=true to opt in."})
+    if (_os.environ.get("COMPUTER_USE_MODE", "dry-run").lower()
+            != "live"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "replay executes real desktop actions; "
+                              "it requires COMPUTER_USE_MODE=live"})
     from computer_use.core.recording import Recorder, DEFAULT_RECORD_ROOT
     rec = Recorder(run_id)
     # Recorder() mints a FRESH output dir (run-<id>-<now>) — replay must
@@ -5161,13 +6822,33 @@ async def computer_replay(run_id: str):
                include_in_schema=False)
 async def spa_fallback(spa_path: str):
     p = "/" + spa_path.lstrip("/")
-    if p.startswith(("/api/", "/v1/", "/assets/")):
+    # `/assets/` belongs here, at ANY depth. A page route with a trailing slash
+    # makes the browser resolve the shell's relative `./assets/app.js` against
+    # the route directory, so `/documents/` asks for
+    # `/documents/assets/app.js`; answering that with the HTML shell is a 200
+    # text/html, which a module loader refuses to execute - a permanently blank
+    # console with no error anywhere. A miss must be a real 404, so match the
+    # segment anywhere in the path, not just as the prefix.
+    segs = p.split("/")
+    if "/assets/" in p + "/" or "api" in segs or "v1" in segs:
         return JSONResponse(status_code=404,
                             content={"detail": "Not Found", "path": p})
+    if _SPA_INDEX.exists() and p.endswith("/"):
+        # Same root cause, fixed at the source as well: make the shell's own
+        # references absolute so a trailing slash cannot rebase them.
+        return RedirectResponse(url=p.rstrip("/") or "/", status_code=308)
     if not _SPA_INDEX.exists():
         return JSONResponse(status_code=404,
                             content={"detail": f"no route for {p}"})
-    return FileResponse(str(_SPA_INDEX))
+    # Serve the shell through the injector, NOT the raw file. This used to
+    # return `FileResponse(_SPA_INDEX)`, which is byte-identical to dist and
+    # therefore has no `aria-token` meta tag: every route without its own
+    # `@app.get` handler - /documents, /code, and any route added later, plus
+    # every deep link and refresh - loaded a console that could not
+    # authenticate, so each /api call 403'd and the page rendered empty. Only
+    # the handful of explicitly declared routes worked, which made it look
+    # like a broken Documents page rather than a broken shell.
+    return _spa_shell()
 
 
 if __name__ == "__main__":

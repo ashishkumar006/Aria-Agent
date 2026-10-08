@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
-import { Rail, TopBar, Skel, Pill } from '../components/ui';
+import { Rail, TopBar, Skel, Pill, SkipLink } from '../components/ui';
 import { api, CONF, gatewayUrl, getToken, setToken } from '../api';
 
 export default function Settings() {
@@ -32,8 +32,14 @@ export default function Settings() {
       api.safe(api.config()),
     ]);
     const gw = !!h && h.gateway_up !== false;
+    /* The agent row used to be hardcoded `true` ("this server :8500"),
+       so with the API unreachable the page contradicted itself: the banner
+       said "agent unreachable" next to a row asserting it was up. The
+       health call that backs the banner is the same one that proves the
+       agent answered, so use it. */
+    const agentUp = !!h;
     const list: [string, boolean, string][] = [
-      ['agent', true, `this server :${CONF.agentPort}`],
+      ['agent', agentUp, agentUp ? `this server :${CONF.agentPort}` : `:${CONF.agentPort} unreachable`],
       ['gateway', gw, gw ? `:${CONF.gatewayPort} reachable` : `:${CONF.gatewayPort} down`],
       ['mcp tools', !!tools, tools ? `${(tools.tools || []).length} registered` : 'unreadable'],
       ['sessions', !!sess, sess ? `${(sess.sessions || []).length} in first 200` : 'unreadable'],
@@ -66,6 +72,7 @@ export default function Settings() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">Environment</div>
@@ -82,7 +89,7 @@ export default function Settings() {
           ))}
         </div>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Settings" />
         <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
           {loaded && apiDown && (
@@ -146,7 +153,7 @@ export default function Settings() {
             <a href={gatewayUrl('/static/system.html')} className="text-zinc-400 hover:text-violet-300">system</a>
           </div>
         </div>
-      </div>
+      </main>
     </div>
   );
 }

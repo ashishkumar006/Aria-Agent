@@ -23,7 +23,12 @@ from atomic_json import load_json, save_json
 ROOT = Path(__file__).resolve().parent.parent
 USAGE_PATH = ROOT / "state" / "usage.json"
 MONTHLY_CAP = 950  # leave 50/mo headroom on Tavily
-MAX_RESULTS = 5
+# 10, not 5. This is the widest single lever on how much a research report can
+# know: one search call returns twice the candidate URLs for the same token
+# cost and the same round trip. The researcher still decides which to fetch, so
+# a wider net widens the choice rather than the bill. Tavily's own tier and the
+# free backends all serve 10 comfortably.
+MAX_RESULTS = 10
 _USAGE_PROVIDERS = ("tavily", "brave", "duckduckgo", "marginalia")
 _BRAVE_CAP = 1900  # leave headroom on the free 2k/mo tier
 _usage_lock = threading.Lock()
@@ -212,10 +217,10 @@ def _marginalia_search(query: str, max_results: int) -> list[dict]:
              "snippet": x.get("description", "")} for x in results]
 
 
-def search(*, query: str, max_results: int = 5) -> list[dict]:
+def search(*, query: str, max_results: int = MAX_RESULTS) -> list[dict]:
     import os
     import time as _t
-    max_results = max(1, min(int(max_results or 5), MAX_RESULTS))
+    max_results = max(1, min(int(max_results or MAX_RESULTS), MAX_RESULTS))
     usage = _load_usage()
     h = source_health()["order"]
     # Paid tier first (quality), each tier walked in health order (reality).

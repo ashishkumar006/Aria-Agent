@@ -100,9 +100,10 @@ the default run because repeated live calls hit rate limits.
 
 Honest list of what is not finished:
 
-- **Gateway `/v1/*` has no authentication.** The agent token guards `:8500`, but
-  every gateway route is reachable unauthenticated on its port. Bind loopback-only
-  or front it before exposing it.
+- **Gateway `/v1/*` now requires `X-Gateway-Token`** (shared token from
+  `GATEWAY_V9_TOKEN`, else `state/gateway.token` published at startup).
+  Unauthenticated calls get 401; non-loopback bind without a configured token
+  refuses to start. Docs endpoints (`/openapi.json`, `/docs`) stay open.
 - **Policy is dry-run**, and MCP mutations dispatched by the agent skip the gate.
 - **Image URLs in `/v1/chat` are fetched without SSRF checks.**
 - **Streaming bypasses rate accounting, retry and failover.**

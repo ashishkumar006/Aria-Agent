@@ -278,20 +278,146 @@ html, body, #root {
 .prose-chat tr:last-child td { border-bottom: 0; }
 .prose-chat th:last-child, .prose-chat td:last-child { border-right: 0; }
 
-.prose-report > :first-child { margin-top: 0; }
-.prose-report h2 { font-size: 1.06rem; margin: 1.5rem 0 0.5rem; color: #c4b5fd; }
-.prose-report h3 { font-size: 0.95rem; margin: 1.1rem 0 0.4rem; color: var(--color-zinc-100); }
-.prose-report h4 { font-size: 0.875rem; margin: 0.9rem 0 0.35rem; }
-.prose-report p { margin: 0.8rem 0; }
-.prose-report ul, .prose-report ol { margin: 0.8rem 0; padding-left: 1.5rem; }
-.prose-report li { margin: 0.3rem 0; }
-.prose-report pre { margin: 1rem 0; padding: 1rem; }
-.prose-report pre code { font-size: 12.5px; color: #e4e4e7; }
-.prose-report :not(pre) > code {
-  background: rgba(255, 255, 255, 0.10); padding: 0.1rem 0.35rem;
-  border-radius: 4px; font-size: 0.9em; color: #fcd34d;
+/* ── Report typography ────────────────────────────────────────────────────
+   A research report is a DOCUMENT, not a chat message, so it gets document
+   metrics: a readable measure, a real heading scale, and section rules.
+
+   The old scale was 0.875 / 0.95 / 1.06rem against a 14px body — a 3px
+   spread across three heading levels, so a 4,000-word report read as one
+   undifferentiated wall. `prose-chat` above keeps the tighter scale, which
+   is right for a short reply and wrong for a report. */
+.prose-report {
+  max-width: 74ch;           /* ~75 characters: the readable measure */
+  font-size: 14.5px;
+  line-height: 1.68;
+  color: var(--color-zinc-200);
 }
-.prose-report table { font-size: 12.5px; }
+/* Opt out of the measure. A plain Tailwind `max-w-*` CANNOT do this: this
+   rule and a Tailwind utility have identical specificity, and because the
+   utilities layer is injected separately the class rule won — so
+   `max-w-none` and `max-w-[76ch]` on the same element were both dead. A
+   research report's tables and code blocks genuinely need the extra width
+   (they were clipped into a 578px column), so this is an explicit opt-in. */
+.prose-report.prose-wide { max-width: none; }
+.prose-report > :first-child { margin-top: 0; }
+
+/* The report's own top-level heading. `renderMarkdown` offsets model
+   headings by one level, so a model's `##` lands here as h2. */
+.prose-report h2 {
+  font-size: 1.42rem;        /* 20.6px — clearly a section */
+  line-height: 1.3;
+  font-weight: 700;
+  letter-spacing: -0.011em;
+  color: #f4f4f5;
+  margin: 2.1rem 0 0.7rem;
+  padding-bottom: 0.42rem;
+  border-bottom: 1px solid var(--color-edge);
+}
+.prose-report h2:first-of-type { margin-top: 0.4rem; }
+
+.prose-report h3 {
+  font-size: 1.16rem;        /* 16.8px */
+  line-height: 1.35;
+  font-weight: 650;
+  color: #e4e4e7;
+  margin: 1.6rem 0 0.5rem;
+}
+.prose-report h4 {
+  font-size: 1.02rem;
+  line-height: 1.4;
+  font-weight: 650;
+  color: var(--color-zinc-300);
+  margin: 1.3rem 0 0.4rem;
+}
+.prose-report h5, .prose-report h6 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--color-zinc-400);
+  margin: 1.1rem 0 0.35rem;
+}
+
+.prose-report p { margin: 0.85rem 0; }
+
+.prose-report ul, .prose-report ol { margin: 0.85rem 0; padding-left: 1.5rem; }
+.prose-report li { margin: 0.32rem 0; }
+.prose-report li::marker { color: var(--color-zinc-500); }
+.prose-report ul ul, .prose-report ul ol,
+.prose-report ol ul, .prose-report ol ol { margin: 0.32rem 0; }
+
+.prose-report a {
+  color: #a78bfa;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: rgba(167, 139, 250, 0.45);
+}
+.prose-report a:hover { color: #c4b5fd; text-decoration-color: currentColor; }
+
+.prose-report b, .prose-report strong {
+  font-weight: 650;
+  color: var(--color-zinc-50);
+}
+.prose-report del { opacity: 0.65; }
+
+.prose-report hr { border: 0; border-top: 1px solid var(--color-edge); margin: 1.6rem 0; }
+
+.prose-report blockquote {
+  margin: 1rem 0;
+  padding: 0.15rem 0 0.15rem 1rem;
+  border-left: 3px solid var(--color-accent);
+  color: var(--color-zinc-400);
+  font-style: italic;
+}
+
+.prose-report pre {
+  margin: 1.1rem 0;
+  padding: 0.95rem 1.1rem;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--color-edge);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.prose-report pre code {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #e4e4e7;
+  background: none;
+  padding: 0;
+}
+.prose-report :not(pre) > code {
+  background: rgba(255, 255, 255, 0.10);
+  padding: 0.12rem 0.36rem;
+  border-radius: 4px;
+  font-size: 0.88em;
+  color: #fcd34d;
+}
+
+/* Tables carry the comparisons in a research report, so they get more
+   room and a real header band instead of hairline-on-black. */
+.prose-report .table-scroll { margin: 1.1rem 0; }
+.prose-report table {
+  font-size: 13px;
+  line-height: 1.5;
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--color-edge);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.prose-report th, .prose-report td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--color-edge);
+  text-align: left;
+  vertical-align: top;
+}
+.prose-report th {
+  background: rgba(255, 255, 255, 0.06);
+  font-weight: 650;
+  color: var(--color-zinc-100);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.prose-report tbody tr:last-child td { border-bottom: 0; }
+.prose-report tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.018); }
 
 /* === FOCUS VISIBILITY (keyboard users) === */
 :focus-visible {
@@ -337,3 +463,120 @@ html, body, #root {
 .status-dot-ok { background: var(--color-ok); color: var(--color-ok); }
 .status-dot-bad { background: var(--color-danger); color: var(--color-danger); }
 .status-dot-warn { background: var(--color-warn); color: var(--color-warn); }
+
+/* ── authoring: setup panel + real document preview ───────────────────────
+   The preview used to be extracted text in a bordered box. It now shows the
+   rendered page, so it needs page-like surfaces (a light sheet on a dark
+   ground) rather than the console's card chrome - otherwise the document
+   cannot be judged against anything. */
+
+.setup { display: flex; flex-direction: column; gap: 0.55rem; }
+.setup-row { display: flex; flex-wrap: wrap; gap: 0.55rem; }
+.setup-field { display: flex; flex: 1 1 8.5rem; min-width: 0; flex-direction: column; gap: 0.25rem; }
+/* the format control has to own its row. five buttons are wider than a field's
+   flex basis, so sharing a row let the segmented control spill over its
+   neighbour and - at 390px - over the card, and the page scrolled sideways. */
+.setup-field-wide { flex: 1 1 100%; }
+.setup-label {
+  display: flex; align-items: baseline; gap: 0.35rem;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: #8b8b96;
+}
+.setup-hint { font-size: 9.5px; font-weight: 400; font-style: normal;
+  letter-spacing: 0; text-transform: none; color: #5f5f6b; }
+.setup-sel {
+  width: 100%; min-width: 0; border-radius: 6px; border: 1px solid rgba(255,255,255,0.11);
+  background: #14141a; color: #e6e6ec; padding: 0.34rem 0.45rem;
+  font-size: 12px; line-height: 1.3;
+}
+.setup-sel:disabled { opacity: 0.55; }
+.setup-toggles { gap: 0.9rem; padding-top: 0.1rem; }
+.setup-toggle { display: inline-flex; align-items: center; gap: 0.35rem;
+  font-size: 11.5px; color: #b9b9c4; cursor: pointer; }
+.setup-toggle input { accent-color: #7c6ee6; }
+
+/* one disclosure for every refinement. the native marker is what makes it a
+   disclosure for a keyboard and a screen reader without any state to wire up,
+   so the summary only gets the panel's own caption typography. */
+.setup-more { padding-top: 0.15rem; }
+.setup-more-sum {
+  width: fit-content; cursor: pointer;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: #8b8b96;
+}
+.setup-more-sum:hover { color: #b9b9c4; }
+.setup-more-sum .setup-hint { margin-left: 0.35rem; }
+.setup-more[open] > .setup-more-sum { margin-bottom: 0.45rem; }
+
+.seg { display: inline-flex; gap: 2px; padding: 2px; border-radius: 6px;
+  background: #14141a; border: 1px solid rgba(255,255,255,0.11); }
+.seg-btn {
+  border: 0; border-radius: 4px; background: transparent; color: #a9a9b6;
+  padding: 0.26rem 0.5rem; font-size: 11.5px; font-weight: 600; cursor: pointer;
+}
+.seg-btn:hover:not(:disabled) { color: #e6e6ec; }
+.seg-btn.on { background: #2a2440; color: #cfc6ff; }
+.seg-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.docview-frame { border-radius: 8px; border: 1px solid rgba(255,255,255,0.1);
+  background: #0b0b0f; overflow: hidden; }
+.docview { display: flex; flex-direction: column; min-height: 0; flex: 1;
+            min-width: 0; }
+   /* `min-height: 0` is what lets the stage actually shrink to the space its
+      parent offers instead of forcing the whole pane taller. Without it the
+      stage kept a 240px floor, collapsed to a letterbox, and a 1281px page
+      showed only its blank top margin. */
+   /* A floor for the stage, because `fit` scales the page to the stage: with
+      no floor the mobile layout left a ~20px-wide page that was no preview at
+      all. Reached only when the pane really is short. */
+   .docview > .docview-stage, .docview > .docview-doc {
+     flex: 1 1 auto; min-height: 220px; }
+.docview-bar {
+  display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+  padding: 0.4rem 0.6rem; border-bottom: 1px solid rgba(255,255,255,0.08);
+  background: #111117; font-size: 11.5px;
+}
+.docview-title { font-weight: 700; color: #d8d8e0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 22rem; }
+.docview-meta { color: #6f6f7d; }
+.docview-meta em { font-style: normal; color: #5a5a66; }
+.docview-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 0.3rem; }
+.docview-nav, .docview-zoom {
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 5px;
+  background: #16161d; color: #c9c9d4; padding: 0.15rem 0.45rem;
+  font-size: 12px; cursor: pointer;
+}
+.docview-nav:disabled { opacity: 0.35; cursor: not-allowed; }
+.docview-zoom:hover { border-color: #7c6ee6; color: #e6e6ec; }
+.docview-count { color: #8b8b96; font-variant-numeric: tabular-nums; }
+.docview-state { padding: 1.6rem; text-align: center; color: #8b8b96; font-size: 12px; }
+.docview-state.err { color: #f0a3a3; }
+.docview-stage {
+         display: flex; justify-content: center; align-items: flex-start;
+         padding: 0.9rem;
+     background: #0b0b0f; overflow: auto;
+   }
+.docview-page, .docview-slide {
+  display: block; border-radius: 2px; box-shadow: 0 4px 18px rgba(0,0,0,0.5);
+  background: #fff;
+  /* Fit mode is driven from JS (max-height + contain on the element itself),
+     because the page's natural pixel size is only known once the image has
+     decoded. In Actual-size mode the inline style drops both, so the stage
+     scrolls instead. */
+  max-width: 100%;
+}
+.docview-slide svg { display: block; width: 100%; height: auto; border-radius: 2px; }
+.docview-doc { width: 100%; height: 68vh; border: 0; background: #f5f5f8; }
+.docview-strip {
+  display: flex; gap: 0.35rem; padding: 0.45rem; overflow-x: auto;
+  border-top: 1px solid rgba(255,255,255,0.08); background: #0f0f14;
+}
+.docview-thumb {
+  flex: none; width: 54px; padding: 0; border-radius: 3px; cursor: pointer;
+  border: 1px solid rgba(255,255,255,0.14); background: #fff; overflow: hidden;
+  line-height: 0;
+}
+.docview-thumb.on { border-color: #7c6ee6; box-shadow: 0 0 0 1px #7c6ee6; }
+.docview-thumb img { width: 100%; height: auto; display: block; }
+.docview-thumb-svg { display: block; width: 100%; }
+.docview-thumb-svg svg { width: 100%; height: auto; display: block; }

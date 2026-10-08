@@ -582,3 +582,66 @@ def test_channel_send_approve_creates_pending(monkeypatch, tmp_path):
     assert out["ok"] is False and out["status"] == "pending"
     assert out["approval_id"].startswith("gw-")
     assert len(_A.list_pending()) == 1
+
+
+def test_pairings_are_masked_for_display_but_resolvable_for_delivery():
+    """Display must stay masked; delivery must not be.
+
+    `list_paired` masks ids because it feeds a panel, and for a long time that
+    was the ONLY way to read the store - so the agent had no way to find a
+    notification destination and a fired reminder went nowhere silently.
+    `resolve_notify_target` returns the real id, reachable loopback-only via
+    GET /v1/control/notify-target.
+    """
+    from adaptors import trust
+
+    trust.pair("telegram", "99887766", "owner")
+    try:
+        shown = trust.list_paired("telegram")["telegram"]
+        assert "99887766" not in shown, "the display path leaked a chat id"
+        assert any(k.endswith("7766") for k in shown), shown
+        assert trust.resolve_notify_target("telegram") == "99887766"
+    finally:
+        trust.unpair("telegram", "99887766")
+
+
+def test_an_unpaired_channel_resolves_to_nothing_rather_than_guessing():
+    from adaptors import trust
+
+    assert not trust.resolve_notify_target("discord"), \
+        "invented a destination for a channel nobody paired with"
+
+def test_first_contact_claims_ownership_but_a_stranger_cannot_take_over():
+    """Trust-on-first-contact, and only on an empty store.
+
+    The pairing store used to be writable only from a loopback control call,
+    so a reminder had a configured bot and no reachable destination. First
+    contact becomes `owner` so the channel works; a LATER sender is only
+    `paired`, and `resolve_notify_target` prefers `owner` - so someone who
+    finds the bot cannot redirect your reminders to themselves.
+    """
+    from adaptors import trust
+    from channels_api import _auto_pair_inbound
+
+    class _Msg:
+        sender_id = "55112233"
+        chat_id = "55112233"
+
+    assert not trust.has_pairings("telegram"), "pre-existing pairing"
+    try:
+        assert _auto_pair_inbound("telegram", _Msg()) == "owner"
+        assert trust.resolve_notify_target("telegram") == "55112233"
+
+        class _Stranger:
+            sender_id = "99998888"
+            chat_id = "99998888"
+
+        assert _auto_pair_inbound("telegram", _Stranger()) == "paired"
+        # The destination must still be the first chat, not the newcomer.
+        assert trust.resolve_notify_target("telegram") == "55112233"
+        # Already known: no re-pairing, no role change.
+        assert _auto_pair_inbound("telegram", _Msg()) == ""
+        assert trust.resolve_notify_target("telegram") == "55112233"
+    finally:
+        trust.unpair("telegram", "55112233")
+        trust.unpair("telegram", "99998888")

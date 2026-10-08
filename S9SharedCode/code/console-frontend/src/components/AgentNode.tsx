@@ -9,6 +9,9 @@ export type AgentNodeData = {
   /** Raw node status (running / complete / skipped / ...) shown as a chip. */
   state?: string;
   selected?: boolean;
+  /** Opens this node's inspector. Passed in as data because React Flow renders
+      the node component itself and does not hand it the canvas callbacks. */
+  onSelect?: () => void;
   [k: string]: unknown;
 };
 
@@ -31,8 +34,23 @@ const SUB: Record<AgentNodeData['status'], string> = {
 };
 
 function AgentNode({ data }: NodeProps<AgentNodeType>) {
+  /* React Flow makes its nodes focusable, so a keyboard user can Tab onto a
+     node - but selection was wired only to onNodeClick, so Enter and Space did
+     nothing at all (measured: a mouse click opened the Inspector, Enter and
+     Space did not). A focusable thing that cannot be operated is worse than
+     one that is skipped, so the key handling belongs here, on the element that
+     actually receives the event. */
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+    e.preventDefault();
+    e.stopPropagation();
+    data.onSelect?.();
+  };
   return (
     <div
+      role="button"
+      aria-pressed={!!data.selected}
+      onKeyDown={onKeyDown}
       className={`w-[200px] rounded-[10px] border bg-[#101016] px-3 py-2.5 shadow-[0_8px_24px_rgba(0,0,0,0.45)] transition-shadow ${RING[data.status]} ${
         data.selected ? 'ring-2 ring-violet-400' : ''
       }`}

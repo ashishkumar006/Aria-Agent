@@ -38,18 +38,26 @@ class _Hit:
 
 
 class _Reg:
-    def __init__(self, filename="handbook.pdf", known=True):
+    def __init__(self, filename="handbook.pdf", known=True, enabled=None):
         self.filename = filename
         self.known = known
+        self._enabled = {"doc-1"} if enabled is None else set(enabled)
 
     def get(self, _doc_id):
         return type("Doc", (), {"filename": self.filename})() if self.known else None
 
+    def list(self):
+        # The route shapes every hit from one list() read now;
+        # mirror the real Registry's list() (all docs, id-tagged)
+        # rather than the per-hit get() above.
+        return [type("Doc", (), {"id": "doc-1", "filename": self.filename})()] \
+            if self.known else []
+
     def enabled_ids(self):
-        return {"doc-1"}
+        return set(self._enabled)
 
 
-def _wire(monkeypatch, hits, filename="handbook.pdf", known=True):
+def _wire(monkeypatch, hits, filename="handbook.pdf", known=True, enabled=None):
     """Patch the plane's search and the registry lookup the route performs."""
     seen: dict = {}
 
@@ -60,7 +68,7 @@ def _wire(monkeypatch, hits, filename="handbook.pdf", known=True):
 
     plane = type("P", (), {"search": fake_search})()
     monkeypatch.setattr(MA, "_plane", lambda _req: plane)
-    monkeypatch.setattr(MA, "_docs", lambda: _Reg(filename, known))
+    monkeypatch.setattr(MA, "_docs", lambda: _Reg(filename, known, enabled))
     return TestClient(M.app), seen
 
 
@@ -110,9 +118,23 @@ def test_empty_query_is_still_rejected(monkeypatch):
 def test_doc_ids_narrowing_is_still_honoured(monkeypatch):
     """The agent sends the enabled set; the handler must pass it down rather
     than falling back to every enabled document."""
-    c, seen = _wire(monkeypatch, [])
+    # `doc-a` must be enabled for it to pass through - disabled ids are
+    # intersected out (see the test below), which is the entire point.
+    c, seen = _wire(monkeypatch, [], enabled={"doc-a"})
     with c:
         r = c.post("/v1/documents/search",
                    json={"query": "x", "doc_ids": ["doc-a"]})
     assert r.status_code == 200, r.text
     assert seen["doc_ids"] == {"doc-a"}, seen
+
+
+def test_a_disabled_doc_id_is_excluded_even_when_explicitly_listed(monkeypatch):
+    """`doc_ids` scopes the search but must never EXPAND it past what the user
+    enabled. Listing a disabled id explicitly used to return that document's
+    full content - a scope allowlist could read switched-off documents."""
+    c, seen = _wire(monkeypatch, [], enabled={"doc-1"})
+    with c:
+        r = c.post("/v1/documents/search",
+                   json={"query": "x", "doc_ids": ["doc-2"]})
+    assert r.status_code == 200, r.text
+    assert seen["doc_ids"] == set(), seen

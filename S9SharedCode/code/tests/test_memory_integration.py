@@ -85,8 +85,12 @@ def test_unknown_kind_is_rejected_by_the_gateway():
     """Fail closed. A typo'd kind must 400, not silently return everything."""
     import httpx
     try:
+        # The gateway now requires X-Gateway-Token on every /v1 route; without
+        # it this gets a 401 before the kinds filter is ever consulted, and the
+        # assertion below would pass for the wrong reason.
         r = httpx.get(f"{gateway.GATEWAY_URL}/v1/memory",
-                      params={"kinds": "nonsense"}, timeout=20)
+                      params={"kinds": "nonsense"}, timeout=20,
+                      headers={"X-Gateway-Token": gateway._gateway_token()})
     except Exception:
         pytest.skip("gateway not reachable")
     assert r.status_code == 400, r.status_code

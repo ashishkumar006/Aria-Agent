@@ -68,6 +68,10 @@ class Document:
     error: str = ""
     embed_model: str = ""
     embed_dim: int = 0
+    # Parser/chunker version this document's chunk_count was
+    # computed under (see INDEX_FORMAT_VERSION). 0 means
+    # "unknown/legacy" and forces a re-index.
+    index_version: int = 0
     title: str = ""
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -116,9 +120,26 @@ class Registry:
             return []
 
     def _save(self, docs: list[dict]) -> None:
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(docs, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        payload = json.dumps(docs, indent=2)
+        # On Windows the atomic replace is racy: any reader
+        # holding the destination open — even for
+        # microseconds — turns `os.replace` into
+        # Access Denied, and the indexer saves after every
+        # batch while API handlers keep reading the file.
+        # Retry with a per-save temp name so a retry can
+        # never clobber another writer's in-flight file.
+        last: Exception | None = None
+        for attempt in range(5):
+            tmp = self.path.with_name(
+                f"{self.path.stem}.{os.getpid()}.{attempt}.tmp")
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, self.path)
+                return
+            except OSError as e:
+                last = e
+                time.sleep(0.05 * (attempt + 1))
+        raise last
 
     # ── CRUD ────────────────────────────────────────────────────────────────
     def add(self, *, filename: str, doc_type: str, size_bytes: int,
@@ -270,6 +291,15 @@ BATCH_DEFAULT = 16
 BATCH_MAX = 32
 YIELD_BETWEEN_BATCHES_S = float(
     os.getenv("DOCUMENT_EMBED_YIELD_S", "1.5") or 1.5)
+# Bump whenever the parser or chunker changes in a way that alters
+# chunk boundaries. A document indexed under an older version carries
+# that version here; on resume, a mismatch resets it to a full
+# re-parse instead of silently mixing the stored chunk_count with a
+# fresh parse that no longer matches it (observed live: a parser
+# fix changed a 69-chunk document into a 257-chunk one, and a
+# resumed run embedded the first 69 chunks of the new parse while
+# the registry still claimed the old ones).
+INDEX_FORMAT_VERSION = 3
 # After this many consecutive batches blocked by an unavailable embedder, the
 # worker stops trying so it does not spin. A later job picks it up again.
 MAX_BLOCKED_ROUNDS = 3
@@ -307,6 +337,16 @@ class Indexer:
         if doc is None:
             return None
 
+        if doc.chunk_count and doc.index_version != INDEX_FORMAT_VERSION:
+            # The chunker or parser changed since this document was
+            # indexed. The stored chunk_count describes a chunk list
+            # a fresh parse no longer produces, so resuming would
+            # embed the wrong chunks under the wrong indices. Reset
+            # and re-parse from scratch.
+            reg.update(doc_id, chunk_count=0, embedded_indices=[],
+                       embedded_count=0, status=PENDING, error="")
+            doc = reg.get(doc_id)
+
         if not doc.chunk_count:
             reg.set_status(doc_id, PARSING)
             data = reg.read_source(doc_id)
@@ -334,7 +374,8 @@ class Indexer:
             chunks = chunk_blocks(parsed.blocks)
             if not chunks:
                 return reg.set_status(doc_id, FAILED, "produced no chunks")
-            reg.update(doc_id, chunk_count=len(chunks))
+            reg.update(doc_id, chunk_count=len(chunks),
+                       index_version=INDEX_FORMAT_VERSION)
 
         todo = reg.pending_indices(doc_id)
         if not todo:
@@ -366,6 +407,16 @@ class Indexer:
                 time.sleep(YIELD_BETWEEN_BATCHES_S)
                 continue
             blocked_rounds = 0
+            if len(ok) != len(window):
+                # The embedder returned fewer vectors than the
+                # window asked for (or some came back falsy).
+                # Those chunks are neither stored nor marked, so
+                # they stay pending and this batch is retried -
+                # loud, because a persistently short response
+                # looks like a slow embed.
+                print(f"[index] {doc_id} short batch {window[0]}-"
+                      f"{window[-1]}: ok={len(ok)}/{len(window)} "
+                      f"vectors={len(vectors)}", flush=True)
             self._store_chunks(doc_id, window, vectors, result)
             reg.mark_embedded(doc_id, ok,
                               model=(result.get("embed_model")

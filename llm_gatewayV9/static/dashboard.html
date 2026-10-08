@@ -116,6 +116,7 @@
     <a class="badge" id="mem-summary" href="/static/system.html">—</a>
     <a class="badge" id="spend-summary" href="/static/system.html">—</a>
     <a class="badge" id="policy-mode" href="/static/system.html">—</a>
+    <span class="badge" id="load-err" style="display:none; border-color:var(--red); color:var(--red);" role="alert"></span>
   </div>
 
   <section class="card">
@@ -148,8 +149,8 @@
     <div class="card-head"><div><h2>Quick test</h2><p>Send one chat completion through the failover ladder.</p></div></div>
     <div class="card-body">
       <div class="test-area">
-        <select id="test-prov"><option value="">auto (failover)</option></select>
-        <select id="test-route">
+        <select id="test-prov" aria-label="Provider"><option value="">auto (failover)</option></select>
+        <select id="test-route" aria-label="Auto route">
           <option value="">no auto_route</option>
           <option value="perception">auto_route=perception</option>
           <option value="memory">auto_route=memory</option>
@@ -170,9 +171,9 @@
     <div class="card-head">
       <div><h2>Recent calls</h2><p>Latest ledger rows — errors and attempts included.</p></div>
       <div class="side">
-        <select id="filter-prov" onchange="loadCalls()"><option value="">all providers</option></select>
-        <div class="seg" id="filter-status-seg">
-          <button data-v="" class="on">All</button><button data-v="ok">OK</button><button data-v="error">Errors</button>
+        <select id="filter-prov" aria-label="Filter by provider" onchange="loadCalls()"><option value="">all providers</option></select>
+        <div class="seg" id="filter-status-seg" role="group" aria-label="Filter by status">
+          <button data-v="" class="on" aria-pressed="true">All</button><button data-v="ok" aria-pressed="false">OK</button><button data-v="error" aria-pressed="false">Errors</button>
         </div>
       </div>
     </div>
@@ -191,6 +192,29 @@
 </div>
 
 <script>
+const escH = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/* Per-source refresh failures. These loops used to swallow
+   every fetch error, so an unreachable gateway left every
+   tile showing its last data as if it were current. */
+const LOAD_ERRS = new Map();
+function renderErr() {
+  const el = document.getElementById('load-err');
+  if (!el) return;
+  if (!LOAD_ERRS.size) { el.style.display = 'none'; el.textContent = ''; return; }
+  el.style.display = '';
+  el.textContent = 'refresh failed: '
+    + [...LOAD_ERRS.entries()].map(([k, v]) => `${k} (${v})`).join(' · ')
+    + ' — showing last data';
+}
+function showErr(what, e) {
+  LOAD_ERRS.set(what, (e && e.message) ? e.message : 'network error');
+  renderErr();
+}
+function clearErr(what) {
+  if (!LOAD_ERRS.delete(what)) return;
+  renderErr();
+}
 function fmtAgo(ts) {
   if (!ts) return '—';
   const d = Math.round(Date.now()/1000 - ts);
@@ -214,8 +238,12 @@ async function loadCaps() { CAPS = await fetch('/v1/capabilities').then(r => r.j
 async function refresh() {
   let r;
   try { r = await fetch('/v1/status').then(x => x.json()); }
-  catch (e) { return; }
-  const _sig = JSON.stringify(r.live);
+  catch (e) { showErr('status', e); return; }
+  clearErr('status');
+  /* Today's counts change on every call, so the dedupe
+     signature must include them — a tile whose only change
+     was "calls today 12 → 13" used to never re-render. */
+  const _sig = JSON.stringify([r.live, r.today]);
   if (refresh._s === _sig) return;
   refresh._s = _sig;
   const isGem = (n) => n === 'gemini' || n === 'gemini35lite' || n.startsWith('gemini-') || n.startsWith('gemini35lite-');
@@ -233,18 +261,26 @@ async function refresh() {
     const card = document.createElement('div');
     card.className = 'tile';
     const cdLeft = s.cooldown_remaining > 0 ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
-    const boLeft = s.backoff_remaining > 0 ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s</span>` : '';
+    /* backoff_reason embeds up to 300 chars of the upstream
+       response body (providers.py) — attribute-escape it, or a
+       hostile model error breaks out of the title attribute. */
+    const boLeft = s.backoff_remaining > 0 ? ` <span class="pill err" title="${escH(s.backoff_reason)}">backoff ${s.backoff_remaining.toFixed(0)}s</span>` : '';
+    /* A 0 limit used to divide to NaN (the bar then sat
+       full-width), and the RPD bar was coloured by the RPM
+       ratio — the width said RPD, the colour said RPM. */
+    const rpmPct = s.rpm_limit > 0 ? Math.min(100, s.rpm_used / s.rpm_limit * 100) : 0;
+    const rpdPct = s.rpd_limit > 0 ? Math.min(100, s.rpd_used / s.rpd_limit * 100) : 0;
     card.innerHTML = `
-      <div class="name">${name}${cdLeft}${boLeft}</div>
-      <div class="model">${s.model}</div>
+      <div class="name">${escH(name)}${cdLeft}${boLeft}</div>
+      <div class="model">${escH(s.model)}</div>
       <div class="caps-row">${capPills(caps)}</div>
       <div style="margin-top:10px;">
         <div class="row"><span>RPM</span><b>${s.rpm_used} / ${s.rpm_limit}</b></div>
-        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${Math.min(100, s.rpm_used/s.rpm_limit*100)}%"></div></div>
+        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${rpmPct}%"></div></div>
       </div>
       <div style="margin-top:8px;">
         <div class="row"><span>RPD</span><b>${s.rpd_used} / ${s.rpd_limit}</b></div>
-        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${Math.min(100, s.rpd_used/s.rpd_limit*100)}%"></div></div>
+        <div class="bar"><div class="${barClass(s.rpd_used, s.rpd_limit)}" style="width:${rpdPct}%"></div></div>
       </div>
       <div class="row" style="margin-top:10px;">
         <span class="stat">calls today <b>${today.calls || 0}</b></span>
@@ -269,8 +305,9 @@ async function refresh() {
 async function refreshRouters() {
   let r;
   try { r = await fetch('/v1/routers').then(x => x.json()); }
-  catch (e) { return; }
-  const _sig = JSON.stringify(r.live);
+  catch (e) { showErr('routers', e); return; }
+  clearErr('routers');
+  const _sig = JSON.stringify([r.live, r.today]);
   if (refreshRouters._s === _sig) return;
   refreshRouters._s = _sig;
   document.getElementById('router-order').textContent = 'failover: ' + r.order.join(' → ');
@@ -287,17 +324,19 @@ async function refreshRouters() {
     card.className = 'tile';
     card.style.borderLeft = '3px solid var(--accent)';
     const cdLeft = s.cooldown_remaining > 0 ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
-    const boLeft = s.backoff_remaining > 0 ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s</span>` : '';
+    const boLeft = s.backoff_remaining > 0 ? ` <span class="pill err" title="${escH(s.backoff_reason)}">backoff ${s.backoff_remaining.toFixed(0)}s</span>` : '';
+    const rpmPct = s.rpm_limit > 0 ? Math.min(100, s.rpm_used / s.rpm_limit * 100) : 0;
+    const rpdPct = s.rpd_limit > 0 ? Math.min(100, s.rpd_used / s.rpd_limit * 100) : 0;
     card.innerHTML = `
-      <div class="name">${name} <span class="pill cap">router</span>${cdLeft}${boLeft}</div>
-      <div class="model">${s.model}</div>
+      <div class="name">${escH(name)} <span class="pill cap">router</span>${cdLeft}${boLeft}</div>
+      <div class="model">${escH(s.model)}</div>
       <div style="margin-top:10px;">
         <div class="row"><span>RPM</span><b>${s.rpm_used} / ${s.rpm_limit}</b></div>
-        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${Math.min(100, s.rpm_used/s.rpm_limit*100)}%"></div></div>
+        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${rpmPct}%"></div></div>
       </div>
       <div style="margin-top:8px;">
         <div class="row"><span>RPD</span><b>${s.rpd_used} / ${s.rpd_limit}</b></div>
-        <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit)}" style="width:${Math.min(100, s.rpd_used/s.rpd_limit*100)}%"></div></div>
+        <div class="bar"><div class="${barClass(s.rpd_used, s.rpd_limit)}" style="width:${rpdPct}%"></div></div>
       </div>
       <div class="row" style="margin-top:10px;"><span class="stat">routing calls today <b>${today.calls || 0}</b></span></div>
       <div class="row"><span>Last call</span><b>${fmtAgo(s.last_call)}</b></div>`;
@@ -307,12 +346,13 @@ async function refreshRouters() {
 async function refreshEmbedders() {
   let r;
   try { r = await fetch('/v1/embedders').then(x => x.json()); }
-  catch (e) { return; }
+  catch (e) { showErr('embedders', e); return; }
+  clearErr('embedders');
   const _sig = JSON.stringify([r.live, r.today]);
   if (refreshEmbedders._s === _sig) return;
   refreshEmbedders._s = _sig;
   document.getElementById('embed-order').innerHTML =
-    `<b>${r.order.join(' → ')}</b> · fixed dim <b>${r.fixed_dim}</b> · max input <b>${r.max_input_chars}</b> chars · backoff ${r.backoff_steps_s.join(' → ')}s`;
+    `<b>${r.order.map(escH).join(' → ')}</b> · fixed dim <b>${r.fixed_dim}</b> · max input <b>${r.max_input_chars}</b> chars · backoff ${r.backoff_steps_s.join(' → ')}s`;
   const grid = document.getElementById('embedders');
   grid.innerHTML = '';
   Object.keys(r.live).forEach(name => {
@@ -324,10 +364,10 @@ async function refreshEmbedders() {
     const rpmLabel = s.rpm_limit > 0 ? `${s.rpm_used} / ${s.rpm_limit}` : `${s.rpm_used} / ∞`;
     const rpmPct = s.rpm_limit > 0 ? Math.min(100, s.rpm_used / s.rpm_limit * 100) : 0;
     const cdPill = s.cooldown_remaining > 0 ? ` <span class="pill err">cooldown ${s.cooldown_remaining.toFixed(1)}s</span>` : '';
-    const boPill = s.backoff_remaining > 0 ? ` <span class="pill err" title="${s.backoff_reason}">backoff ${s.backoff_remaining.toFixed(0)}s (step ${s.backoff_step})</span>` : '';
+    const boPill = s.backoff_remaining > 0 ? ` <span class="pill err" title="${escH(s.backoff_reason)}">backoff ${s.backoff_remaining.toFixed(0)}s (step ${s.backoff_step})</span>` : '';
     card.innerHTML = `
-      <div class="name">${name}${cdPill}${boPill}</div>
-      <div class="model">${r.models[name]}</div>
+      <div class="name">${escH(name)}${cdPill}${boPill}</div>
+      <div class="model">${escH(r.models[name])}</div>
       <div style="margin-top:10px;">
         <div class="row"><span>RPM</span><b>${rpmLabel}</b></div>
         <div class="bar"><div class="${barClass(s.rpm_used, s.rpm_limit || 99999)}" style="width:${rpmPct}%"></div></div>
@@ -341,8 +381,12 @@ async function refreshEmbedders() {
 document.addEventListener('click', (e) => {
   const b = e.target.closest ? e.target.closest('#filter-status-seg button') : null;
   if (!b) return;
-  document.querySelectorAll('#filter-status-seg button').forEach((x) => x.classList.remove('on'));
+  document.querySelectorAll('#filter-status-seg button').forEach((x) => {
+    x.classList.remove('on');
+    x.setAttribute('aria-pressed', 'false');
+  });
   b.classList.add('on');
+  b.setAttribute('aria-pressed', 'true');
   loadCalls();
 });
 async function loadCalls() {
@@ -352,8 +396,21 @@ async function loadCalls() {
   const params = new URLSearchParams({limit: 100});
   if (prov) params.set('provider', prov);
   if (stat) params.set('status', stat);
-  const rows = await fetch('/v1/calls?' + params).then(r => r.json());
-  const _sig = JSON.stringify(rows.map((c) => [c.ts, c.provider, c.status, c.latency_ms]));
+  let rows;
+  /* No try/catch before: a non-array body (an auth JSON
+     error, a 500 page) threw inside json() or in the map
+     below, as an unhandled rejection every 15 seconds,
+     with the table silently keeping its stale rows. */
+  try {
+    rows = await fetch('/v1/calls?' + params).then(r => r.json());
+  } catch (e) { showErr('calls', e); return; }
+  if (!Array.isArray(rows)) { showErr('calls', new Error('unexpected response')); return; }
+  clearErr('calls');
+  /* The error text and the attempt count change on a retry
+     while ts/provider/status/latency stay identical, so the
+     dedupe signature has to carry them too. */
+  const _sig = JSON.stringify(rows.map((c) =>
+    [c.ts, c.provider, c.status, c.latency_ms, c.error || '', c.attempted || 0]));
   const tb = document.querySelector('#calls-table tbody');
   if (tb.dataset.sig === _sig) return;
   tb.dataset.sig = _sig;
@@ -364,14 +421,14 @@ async function loadCalls() {
     const role = c.call_role || 'worker';
     const isRouter = role.startsWith('router');
     const roleBadge = isRouter
-      ? `<span class="pill cap" style="background:rgba(163,113,247,0.2);color:var(--accent)">${role.replace('router_','rt:')}</span>`
+      ? `<span class="pill cap" style="background:rgba(163,113,247,0.2);color:var(--accent)">${escH(role.replace('router_','rt:'))}</span>`
       : `<span class="pill ok">worker</span>`;
-    const tier = c.router_decision ? `<span class="badge">${c.router_decision}</span>` : '—';
-    tr.innerHTML = `<td>${dt}</td><td>${roleBadge}</td><td class="prov">${c.provider}</td><td>${c.model}</td>
-      <td class="${c.status === 'ok' ? 'ok' : 'err'}">${c.status}</td><td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td>
-      <td>${tier}</td><td>${c.tool_calls || 0}${c.tool_dialect ? ' <span class="badge">'+c.tool_dialect+'</span>' : ''}</td>
-      <td class="${(c.latency_ms || 0) > 5000 ? 'err' : ((c.latency_ms || 0) > 1500 ? 'warn' : 'ok')}">${c.latency_ms}ms</td><td>${c.override || '—'}</td>
-      <td class="err-msg" title="${(c.error || '') + (c.attempted ? ' | attempted: ' + c.attempted : '')}">${c.error || (c.attempted || '—')}</td>`;
+    const tier = c.router_decision ? `<span class="badge">${escH(c.router_decision)}</span>` : '—';
+    tr.innerHTML = `<td>${dt}</td><td>${roleBadge}</td><td class="prov">${escH(c.provider)}</td><td>${escH(c.model)}</td>
+      <td class="${c.status === 'ok' ? 'ok' : 'err'}">${escH(c.status)}</td><td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td>
+      <td>${tier}</td><td>${c.tool_calls || 0}${c.tool_dialect ? ' <span class="badge">'+escH(c.tool_dialect)+'</span>' : ''}</td>
+      <td class="${(c.latency_ms || 0) > 5000 ? 'err' : ((c.latency_ms || 0) > 1500 ? 'warn' : 'ok')}">${c.latency_ms}ms</td><td>${escH(c.override || '—')}</td>
+      <td class="err-msg" title="${escH((c.error || '') + (c.attempted ? ' | attempted: ' + c.attempted : ''))}">${escH(c.error || (c.attempted || '—'))}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -440,7 +497,7 @@ async function loadCost() {
     if (!rows.length) { el.textContent = 'no cost rows yet'; return; }
     const fmt$ = (v) => '$' + Number(v || 0).toFixed(4);
     el.innerHTML = rows.slice(0, 20).map(x =>
-      `${x.agent}/${x.provider}: ${x.calls} calls · in=${x.in_tok} out=${x.out_tok} · ${fmt$(x.dollars)}`).join('<br>');
+      `${escH(x.agent)}/${escH(x.provider)}: ${x.calls} calls · in=${x.in_tok} out=${x.out_tok} · ${fmt$(x.dollars)}`).join('<br>');
   } catch (e) { el.textContent = 'cost failed: ' + e.message; }
 }
 // Cross-page status strip (lightweight: no tables on this page).
@@ -450,34 +507,40 @@ async function loadStrip() {
     const chans = c.channels || [];
     document.getElementById('chan-summary').textContent =
       `channels ${chans.filter(x => x.configured).length}/${chans.length} live`;
-  } catch {}
+    clearErr('channels');
+  } catch (e) { showErr('channels', e); }
   try {
     const k = await fetch('/v1/config/keys').then(r => r.json());
     const keys = k.keys || [];
     document.getElementById('keys-summary').textContent =
       `keys ${keys.filter(x => x.set).length}/${keys.length} set`;
-  } catch {}
+    clearErr('keys');
+  } catch (e) { showErr('keys', e); }
   try {
     const i = await fetch('/v1/integrations').then(r => r.json());
     const svcs = i.integrations || [];
     document.getElementById('int-summary').textContent =
       `integrations ${svcs.filter(x => x.configured).length}/${svcs.length} live`;
-  } catch {}
+    clearErr('integrations');
+  } catch (e) { showErr('integrations', e); }
   try {
     const m = await fetch('/v1/memory/stats').then(r => r.json());
     let total = (m.legacy || {}).items || 0;
     Object.values(m.drawers || {}).forEach(s => { total += (s || {}).items || 0; });
     document.getElementById('mem-summary').textContent = `memory ${total} records`;
-  } catch {}
+    clearErr('memory');
+  } catch (e) { showErr('memory', e); }
   try {
     const s = await fetch('/v1/spend').then(r => r.json());
     document.getElementById('spend-summary').textContent =
       `spend ${((s.totals || {}).calls) || 0} calls · $${((s.totals || {}).dollars) || 0}`;
-  } catch {}
+    clearErr('spend');
+  } catch (e) { showErr('spend', e); }
   try {
     const p = await fetch('/v1/policy').then(r => r.json());
     document.getElementById('policy-mode').textContent = p.dry_run ? 'policy DRY-RUN' : 'policy ENFORCING';
-  } catch {}
+    clearErr('policy');
+  } catch (e) { showErr('policy', e); }
 }
 document.getElementById('port-badge').textContent = 'port ' + location.port;
 loadCaps().then(() => { refresh(); refreshRouters(); refreshEmbedders(); loadCalls(); loadStrip(); });

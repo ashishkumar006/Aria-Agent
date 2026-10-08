@@ -87,11 +87,11 @@
     </div>
     <div class="card-body">
       <div class="status-strip" id="deploy-filters" hidden>
-        <div class="seg" id="deploy-seg">
-          <button class="on" data-f="all">all</button>
-          <button data-f="FAILED">needs attention</button>
-          <button data-f="UNKEYED">unkeyed</button>
-          <button data-f="SKIPPED">skipped</button>
+        <div class="seg" id="deploy-seg" role="group" aria-label="Filter deploy results">
+          <button class="on" data-f="all" aria-pressed="true">all</button>
+          <button data-f="FAILED" aria-pressed="false">needs attention</button>
+          <button data-f="UNKEYED" aria-pressed="false">unkeyed</button>
+          <button data-f="SKIPPED" aria-pressed="false">skipped</button>
         </div>
         <span class="hint" id="deploy-count"></span>
       </div>
@@ -169,6 +169,8 @@
 </div>
 
 <script>
+const escH = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const POOL_PROVIDERS = ['gemini', 'nvidia', 'groq', 'cerebras', 'openrouter', 'github', 'kilo'];
 let POOLS = {};
 let POOLS_BUILT = false;
@@ -290,8 +292,12 @@ function _renderDeploy() {
 document.addEventListener('click', (e) => {
   const b = e.target.closest ? e.target.closest('#deploy-seg button') : null;
   if (!b) return;
-  document.querySelectorAll('#deploy-seg button').forEach((x) => x.classList.remove('on'));
+  document.querySelectorAll('#deploy-seg button').forEach((x) => {
+    x.classList.remove('on');
+    x.setAttribute('aria-pressed', 'false');
+  });
   b.classList.add('on');
+  b.setAttribute('aria-pressed', 'true');
   _deployFilter = b.dataset.f;
   _renderDeploy();
 });
@@ -331,11 +337,14 @@ async function loadPolicy() {
     tb.innerHTML = '';
     (d.rules || []).forEach(r => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td class="prov">${r.id || ''}</td><td class="err-msg">${JSON.stringify(r.when || {})}</td>` +
-        `<td>${r.action || ''}</td><td>${r.enforce ? 'yes' : 'no'}</td>`;
+      /* Rule ids and actions come from policy.yaml and `when`
+         is rendered as JSON — all of it lands in innerHTML,
+         so a rule value containing markup used to execute. */
+      tr.innerHTML = `<td class="prov">${escH(r.id || '')}</td><td class="err-msg">${escH(JSON.stringify(r.when || {}))}</td>` +
+        `<td>${escH(r.action || '')}</td><td>${r.enforce ? 'yes' : 'no'}</td>`;
       tb.appendChild(tr);
     });
-  } catch (e) { tb.innerHTML = `<tr><td colspan="4">policy load failed: ${e.message}</td></tr>`; }
+  } catch (e) { tb.innerHTML = `<tr><td colspan="4">policy load failed: ${escH(e.message)}</td></tr>`; }
 }
 async function loadMemory() {
   const tb = document.querySelector('#memory-table tbody');
@@ -351,11 +360,11 @@ async function loadMemory() {
     tb.innerHTML = '';
     rows.forEach(([name, s]) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td class="prov">${name}</td><td>${s.items || 0}</td>` +
+      tr.innerHTML = `<td class="prov">${escH(name)}</td><td>${s.items || 0}</td>` +
         `<td>${s.index_size || 0}</td><td>${s.index_dim == null ? '—' : s.index_dim}</td>`;
       tb.appendChild(tr);
     });
-  } catch (e) { tb.innerHTML = `<tr><td colspan="4">memory load failed: ${e.message}</td></tr>`; }
+  } catch (e) { tb.innerHTML = `<tr><td colspan="4">memory load failed: ${escH(e.message)}</td></tr>`; }
 }
 async function loadSpend() {
   const tb = document.querySelector('#spend-table tbody');
@@ -370,13 +379,13 @@ async function loadSpend() {
     tb.innerHTML = '';
     (d.rows || []).slice(0, 30).forEach(r => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td class="prov">${r.agent || ''}</td><td>${r.provider || ''}</td>` +
+      tr.innerHTML = `<td class="prov">${escH(r.agent || '')}</td><td>${escH(r.provider || '')}</td>` +
         `<td>${r.calls || 0}</td><td>${r.in_tok || 0}</td><td>${r.out_tok || 0}</td>` +
         `<td>$${r.dollars || 0}</td>`;
       tb.appendChild(tr);
     });
     if (!(d.rows || []).length) tb.innerHTML = '<tr><td colspan="6">no spend recorded today</td></tr>';
-  } catch (e) { tb.innerHTML = `<tr><td colspan="6">spend load failed: ${e.message}</td></tr>`; }
+  } catch (e) { tb.innerHTML = `<tr><td colspan="6">spend load failed: ${escH(e.message)}</td></tr>`; }
 }
 async function loadCost() {
   const el = document.getElementById('cost-out');
@@ -398,7 +407,7 @@ async function loadCost() {
     if (!rows.length) { el.textContent = 'no cost rows yet'; return; }
     const fmt$ = (v) => '$' + Number(v || 0).toFixed(4);
     el.innerHTML = rows.slice(0, 20).map(x =>
-      `${x.agent}/${x.provider}: ${x.calls} calls · in=${x.in_tok} out=${x.out_tok} · ${fmt$(x.dollars)}`).join('<br>');
+      `${escH(x.agent)}/${escH(x.provider)}: ${x.calls} calls · in=${x.in_tok} out=${x.out_tok} · ${fmt$(x.dollars)}`).join('<br>');
   } catch (e) { el.textContent = 'cost failed: ' + e.message; }
 }
 async function runTTS() {

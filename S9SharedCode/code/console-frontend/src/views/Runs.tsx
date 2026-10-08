@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { GitBranch, Square } from 'lucide-react';
-import { Rail, TopBar, Empty, Skel, Pill } from '../components/ui';
-import { classifyStatus, isTerminal, pillForStatus, type RunStatus } from '../components/markdown';
+import { Rail, TopBar, Empty, Skel, Pill, SkipLink } from '../components/ui';
+import { classifyStatus, isRunLive, pillForStatus, type RunStatus } from '../components/markdown';
 import DagCanvas from '../components/DagCanvas';
 import Inspector from '../components/Inspector';
 import { api, ago, displayTopic, CONF, type RunRow, type GraphPayload } from '../api';
@@ -85,8 +85,15 @@ const nav = useNavigate();
        unconditionally, so the poll effect immediately re-fetched the graph
        open() had just loaded — two identical requests for every run,
        including years-old terminal ones. */
-    const looksLive = !r || !r.status_counts || Object.keys(r.status_counts).some(
-      (s) => !isTerminal(s));
+    /* Same rule as the poll below, for the same reason: `status_counts` from
+       the rollup contains a stranded `pending` on many finished runs, so
+       "some status is not terminal" is not evidence that a run is going. A
+       pending alongside anything settled means it is not live. */
+    const counts = Object.entries(r?.status_counts || {})
+      .map(([k, v]) => ({ status: k, n: (v as number) || 0 }));
+    const looksLive = !r || !r.status_counts
+      ? true
+      : isRunLive(counts);
     setLiveSid(looksLive ? id : '');
     try {
       const g = await api.graph(id);
@@ -110,15 +117,28 @@ const nav = useNavigate();
   useEffect(() => {
     if (!liveSid) return;
     let dead = false;
+    /* The server answers 200 with an EMPTY node list for an unknown
+       or deleted session, so "every node terminal" (which needs at
+       least one node) never fires and this poll spun forever. Count
+       consecutive empty frames instead: a couple also cover the
+       warmup window before the first node is written, three means
+       nothing is ever going to appear. */
+    let emptyTicks = 0;
     const tick = async () => {
       const seq = ++gSeq.current;
       try {
         const g = await api.graph(liveSid);
         if (dead || seq !== gSeq.current) return;
         setGraph(g);
-        const terminal = (g.nodes || []).length > 0 && (g.nodes || []).every((n) =>
-          isTerminal(n.status));
-        if (terminal) setLiveSid('');
+        const nodes = g.nodes || [];
+        /* `every(isTerminal)` could never be true for a run whose recovery
+           replan left a stranded `pending` node, so the poll never stopped and
+           the Stop button stayed offered on a run that finished hours ago
+           (measured: 9 requests in 18s, still going). `isRunLive` mirrors the
+           server's `_run_is_live`: a pending node alone is not work in flight. */
+        const live = nodes.length === 0 ? emptyTicks < 3 : isRunLive(nodes);
+        emptyTicks = nodes.length === 0 ? emptyTicks + 1 : 0;
+        if (!live) setLiveSid('');
       } catch { /* keep last frame */ }
     };
     tick();
@@ -135,10 +155,14 @@ const nav = useNavigate();
     if (flt === 'err' && st !== 'err') return false;
     return true;
   });
-  const nErr = runs.filter((s) => statusOf(s) === 'err').length;
+  /* Counts the FILTERED rows, not the whole board: the badge sits
+     under the list, so "3 runs with failures" must describe what is
+     actually on screen after search/status filters. */
+  const nErr = vis.filter((s) => statusOf(s) === 'err').length;
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[264px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
@@ -159,7 +183,13 @@ const nav = useNavigate();
               <button onClick={refresh} className="ml-1.5 underline">retry</button>
             </div>
           )}
-          {loaded && !loadError && !vis.length && <Empty icon={<GitBranch size={30} />} title="No runs yet" sub="Run something in Research (or a scheduled job) and every pipeline execution lands here. Chat is lightweight and leaves no trace." />}
+          {loaded && !loadError && !vis.length && (
+            runs.length
+              /* Runs exist but the filter excludes them all: "No runs yet"
+                 told the user they had never run anything. */
+              ? <Empty icon={<GitBranch size={30} />} title="No runs match" sub="Clear the filter or status to see the rest of your history." />
+              : <Empty icon={<GitBranch size={30} />} title="No runs yet" sub="Run something in Research (or a scheduled job) and every pipeline execution lands here. Chat is lightweight and leaves no trace." />
+          )}
           {loaded && loadError && !runs.length && (
             <div className="rounded-lg border border-red-400/30 bg-red-400/5 p-3 text-center text-xs text-red-200">
               couldn't load runs ({loadError}). <button onClick={refresh} className="underline">retry</button>
@@ -187,7 +217,7 @@ const nav = useNavigate();
           })}
         </div>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Runs">
           {/* Kept mounted and hidden rather than conditionally rendered:
               swapping the button out on run start/end destroyed keyboard
@@ -220,7 +250,12 @@ const nav = useNavigate();
             {!graph || !graph.nodes.length ? (
               <Empty icon={<GitBranch size={30} />} title="Select a run" sub="Its execution graph renders here — click any node to inspect it." />
             ) : (
-              <DagCanvas graph={graph} running={!!liveSid} selectedId={selected} onSelect={setSelected} />
+              /* DagCanvas is keyed by sid: it keeps per-instance
+                 state (dragged node positions, the fitted-once
+                 structure signature) in refs, and without a remount
+                 opening a different run inherited the previous
+                 run's positions and never re-fit. */
+              <DagCanvas key={sid} graph={graph} running={!!liveSid} selectedId={selected} onSelect={setSelected} />
             )}
           </div>
           {selected && sid && (
@@ -238,7 +273,7 @@ const nav = useNavigate();
           )}
         </div>
         {!!nErr && <div className="px-4 pb-2 text-[11px] text-red-300">{nErr} run{nErr === 1 ? '' : 's'} with failures</div>}
-      </div>
+      </main>
     </div>
   );
 }

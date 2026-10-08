@@ -125,10 +125,12 @@ def test_ee01_mcp_tool_catalogue():
     import mcp_server as mcp_mod
     tools = asyncio.run(mcp_mod.mcp.list_tools())
     names = {t.name for t in tools}
-    # 38-tool catalogue (matches tests/comprehensive/test_mcp_tools.py).
-    assert len(tools) == 38, f"expected 38 tools, got {len(tools)}"
+    # 40-tool catalogue (matches tests/comprehensive/test_mcp_tools.py).
+    # Was 40: render_document was counted as present while never having been
+    # registered, so the model could not call it.
+    assert len(tools) == 40, f"expected 40 tools, got {len(tools)}"
     for expected in ("list_scheduled", "web_search", "read_file", "list_dir",
-                     "search_knowledge", "github_query"):
+                     "search_knowledge", "github_query", "read_artifact"):
         assert expected in names, f"missing MCP tool: {expected}"
 
 

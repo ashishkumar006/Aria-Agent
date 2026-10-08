@@ -144,22 +144,32 @@ async def _dispatch_tool(session: ClientSession, name: str, args: dict) -> str:
 
 async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                          max_hops: int = MAX_TOOL_HOPS,
-                         on_event=None, on_outcome=None) -> dict:
+                         on_event=None, on_outcome=None,
+                         prepare_fn=None) -> dict:
     """The tool-use loop, factored for testability: `chat_fn(messages)`
     returns a gateway reply dict; `dispatch_fn(name, args)` returns result
     text. Returns the FINAL reply dict. Stops early with an explicit error
     reply on hop-cap or verifier-stall (same tool+args repeating).
 
     `on_event(kind, payload)` is an optional sync callback for live
-    progress (chat streaming): kind is "tool_call" ({name}) or
-    "tool_result" ({name, ok}). It must never raise — errors are swallowed
+    progress (chat streaming): kind is "tool_call" ({name,
+    arguments}) or "tool_result" ({name, ok, result | error}).
+    The arguments and a bounded result ride the events so an
+    operator watching a stream sees what was actually dispatched
+    and what came back — the name alone cannot answer either.
+    It must never raise — errors are swallowed
     so progress reporting can never break the loop.
 
     `on_outcome(name, arguments, ok, result_text, latency_s)` fires once per
     tool call with the measured latency. This is the single choke point every
     tool result passes through, which is what makes the tool-outcome memory
     write deterministic instead of depending on the model to remember to
-    record it. Same contract: never raises, never blocks."""
+    record it. Same contract: never raises, never blocks.
+
+    `prepare_fn(name, arguments)` runs BEFORE the call is dispatched and may
+    return rewritten arguments. Anything that has to change what a tool
+    receives must happen here, not in on_outcome - by then the call is
+    already out over the wire. Also never raises."""
     def _emit(kind: str, payload: dict) -> None:
         if on_event is None:
             return
@@ -169,6 +179,7 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             pass
     last_reply: dict = {}
     repeats: dict[str, int] = {}
+    succeeded: set[str] = set()
     for _ in range(max_hops + 1):
         reply = await chat_fn(messages)
         last_reply = reply
@@ -179,6 +190,18 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             key = _call_key(tc.get("name", ""), tc.get("arguments") or {})
             repeats[key] = repeats.get(key, 0) + 1
             if repeats[key] > MAX_SAME_CALL_REPEATS:
+                # A repeat of a call that already SUCCEEDED is not a stall, it
+                # is a model that has what it needs and is looping anyway.
+                # Observed live: render_document returned 200 and stored the
+                # PDF, the model called it again unchanged, and this guard
+                # aborted the loop - so the node died holding a real document
+                # and the receipt reported nothing. Break out and keep it.
+                if key in succeeded:
+                    return {"text": reply.get("text", "") or "",
+                            "tool_calls": [],
+                            "provider": reply.get("provider", ""),
+                            "note": ("repeated an already-successful call; "
+                                     "stopping the loop")}
                 return {"text": "", "tool_calls": [],
                         "provider": reply.get("provider", ""),
                         "error": f"verifier stall: tool '{tc.get('name')}' "
@@ -191,17 +214,33 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             "tool_calls": tool_calls,
         })
         for tc in tool_calls:
-            _emit("tool_call", {"name": tc.get("name", "")})
+            _emit("tool_call", {"name": tc.get("name", ""),
+                                "arguments": tc.get("arguments") or {}})
             _t0 = time.perf_counter()
             try:
-                result_text = await dispatch_fn(tc.get("name", ""),
-                                                tc.get("arguments") or {})
+                # `prepare_fn` runs BEFORE dispatch, and that is the only
+                # place a rewrite can still change what the tool receives.
+                # Doing it in on_outcome looked equivalent and was not: the
+                # call had already gone out over the wire by then, so the
+                # arguments the tool actually saw were the model's own.
+                _name, _args = tc.get("name", ""), tc.get("arguments") or {}
+                if prepare_fn is not None:
+                    try:
+                        _args = prepare_fn(_name, _args) or _args
+                    except Exception:
+                        pass
+                result_text = await dispatch_fn(_name, _args)
                 ok = True
-                _emit("tool_result", {"name": tc.get("name", ""), "ok": True})
+                succeeded.add(_call_key(_name, _args))
+                _emit("tool_result", {"name": tc.get("name", ""),
+                                      "ok": True,
+                                      "result": result_text[:400]})
             except Exception as e:
                 result_text = f"tool error: {type(e).__name__}: {e}"
                 ok = False
-                _emit("tool_result", {"name": tc.get("name", ""), "ok": False})
+                _emit("tool_result", {"name": tc.get("name", ""),
+                                      "ok": False,
+                                      "error": str(e)[:400]})
             if on_outcome is not None:
                 try:
                     on_outcome(tc.get("name", ""), tc.get("arguments") or {},
@@ -231,6 +270,7 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          temperature: float = 0.3,
                          messages: list[dict] | None = None,
                          on_event=None, on_outcome=None,
+                         prepare_fn=None,
                          doc_ids: set[str] | None = None) -> dict:
     """Multi-turn chat: dispatch tool_calls via MCP, keep going until the
     model returns text. Returns the FINAL gateway reply dict (so callers
@@ -245,6 +285,13 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
     process with no other way to learn which conversation invoked it. `None`
     means no document filtering; an empty set means no documents."""
     _messages: list[dict] = messages if messages is not None else [{"role": "user", "content": prompt}]
+    # `_os` was first imported sixteen lines below its use, so Python bound it as
+    # a local and every entry raised `UnboundLocalError: cannot access local
+    # variable '_os'`. It was invisible because the caller caught it and fell
+    # back to a plain-text call, so a broken tool loop surfaced as a merely worse
+    # answer rather than an error - and when the fallback produced nothing, as
+    # the literal string "(empty answer)", it surfaced as success.
+    import os as _os
     _doc_env = _os.environ.copy()
     if doc_ids is not None:
         # An empty set is meaningful ("no documents"), so it must be sent as
@@ -261,7 +308,6 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
     # the encoding layer, not the network. PYTHONUTF8 makes the child use
     # UTF-8 for all stdio; `encoding` makes the client decode it as UTF-8
     # instead of the locale default.
-    import os as _os
     # Fail fast and honestly if the tool subprocess is known-broken, instead of
     # spawning another child that will fail the same way.
     breaker_check()
@@ -288,7 +334,8 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                 return await run_tool_loop(messages=_messages, chat_fn=_chat,
                                            dispatch_fn=_dispatch,
                                            on_event=on_event,
-                                           on_outcome=on_outcome)
+                                           on_outcome=on_outcome,
+                                           prepare_fn=prepare_fn)
     except McpUnavailable:
         raise
     except BaseException as e:

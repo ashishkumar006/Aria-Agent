@@ -96,12 +96,12 @@ def test_capabilities_only_claims_what_is_implemented():
     # Claiming a transport we do not implement sends a client down a path that
     # fails mid-run.
     for unsupported in ("websocket", "http_binary", "resumable",
-                        "push_notifications"):
+                        "pushNotifications"):
         assert tr[unsupported] is False, unsupported
     assert caps["tools"]["toolCalling"] is True
     assert caps["tools"]["tools"] == ["web_search"]
     assert caps["reasoning"]["reasoning"] is False
-    assert caps["multi_agent"]["subAgents"] is False
+    assert caps["multiAgent"]["subAgents"] is False
     assert caps["execution"]["codeExecution"] is False
 
 
@@ -221,14 +221,19 @@ def test_agui_rejects_non_json():
 
 def test_agui_emits_a_well_formed_run(monkeypatch):
     """A real request, a stubbed model. Asserts the sequence the spec requires.
+
+    `mcp_runner.LLM` is patched too, for the same reason as the failure test
+    below: the name is bound at import time there.
     """
     import gateway as G
+    import mcp_runner as MR
 
     class _LLM:
         def chat(self, **kw):
             return {"text": "the answer is four"}
 
     monkeypatch.setattr(G, "LLM", _LLM)
+    monkeypatch.setattr(MR, "LLM", _LLM)
     monkeypatch.setattr(G, "ensure_gateway", lambda: None)
     monkeypatch.setattr(agent_server, "_session_cost_breakdown",
                         lambda _s: {})
@@ -274,14 +279,26 @@ def test_agui_emits_a_well_formed_run(monkeypatch):
 def test_agui_reports_a_model_failure_as_run_error_not_a_silent_end(
         monkeypatch):
     """A stream that dies without a terminal event leaves the client waiting
-    forever and renders a partial answer as a finished one."""
+    forever and renders a partial answer as a finished one.
+
+    Patches `mcp_runner.LLM` as well as `gateway.LLM`. `mcp_runner` binds the
+    name at import time (`from gateway import LLM`), so patching only the
+    gateway attribute never reached the tool loop that AG-UI actually uses.
+
+    This test was passing for the wrong reason until the tool loop's
+    use-before-import of `os` was fixed: the loop raised `UnboundLocalError`,
+    AG-UI correctly reported RUN_ERROR, and the assertion was satisfied by a
+    crash rather than by the intended stubbed failure.
+    """
     import gateway as G
+    import mcp_runner as MR
 
     class _Boom:
         def chat(self, **kw):
             raise RuntimeError("provider exploded")
 
     monkeypatch.setattr(G, "LLM", _Boom)
+    monkeypatch.setattr(MR, "LLM", _Boom)
     monkeypatch.setattr(G, "ensure_gateway", lambda: None)
     monkeypatch.setattr(agent_server, "_session_cost_breakdown",
                         lambda _s: {})

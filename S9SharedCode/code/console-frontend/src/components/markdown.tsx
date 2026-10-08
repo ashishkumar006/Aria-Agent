@@ -49,9 +49,27 @@ const TABLE_SEP = /^\|?[\s:|-]+\|[\s:|-]*$/;
     Fences and tables are the two things research reports actually contain
     constantly, and without them every code block rendered as a stack of
     separate paragraphs with visible backticks — while the container styles
-    in the views styled a `pre` the renderer never emitted. */
-export function renderMarkdown(src: string, headingOffset = 0): string {
+    in the views styled a `pre` the renderer never emitted.
+
+    `fitTopLevel` anchors the SHALLOWEST heading the model actually wrote to
+    h2. Without it a report written entirely with `##` sections (which is
+    what the research formatter is instructed to produce) rendered every
+    section as an <h3> and the document had no top level at all — no h2
+    anywhere, so a screen reader and an outline view saw one flat list of
+    sub-headings under nothing. Clamped to >= 2, so it never emits an h1 and
+    never outranks the page's own structure. */
+export function renderMarkdown(src: string, headingOffset = 0,
+                               fitTopLevel = false): string {
   const lines = String(src || '').split('\n');
+  let off = headingOffset;
+  if (fitTopLevel) {
+    let min = Infinity;
+    for (const l of lines) {
+      const h = l.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (h) min = Math.min(min, h[1].length);
+    }
+    if (Number.isFinite(min)) off = 2 - min;
+  }
   let html = '';
   // Open list stack, so nesting depth is preserved instead of flattened.
   const stack: string[] = [];
@@ -124,7 +142,7 @@ export function renderMarkdown(src: string, headingOffset = 0): string {
     const h = t.match(/^(#{1,6})\s+(.*)$/);
     if (h) {
       closeLists();
-      const lv = Math.min(6, h[1].length + headingOffset);
+      const lv = Math.max(2, Math.min(6, h[1].length + off));
       html += `<h${lv}>${inline(h[2])}</h${lv}>`;
       continue;
     }
@@ -145,7 +163,12 @@ export function renderMarkdown(src: string, headingOffset = 0): string {
       const kind = ordered ? 'ol' : 'ul';
       closeLis(depth); // siblings at this depth, then anything deeper
       if (stack.length > depth) closeLists(depth);
-      else if (stack.length === depth && depth > 0 && stack[depth - 1] !== kind) {
+      // The type check must come AFTER closing deeper lists. It used to run
+      // first, so this line pre-empted it: after a nested sublist, a sibling
+      // `1. first` had `stack.length > depth`, took closeLists, and landed
+      // inside the still-open <ul> — an ordered list rendered as bullets, and
+      // a document containing zero <ol> elements.
+      if (stack.length === depth && depth > 0 && stack[depth - 1] !== kind) {
         html += `</${stack.pop()}>`;
       }
       while (stack.length < depth) {
@@ -178,9 +201,35 @@ export type RunStatus = 'ok' | 'err' | 'warn' | 'info' | 'muted';
     one page and "still running" on another. */
 export function isTerminal(status?: string): boolean {
   /* `interrupted` is the server's label for a run whose process died before
-     it could mark a node terminal (stale-graph reconciliation). It must read
-     as terminal, or the Runs page keeps polling a dead run forever. */
+   it could mark a node terminal (stale-graph reconciliation). It must read
+   as terminal, or the Runs page keeps polling a dead run forever. */
   return /done|complete|ok|success|pass|error|fail|skip|cancel|interrupt/i.test(status || '');
+}
+
+/* Is this RUN still going?
+ *
+ * A node being `pending` does NOT mean work is in flight. When the recovery
+ * planner abandons a branch it replaces the node and the old one stays
+ * `pending` forever, so a finished run can carry a stranded pending node. The
+ * Runs page used to treat that as "not terminal", which showed a Stop button on
+ * a run that finished hours ago and polled it forever (measured: 9 requests in
+ * 18s on a 4-hour-old run, then continuing).
+ *
+ * The server already solved exactly this - `agent_server._run_is_live`, whose
+ * comment says "a stranded pending node must not mean live". This mirrors it:
+ * something is live only while a node is actually running/queued, or while
+ * nothing has settled yet and a node is still waiting to start. */
+export function isRunLive(
+  nodes: { status?: string }[],
+  producedLive?: boolean,
+): boolean {
+  if (typeof producedLive === 'boolean') return producedLive;
+  const s = nodes.map((n) => String(n?.status || '').toLowerCase());
+  if (s.some((x) => x === 'running' || x === 'queued' || x === 'live')) return true;
+  const settled = s.some((x) =>
+    /done|complete|ok|success|pass|error|fail|skip|cancel|interrupt/.test(x));
+  if (settled) return false;
+  return s.some((x) => x === 'pending' || x === 'queued' || x === '');
 }
 
 /** One label + tone per lifecycle state, for the status pills. Pages

@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { Search, FlaskConical } from 'lucide-react';
 import DagCanvas from '../components/DagCanvas';
 import Inspector from '../components/Inspector';
 import { isTerminal, renderMarkdown } from '../components/markdown';
-import { Rail, TopBar, Pill, useHealth } from '../components/ui';
-import { api, briefFor, displayTopic, ago, CONF, type GraphPayload, type GraphNode, type SessionSummary } from '../api';
+import { Rail, TopBar, Pill, useHealth, SkipLink } from '../components/ui';
+import { DocumentViewer } from './DocSetup';
+import { api, headers, briefFor, displayTopic, ago, CONF, type GraphPayload, type GraphNode, type SessionSummary } from '../api';
 
 type Depth = 'quick' | 'standard' | 'deep';
 type CanvasView = 'graph' | 'report' | 'log';
@@ -13,14 +14,63 @@ type CanvasView = 'graph' | 'report' | 'log';
 /** Pull readable markdown out of a formatter node's stored output
  *  ({final_answer} today; tolerant of older shapes). */
 function extractReport(out: unknown): string {
-  if (typeof out === 'string') return out;
+  if (typeof out === 'string') return unwrapAnswer(out);
   if (out && typeof out === 'object') {
     const o = out as Record<string, unknown>;
     for (const k of ['final_answer', 'report', 'markdown', 'content', 'text', 'answer']) {
-      if (typeof o[k] === 'string' && (o[k] as string).trim()) return o[k] as string;
+      if (typeof o[k] === 'string' && (o[k] as string).trim()) return unwrapAnswer(o[k] as string);
     }
   }
   return '';
+}
+
+/** Recover plain markdown from a model reply that still wears its
+ *  transport wrapper. Three shapes occur in practice, all observed live:
+ *    1. fenced:        ```json\n{"final_answer": "…"}\n```
+ *    2. closed object:  {"final_answer": "…"}
+ *    3. UNTERMINATED:   {"final_answer": "…      (no closing brace)
+ *  Left alone, shape 1 made renderMarkdown treat the ENTIRE report as one
+ *  code block — headings, lists and links all vanished — and shape 3
+ *  printed raw JSON as the report body. The server strips this on the
+ *  sectioned path (`skills._strip_answer_envelope`) but a single-call
+ *  formatter or an older stored run still ships the wrapper, so the
+ *  client normalises too. Belt and braces: the user must never see JSON. */
+function unwrapAnswer(s: string): string {
+  let t = (s || '').trim();
+  if (!t) return '';
+  // Strip the opening and closing fences INDEPENDENTLY. The old regex
+  // required both, so an envelope whose closing fence was missing (a stored
+  // 4,597-char `final_answer` starting "```json" and ending mid-string) fell
+  // through every branch: the fence regex missed, `startsWith('{')` was false
+  // because the text began with backticks, and the bare-fence regex missed
+  // too - so the whole report rendered as one code block of raw JSON, which
+  // is precisely what this function exists to prevent.
+  t = t.replace(/^```(?:json|markdown|md)?[ \t]*\r?\n?/i, '');
+  t = t.replace(/```\s*$/, '');
+  t = t.trim();
+  if (t.startsWith('{')) {
+    try {
+      const obj = JSON.parse(t) as Record<string, unknown>;
+      for (const k of ['final_answer', 'answer', 'report', 'text', 'content', 'markdown']) {
+        const v = obj?.[k];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+      }
+    } catch {
+      // Unterminated object: take everything after the first colon.
+      const m = /^\{\s*"(?:final_answer|answer|report|text|content|markdown)"\s*:\s*"([\s\S]*)$/.exec(t);
+      if (m) {
+        let body = m[1].replace(/["'}\s,]+$/, '');
+        // The value still carries escaped newlines from the JSON string.
+        body = body.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"');
+        if (body.trim()) return body.trim();
+      }
+      return '';
+    }
+  }
+  // A bare fence (no envelope) around real markdown.
+  const bare = /^```(?:markdown|md)?[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/i.exec(t);
+  if (bare) return bare[1].trim();
+  return t;
 }
 
 export default function Research() {
@@ -38,6 +88,8 @@ export default function Research() {
   const [note, setNote] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
   const [answer, setAnswer] = useState('');
+const [files, setFiles] = useState<{ artifact: string; filename: string; format: string }[]>([]);
+const [viewFile, setViewFile] = useState<string | null>(null);
   const [view, setView] = useState<CanvasView>('graph');
   /* Live reasoning log. The server streams a `log` frame per orchestrator
      stdout line, and this view used to DISCARD them all — so a five-minute
@@ -53,6 +105,12 @@ export default function Research() {
   // Set by the Stop button so the abort path keeps "stopped." instead of
   // overwriting it with the generic "cancelled." a moment later.
   const stoppedRef = useRef(false);
+  // Focus handoff for the Start/Stop pair: both buttons stay
+  // mounted and the inactive one is disabled, so clicking one
+  // disables it — focus moves to the button that just became the
+  // live action instead of being thrown back to <body>.
+  const stopBtnRef = useRef<HTMLButtonElement | null>(null);
+  const startBtnRef = useRef<HTMLButtonElement | null>(null);
   // Post-stop catch-up poll (see stop()): the server skips the remaining
   // nodes a moment AFTER the cancel lands, so the canvas needs a few extra
   // fetches to show the partial graph instead of the pre-cancel frame.
@@ -75,11 +133,16 @@ export default function Research() {
 
   const refreshTopics = useCallback(async () => {
     try {
-      const d = await api.sessions(50);
-      if (!aliveRef.current) return;
-      setTopics((d.sessions || []).filter(
-        (s) => /research agent/i.test(s.query || '') || (s.skills || []).length > 1,
-      ));
+        const d = await api.sessions(50);
+        if (!aliveRef.current) return;
+        /* Research runs only. An authoring run is in the same session store,
+           so this list used to show documents being built on the Authoring
+           page as if they were research topics - and the research sidebar
+           offered no way to open one. */
+        setTopics((d.sessions || []).filter(
+          (s) => s.run_kind !== 'authoring'
+            && (/research agent/i.test(s.query || '') || (s.skills || []).length > 1),
+        ));
       setTopicsError('');
     } catch (e) {
       if (!aliveRef.current) return;
@@ -105,6 +168,11 @@ export default function Research() {
     abortRef.current?.abort();
     abortRef.current = null;
     stopPoll();
+    // The post-stop catch-up must die here too: openTopic() routes
+    // through abortRun, and a catch-up left running keeps polling
+    // the OLD session and painting its partial graph over the topic
+    // the user just opened.
+    stopCatchUp();
   };
 
   // Unmount (or navigation away) mid-run: kill the SSE stream, the graph
@@ -134,6 +202,38 @@ export default function Research() {
     }
   }, []);
 
+  const [dlErr, setDlErr] = useState('');
+
+  /* A top-level navigation CANNOT send X-Aria-Token, so the Get control used to
+     be a bare <a href> that returned 403 on every click: the button existed
+     and did nothing. Measured on the same session and URL — 403 via
+     navigation, 200 application/pdf via fetch with the header. Fetch the bytes
+     and save from a blob, the way Authoring does. */
+  const downloadArtifact = useCallback(
+    async (artifact: string, filename: string) => {
+      setDlErr('');
+      try {
+        const r = await fetch(
+          `/api/artifact/${encodeURIComponent(artifact)}?download=1`,
+          { headers: headers() },
+        );
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || 'document';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      } catch (e) {
+        setDlErr(
+          `could not download ${filename || 'the file'}: ${(e as Error)?.message || e}`,
+        );
+      }
+    },
+    [],
+  );
+
   const openTopic = async (s: SessionSummary) => {
     if (running) {
       setNote('stop or wait for the current run first.');
@@ -150,15 +250,26 @@ export default function Research() {
     setBrief((prev) => prev || displayTopic(s));
     setAnswer('');
     setLogs([]);
+    setFiles([]);
     setView('graph');
     setSelected(null);
     setStatus('idle');
     setNote('');
+    /* The Files row was only ever populated from the live `done` frame, so a
+       run you opened again from the sidebar lost its files even though the
+       server still had them. Read the produced record. */
+    void api.runProduced(s.session_id).then((snap) => {
+      if (reqRef.current !== req) return;
+      if (snap?.files?.length) setFiles(snap.files);
+    }).catch(() => { /* no files, or unreadable: the row simply stays empty */ });
     try {
       const g = await api.graph(s.session_id);
       if (reqRef.current !== req) return;
       setGraph(g);
-      if (!g) {
+      // An empty node list is the same "no graph" as a null payload
+      // (the server returns 200 + empty nodes for a session whose
+      // graph was never written) — the note must cover both.
+      if (!g || !g.nodes.length) {
         setNote('that run has no graph — it may not have started.');
         return;
       }
@@ -190,6 +301,12 @@ export default function Research() {
     const ctl = new AbortController();
     abortRef.current = ctl;
     setRunning(true);
+    // The focus handoff has to wait for React to COMMIT the disabled
+    // flip. `setRunning(true)` and this `.focus()` share one batched
+    // tick, so Stop is still `disabled` when focus() runs — the call
+    // silently does nothing and focus falls to <body> (measured: 53 Tabs
+    // from there to reach Stop). A rAF lands after the commit.
+    requestAnimationFrame(() => stopBtnRef.current?.focus());
     setStatus('running');
     stoppedRef.current = false;
     setTopic(t);
@@ -234,25 +351,51 @@ export default function Research() {
           stopPoll();
           const id = ((ev as { session_id?: string }).session_id || sid) as string;
           if (id) {
-            try { setGraph(await api.graph(id)); } catch { /* keep */ }
+            try {
+              const g = await api.graph(id);
+              // A Stop during that fetch must not resurrect "done"
+              // over the "stopped." state stop() already set.
+              if (!ctl.signal.aborted) setGraph(g);
+            } catch { /* keep */ }
           }
-          setAnswer(typeof (ev as { answer?: string }).answer === 'string' ? ((ev as { answer?: string }).answer as string) : '');
+          if (ctl.signal.aborted) return; // stop() owns the final state now
+          /* Files the run ACTUALLY produced. The `done` frame carries them and
+             this view used to ignore that field, so a research run that really
+             did render a PDF showed only a "Download .md" button built from the
+             answer text: the user was told a file existed and had no way to
+             open it. Prefer what the server says exists over what the prose
+             claims. */
+          const evFiles = ((ev as { files?: { artifact: string; filename: string; format: string }[] }).files) || [];
+          setFiles(evFiles);
+          if (id) {
+            const snap = await api.runProduced(id).catch(() => null);
+            if (snap && snap.files?.length) setFiles(snap.files);
+          }
+          // Normalise here too, not just on the history path: the live
+          // `done` frame is the same model text and can arrive fenced or
+          // wrapped, which used to render the whole report as one code
+          // block or print raw JSON.
+          const raw = (ev as { answer?: string }).answer;
+          setAnswer(typeof raw === 'string' ? unwrapAnswer(raw) : '');
           setStatus('done');
           setView('report'); // the finished report is the readable thing
           setNote(`done in ${Math.round((Date.now() - t0.current) / 1000)}s.`);
           setRunning(false);
+          requestAnimationFrame(() => startBtnRef.current?.focus());
           refreshTopics();
         } else if (ev.type === 'error') {
           stopPoll();
           setStatus('error');
           setNote(String((ev as { text?: string }).text || 'error'));
           setRunning(false);
+          requestAnimationFrame(() => startBtnRef.current?.focus());
         }
       }
       if (ctl.signal.aborted) {
         setStatus('idle');
         setNote(stoppedRef.current ? 'stopped.' : 'cancelled.');
         setRunning(false);
+        requestAnimationFrame(() => startBtnRef.current?.focus());
       }
     } catch (e) {
       if (ctl.signal.aborted) {
@@ -262,9 +405,10 @@ export default function Research() {
         setStatus('error');
         setNote(String((e as Error).message || e));
       }
-      stopPoll();
-      setRunning(false);
-    } finally {
+        stopPoll();
+        setRunning(false);
+        requestAnimationFrame(() => startBtnRef.current?.focus());
+      } finally {
       if (abortRef.current === ctl) abortRef.current = null;
     }
   };
@@ -278,6 +422,7 @@ export default function Research() {
     stoppedRef.current = true;
     abortRun();
     setRunning(false);
+    requestAnimationFrame(() => startBtnRef.current?.focus());
     setStatus('idle');
     setNote('stopped.');
     // The graph poll just died with the stream, but the executor may not
@@ -290,10 +435,15 @@ export default function Research() {
       let n = 0;
       const tick = async () => {
         const g = await poll(liveSid);
-        refreshTopics();
         const nodes = g?.nodes || [];
         const settled = nodes.length > 0 && nodes.every((nd) => isTerminal(nd.status));
-        if (settled || ++n >= 20) stopCatchUp();
+        // Refresh the topic list once, at settle (or give-up) — not
+        // every tick: 20 ticks of full session-list reloads for one
+        // stop, most of which show nothing new.
+        if (settled || ++n >= 20) {
+          stopCatchUp();
+          refreshTopics();
+        }
       };
       catchUpRef.current = window.setInterval(() => { void tick(); }, CONF.pollCatchUpMs);
       void tick();
@@ -330,6 +480,7 @@ export default function Research() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
@@ -383,7 +534,7 @@ export default function Research() {
         </div>
       </div>
 
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Research">
           {statusPill}
           <div className="flex gap-1 rounded-lg border border-white/10 bg-white/5 p-[3px]" role="group" aria-label="Canvas view">
@@ -403,6 +554,41 @@ export default function Research() {
           <button onClick={copy} disabled={!answer} aria-label="Copy report to clipboard" className="rounded-md border border-white/15 bg-white/5 px-3.5 py-1.5 text-xs hover:border-violet-400 disabled:opacity-45">Copy</button>
         </TopBar>
 
+                {/* Real files first. This row exists because research would say "I
+            created report.pdf" and offer only a markdown download - the file
+            was never reachable. Anything listed here came from the server's
+            produced-files record, not from the answer's prose. */}
+        {files.length > 0 && (
+          <div className="mx-3.5 mt-3 flex flex-wrap items-center gap-2 rounded-[10px] border border-white/10 bg-[#0e0e12] p-2.5">
+            <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-zinc-muted">
+              Files
+            </span>
+            {files.map((f) => (
+              <span key={f.artifact} className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11.5px]">
+                <Pill tone="muted">{f.format || 'file'}</Pill>
+                <span className="max-w-[220px] truncate text-zinc-200" title={f.filename}>
+                  {f.filename}
+                </span>
+                <button
+                  onClick={() => setViewFile(f.artifact)}
+                  className="rounded border border-violet-400/50 px-1.5 py-0.5 text-[11px] text-violet-200 hover:bg-violet-400/20"
+                >
+                  View
+                </button>
+                <button
+                  type="button"
+                  onClick={() => downloadArtifact(f.artifact, f.filename)}
+                  className="rounded border border-white/15 px-1.5 py-0.5 text-[11px] text-zinc-300 hover:border-violet-400"
+                >
+                  Get
+                </button>
+              </span>
+            ))}
+            {dlErr && (
+              <span role="alert" className="text-[11px] text-red-300">{dlErr}</span>
+            )}
+          </div>
+        )}
         <div className="mx-3.5 mt-3 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5 shadow-[0_8px_24px_rgba(0,0,0,0.45)]">
           <textarea
             value={brief}
@@ -431,21 +617,24 @@ export default function Research() {
             </div>
             <span className="text-[11px] text-zinc-muted" role="status">{note}</span>
             <span className="flex-1" />
-            {/* Both buttons stay mounted and toggle visibility. Swapping
-                them on run start destroyed keyboard focus and reset it to
-                <body>, so a keyboard user lost their place every run. */}
+            {/* Both buttons stay mounted; the inactive one is
+                disabled — never swapped out, because removing a
+                focused button from the DOM throws focus back to
+                <body>. start()/stop() (and the done/error paths)
+                hand focus to whichever button just became live. */}
             <button
-              hidden={!running}
+              ref={stopBtnRef}
               onClick={stop}
-              tabIndex={running ? 0 : -1}
-              className="rounded-md border border-red-400/50 bg-red-400/10 px-4 py-2 text-xs font-bold text-red-200 hover:bg-red-400/20"
+              disabled={!running}
+              aria-label="Stop the run"
+              className="rounded-md border border-red-400/50 bg-red-400/10 px-4 py-2 text-xs font-bold text-red-200 hover:bg-red-400/20 disabled:opacity-40"
             >
               Stop
             </button>
             <button
-              hidden={running}
+              ref={startBtnRef}
               onClick={start}
-              tabIndex={running ? -1 : 0}
+              disabled={running}
               className="rounded-md bg-violet-400 px-4 py-2 text-xs font-bold text-[#0b0b0e] shadow-[0_0_16px_rgba(139,124,246,0.35)] hover:brightness-110 disabled:opacity-50"
             >
               Research this topic
@@ -461,19 +650,41 @@ export default function Research() {
             {graph && graph.nodes.length > 0 && view !== 'report' && (
               <RunSummary graph={graph} running={running} sid={sid} />
             )}
-            {view === 'log' ? (
+            {viewFile ? (
+          <div className="docview-frame m-3.5">
+            <div className="docview-bar">
+              <span className="font-semibold">
+                {files.find((f) => f.artifact === viewFile)?.filename || viewFile}
+              </span>
+              <button onClick={() => setViewFile(null)} className="rounded-md border border-white/15 px-2 py-1 text-[11px] hover:border-violet-400">
+                Back to report
+              </button>
+            </div>
+            <DocumentViewer
+              source={{
+                kind: 'artifact',
+                artifact: viewFile,
+                format: files.find((f) => f.artifact === viewFile)?.format || '',
+                label: files.find((f) => f.artifact === viewFile)?.filename || viewFile,
+              }}
+            />
+          </div>
+        ) : view === 'log' ? (
               <LogView logs={logs} running={running} follow={logFollow} setFollow={setLogFollow} boxRef={logBoxRef} />
             ) : view === 'report' && answer ? (
               <div className="h-full overflow-y-auto">
-                {/* `renderMarkdown(answer, 1)` demotes model headings one level
-                    so a report's "# Executive Summary" can never become the
-                    page's only h1 mid-document. The `prose-report` class
-                    replaces a 30-utility `[&_…]` chain that styled elements
-                    the renderer previously didn't emit. */}
+                {/* `renderMarkdown(answer, 1, true)` demotes model headings so a report's
+                    "# Executive Summary" can never become the page's only h1
+                    mid-document, AND anchors the shallowest heading the model
+                    actually wrote to h2 - the formatter emits `##` sections,
+                    which without the fit produced a report with no top-level
+                    heading at all. The `prose-report` class replaces a
+                    30-utility `[&_...]` chain that styled elements the
+                    renderer previously didn't emit. */}
                 <article
                   tabIndex={-1}
                   aria-live="polite"
-                  className="prose-chat prose-report mx-auto max-w-[76ch] px-8 py-7 text-[14px] leading-[1.8] text-zinc-200"
+                  className="prose-chat prose-report mx-auto px-8 py-7 text-[14px] leading-[1.8] text-zinc-200"
                 >
                   <div className="mb-5 border-b border-white/10 pb-4">
                     <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-violet-300/80">Report</div>
@@ -482,7 +693,7 @@ export default function Research() {
                       {(graph?.nodes.length || 0)} nodes{note ? ` · ${note}` : ''}{sid ? ` · ${sid.slice(0, 12)}…` : ''}
                     </div>
                   </div>
-                  <div dangerouslySetInnerHTML={{ __html: renderMarkdown(answer, 1) }} />
+                  <div dangerouslySetInnerHTML={{ __html: renderMarkdown(answer, 1, true) }} />
                 </article>
               </div>
             ) : !graph || !graph.nodes.length ? (
@@ -498,7 +709,7 @@ export default function Research() {
                 </div>
               </div>
             ) : (
-              <DagCanvas graph={graph} running={running} selectedId={selected} onSelect={setSelected} />
+              <DagCanvas key={sid} graph={graph} running={running} selectedId={selected} onSelect={setSelected} />
             )}
             {(view === 'graph' && graph && graph.nodes.length > 0) && (
               <div className="absolute bottom-2.5 left-2.5 rounded-full border border-white/10 bg-black/70 px-3 py-1 font-mono text-[10.5px] text-zinc-400 backdrop-blur">
@@ -515,7 +726,7 @@ export default function Research() {
         <div className="px-4 pb-2 text-[11px] text-zinc-muted">
           pipeline runs on the agent DAG · gateway {gwUp ? 'up' : 'down'}
         </div>
-      </div>
+      </main>
     </div>
   );
 }
@@ -542,7 +753,7 @@ function fmtDur(s?: number | null): string {
 }
 
 /** One-line run summary + duration bars, docked above the canvas. Span is
-    min(started) → max(completed, now if live), straight from the graph
+    min(started) â†’ max(completed, now if live), straight from the graph
     rollup's own timestamps — no extra requests. The pill reflects the RUN
     (done/failed/live), not the page: showing "idle" for a finished run
     buried the outcome. */
@@ -572,7 +783,7 @@ function RunSummary({ graph, running, sid }: {
         </span>
         {span && (
           <span className="font-mono text-[11px] tabular-nums text-zinc-300" title="Wall-clock span across node timestamps">
-            ⏱ {span}{running ? ' so far' : ' total'}
+            â± {span}{running ? ' so far' : ' total'}
           </span>
         )}
         {sid && (

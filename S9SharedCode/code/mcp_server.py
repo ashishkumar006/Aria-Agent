@@ -169,6 +169,59 @@ def neutralize_untrusted(text: str, url: str = "") -> dict:
                 "chars": len(text or ""), "neutralize_error": repr(e)[:120]}
 
 
+def _guard_url(url: str) -> str | None:
+    """SSRF guard for every server-side fetch. Returns an error
+    string when the URL must NOT be fetched, else None.
+
+    Model-visible tools accept caller-supplied URLs, so the agent
+    host itself is a reachable target: cloud metadata endpoints
+    (169.254.169.254), the gateway on :8109, and every loopback
+    service. Only http(s) with a global-routable destination is
+    fetchable — the literal host and every address it resolves to
+    (a public-looking name can resolve into a private range).
+    Redirects are the caller's provider's business: the initial
+    URL is validated here, before any bytes move.
+    """
+    import ipaddress as _ipa
+    import socket as _sock
+    from urllib.parse import urlsplit as _split
+    try:
+        parts = _split(str(url or "").strip())
+    except Exception:
+        return "invalid URL"
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return "only http(s) URLs may be fetched"
+    host = parts.hostname.lower().strip("[]")
+    if host == "localhost" or host.endswith(".localhost"):
+        return f"refusing to fetch loopback host {host!r}"
+    try:
+        literal = _ipa.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not literal.is_global:
+            return f"refusing to fetch non-public address {host}"
+        return None
+    try:
+        infos = _sock.getaddrinfo(host, None)
+    except Exception:
+        return None  # unresolvable here; the fetch itself will fail
+    seen: set[str] = set()
+    for _fam, _typ, _proto, _canon, sockaddr in infos:
+        ip = sockaddr[0]
+        if ip in seen:
+            continue
+        seen.add(ip)
+        try:
+            addr = _ipa.ip_address(ip)
+        except ValueError:
+            continue
+        if not addr.is_global:
+            return (f"refusing to fetch {host!r}: "
+                    f"resolves to non-public {ip}")
+    return None
+
+
 # ── fetch cache ─────────────────────────────────────────────────────────────
 # The researcher was 36s of a 74s run and is fetch-bound. Nothing was cached,
 # so the same URL was re-fetched on every run, and two facets of one plan that
@@ -344,6 +397,14 @@ async def _extract_page(url: str, timeout_s: int = 20,
     need interaction remain the browser SKILL's job, not this tool's.
     """
     import asyncio as _aio
+
+    _refused = _guard_url(url)
+    if _refused:
+        return {"status": 400,
+                "content_type": "text/markdown",
+                "length_bytes": 0,
+                "truncated": False,
+                "text": f"[refused: {_refused}: {url}]"}
 
     def _fetch_and_extract() -> dict:
         from trafilatura import extract, fetch_url as _tfetch
@@ -535,6 +596,13 @@ def verify_citations(evidence: list, timeout: int = 12) -> dict:
                "reachable": None, "quote_found": None, "note": ""}
         if not url.startswith(("http://", "https://")):
             row["note"] = "not an http(s) url"
+            return row
+        # Reachability ORACLE: an internal URL answers "reachable:
+        # true, HTTP 200", mapping the host's private topology to
+        # the model. Same guard as the fetch tools.
+        _refused = _guard_url(url)
+        if _refused:
+            row["note"] = _refused
             return row
         try:
             import httpx as _h
@@ -906,6 +974,10 @@ async def fetch_pdf(url: str, timeout: int = 30) -> dict:
     import asyncio as _aio
     import io as _io
 
+    _refused = _guard_url(url)
+    if _refused:
+        return {"ok": False, "error": f"refused: {_refused}"}
+
     def _extract(data: bytes, max_chars: int = 30000) -> dict:
         try:
             from pypdf import PdfReader
@@ -986,6 +1058,9 @@ def extract_tables(url: str, max_tables: int = 5, max_rows: int = 50) -> dict:
     """Pull HTML tables from a URL as structured rows (no browser — fast).
     For benchmark numbers, stats pages, comparison tables that prose
     extraction mangles. Example: extract_tables("https://en.wikipedia.org/wiki/List_of_cities_in_Japan")."""
+    _refused = _guard_url(url)
+    if _refused:
+        return {"ok": False, "error": f"refused: {_refused}"}
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -1177,6 +1252,47 @@ async def wayback_fetch(url: str, timestamp: str = "") -> dict:
 
 
 @mcp.tool()
+def read_artifact(artifact_id: str, offset: int = 0,
+                  limit: int = 20000) -> dict:
+    """Read an upstream node result that INPUTS showed as an artifact handle.
+
+    Large results (over ~24 KB) are moved into the artifact store and appear
+    in INPUTS as {"artifact": "art:...", "title": ..., "preview": ...}. Call
+    this with that handle to get the full text when the detail matters.
+    Example: read_artifact("art:1a2b3c4d5e6f7890")
+    """
+    if not isinstance(artifact_id, str) or not artifact_id.startswith("art:"):
+        return {"ok": False,
+                "error": "artifact_id must be a handle like art:<16 hex digits>"}
+    try:
+        raw = _artifacts.get_bytes(artifact_id)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except FileNotFoundError:
+        return {"ok": False, "error": f"no such artifact: {artifact_id}"}
+    meta = None
+    try:
+        meta = _artifacts.get_meta(artifact_id)
+    except Exception:
+        pass
+    total = len(raw)
+    start = max(0, int(offset or 0))
+    cap = max(200, min(int(limit or 20000), 200_000))
+    text = raw[start:start + cap].decode("utf-8", errors="replace")
+    return {
+        "ok": True,
+        "artifact_id": artifact_id,
+        "title": (getattr(meta, "descriptor", "") or ""),
+        "size_bytes": total,
+        "offset": start,
+        "returned_chars": len(text),
+        "truncated": start + cap < total,
+        "next_offset": (start + cap) if start + cap < total else None,
+        "content": text,
+    }
+
+
+@mcp.tool()
 def read_file(path: str) -> dict:
     """Read a UTF-8 text file from the sandbox. Example: read_file("notes.txt")."""
     p = _safe(path)
@@ -1341,12 +1457,33 @@ def index_document(path: str, chunk_size: int = 400, overlap: int = 80,
 _GW = os.environ.get("LLM_GATEWAY_V9_URL", "http://localhost:8109").rstrip("/")
 
 
+def _gw_headers() -> dict:
+    """The shared gateway token. /v1 routes 401 without it, and these calls
+    are fail-soft, so a missing token surfaced as "gateway unreachable" for
+    every Gmail/calendar/Slack/Telegram tool rather than as an auth error."""
+    tok = (os.environ.get("GATEWAY_V9_TOKEN") or "").strip()
+    if not tok:
+        try:
+            from pathlib import Path
+            p = (Path(__file__).resolve().parents[2] / "llm_gatewayV9"
+                 / "state" / "gateway.token")
+            tok = p.read_text(encoding="utf-8").strip()
+        except Exception:
+            tok = ""
+    return {"X-Gateway-Token": tok} if tok else {}
+
+
 def _gw_integration(service: str, op: str, args: dict) -> dict:
     """POST /v1/integrations/{service}/{op} with transport fail-soft."""
     try:
-        with httpx.Client(timeout=60, follow_redirects=True) as client:
+        with httpx.Client(timeout=60, follow_redirects=True,
+                          headers=_gw_headers()) as client:
             r = client.post(f"{_GW}/v1/integrations/{service}/{op}",
                             json={"args": args or {}})
+            if r.status_code == 401:
+                return {"ok": False,
+                        "error": "gateway rejected our token (401); restart the "
+                                 "agent so it re-reads state/gateway.token"}
             r.raise_for_status()
             data = r.json()
             if isinstance(data, dict):
@@ -1360,9 +1497,14 @@ def _gw_integration(service: str, op: str, args: dict) -> dict:
 def _gw_channel(name: str, to: str, text: str, **kw) -> dict:
     """POST /v1/channels/{name}/send with transport fail-soft."""
     try:
-        with httpx.Client(timeout=60, follow_redirects=True) as client:
+        with httpx.Client(timeout=60, follow_redirects=True,
+                          headers=_gw_headers()) as client:
             r = client.post(f"{_GW}/v1/channels/{name}/send",
                             json={"to": to, "text": text, **kw})
+            if r.status_code == 401:
+                return {"ok": False,
+                        "error": "gateway rejected our token (401); restart the "
+                                 "agent so it re-reads state/gateway.token"}
             if r.status_code == 404:
                 return {"ok": False, "error": f"unknown channel '{name}'"}
             if r.status_code == 501:
@@ -1716,6 +1858,209 @@ def cancel_scheduled(schedule_id: str) -> dict:
         return {"ok": True, "cancelled": bool(removed), "schedule_id": schedule_id}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# NOT an MCP tool. This is a helper `render_document` calls to tell the model
+# what it actually delivered, and it used to carry `@mcp.tool()`, which put a
+# private helper in the advertised catalogue and on the Skills page as
+# `_doc_stats`. A model could call it directly and get a word count instead of
+# rendering a document. The underscore said "internal"; the decorator said the
+# opposite.
+def _doc_stats(spec: dict, fmt: str) -> dict:
+    """What the document actually contains, so the model can check itself.
+
+    The delivered word count is the missing feedback signal: without it the
+    model wrote whatever felt long enough and could not tell a 2,000-word
+    report from a 200-word stub. Counting from the spec is exact enough and
+    costs nothing - no re-parse of the binary."""
+    words = 0
+    sections = 0
+
+    def _count(v) -> int:
+        if v is None:
+            return 0
+        if isinstance(v, (list, tuple)):
+            return sum(_count(x) for x in v)
+        if isinstance(v, dict):
+            return sum(_count(x) for x in v.values())
+        return len(str(v).split())
+
+    for b in (spec.get("blocks") or []):
+        if not isinstance(b, dict):
+            continue
+        t = str(b.get("type") or "").lower()
+        if t == "heading" and int(b.get("level") or 1) == 1:
+            sections += 1
+        words += _count(b.get("text")) + _count(b.get("items"))
+        words += _count(b.get("header")) + _count(b.get("rows"))
+        if t == "chart":
+            words += _count(b.get("categories")) + _count(b.get("series"))
+        if t == "cover":
+            sections = 0  # a cover title is not a section
+    for s in (spec.get("sheets") or []):
+        if isinstance(s, dict):
+            words += _count(s.get("header")) + _count(s.get("rows"))
+    words += _count(spec.get("title")) + _count(spec.get("subtitle"))
+    return {"words": words, "sections": sections, "format": fmt}
+
+
+# Registered as a REAL MCP tool. It was a bare function, so it was absent
+# from the advertised tool list and every model call for it came back
+# "Unknown tool: render_document". A run only ever produced a file when the
+# model happened to also write the spec as JSON data for the in-process
+# fallback - which is why roughly half of all runs rendered nothing.
+@mcp.tool()
+def render_document(format: str, title: str, blocks: list = None,
+                    sheets: list = None, subtitle: str = "",
+                    author_name: str = "", toc: bool = False,
+                    running_header: str = "", page_size: str = "",
+                    orientation: str = "", margins: str = "",
+                    columns: int = 0, style: str = "",
+                    citation_style: str = "", references: list = None,
+                    slide_size: str = "") -> dict:
+    """Render a document and return a downloadable artifact.
+
+    Formats: pdf, pptx, docx, xlsx.
+
+    `blocks` is a list of content blocks, each a dict:
+      {"type": "heading",   "level": 1-3, "text": "..."}
+      {"type": "paragraph", "text": "... **bold**, `code`, [link](url)"}
+      {"type": "bullets" | "numbers", "items": ["...", "..."]}
+      {"type": "quote",     "text": "..."}
+      {"type": "table",     "header": ["A","B"], "rows": [["1","2"]]}
+      {"type": "chart",     "kind": "bar|line|pie", "categories": [...],
+                            "series": [{"name": "...", "data": [1,2]}],
+                            "title": "..."}
+      {"type": "image",     "document": "<uploaded doc id>", "page": 1,
+                            "caption": "..."}
+      {"type": "cover",     "title": "...", "subtitle": "...",
+                            "meta": ["..."]}
+      {"type": "pagebreak"}
+
+    `toc=True` numbers the level 1 sections and adds a contents list (pdf).
+    `running_header` puts short text in the page header.
+
+    A chart is drawn as vectors in pdf, is a NATIVE editable chart in pptx,
+    and degrades to a data table in docx. An `image` reuses a figure from a
+    document the user already uploaded - there is no URL fetching.
+
+    PAGE AND TYPE SYSTEM - these are how you get a document that reads as
+    designed rather than dumped:
+      page_size       "a4" (default), "letter", "legal", "a3", "a5", "b5",
+                     "tabloid", "statement", "executive", "royal", "pocket"...
+      orientation     "portrait" (default) | "landscape"
+      margins         "narrow" | "normal" | "moderate" (default) | "wide" |
+                     "generous"
+      columns         1-3 text columns
+      style           the typographic system - pick by what the document IS:
+                       report (default), brief, memo, academic, whitepaper,
+                       manual, newsletter (2-column), technical, book, plain
+      citation_style  how to set the reference list:
+                       apa, mla, chicago, harvard (alphabetical) |
+                       ieee, vancouver, ama (numbered, by citation order) |
+                       bluebook, oscola
+      references      [{"authors": "...", "year": "...", "title": "...",
+                       "container": "...", "volume": "...", "issue": "...",
+                       "pages": "...", "url": "..."}]
+      slide_size      pptx: "16:9" (default), "4:3", "16:10", "a4", "1:1"...
+
+    For xlsx you may instead pass `sheets`: [{"name","header","rows"}].
+    xlsx also renders one sheet per `table` block if `sheets` is omitted.
+
+    Returns {"ok": true, "artifact": "art:...", "filename", "format",
+    "bytes", "stats"} on success. The file is stored as an artifact and the
+    console offers it as a download; report the filename to the user. Copy
+    the artifact handle EXACTLY as returned - an invented one is not a file.
+
+    Example: render_document("pdf", "Q3 Report", blocks=[
+      {"type": "heading", "level": 1, "text": "Summary"},
+      {"type": "paragraph", "text": "Revenue grew 12%."}])
+    """
+    fmt = str(format or "").strip().lower()
+    if fmt not in ("pdf", "pptx", "docx", "xlsx"):
+        return {"ok": False, "error": f"format must be one of pdf/pptx/docx/xlsx, "
+                                     f"got {format!r}"}
+    spec: dict = {"title": str(title or "").strip()[:200]}
+    if subtitle:
+        spec["subtitle"] = str(subtitle)[:300]
+    if author_name:
+        spec["author"] = str(author_name)[:120]
+    # Front matter, page setup and the type system. Without these parameters
+    # the model could not ask for a contents list, a running header or a
+    # Letter page: the features existed in the gateway and were unreachable
+    # from the only entry point that matters.
+    if toc:
+        spec["toc"] = True
+    if running_header:
+        spec["running_header"] = str(running_header)[:120]
+    for key, val in (("page_size", page_size), ("orientation", orientation),
+                     ("margins", margins), ("style", style),
+                     ("citation_style", citation_style),
+                     ("slide_size", slide_size)):
+        if val:
+            spec[key] = str(val)[:40]
+    if columns:
+        try:
+            spec["columns"] = max(1, min(3, int(columns)))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(references, list) and references:
+        spec["references"] = [r for r in references[:200]
+                              if isinstance(r, (dict, str))]
+    if isinstance(blocks, list) and blocks:
+        # Clip before the wire: a runaway list is a client bug, and the
+        # gateway would 400 on the whole document rather than trimming.
+        spec["blocks"] = [b for b in blocks[:400] if isinstance(b, dict)]
+    if isinstance(sheets, list) and sheets:
+        spec["sheets"] = [s for s in sheets[:20] if isinstance(s, dict)]
+    if not spec.get("blocks") and not spec.get("sheets") and not spec["title"]:
+        return {"ok": False, "error": "nothing to render: pass a title, blocks "
+                                     "or sheets"}
+
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True,
+                          headers=_gw_headers()) as client:
+            r = client.post(f"{_GW}/v1/docgen",
+                            json={"format": fmt, "spec": spec})
+            if r.status_code == 401:
+                return {"ok": False, "error": "gateway rejected our token (401)"}
+            if r.status_code >= 400:
+                try:
+                    detail = r.json().get("error") or r.text[:200]
+                except Exception:
+                    detail = r.text[:200]
+                return {"ok": False, "error": str(detail)[:300]}
+            blob = r.content
+            disp = r.headers.get("content-disposition", "")
+    except Exception as e:
+        return {"ok": False,
+                "error": f"gateway unreachable: {type(e).__name__}: {e}"}
+
+    if not blob:
+        return {"ok": False, "error": "the gateway returned an empty file"}
+    fname = disp.split("filename=")[-1].strip('"; ') if "filename=" in disp else f"document.{fmt}"
+    # Store as an artifact: content-addressed, deduped, and downloadable
+    # from the console. The descriptor becomes the download filename, so it
+    # is sanitised here — agent-written titles carry parentheses, colons and
+    # non-ASCII that produce a Content-Disposition the browser refuses.
+    safe_desc = re.sub(r"[^\w .\-]+", " ", spec.get("title") or "document")
+    safe_desc = re.sub(r"\s+", " ", safe_desc).strip()[:80] or "document"
+    try:
+        import artifacts as _arts
+        art_id = _arts.put(blob, content_type=r.headers.get("content-type", ""),
+                           source=f"author:{fmt}",
+                           descriptor=f"{safe_desc} ({fmt})")
+    except Exception as e:
+        return {"ok": False,
+                "error": f"rendered but could not store the artifact: {e}"}
+    return {"ok": True, "artifact": art_id, "filename": fname, "format": fmt,
+            "bytes": len(blob),
+            "blocks": len(spec.get("blocks") or []),
+            "stats": _doc_stats(spec, fmt),
+            "note": "Report this filename to the user; the console offers it "
+                    "as a download. `stats.words` is what you actually "
+                    "delivered — if it is far below the length you were asked "
+                    "for, expand the content and render again."}
 
 
 if __name__ == "__main__":

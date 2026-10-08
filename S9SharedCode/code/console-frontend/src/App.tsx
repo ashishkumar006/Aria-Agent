@@ -16,6 +16,7 @@ const Ledger = lazy(() => import('./views/Ledger'));
 const Mission = lazy(() => import('./views/Mission'));
 const Settings = lazy(() => import('./views/Settings'));
 const Code = lazy(() => import('./views/Code'));
+const Authoring = lazy(() => import('./views/Authoring'));
 
 /* The split chunks, kept as thunks so we can warm them before they are
    needed. Suspense otherwise blanks the whole shell on every hop to a
@@ -123,6 +124,7 @@ export default function App() {
             <Route path="/mission" element={<Mission />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/code" element={<Code />} />
+            <Route path="/authoring" element={<Authoring />} />
             <Route path="*" element={<Navigate to="/research" replace />} />
           </Routes>
         </Suspense>

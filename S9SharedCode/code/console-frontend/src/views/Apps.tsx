@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LayoutGrid, Flag, Plus, ArrowLeft, RefreshCw, Trash2 } from 'lucide-react';
-import { Rail, TopBar, Empty, Stat, Pill } from '../components/ui';
-import { api, CONF, type FeedEvent, type FlagRow, type TrackerApp, type TrackerAppDetail, type FeedbackRollup, type McpStats } from '../api';
+import { Rail, TopBar, Empty, Stat, Pill, SkipLink } from '../components/ui';
+import { A2ui } from '../components/A2ui';
+import { api, CONF, type A2uiSurface, type FeedEvent, type FlagRow, type TrackerApp, type TrackerAppDetail, type FeedbackRollup, type McpStats } from '../api';
 
 const fmtTs = (ts: number | null | undefined) =>
   !ts ? '—' : new Date(ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -40,6 +41,16 @@ export default function Apps() {
   const [itemFilter, setItemFilter] = useState('');
   const [viewSel, setViewSel] = useState<'auto' | ItemView>('auto');
   const [showPrefab, setShowPrefab] = useState(false);
+  const [showA2ui, setShowA2ui] = useState(false);
+  const [a2ui, setA2ui] = useState<{ surface: A2uiSurface; notes?: string[] } | null>(null);
+  const [a2uiErr, setA2uiErr] = useState('');
+  /* Live refresh progress, from the AG-UI stream. `steps` holds the phase names
+     currently open so the bar can be closed on STEP_FINISHED rather than left
+     spinning - the encoder had no step_finished at all, so a client had no way
+     to do this. */
+  const [steps, setSteps] = useState<string[]>([]);
+  const [stepNote, setStepNote] = useState('');
+  const refreshAbort = useRef<AbortController | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [createErr, setCreateErr] = useState('');
   const [form, setForm] = useState({ name: '', kind: 'openrouter_free', schedule: 'daily@09:00', url: '', items_path: 'data', id_field: 'id', match_field: '', match_equals: '', fields: 'id,name' });
@@ -114,6 +125,16 @@ export default function Apps() {
        A's items under B's breadcrumb — after which "Delete app" and
        "Refresh now" acted on the wrong id. */
     const req = ++detailReq.current;
+    // Abandon any in-flight refresh. It bumped detailReq, so its own
+    // `finally` no longer owns the busy flag and would leave `busy`
+    // true forever — Refresh now AND Delete app stayed disabled on every
+    // board until a full page reload. Clear the flag here, where the
+    // navigation actually happens.
+    refreshAbort.current?.abort();
+    refreshAbort.current = null;
+    setBusy(false);
+    setSteps([]);
+    setStepNote('');
     setOpenId(id);
     setDetail(null);
     setDetailErr('');
@@ -135,20 +156,78 @@ export default function Apps() {
     const req = ++detailReq.current;
     const id = openId;
     setBusy(true);
+    setDetailErr('');
+    setSteps([]);
+    setStepNote('starting');
+    refreshAbort.current?.abort();
+    const ac = new AbortController();
+    refreshAbort.current = ac;
     try {
-      await api.trackerRefresh(id);
+      /* The AG-UI stream, not the blocking POST. A tracker refresh fetches a
+         third-party feed, so on a slow source the old single call left the
+         board looking frozen with no way to tell whether the click landed.
+         Steps are opened and closed from typed frames, so the phases are
+         visible and always end up closed. */
+      for await (const ev of api.trackerRefreshStream(id, ac.signal)) {
+        if (detailReq.current !== req) return;
+        if (ev.type === 'STEP_STARTED' && ev.stepName) {
+          setSteps((s) => [...s, ev.stepName as string]);
+        } else if (ev.type === 'STEP_FINISHED' && ev.stepName) {
+          setSteps((s) => s.filter((x) => x !== ev.stepName));
+        } else if (ev.type === 'ACTIVITY_SNAPSHOT') {
+          setStepNote(ev.content?.text || '');
+        } else if (ev.type === 'RUN_ERROR') {
+          throw new Error(ev.message || 'refresh failed');
+        } else if (ev.type === 'RUN_FINISHED') {
+          setStepNote(ev.result?.error
+            ? `source error: ${ev.result.error}`
+            : `${ev.result?.count ?? 0} items`);
+        }
+      }
       const d = await api.trackerApp(id);
       if (detailReq.current !== req) return;
       setDetail(d);
+      /* Keep the A2UI view in step with the data it is rendering. Refetching
+         it only when it is visible keeps a board that has never been switched
+         to A2UI from making a request per refresh. */
+      if (showA2ui) {
+        const s = await api.safe(api.appSurface(id));
+        if (detailReq.current === req) {
+          if (s) setA2ui(s); else setA2uiErr('the server returned no surface');
+        }
+      }
       const t = await api.safe(api.trackerApps());
       if (t) setTrackers(t.apps || []);
     } catch (e) {
       if (detailReq.current !== req) return;
       setDetailErr(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      if (detailReq.current === req) {
+        setBusy(false);
+        setSteps([]);
+      }
+      // Only clear the ref if THIS refresh still owns it: an
+      // aborted older refresh otherwise nulls a newer one's
+      // controller, and the next refresh could no longer
+      // abort it.
+      if (refreshAbort.current === ac) {
+        refreshAbort.current = null;
+      }
     }
-  }, [openId]);
+  }, [openId, showA2ui]);
+
+  /* Load the surface when the toggle turns on, so the panel is populated
+     before the user looks at it rather than after. */
+  useEffect(() => {
+    if (!showA2ui || !openId) return;
+    let live = true;
+    setA2uiErr('');
+    api.safe(api.appSurface(openId)).then((s) => {
+      if (!live) return;
+      if (s) setA2ui(s); else setA2uiErr('the server returned no surface');
+    });
+    return () => { live = false; };
+  }, [showA2ui, openId]);
 
   const deleteApp = useCallback(async () => {
     if (!openId || busy) return;
@@ -159,7 +238,15 @@ export default function Apps() {
     setBusy(true);
     try {
       const r = await api.safe(api.trackerDelete(openId));
-      if (r) setTrackers(r.apps || []);
+      // A failed delete used to clear the detail panel
+      // anyway — the board vanished from the UI while its
+      // spec and every snapshot were still on disk, with
+      // no error to say why.
+      if (!r) {
+        setDetailErr('delete failed — the board is still there');
+        return;
+      }
+      setTrackers(r.apps || []);
       setOpenId(null);
       setDetail(null);
     } finally {
@@ -270,6 +357,7 @@ export default function Apps() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
@@ -314,7 +402,7 @@ export default function Apps() {
           </button>
         </div>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb={openId && detail ? `Apps / ${detail.name}` : 'Apps'}>
           {openId ? (
             <>
@@ -324,6 +412,19 @@ export default function Apps() {
               <button onClick={refreshDetail} disabled={busy} aria-label="Refresh app now" className="flex items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-3.5 py-1.5 text-xs hover:border-violet-400 disabled:opacity-45">
                 <RefreshCw size={13} className={busy ? 'animate-spin' : ''} /> Refresh now
               </button>
+              {busy ? (
+                /* Real progress, from the stream's own frames. The open phase
+                   names come from STEP_STARTED and are removed on
+                   STEP_FINISHED, so this cannot be left spinning - which is
+                   exactly what a client could not do before, because the
+                   encoder emitted STEP_STARTED with no way to close it. */
+                <span className="flex items-center gap-1.5 text-[11px] text-zinc-400"
+                  role="status" aria-live="polite">
+                  {steps.length
+                    ? `fetching: ${steps.join(', ')}`
+                    : (stepNote || 'working…')}
+                </span>
+              ) : null}
               <button onClick={deleteApp} disabled={busy} aria-label="Delete app" className="flex items-center gap-1.5 rounded-md border border-red-400/40 bg-red-400/5 px-3 py-1.5 text-xs text-red-200 hover:bg-red-400/15 disabled:opacity-45">
                 <Trash2 size={13} />
               </button>
@@ -416,15 +517,25 @@ export default function Apps() {
                     />
                     {prefabOn && detail && (
                       <button
-                        onClick={() => setShowPrefab((v) => !v)}
+                        onClick={() => setShowPrefab((v) => { if (!v) setShowA2ui(false); return !v; })}
                         aria-pressed={showPrefab}
-                        title="PrefectHQ/prefab bundled render (spike)"
+                        title="Bundled render of the app's own layout"
                         className={`rounded-lg border px-3 py-1 text-[11px] ${showPrefab ? 'border-violet-400/60 bg-violet-400/20 font-bold text-zinc-100' : 'border-white/10 bg-white/5 text-zinc-400 hover:text-zinc-200'}`}
                       >
                         Prefab
                       </button>
                     )}
-                    {tableOn && cardsOn && !showPrefab && (
+                    {detail && (
+                      <button
+                        onClick={() => setShowA2ui((v) => { if (!v) setShowPrefab(false); return !v; })}
+                        aria-pressed={showA2ui}
+                        title="Same app rendered as a validated A2UI surface"
+                        className={`rounded-lg border px-3 py-1 text-[11px] ${showA2ui ? 'border-accent/60 bg-accent/20 font-bold text-zinc-100' : 'border-white/10 bg-white/5 text-zinc-400 hover:text-zinc-200'}`}
+                      >
+                        A2UI
+                      </button>
+                    )}
+                    {tableOn && cardsOn && !showPrefab && !showA2ui && (
                       <div className="flex gap-1 rounded-lg border border-white/10 bg-white/5 p-[3px]" role="group" aria-label="Item view">
                       {(['table', 'cards'] as const).map((v) => (
                         <button
@@ -442,6 +553,18 @@ export default function Apps() {
                 </div>
                 {showPrefab && detail ? (
                   <PrefabFrame id={detail.id} name={detail.name} />
+                ) : showA2ui && detail ? (
+                  a2uiErr ? (
+                    <p className="rounded-[10px] border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
+                      A2UI surface unavailable: {a2uiErr}
+                    </p>
+                  ) : !a2ui ? (
+                    <p className="text-xs text-zinc-muted">Building surface…</p>
+                  ) : (
+                    <section className="rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
+                      <A2ui surface={a2ui.surface} notes={a2ui.notes} />
+                    </section>
+                  )
                 ) : (
                 <section className="rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
                   {/* A filter with no matches used to render a bare empty box
@@ -662,7 +785,7 @@ export default function Apps() {
           </section>
         </div>
         )}
-      </div>
+      </main>
     </div>
   );
 }
@@ -679,15 +802,43 @@ export default function Apps() {
     blank white box. */
 function PrefabFrame({ id, name }: { id: string; name: string }) {
   const [err, setErr] = useState('');
+  /* The iframe is a browser navigation and cannot send the
+     X-Aria-Token header, so with auth enforced its view
+     403'd inside the frame (the authed pre-flight below
+     passed precisely because a fetch CAN send the header,
+     which masked this). Fetch a short-lived signed pass
+     through the authenticated API and mount the iframe
+     with it; the server re-verifies the HMAC inside the
+     auth middleware. No token = auth disabled, load bare. */
+  const [pass, setPass] = useState<{ token: string; exp: number } | null>(null);
+  /* 'pending' until we know whether auth is enforced. The old code
+     mounted the iframe BARE on first paint and only added `t=`/`exp=`
+     once the mint resolved; the bare navigation 403'd inside the frame
+     and a later src change did not reliably re-navigate it, so ~40% of
+     opens were permanently stuck showing the raw auth-error JSON (the
+     pre-flight passed, because it sends the header, so the error branch
+     never fired). Resolve the pass FIRST, then mount once. */
+  const [phase, setPhase] = useState<'pending' | 'ready'>('pending');
   useEffect(() => {
     let live = true;
     setErr('');
+    setPass(null);
+    setPhase('pending');
     api.prefabCheck(id)
       .then((r) => {
         if (!live) return;
         if (!r.ok) setErr(`${r.status} ${r.text || 'render failed'}`);
       })
       .catch((e) => { if (live) setErr(String(e?.message || e)); });
+    api.prefabToken(id)
+      .then((p) => {
+        if (!live) return;
+        // An empty token means auth is disabled server-side: a bare
+        // mount is correct in that case, so proceed either way.
+        if (p.token) setPass(p);
+        setPhase('ready');
+      })
+      .catch(() => { if (live) setPhase('ready'); }); // mint failed: bare src
     return () => { live = false; };
   }, [id]);
 
@@ -699,10 +850,20 @@ function PrefabFrame({ id, name }: { id: string; name: string }) {
       </div>
     );
   }
+  if (phase === 'pending') {
+    return (
+      <div className="h-[640px] w-full rounded-[10px] border border-white/10 bg-white/5 p-4 text-xs text-zinc-400">
+        preparing the signed view…
+      </div>
+    );
+  }
+  const src = pass
+    ? `/api/apps/${encodeURIComponent(id)}/prefab?t=${encodeURIComponent(pass.token)}&exp=${pass.exp}`
+    : `/api/apps/${encodeURIComponent(id)}/prefab`;
   return (
     <iframe
       title={`Prefab view of ${name}`}
-      src={`/api/apps/${encodeURIComponent(id)}/prefab`}
+      src={src}
       sandbox="allow-scripts"
       referrerPolicy="no-referrer"
       loading="lazy"

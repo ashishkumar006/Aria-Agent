@@ -133,10 +133,42 @@ _PDF_TABLE_SETTINGS = {
     "text_tolerance": 2,
 }
 
+# Ruled tables: trust the ruling, never the text alignment.
+_PDF_TABLE_SETTINGS_RULED = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+}
+# A page must carry at least this many ruling lines/rects before
+# the ruled-grid path runs. Prose pages carry a handful of stray
+# rules (underlines, a header rule, bullet leaders) and
+# lines-based extraction turns three of them into a 1-3 row
+# non-table; a real grid has one line per row and column
+# boundary (measured on a placement bluebook: prose pages carry
+# 3-5, its degree tables carry 8-25).
+_MIN_RULING_LINES = 8
+
 # Below these, a "header" row is just text and guessing a grid would invent
 # structure that is not there.
 _MIN_TABLE_COLS = 3
 _MIN_TABLE_ROWS = 3
+# How many distinct lines below the header must start at (or within a
+# couple points of) EACH column start before the grid is believed.
+# Real table cells are left-aligned under their headers, so every wrapped
+# line in a column starts at the column's x. Multi-column PROSE has no
+# such regularity - words start wherever the justification lands them -
+# so without this check a brochure page's heading words pass every shape
+# test and the whole page is shredded into a fake table (observed live:
+# a 6 MB placement bluebook parsed as 64 table blocks and zero prose,
+# with justified words split mid-word).
+_MIN_COLUMN_ANCHORS = 3
+# Fraction of ALL words below the header that start at (or within a
+# couple points of) SOME column start. Measured on the shipped menu
+# (a real borderless grid): 0.36 - cells are left-aligned under their
+# headers, so a third of every word sits at a column start. Measured on
+# the bluebook's prose pages (false positives): 0.04-0.20 - justified
+# text starts words wherever it lands. Anything below the threshold is
+# prose and is declined here rather than shredded into a fake grid.
+_MIN_COLUMN_ALIGN_FRACTION = 0.25
 
 
 def _cell(row: list, i: int) -> str:
@@ -293,7 +325,7 @@ def _rebuild_grid(grid: list[list]) -> tuple[list[str], list[list]] | None:
     return header, rows
 
 
-_WORD_X_TOL = 1.5
+_WORD_X_TOL = 3.5
 _WORD_Y_TOL = 2.0
 # How far a data line's leftmost word may sit from a column start and still
 # count as "that column has content here". Cells are left-aligned under their
@@ -402,6 +434,28 @@ def _layout_table(words: list[dict]) -> tuple[list[str], list[list]] | None:
     columns.sort()
     col_x = [c[0] for c in columns]
     col_name = [c[1] for c in columns]
+    # Column-start regularity: count the distinct lines below the header
+    # that BEGIN at each column start. A real grid anchors many lines per
+    # column (one per wrapped cell line); prose anchors almost none, so a
+    # multi-column brochure page is declined here instead of shredded.
+    anchors = [0] * len(columns)
+    for ws in line_words[header_idx + 1:]:
+        starts = [w["x0"] for w in ws]
+        for n, cx in enumerate(col_x):
+            if any(abs(x - cx) <= _COLUMN_ALIGN_TOL for x in starts):
+                anchors[n] += 1
+    if min(anchors) < _MIN_COLUMN_ANCHORS:
+        return None
+    # Alignment density: in a real grid, cells are left-aligned under
+    # their headers, so a substantial share of EVERY word below the
+    # header starts at a column start. Justified prose starts words
+    # wherever the line lands them, so its share stays near zero.
+    below = [w for ws in line_words[header_idx + 1:] for w in ws]
+    aligned = sum(1 for w in below
+                  if any(abs(w["x0"] - cx) <= _COLUMN_ALIGN_TOL
+                         for cx in col_x))
+    if below and aligned / len(below) < _MIN_COLUMN_ALIGN_FRACTION:
+        return None
     label_gutter_max = min(col_x) - 15
 
     # ── row labels in the left gutter ────────────────────────────────────────
@@ -510,30 +564,39 @@ def _layout_table(words: list[dict]) -> tuple[list[str], list[list]] | None:
             row.append(_clean(" ".join(cells.get((b, c), []))))
         if any(row[1:]):
             rows.append(row)
-    if len(rows) < 2:
+    # A two-row "table" is indistinguishable from a page of
+    # columnar prose with a couple of ALL-CAPS section words in
+    # the gutter (measured on a placement bluebook: every false
+    # positive was a 2-row grid built from one "DUAL DEGREE"
+    # heading). The grid path requires `_MIN_TABLE_ROWS` already;
+    # hold the coordinate path to the same bar. The real menu
+    # yields four (one per meal).
+    if len(rows) < _MIN_TABLE_ROWS:
         return None
     return ["Meal"] + col_name, rows
 
 
-def _pdf_table_blocks(data: bytes) -> tuple[list[Block], list[str]]:
-    """Table blocks recovered from a PDF, plus any warnings.
+def _pdf_table_blocks(data: bytes) -> tuple[list[Block], set[int], list[str]]:
+    """Table blocks recovered from a PDF, the pages they came
+    from, plus any warnings.
 
-    Empty when pdfplumber is unavailable or finds nothing usable, in which case
-    the caller falls back to flat text extraction. Degrading rather than
-    failing matters: a PDF with no tables must still be searchable.
+    Empty when pdfplumber is unavailable or finds nothing usable, in which
+    case the caller falls back to flat text extraction. Degrading rather
+    than failing matters: a PDF with no tables must still be searchable.
     """
     try:
         import pdfplumber
     except ImportError:
-        return [], ["pdfplumber unavailable; PDF tables cannot be recovered "
-                    "and a table document will be indexed as flat text"]
+        return [], set(), ["pdfplumber unavailable; PDF tables cannot be recovered "
+                           "and a table document will be indexed as flat text"]
     warnings: list[str] = []
     blocks: list[Block] = []
+    table_pages: set[int] = set()
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             for pno, page in enumerate(pdf.pages, start=1):
                 # Coordinate reconstruction first: it is strictly more
-                # faithful than the physical grid on a borderless table, and it
+                # faithful than the physical grid on a borderless table, and
                 # keeps words whole.
                 try:
                     words = page.extract_words(
@@ -548,26 +611,62 @@ def _pdf_table_blocks(data: bytes) -> tuple[list[Block], list[str]]:
                         blocks.append(Block(
                             kind="table", header=header, rows=rows, page=pno,
                             text="\n".join(" | ".join(r) for r in rows)[:20000]))
+                        table_pages.add(pno)
                         continue
+                # Ruled tables only, and only where the ruling is
+                # dense enough to be a grid. The text-strategy
+                # extraction that used to run here treated ANY text
+                # alignment as a grid, so every prose page of a
+                # brochure was shredded into a fake table (observed
+                # live: 46 invented grids, cells split mid-word, on
+                # a document with no borderless table at all). The
+                # coordinate path above already covers borderless
+                # grids; a page without ruling has nothing for THIS
+                # path to find, so it is skipped and its prose is
+                # extracted flat below.
+                if len(page.lines) + len(page.rects) < _MIN_RULING_LINES:
+                    continue
                 try:
-                    found = page.extract_tables(_PDF_TABLE_SETTINGS)
+                    found = page.extract_tables(
+                        _PDF_TABLE_SETTINGS_RULED)
                 except Exception as e:
                     warnings.append(f"page {pno} table scan failed: {e}")
                     continue
                 if not found:
                     continue
                 for grid in found:
-                    rebuilt = _rebuild_grid(grid)
-                    if not rebuilt:
+                    if not grid or len(grid) < _MIN_TABLE_ROWS:
                         continue
-                    header, rows = rebuilt
+                    width = max(len(r) for r in grid)
+                    if width < _MIN_TABLE_COLS:
+                        continue
+                    # Ruling already defines the logical cells, so the
+                    # grid is emitted as-is (the column re-merging in
+                    # `_rebuild_grid` exists for the borderless path,
+                    # where one cell wraps across a physical gap).
+                    rows = [[_cell(r, j) for j in range(width)]
+                            for r in grid]
+                    rows = [r for r in rows if any(r)]
+                    if len(rows) < _MIN_TABLE_ROWS:
+                        continue
+                    header: list[str] = []
+                    body = rows
+                    # A leading row of short cells is the header row.
+                    if (len(rows) > _MIN_TABLE_ROWS and rows[0]
+                            and all(c and len(c) <= 28
+                                    for c in rows[0] if c)):
+                        header = rows[0]
+                        body = rows[1:]
+                        if len(body) < 2:
+                            continue
                     blocks.append(Block(kind="table", header=header,
-                                        rows=rows, page=pno,
+                                        rows=body, page=pno,
                                         text="\n".join(
-                                            " | ".join(r) for r in rows)[:20000]))
+                                            " | ".join(r) for r in body)[:20000]))
+                    table_pages.add(pno)
     except Exception as e:
         warnings.append(f"table extraction failed: {e}")
-    return blocks, warnings
+    return blocks, table_pages, warnings
 
 
 def _is_heading_text(text: str) -> int | None:
@@ -877,25 +976,32 @@ def parse_pdf(data: bytes) -> ParseResult:
     # Tables first. Flat extraction is lossy for them in a way that is not
     # recoverable downstream: a weekly-menu grid arrives as the day names once
     # in a header followed by an unstructured run of dishes, and no chunking or
-    # retrieval strategy can put the association back. `extract_text()` also
-    # flattens the non-table prose on the same page, so when tables are found
-    # the flat pass is skipped for the whole document to avoid indexing every
-    # cell twice.
-    table_blocks, twarnings = _pdf_table_blocks(data)
+    # retrieval strategy can put the association back.
+    #
+    # The flat pass is skipped only for the PAGES that produced a table, not
+    # the whole document: a mixed document (a brochure with one summary grid
+    # and prose elsewhere) used to lose every prose page the moment one page
+    # yielded a table, because `extract_text()` also flattens the non-table
+    # prose on the same page and indexing both would double-count the table.
+    table_blocks, table_pages, twarnings = _pdf_table_blocks(data)
     res.warnings.extend(twarnings)
     if table_blocks:
         res.blocks.extend(table_blocks)
         res.meta["tables"] = len(table_blocks)
-        res.meta["pages"] = len({b.page for b in table_blocks if b.page})
-        res.meta["table_only"] = True
-        return res
+        res.meta["table_pages"] = sorted(table_pages)
 
     try:
         import pypdf
     except ImportError:
-        return ParseResult(blocks=_blocks_from_text(_dec(data, "latin-1")),
-                           warnings=["pypdf unavailable; "
-                                     "parsed as plain text"])
+        if not table_blocks:
+            res = ParseResult(blocks=_blocks_from_text(_dec(data, "latin-1")),
+                              warnings=["pypdf unavailable; "
+                                        "parsed as plain text"])
+        else:
+            res.warnings.append("pypdf unavailable; prose on non-table "
+                                "pages was not extracted")
+        res.meta["pages"] = res.meta.get("pages") or None
+        return res
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
     except Exception as e:
@@ -908,6 +1014,8 @@ def parse_pdf(data: bytes) -> ParseResult:
             res.warnings.append("this PDF is password-protected")
             return res
     for pno, page in enumerate(reader.pages, start=1):
+        if pno in table_pages:
+            continue  # already indexed as a table
         try:
             raw = page.extract_text() or ""
         except Exception as e:

@@ -311,16 +311,24 @@ def test_mcp_tool_catalogue():
     # calendar_refresh_token + discord_message + index_document - weather = 26,
     # + 11 expansion tools (arxiv/wikipedia/openalex/news/fetch_pdf/
     # extract_tables/wayback/calendar_query/slack_history/delete_file/
-    # search_files) = 37.
-    assert len(tools) == 38, f"expected 38 tools, got {len(tools)}"
+    # search_files) = 37, + read_artifact (expand a spilled upstream
+# result) = 38, + render_document = 39, and _doc_stats removed again = 40.
+# render_document was always counted here as if it existed, but it was a bare
+# function with no @mcp.tool(), so it was not in the list at all and every
+# model call for it returned "Unknown tool: render_document". _doc_stats is a
+# private helper for render_document and was likewise counted as a tool, which
+# let a model ask it for a word count instead of rendering a document.
+    assert len(tools) == 40, f"expected 40 tools, got {len(tools)}"
+    assert "render_document" in names, \
+        "the deliverable tool must be a real, callable MCP tool"
     # get_time was dropped here: the model's own clock covers it, and the tool
     # was not even reachable from the research DAG.
     assert "get_time" not in names, "get_time should have been removed"
     for expected in ("web_search", "read_file", "list_dir",
-                     "search_knowledge", "github_query",
+                     "search_knowledge", "github_query", "read_artifact",
                      "schedule_task", "list_scheduled", "cancel_scheduled"):
         assert expected in names, f"missing MCP tool: {expected}"
-    print("PASS  MCP tool catalogue (38 tools)")
+    print("PASS  MCP tool catalogue (40 tools)")
 
 
 def test_toggle_off_runs_full_dag():

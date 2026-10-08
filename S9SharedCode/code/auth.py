@@ -237,14 +237,77 @@ def cross_origin_write(headers, method: str) -> str | None:
     return None if tail == host.strip().lower() else (
         f"cross-origin {method} from {origin} refused")
 
-
 def token_meta_snippet() -> str:
     """The meta tag injected into the SPA shell.
 
-    The SPA must learn the token somehow, and the shell is the natural place:
-    it is same-origin, and a cross-origin page cannot read it. This is why the
-    token is not a defence against a local process.
+    The SPA must learn the token somehow, and the shell is the
+    natural place: it is same-origin, and a cross-origin page
+    cannot read it. This is why the token is not a defence
+    against a local process.
     """
     if _token is None:
         return ""
     return (f'<meta name="{TOKEN_META}" content="{_token}">')
+
+
+# ── prefab iframe pass ───────────────────────────────────────────────
+# The prefab app view is embedded as an <iframe src="/api/apps/{id}/
+# prefab">, and a browser navigation cannot carry the custom auth
+# header — so with enforcement on, the view 403'd inside its own
+# frame (the fetch-based pre-flight passed precisely because a fetch
+# CAN send the header, which masked this). This is a second, narrow
+# door for exactly that one path: a URL-signed, short-lived pass.
+# It is HMAC-signed with the per-launch token (which a cross-origin
+# page cannot read), so it cannot be forged, and it expires within
+# seconds, so it cannot be replayed far. The iframe is mounted with
+# referrerPolicy="no-referrer" so the signed URL does not leak via
+# the Referer header either.
+
+import hashlib
+import time as _time
+
+PREFAB_TTL_S = 120.0
+
+
+def prefab_pass(app_id: str, ttl_s: float = PREFAB_TTL_S) -> tuple[float, str]:
+    """Mint (exp, signature) letting one app's prefab view load."""
+    if _token is None:
+        raise AuthNotConfigured("auth token not generated")
+    exp = _time.time() + ttl_s
+    sig = hmac.new(
+        _token.encode("utf-8"),
+        f"prefab:{app_id}:{int(exp)}".encode("utf-8"),
+        hashlib.sha256).hexdigest()
+    return exp, sig
+
+
+def valid_prefab_pass(path: str, query_params) -> bool:
+    """Does this request carry a valid prefab pass for its path?
+
+    `query_params` is any mapping with `.get(name, default)`
+    (starlette QueryParams qualifies). Constant-time comparison,
+    expiry enforced, and the app id is taken FROM the path so a
+    pass minted for one app cannot open another's view.
+    """
+    if _token is None:
+        return False
+    clean = (path or "").rstrip("/")
+    if not clean.startswith("/api/apps/") or not clean.endswith("/prefab"):
+        return False
+    app_id = clean[len("/api/apps/"):-len("/prefab")]
+    if not app_id or "/" in app_id:
+        return False
+    try:
+        exp = float(query_params.get("exp", "") or "")
+    except (TypeError, ValueError):
+        return False
+    if exp <= _time.time():
+        return False
+    sig = (query_params.get("t") or "").strip()
+    if not sig:
+        return False
+    want = hmac.new(
+        _token.encode("utf-8"),
+        f"prefab:{app_id}:{int(exp)}".encode("utf-8"),
+        hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, want)

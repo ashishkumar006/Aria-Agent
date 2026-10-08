@@ -30,7 +30,7 @@ const KIND_CLASS: Record<TokKind, string> = {
   function: 'text-emerald-300',
   property: 'text-sky-200',
   string: 'text-amber-300',
-  comment: 'text-zinc-500 italic',
+  comment: 'text-zinc-muted italic',
   number: 'text-orange-300',
   operator: 'text-pink-300',
   punctuation: 'text-zinc-400',
@@ -53,6 +53,10 @@ export interface EditorProps {
   selectionEnd: number;
   problems: { line: number }[];
   ariaLabel: string;
+  /** Word wrap. The toggle existed in the palette, the status bar and the
+      shortcut sheet, and `wrap` was hard-coded to "off" here, so all three
+      claimed a control that changed nothing. */
+  wrap?: boolean;
   onChange: (v: string) => void;
   onCursor: () => void;
   onFoldToggle: (line: number) => void;
@@ -115,7 +119,7 @@ function Highlighted({ body, lang, folded }: {
       {visible.map((row, i) => (
         <div key={i} className="whitespace-pre">
           {foldMarkers.has(i)
-            ? <span className="text-zinc-600">⋯ {foldMarkers.get(i)} folded</span>
+            ? <span className="text-zinc-muted/80">⋯ {foldMarkers.get(i)} folded</span>
             : row.length === 0
               ? <span> </span>
               : row.map((t, k) => (
@@ -136,8 +140,16 @@ function f_end(folded: Set<number>, line: number): number {
 const Editor = memo(function Editor(props: EditorProps) {
   const {
     body, lang, folded, cursorLine, caretOffset, problems,
-    ariaLabel, onChange, onCursor, onFoldToggle, registerRef, scrollerRef,
+    ariaLabel, wrap = false,
+    onChange, onCursor, onFoldToggle, registerRef, scrollerRef,
   } = props;
+
+  /* All three layers must agree on the wrap mode. The <pre> draws the glyphs,
+     the textarea holds the caret, and the sizer sets the scroll geometry - if
+     only one of them wraps, the caret drifts away from the text it is editing,
+     which is worse than not wrapping at all. */
+  const wrapCls = wrap ? 'whitespace-pre-wrap' : 'whitespace-pre';
+  const wrapAttr = wrap ? 'soft' : 'off';
 
   const preRef = useRef<HTMLPreElement>(null);
 
@@ -180,7 +192,7 @@ const Editor = memo(function Editor(props: EditorProps) {
             to reach by keyboard or screen reader. Only the numbers are
             decorative, so only they are hidden. */}
         <div
-          className="sticky left-0 z-20 flex-none select-none border-r border-glass-border bg-surface-0 px-2 py-2 text-right font-mono text-[11px] leading-[1.55rem] text-zinc-muted/60">
+          className="sticky left-0 z-20 flex-none select-none border-r border-glass-border bg-surface-0 px-2 py-2 text-right font-mono text-[11px] leading-[1.55rem] text-zinc-muted/80">
           {Array.from({ length: body.split('\n').length }).map((_, i) => (
             <div key={i} className="flex items-center justify-end gap-1">
               {problemLines.has(i) && (
@@ -191,6 +203,14 @@ const Editor = memo(function Editor(props: EditorProps) {
                 <button
                   type="button"
                   aria-label={`Fold line ${i + 1}`}
+                  /* Out of the tab order. The gutter renders BEFORE the
+                     textarea and has one button per foldable line — up to
+                     287 in memory_api.py — which put the editor at tab stop
+                     #404. 180 Tab presses after opening a file never reached
+                     it, so the workspace was unusable by keyboard. Folding
+                     stays available by click; reaching the text is what
+                     matters. */
+                  tabIndex={-1}
                   onClick={() => onFoldToggle(i)}
                   className="ml-0.5 text-zinc-muted hover:text-zinc-200"
                 >▾</button>
@@ -207,12 +227,19 @@ const Editor = memo(function Editor(props: EditorProps) {
             overlay was offset once. The width lives here too, so the two layers
             cannot disagree about where the text ends either. */}
         <div className="relative flex-none"
-             style={{ width: maxCol(body) * METRICS.fontSize * 0.6 + METRICS.padX * 2 + 40 }}>
+             style={wrap
+               ? { width: '100%' }
+               : { width: maxCol(body) * METRICS.fontSize * 0.6 + METRICS.padX * 2 + 40 }}>
           {/* Height comes from a transparent sizer, so both absolutely
               positioned layers can fill the box without either of them
-              scrolling internally. */}
-          <div aria-hidden className="invisible py-2 pl-3 pr-4 font-mono text-[12.5px] leading-[1.55rem]">
-            {body.split('\n').map((_, i) => <div key={i}>{i === 0 ? ' ' : ' '}</div>)}
+              scrolling internally. With wrap on, the sizer has to render the
+              real line text: a wrapped line occupies more than one row of
+              height, and a sizer of blank rows would under-report the document
+              and cut the caret off at the bottom. */}
+          <div aria-hidden className={`invisible py-2 pl-3 pr-4 font-mono text-[12.5px] leading-[1.55rem] ${wrapCls}`}>
+            {(wrap ? body.split('\n') : body.split('\n').map(() => ' ')).map((ln, i) => (
+              <div key={i}>{ln.length ? ln : ' '}</div>
+            ))}
           </div>
 
           {/* current-line band, behind everything */}
@@ -246,7 +273,7 @@ const Editor = memo(function Editor(props: EditorProps) {
 
           {/* highlighted layer */}
           <pre ref={preRef} aria-hidden
-            className="pointer-events-none absolute inset-0 z-10 overflow-hidden whitespace-pre bg-transparent py-2 pl-3 pr-4 font-mono text-[12.5px] leading-[1.55rem]">
+            className={`pointer-events-none absolute inset-0 z-10 overflow-hidden ${wrapCls} bg-transparent py-2 pl-3 pr-4 font-mono text-[12.5px] leading-[1.55rem]`}>
             <Highlighted body={body} lang={lang} folded={folded} />
           </pre>
 
@@ -263,9 +290,9 @@ const Editor = memo(function Editor(props: EditorProps) {
             spellCheck={false}
             autoCapitalize="off"
             autoCorrect="off"
-            wrap="off"
+            wrap={wrapAttr}
             aria-label={ariaLabel}
-            className="absolute inset-0 z-30 resize-none overflow-hidden whitespace-pre bg-transparent py-2 pl-3 pr-4 font-mono text-[12.5px] leading-[1.55rem] text-transparent caret-accent outline-none selection:bg-accent/25"
+            className={`absolute inset-0 z-30 resize-none overflow-hidden ${wrapCls} bg-transparent py-2 pl-3 pr-4 font-mono text-[12.5px] leading-[1.55rem] text-transparent caret-accent outline-none selection:bg-accent/25`}
           />
         </div>
       </div>

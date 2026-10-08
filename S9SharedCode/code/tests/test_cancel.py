@@ -149,6 +149,36 @@ def test_cancel_endpoint_reports_and_fires():
     assert r.json()["found"] is False
 
 
+def test_concurrent_runs_on_one_key_stay_independently_cancellable():
+    """Two runs sharing a conversation key (a chat plus a scheduled
+    job, or a double-clicked send) used to clobber each other: the
+    second registration orphaned the first run's cancel event, and
+    the first run to finish popped the keys from under the second,
+    leaving it uncancellable."""
+    import agent_server as ag
+
+    ev_a = ag.threading.Event()
+    ev_b = ag.threading.Event()
+    ag._register_run(ev_a, "t-shared-sid", "c-shared-cid")
+    ag._register_run(ev_b, "t-shared-sid", "c-shared-cid")
+    try:
+        # Both runs are registered under the shared keys, so a
+        # cancel reaches BOTH.
+        assert ag._ACTIVE_RUNS["t-shared-sid"] == {ev_a, ev_b}
+        assert ag._ACTIVE_RUNS["c-shared-cid"] == {ev_a, ev_b}
+        # The first run to finish unregisters only its own event:
+        # the still-running second one stays cancellable.
+        ag._unregister_run("t-shared-sid", "c-shared-cid",
+                           cancel_ev=ev_a)
+        assert ag._ACTIVE_RUNS["t-shared-sid"] == {ev_b}
+        assert ag._ACTIVE_RUNS["c-shared-cid"] == {ev_b}
+    finally:
+        ag._unregister_run("t-shared-sid", "c-shared-cid",
+                           cancel_ev=ev_b)
+    assert "t-shared-sid" not in ag._ACTIVE_RUNS
+    assert "c-shared-cid" not in ag._ACTIVE_RUNS
+
+
 class TestCancelWiring:
     """The predicate handed to the orchestrator must be `Event.is_set`.
 

@@ -1,26 +1,30 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Boxes } from 'lucide-react';
-import { Rail, TopBar, Empty, Skel, Pill, Stat } from '../components/ui';
+import { Rail, TopBar, Empty, Skel, Pill, Stat, SkipLink } from '../components/ui';
 import { api, CONF, type ToolSpec } from '../api';
 
 const PACKS = [
   { id: 'research', name: 'Web Research', ico: '◉',
-    desc: 'Search the web, fetch pages, query memory and index documents for retrieval.',
-    tools: ['web_search', 'fetch_url', 'search_knowledge', 'index_document'] },
+    desc: 'Search the web, fetch pages and PDFs, query memory and index documents for retrieval.',
+    tools: ['web_search', 'fetch_url', 'fetch_pdf', 'wayback_fetch',
+      'news_search', 'wikipedia_search', 'openalex_search', 'arxiv_search',
+      'extract_tables', 'search_knowledge', 'index_document',
+      'verify_citations', 'recall_preferences', 'remember_preference',
+      'search_files'] },
   { id: 'comms', name: 'Messaging', ico: '✉',
     desc: 'Email, Telegram, Slack and Discord — read, send and stay in the loop.',
     tools: ['send_email', 'gmail_query', 'gmail_refresh_token', 'send_telegram',
-      'slack_message', 'slack_refresh_token', 'discord_message'] },
+      'slack_history', 'slack_message', 'slack_refresh_token', 'discord_message'] },
   { id: 'plan', name: 'Calendar & Scheduling', ico: '◷',
     desc: 'Calendar events plus the built-in job scheduler the Scheduler page drives.',
-    tools: ['create_calendar_event', 'calendar_refresh_token', 'schedule_task',
-      'list_scheduled', 'cancel_scheduled'] },
+    tools: ['create_calendar_event', 'calendar_query', 'calendar_refresh_token',
+      'schedule_task', 'list_scheduled', 'cancel_scheduled'] },
   { id: 'files', name: 'Workspace Files', ico: '▤',
-    desc: 'List, read, create and edit files in the agent workspace.',
-    tools: ['read_file', 'list_dir', 'create_file', 'update_file', 'edit_file'] },
+    desc: 'List, read, create, edit and delete files in the agent workspace.',
+    tools: ['read_file', 'list_dir', 'create_file', 'update_file', 'edit_file', 'delete_file'] },
   { id: 'integrations', name: 'Integrations', ico: '❖',
-    desc: 'GitHub, Notion, computer use, currency and clock utilities.',
-    tools: ['github_query', 'notion_query', 'computer_action', 'currency_convert', 'get_time'] },
+    desc: 'GitHub, Notion and computer use.',
+    tools: ['github_query', 'notion_query', 'computer_action'] },
 ];
 
 function packOf(tool: string): string {
@@ -49,8 +53,17 @@ export default function Skills() {
       setCatalog(d.tools || []);
       try {
         const g = await api.toolsGuard();
-        setDisabled(new Set(g.disabled || []));
-        setGuardError('');
+        if (g.disabled === null || g.error) {
+          // The guard read failed SERVER-SIDE: it answers
+          // 200 with disabled:null, and an empty list here
+          // would render as an authoritative all-clear —
+          // exactly the failure mode this state exists for.
+          setDisabled(new Set());
+          setGuardError(g.error || 'tool guard state unknown');
+        } else {
+          setDisabled(new Set(g.disabled || []));
+          setGuardError('');
+        }
       } catch (e) {
         // Do NOT assume all live. This is the permission surface: a failed
         // guard read used to render "40/40 tools live / WITHHELD none", an
@@ -106,7 +119,13 @@ export default function Skills() {
   const flipPack = async (id: string) => {
     const p = PACKS.find((k) => k.id === id);
     if (!p || packBusy === id) return;
-    const enable = p.tools.some((t) => !disabled.has(t));
+    // "Disable pack" must win when anything in the pack is still live.
+    // `some(t => !disabled.has(t))` asked the opposite question: on an
+    // all-live pack it was TRUE, so the Disable button POSTed
+    // enabled:true for every tool and changed nothing (two of the three
+    // label states were dead). Enable only when every tool is withheld.
+    const off = p.tools.filter((t) => disabled.has(t)).length;
+    const enable = off === p.tools.length;
     setPackBusy(id);
     try {
       // Do not swallow per-tool failures: `.catch(() => null)` made a pack
@@ -141,6 +160,7 @@ export default function Skills() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
@@ -149,7 +169,14 @@ export default function Skills() {
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-2.5 pb-3">
           {PACKS.map((p) => {
-            const live = p.tools.filter((t) => known.has(t) && !disabled.has(t)).length;
+            // With the guard unreadable the withheld set is UNKNOWN, so
+            // "live" is not knowable either. The pack header and the
+            // rail footer used to compute a definite count anyway and
+            // printed "live 15/15" next to the amber guard-error banner
+            // — a false all-clear in the same viewport.
+            const live = guardError
+              ? 0
+              : p.tools.filter((t) => known.has(t) && !disabled.has(t)).length;
             const off = p.tools.length - live;
             return (
               <div key={p.id} className="rounded-[10px] border border-white/10 bg-[#0e0e12] p-2.5">
@@ -159,21 +186,27 @@ export default function Skills() {
                       everywhere else; this pack header used green + yellow
                       for the same two states the table below calls
                       muted "withheld". */}
-                  <Pill tone={off ? 'muted' : 'info'}>{off ? `${off} off` : 'live'}</Pill>
+                  <Pill tone={guardError ? 'err' : off ? 'muted' : 'info'}>
+                    {guardError ? 'unknown' : off ? `${off} off` : 'live'}
+                  </Pill>
                 </div>
-                <div className="mt-1 text-[11px] text-zinc-muted">{live}/{p.tools.length} tools live</div>
+                <div className="mt-1 text-[11px] text-zinc-muted">
+                  {guardError ? 'counts unknown' : `${live}/${p.tools.length} tools live`}
+                </div>
               </div>
             );
           })}
         </div>
         <div className="hidden space-y-1.5 border-t border-white/10 px-3.5 py-2.5 text-[11px] lg:block">
           <div className="text-[10px] font-bold tracking-[0.12em] text-zinc-muted">LIVE TOOLS</div>
-          <div>{nLive} / {catalog.length}</div>
+          <div>{guardError ? '?' : `${nLive} / ${catalog.length}`}</div>
           <div className="text-[10px] font-bold tracking-[0.12em] text-zinc-muted">WITHHELD</div>
-          <div className="break-words">{disabled.size ? [...disabled].join(', ') : 'none'}</div>
+          <div className="break-words">
+            {guardError ? 'unknown — guard read failed' : disabled.size ? [...disabled].join(', ') : 'none'}
+          </div>
         </div>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Skills">
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter tools" className="w-44 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
         </TopBar>
@@ -184,6 +217,15 @@ export default function Skills() {
               <>
                 <Stat k="TOOLS LIVE" v="?" s="guard state unknown" tone="bad" />
                 <Stat k="WITHHELD" v="?" s="guard read failed" tone="bad" />
+              </>
+            ) : loadError ? (
+              // A failed catalogue read is not "zero tools": the counts
+              // below were computed from an empty list, so the page used
+              // to assert TOOLS LIVE 0 / WITHHELD 0 beside a red error
+              // panel. Say what is actually true.
+              <>
+                <Stat k="TOOLS LIVE" v="?" s="catalogue unavailable" tone="bad" />
+                <Stat k="WITHHELD" v="?" s="catalogue unavailable" tone="bad" />
               </>
             ) : (
               <>
@@ -243,7 +285,14 @@ export default function Skills() {
             })}
           </div>
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">ALL TOOLS</div>
-          <section className="mx-3.5 mb-3.5 overflow-hidden rounded-[10px] border border-white/10 bg-[#0e0e12]">
+          {/* `overflow-hidden` clipped the table instead of scrolling it. At
+              390px the table is 549px in a 362px section, so the State pill
+              AND the Withhold/Enable button (right edge 554px) sat off-screen
+              and could not be operated on at all — the permission control was
+              unreachable on a phone. Note `documentElement.scrollWidth ==
+              clientWidth` throughout, so a page-level overflow check reports
+              "fine" while the control is unusable. */}
+          <section className="mx-3.5 mb-3.5 overflow-x-auto rounded-[10px] border border-white/10 bg-[#0e0e12]">
             <table className="w-full border-collapse text-[12.5px]">
               <thead>
                 <tr className="border-b border-white/10 text-left text-[10px] tracking-[0.1em] text-zinc-muted">
@@ -257,12 +306,18 @@ export default function Skills() {
               <tbody>
                 {rows.map((t) => {
                   const off = disabled.has(t.name);
+                  // Guard unreadable: "live" is not knowable, so the row
+                  // must not claim it. The button still works — the write
+                  // is authoritative — but the state cell says unknown.
+                  const state = guardError ? 'unknown' : off ? 'withheld' : 'live';
                   return (
                     <tr key={t.name} className="border-b border-white/5 hover:bg-white/[0.02]">
                       <td className="px-2.5 py-2 font-mono text-[11.5px]">{t.name}</td>
                       <td className="px-2.5 py-2 text-zinc-400">{packOf(t.name)}</td>
                       <td className="px-2.5 py-2 text-zinc-400">{(t.description || '').slice(0, 110)}</td>
-                      <td className="px-2.5 py-2"><Pill tone={off ? 'muted' : 'ok'}>{off ? 'withheld' : 'live'}</Pill></td>
+                      <td className="px-2.5 py-2">
+                        <Pill tone={guardError ? 'err' : off ? 'muted' : 'ok'}>{state}</Pill>
+                      </td>
                       <td className="px-2.5 py-2 text-right">
                         <button
                           onClick={() => flip(t.name, off)}
@@ -281,7 +336,7 @@ export default function Skills() {
             </table>
           </section>
         </div>
-      </div>
+      </main>
     </div>
   );
 }

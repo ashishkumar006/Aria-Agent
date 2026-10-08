@@ -65,6 +65,19 @@ class V9Client:
         # Default session tag for ledger attribution. Per-call overrides win.
         self.session = session
 
+    def _headers(self) -> dict:
+        """Every /v1 route needs the shared gateway token (401 without it)."""
+        tok = os.environ.get("GATEWAY_V9_TOKEN") or ""
+        if not tok:
+            try:
+                from pathlib import Path
+                p = (Path(__file__).resolve().parents[2] / "llm_gatewayV9"
+                     / "state" / "gateway.token")
+                tok = p.read_text(encoding="utf-8").strip()
+            except Exception:
+                tok = ""
+        return {"X-Gateway-Token": tok} if tok else {}
+
     @staticmethod
     def _normalise(d: dict) -> GatewayResult:
         return GatewayResult(
@@ -107,7 +120,8 @@ class V9Client:
         body["model"] = model or self.DEFAULT_MODEL
         body["provider"] = provider or self.DEFAULT_PROVIDER
 
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
+        async with httpx.AsyncClient(timeout=self.timeout,
+                                 headers=self._headers()) as c:
             r = await c.post(f"{self.base_url}/v1/vision", json=body)
             r.raise_for_status()
             return self._normalise(r.json())
@@ -146,7 +160,8 @@ class V9Client:
         body["model"] = model or self.DEFAULT_MODEL
         body["provider"] = provider or self.DEFAULT_PROVIDER
 
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
+        async with httpx.AsyncClient(timeout=self.timeout,
+                                 headers=self._headers()) as c:
             r = await c.post(f"{self.base_url}/v1/chat", json=body)
             r.raise_for_status()
             return self._normalise(r.json())
@@ -158,7 +173,8 @@ class V9Client:
         params: dict[str, Any] = {}
         if agent:   params["agent"] = agent
         if session: params["session"] = session
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
+        async with httpx.AsyncClient(timeout=self.timeout,
+                                 headers=self._headers()) as c:
             r = await c.get(f"{self.base_url}/v1/cost/by_agent", params=params)
             r.raise_for_status()
             return r.json()

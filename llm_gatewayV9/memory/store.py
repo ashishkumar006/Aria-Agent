@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -100,19 +101,38 @@ class MemoryStore:
         tmp = self.path.with_name(
             f"{self.path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}"
         )
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self.path)
-        except Exception:
+        # `os.replace` on Windows fails with Access Denied while ANY
+        # handle to the destination is open - a reader's `read_text`
+        # or `stat` on the same file. Handles close in milliseconds,
+        # but this store rewrites the whole file on every mutation,
+        # and the document indexer deletes-then-appends once per
+        # chunk: over a 1370-chunk run a single unlucky replace lost
+        # an entire embed batch's records (the priors were already
+        # deleted), wedged the worker on FAILED, and left the
+        # registry claiming chunks the drawer no longer held - which
+        # the drift check then reset forever. Retry the replace
+        # instead of losing the write.
+        last: Exception | None = None
+        for attempt in range(5):
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, self.path)
+                last = None
+                break
+            except OSError as e:
+                last = e
+                time.sleep(0.05 * (attempt + 1))
+        if last is not None:
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
             self._cache_key = None
             self._cache = []
-            raise
-        # Invalidate: the on-disk file is now a different (mtime, size), and
-        # the next _load_locked must re-parse rather than serve the old list.
+            raise last
+        # Invalidate: the on-disk file is now a different (mtime, size),
+        # and the next _load_locked must re-parse rather than serve the
+        # old list.
         self._cache_key = None
         self._cache = []
 

@@ -36,6 +36,11 @@ Output schema (JSON, no prose, no markdown fences):
 Notes:
   - The fields dictionary is the load-bearing output; downstream
     Formatter nodes read it.
+  - Lists and comparisons stay ITEMISED: one field per item, in
+    the input's order — do NOT merge items into a single field,
+    and do NOT round figures ("about 1,000" is a loss; copy
+    "1,024" exactly). A merged or rounded row is detail the
+    Formatter can never recover.
   - Budget honesty: upstream content is truncated to the prompt budget
     before you see it (browser content ~1500 chars with the structured
     card block preserved; total inputs capped). Quote evidence from what

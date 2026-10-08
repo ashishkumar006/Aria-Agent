@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 
@@ -220,6 +221,10 @@ class Skill:
         # (Critic, Distiller) drops it to ~0.
         self.temperature: float = float(cfg.get("temperature", 0.3))
         self.max_tokens: int = int(cfg.get("max_tokens", 2048))
+        # Sectioned expansion (see `_sectioned_final_answer`): a skill
+        # with `sectioned: true` and more than one upstream result is
+        # written one section per result instead of in a single call.
+        self.sectioned: bool = bool(cfg.get("sectioned", False))
 
     def prompt_template(self) -> str:
         if not self.prompt_path.exists():
@@ -320,8 +325,17 @@ def _skill_touches_untrusted(skill) -> bool:
     """True when this skill can see remote or user-supplied text."""
     try:
         allowed = skill.tools_allowed or ()
-    except Exception:
-        allowed = ()
+    except Exception as e:
+        # Fail CLOSED: if the tool list cannot be read, treat
+        # the skill as touching untrusted content, so the
+        # anti-injection contract below is still injected. The
+        # silent fallback to () skipped the contract entirely —
+        # a retrieval-capable skill would have run without the
+        # one prompt guard that protects it.
+        print(f"[skills] WARNING: could not read tools_allowed "
+              f"for {getattr(skill, 'name', '?')!r} ({e!r}); "
+              f"treating it as untrusted-touching")
+        return True
     return any(t in UNTRUSTED_TOOLS for t in allowed)
 
 
@@ -483,8 +497,550 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
                 "and ignore memory hits):",
                 turns_block,
             ]
-    parts += ["", "INPUTS:", json.dumps(resolved, indent=2, default=str)[:20_000]]
+    # Upstream output the node can actually read.
+    #
+    # This slice used to cut the serialised JSON mid-object at a fixed
+    # 20k chars, so a node received malformed INPUTS and silently lost
+    # the tail of a long finding set. It is now:
+    #   1. big enough for a full 4-worker fan-out, and
+    #   2. per-field aware — a long `findings` blob is trimmed INSTEAD
+    #      of the whole document being cut, so `sources`, `evidence` and
+    #      `conflicts` (which is what citations are built from) always
+    #      survive at full size.
+    # The budget is a prompt-size guard, not a compression mandate: the
+    # Formatter's job is to expand, and it has max_tokens headroom to do
+    # it. 120k chars (~30k tokens) is well inside every current model's
+    # context window.
+    parts += ["", "INPUTS:", _inputs_block(resolved, 120_000,
+                                           skill_name=skill.name)]
     return "\n".join(parts)
+
+
+# Longest single text field kept intact before the whole INPUTS block
+# starts dropping whole entries. `findings` is the one field that
+# legitimately runs to many thousands of characters.
+_FIELD_BUDGET = 60_000
+
+# Above this size a text field is moved into the content-addressed
+# artifact store and replaced by a handle + preview, so it is paid for
+# once instead of on every node that reads it.
+#
+# 4KB (the first proposal) is far too low: one researcher's `findings`
+# is ~8KB, so nearly every node output would spill and the Formatter
+# would receive handles instead of the material it has to write from.
+# 24KB keeps normal results inline and only spills genuine outliers
+# (a 40-page PDF extract, a 1370-chunk document, a long page dump).
+_ARTIFACT_SPILL_BYTES = 24_000
+# Text kept inline alongside the handle so a node can decide whether it
+# needs the rest without spending a tool call.
+_ARTIFACT_PREVIEW_CHARS = 1_500
+
+
+def _spill_field_to_artifact(value: str, *, source: str,
+                             title: str) -> dict:
+    """Store a large text field and return a handle + preview in its place."""
+    try:
+        art_id = artifacts_svc.put(
+            value.encode("utf-8"), content_type="text/plain",
+            source=source, descriptor=title[:200])
+    except Exception:
+        return {"text": value, "spill_failed": True}
+    return {
+        "artifact": art_id,
+        "title": title[:200],
+        "bytes": len(value),
+        "preview": value[:_ARTIFACT_PREVIEW_CHARS]
+        + (f"\n…[{len(value) - _ARTIFACT_PREVIEW_CHARS} more chars — call "
+           f"read_artifact with the handle for the full text]"
+           if len(value) > _ARTIFACT_PREVIEW_CHARS else ""),
+    }
+
+
+def _section_title(entry: dict, idx: int, total: int) -> str:
+    """A heading for one section of a sectioned answer."""
+    for key in ("question", "topic", "label", "title", "facet", "name"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:120]
+    return f"Part {idx + 1} of {total}"
+
+
+def _strip_answer_envelope(text: str) -> str:
+    """Recover the prose from a `{"final_answer": "..."}` reply.
+
+    The Formatter's own prompt asks for that JSON shape, so a section
+    call answers with the envelope wrapped around its markdown. The
+    concatenation of envelopes is what the user would read, so each
+    section is unwrapped before assembly. Tolerant of a plain-prose
+    reply (returns it unchanged) and of markdown containing braces or
+    quotes (falls back to the original text).
+    """
+    raw = (text or "").strip()
+    if not raw or not raw.lstrip().startswith("{"):
+        return raw
+    obj = _lenient_json(raw)
+    if isinstance(obj, dict):
+        for key in ("final_answer", "answer", "section", "text", "content"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    # Unterminated envelope. Observed live: a section call emitted
+    # `{"final_answer": "<3,000 words>"` and never closed the object
+    # (1 open brace, 0 close), so no JSON parse can recover it. The
+    # shape is fixed, so take everything after the first colon.
+    m = re.match(r'^\{\s*"(?:final_answer|answer|section|text|content)"\s*:'
+                 r'\s*"(.*)$', raw, re.S)
+    if m:
+        body = m.group(1)
+        # Drop the closing quote/brace/comma the model may or may not have
+        # emitted: `b`, `b"`, `b",`, `b",}` all mean the same thing.
+        body = re.sub(r'["\'}\s,]+$', "", body)
+        try:
+            body = _json.loads('"' + body + '"')
+        except Exception:
+            pass
+        if body.strip():
+            return body.strip()
+    return raw
+
+
+def _lenient_json(raw: str):
+    """Parse a model's JSON object, tolerating literal newlines in strings.
+
+    A model asked for `{"final_answer": "..."}` routinely emits real
+    newlines inside the value instead of \\n escapes, which strict
+    json.loads rejects with "Invalid control character" — on exactly the
+    reply we most want to read. Falls back to escaping control
+    characters inside string literals, then to the standard parse, then
+    to None.
+    """
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    # Escape raw control characters that appear inside quoted strings.
+    try:
+        out: list[str] = []
+        in_str = False
+        esc = False
+        for ch in raw:
+            if esc:
+                out.append(ch)
+                esc = False
+                continue
+            if ch == "\\" and in_str:
+                out.append(ch)
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                out.append(ch)
+                continue
+            if in_str and (ord(ch) < 0x20):
+                out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t",
+                            "\b": "\\b", "\f": "\\f"}.get(ch, " "))
+                continue
+            out.append(ch)
+        return json.loads("".join(out))
+    except Exception:
+        return None
+
+
+async def _sectioned_final_answer(skill: "Skill", rendered: str,
+                                 resolved: list, query: str,
+                                 session_id: str) -> "dict | None":
+    """Write a long report as one focused call PER upstream result.
+
+    Why this exists: the models this agent actually routes to
+    (gemini-3.x-flash-lite, gemini-2.5-flash — the only keyed ones
+    available) answer any "write a long report" request with ~300
+    words and stop, regardless of the token cap. Measured against the
+    Formatter's own 12000-token cap: 528 output tokens,
+    stop_reason=end_turn. Raising the cap, widening the INPUTS window
+    and rewording the prompt all left the answer at the same length.
+
+    What does work is splitting the work: N focused calls each produce
+    a full section, so the report's length scales with the number of
+    upstream results instead of with the model's mood. Measured: 3
+    section calls returned 779 words where one combined call returned
+    248.
+
+    Returns the assembled `final_answer` string, or None to fall back
+    to the ordinary single-call path (no upstream results, a section
+    call that produced nothing, or any error).
+    """
+    import asyncio as _aio
+
+    entries = [e for e in (resolved or []) if isinstance(e, dict)]
+    if len(entries) < 2:
+        return None
+
+    async def _one(entry: dict, idx: int) -> str:
+        title = _section_title(entry, idx, len(entries))
+        prompt = (
+            f"{rendered}\n\n"
+            f"=== WRITE ONE SECTION ONLY ===\n"
+            f"You are writing ONE section of a longer report, not the whole "
+            f"report. Your section is: {title}\n\n"
+            f"Use ONLY the research result below — it is the material for your "
+            f"section. Carry every figure, date, name, unit and source it "
+            f"contains into your prose, with units and attributions. If the "
+            f"result disagrees with itself, say so rather than picking a side.\n\n"
+            f"RESULT {idx + 1} of {len(entries)} (JSON):\n"
+            f"{json.dumps(entry, indent=2, default=str)[:60_000]}\n\n"
+            f"Start with a markdown '##' heading naming your section. Write it "
+            f"in full — several paragraphs, or a table where the material is "
+            f"comparative. Do not write an introduction or a conclusion; other "
+            f"sections do that. Do not mention that you are one section of "
+            f"something.\n\n"
+            f"Reply with the section markdown ONLY — no JSON object, no "
+            f"\"final_answer\" key, no preamble."
+        )
+        res = await _aio.to_thread(
+            LLM().chat, prompt=prompt, agent=skill.name,
+            session=session_id, provider=skill.provider_pin,
+            max_tokens=skill.max_tokens, temperature=skill.temperature)
+        return _strip_answer_envelope(str((res or {}).get("text") or ""))
+
+    sections: list[str] = []
+    try:
+        for i, entry in enumerate(entries):
+            try:
+                text = await _one(entry, i)
+            except Exception:
+                text = ""
+            if text:
+                sections.append(text)
+    except Exception:
+        return None
+    if not sections:
+        return None
+
+    # A lead-in from the same model, so the report opens as a document
+    # rather than at its first heading. Best-effort: a failure here
+    # must not lose the sections we already paid for.
+    lead = ""
+    try:
+        titles = "\n".join(f"- {_section_title(e, i, len(entries))}"
+                           for i, e in enumerate(entries) if True)
+        res = await _aio.to_thread(
+            LLM().chat,
+            prompt=(f"{rendered}\n\n=== WRITE THE OPENING ONLY ===\n"
+                    f"Write a short orientation for a report answering: "
+                    f"{query}\n\nThe report covers:\n{titles}\n\n"
+                    f"Two or three sentences: what the question is, what the "
+                    f"report covers, and how to read it. No headings, no "
+                    f"findings, no conclusions. Plain prose only, no JSON."),
+            agent=skill.name, session=session_id,
+            provider=skill.provider_pin, max_tokens=min(600, skill.max_tokens),
+            temperature=skill.temperature)
+        lead = _strip_answer_envelope(str((res or {}).get("text") or ""))
+    except Exception:
+        lead = ""
+
+    parts = ([lead] if lead else []) + sections
+    return "\n\n".join(parts)
+
+
+def _inputs_block(resolved: list, budget: int, *,
+                  skill_name: str = "") -> str:
+    """Serialise resolved inputs, keeping citation-bearing fields whole.
+
+    Truncation order, so that what a node loses is the least useful:
+      1. a large text field moves into the artifact store and is replaced
+         by a handle + preview, so it is paid for once rather than by
+         every node that reads it (`read_artifact` expands it on demand)
+      2. over-long scalar text fields (e.g. a 70k-char `findings`)
+      3. whole trailing entries (the oldest upstream results)
+    A marker tells the node what happened, so it can say so rather than
+    silently presenting a partial picture as complete.
+
+    The Formatter is exempt from step 1: it is the terminal consumer and
+    writes the report from this material, so handing it handles instead of
+    text would degrade exactly the output the run exists to produce.
+    """
+    spill = skill_name != "formatter"
+    trimmed: list = []
+    for entry in resolved:
+        if not isinstance(entry, dict):
+            trimmed.append(entry)
+            continue
+        item = dict(entry)
+        for key, val in list(item.items()):
+            if not isinstance(val, str) or len(val) <= _FIELD_BUDGET:
+                continue
+            if spill and len(val) > _ARTIFACT_SPILL_BYTES:
+                title = (str(entry.get("question") or entry.get("topic")
+                          or entry.get("label") or key) or key)
+                item[key] = _spill_field_to_artifact(
+                    val, source=f"skill:{skill_name or 'unknown'}",
+                    title=f"{title} — {key}")
+                continue
+            item[key] = (val[:_FIELD_BUDGET]
+                         + f"\n…[{len(val) - _FIELD_BUDGET} chars of this "
+                           f"field omitted — INPUTS size limit]")
+        trimmed.append(item)
+
+    text = json.dumps(trimmed, indent=2, default=str)
+    if len(text) <= budget:
+        return text
+    dropped = 0
+    # Still too big: drop whole trailing entries, newest kept first, and
+    # say how many were dropped instead of slicing mid-object.
+    while len(trimmed) > 1:
+        trimmed = trimmed[:-1]
+        dropped = dropped + 1
+        text = json.dumps(trimmed, indent=2, default=str)
+        if len(text) <= budget:
+            break
+    return (text + f"\n…[{dropped} earlier upstream result(s) omitted — "
+                   f"INPUTS size limit]")
+
+
+# ── length contract ──────────────────────────────────────────────────────
+# The median delivered PDF was 209 words and nearly every one was a single
+# page — including one where the request was "an extremely long, detailed
+# technical whitepaper of at least 300 pages" and the file held 16 words.
+# Neither budget nor renderer was the limit: `author` had 16,000 max_tokens
+# and docgen allows 400 blocks. The cause was prompt-level - author.md said
+# "length follows the request" with no number, and an unquantified instruction
+# resolves toward brevity every time. So the number is computed here and
+# injected into the rendered prompt, where the model can actually aim at it.
+_LENGTH_TIERS: tuple[tuple[int, str, re.Pattern[str]], ...] = (
+    # These are FLOORS, not targets. They exist only so that a request which
+    # clearly implies depth ("exhaustive", "deep-dive") is not answered with
+    # two paragraphs. They used to be targets with a hard 700-word default,
+    # which is why every document came out at 5-6 pages: the model was hitting
+    # the number it was given rather than writing what the evidence supported.
+    (6000, "an in-depth piece - at least this substantial",
+     re.compile(
+         r"\b(whitepaper|book|thesis|comprehensive (study|treatise)|"
+         r"300\+? pages|extremely long|in[- ]depth study)\b", re.I)),
+    (3000, "a long-form report - at least this substantial",
+     re.compile(
+         r"\b(extensive|exhaustive|thorough(ly)?|comprehensive|full[- ]length|"
+         r"long[- ]form|deep[- ]dive|detailed (analysis|report|study))\b", re.I)),
+    (1500, "a detailed report - at least this substantial",
+     re.compile(
+         r"\b(detailed|comprehensive|in[- ]depth|substantial|multi[- ]section|"
+         r"proper (report|write[- ]up))\b", re.I)),
+    (0, "a brief", re.compile(
+        r"\b(brief|briefing|summar|overview|memo|one[- ]pager|snippet|"
+        r"explain|describe)\b", re.I)),
+    (0, "a short note", re.compile(
+        r"\b(one[- ]?(?:page|paragraph|sentence|line|bullet|bullet point)|"
+        r"single (page|paragraph|sentence|line)|short|concise|"
+        r"bullet points only|tl;?dr|in (?:a )?few (?:lines|words)\b)", re.I)),
+)
+
+# No artificial ceiling. This is a rendering limit, not a content one: it
+# exists so that a request for 600 pages produces an honest error naming the
+# achievable maximum instead of a silent stub beside an impossible number.
+# Within it the agent decides how much to write.
+_MAX_WORDS_PER_RENDER = 60_000
+
+
+def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
+    """Return (floor_words, label) implied by a request. 0 means "no floor" -
+    the request said nothing about length, so nothing is imposed.
+
+    An explicit ask always wins: "about 2000 words" or "at least 5 pages".
+    Slides are converted from a slide count, since a deck's length IS slides.
+
+    NOTE on the short/brief tiers: they deliberately yield 0 rather than a
+    small number. Removing the invented 700-word target would otherwise mean
+    "a one-page summary" - an explicit LIMIT the user gave - came back as
+    twenty pages. A ceiling is the user's instruction, not a cap we invented,
+    and `length_contract` reads it via `ceiling_for`.
+    """
+    q = str(query or "")
+    if skill_name == "deck":
+        n = 0
+        m = re.search(r"(\d{1,3})\s*[- ]?\s*(?:slide|page|deck)", q, re.I)
+        if m:
+            n = int(m.group(1))
+        if not n:
+            m = re.search(r"(\d{1,3})\s*[- ]\s*minute", q, re.I)
+            # ~1 slide a minute is the usual rule of thumb; 2/min produced a
+            # 40-slide deck from a 20-minute talk, which nobody can present.
+            n = max(3, round(int(m.group(1)) * 1.1)) if m else 0
+        if not n:
+            return 0, "as many slides as the material needs"
+        n = max(6, min(40, n))
+        return n * 35, f"a {n}-slide deck"
+
+    # Explicit word counts.
+    m = re.search(r"(\d[\d,]{2,7})\s*(?:words?|w)\b", q, re.I)
+    if m:
+        v = int(m.group(1).replace(",", ""))
+        if 20 <= v <= 200000:
+            return min(v, _MAX_WORDS_PER_RENDER), f"the requested {v:,} words"
+    # Explicit page counts, at ~450 words of solid prose per page.
+    m = re.search(r"(\d{1,4})\s*\+?\s*pages?\b", q, re.I)
+    if m:
+        v = int(m.group(1))
+        if 1 <= v <= 2000:
+            return min(max(150, v * 450), _MAX_WORDS_PER_RENDER), \
+                f"the requested {v} page(s)"
+
+    for floor, label, pat in _LENGTH_TIERS:
+        if pat.search(q):
+            return floor, label
+    # Nothing was asked for. Imposing a number here is what produced 700-word
+    # documents from every brief, including the ones that said "comprehensive".
+    return 0, "whatever the material genuinely supports"
+
+
+def ceiling_for(query: str, skill_name: str = "") -> int:
+    """A length the user explicitly asked you NOT to exceed. 0 if none.
+
+    Distinct from a floor: "one page", "short", "concise" and "TL;DR" are
+    instructions, and ignoring them would be its own failure. Only an explicit
+    limit produces one - never a default.
+    """
+    q = str(query or "")
+    if skill_name == "deck":
+        m = re.search(r"(\d{1,3})\s*[- ]?\s*slides?\b", q, re.I)
+        return int(m.group(1)) * 35 if m else 0
+    if re.search(r"\b(one|single|1)[\s-]?(?:page|pager)\b", q, re.I):
+        return 450
+    m = re.search(r"\bat\s+most\s+(\d[\d,]{0,5})\s*(?:words?|pages?)\b", q, re.I)
+    if m:
+        v = int(m.group(1).replace(",", ""))
+        return v * 450 if "page" in m.group(0).lower() else v
+    if re.search(r"\b(tl;?dr|in (?:a )?few (?:lines|words)|"
+                 r"(?:one|single|1)[\s-]?(?:sentence|paragraph|bullet)|"
+                 r"bullet points only)\b", q, re.I):
+        return 120
+    if re.search(r"\b(short|concise|brief|snippet|quick)\b", q, re.I):
+        # "brief" as a genre noun is not a limit; "keep it brief" is.
+        if re.search(r"\b(keep it|make it|stay|be)\s+(short|concise|brief)\b", q, re.I) \
+           or re.search(r"\b(one|two|three|\d)[\s-]?(sentence|paragraph|bullet)", q, re.I):
+            return 700
+        return 0
+    return 0
+
+
+def length_contract(query: str, skill_name: str = "") -> str:
+    """The block appended to a writing skill's prompt.
+
+    Two modes, and the difference matters:
+
+    * A floor was derived (the request implied depth, or named a length). Aim
+      above it, and treat it as a minimum, not a stop.
+    * No floor (the request said nothing about length). Impose NOTHING. A
+      document's length should follow its material, and a number here is what
+      made every brief come out at the same 700 words regardless of subject.
+
+    What is NOT optional in either mode is section depth. The measured cause of
+    short documents was not a document-level target but 140-word sections:
+    five stubs plus a cover is a 5-6 page document that reads thin.
+    """
+    floor, label = length_target(query, skill_name)
+    cap = ceiling_for(query, skill_name)
+    unit = "words" if skill_name != "deck" else "words of slide text"
+    shared = (
+        f"- Reach length with ANALYSIS, not repetition: mechanisms, "
+        f"trade-offs, worked examples, edge cases, and the numbers behind "
+        f"each claim. A section that restates its own heading has not been "
+        f"written.\n"
+        f"- Sections carry the document. Develop each one with its evidence, "
+        f"its numbers and its consequences - do not summarise a finding in two "
+        f"sentences and move on.\n"
+        f"- `render_document` reports the delivered word count. If it is "
+        f"short of what you intended, develop the thinnest sections and call "
+        f"it again.\n"
+        f"- Do not pad with filler and do not invent facts to reach a number. "
+        f"If the request asked for more than you can support, say so in the "
+        f"summary and deliver the honest length."
+    )
+    if cap and cap > floor:
+        # An explicit limit is the user's instruction. Respecting it is not a
+        # cap we imposed; ignoring it would be the bug. When a deck's floor and
+        # ceiling are the same slide count, the floor branch below reads
+        # correctly and this would contradict itself.
+        return (
+            "\n\n## LENGTH\n\n"
+            f"The user asked for something SHORT: keep the whole document "
+            f"under about {cap:,} {unit}. Spend that budget on the most "
+            f"important material and stop - depth within the limit, not "
+            f"breadth past it.\n\n"
+            + shared
+        )
+    if floor <= 0:
+        return (
+            "\n\n## LENGTH\n\n"
+            f"The request reads as {label}. No length has been imposed on "
+            f"you: write as much as the material genuinely supports, and no "
+            f"more.\n\n"
+            + shared
+        )
+    target_floor = max(80, int(floor * 0.75))
+    return (
+        f"\n\n## LENGTH CONTRACT\n\n"
+        f"The request implies {label}. Treat **{floor:,} {unit}** as a FLOOR "
+        f"to clear, not a ceiling to stop at: anything below about "
+        f"{target_floor:,} is a failed document, not a concise one.\n\n"
+        f"- Write until the material runs out. If you clear the floor and "
+        f"still have evidence you have not used, keep going.\n"
+        + shared
+    )
+
+
+def _format_requested_in(text: str) -> str:
+    """The file format the USER explicitly asked for, or "".
+
+    Deliberately narrow. A brief that merely mentions a format in passing
+    ("compare PDF and DOCX export") must not pin one, or the console would
+    override a deliberate choice on a technicality. So this only fires on a
+    request shape - "as a pdf", "a pdf briefing", "produce a pdf file",
+    "in word", "as a spreadsheet", "a 10-slide deck" - and prefers the LAST
+    such mention, because that is the one nearest the instruction.
+
+    Observed live: a brief ending "As a PDF." rendered a .docx, and the receipt
+    did not mention it. Nothing anywhere compared what was asked for with what
+    was delivered, so the mismatch was invisible to the user.
+    """
+    t = (text or "").lower()
+    # Every family captures the phrase in group 1. Only request SHAPES count,
+    # so a brief that merely mentions a format in passing ("compare PDF and
+    # DOCX export") does not pin one and override a deliberate choice on a
+    # technicality.
+    families = [
+        r"\b(?:as|in|into|to)\s+(?:an?\s+|the\s+)?"
+        r"(word\s+document|word\s+file|spreadsheet|workbook|powerpoint|"
+        r"presentation|pdf|pptx|docx|xlsx|csv|excel|deck)\b",
+        r"\b(?:generate|produce|create|render|write|make|build|give|deliver|"
+        r"output|export)\s+(?:me\s+)?(?:an?\s+|the\s+)?"
+        r"(word\s+document|word\s+file|spreadsheet|workbook|pdf|pptx|docx|"
+        r"xlsx|csv|excel|deck)\b",
+        r"\ban?\s+(pdf|pptx|docx|xlsx)\s+(?:file|document|brief|note|"
+        r"report|deck|presentation|summary|workbook)\b",
+        r"\b\d+[\s-]*slide\s+deck\b",
+        r"\b(?:a|an|the)\s+(?:short\s+|brief\s+)?deck\b",
+        r"\b(?:presentation|slides)\s+(?:on|about|for)\b",
+    ]
+    canon = {
+        "pdf": "pdf",
+        "worddocument": "docx", "wordfile": "docx", "docx": "docx",
+        "powerpoint": "pptx", "pptx": "pptx", "deck": "pptx",
+        "presentation": "pptx", "slidedeck": "pptx",
+        "spreadsheet": "xlsx", "workbook": "xlsx", "excel": "xlsx",
+        "xlsx": "xlsx", "csv": "xlsx",
+    }
+    best_pos, best_fmt = -1, ""
+    for pat in families:
+        for m in re.finditer(pat, t):
+            # An earlier mention loses to a later one: the last is nearest the
+            # instruction.
+            if m.start() <= best_pos:
+                continue
+            key = re.sub(r"[^a-z]", "", m.group(0)) if m.lastindex is None \
+                else re.sub(r"[^a-z]", "", m.group(1))
+            fmt = canon.get(key, "")
+            if fmt:
+                best_pos, best_fmt = m.start(), fmt
+    return best_fmt
 
 
 def parse_skill_json(text: str) -> dict:
@@ -542,6 +1098,182 @@ def take_browser_artifacts(session_id: str) -> list[str]:
 # ── MCP tool schemas exposed through the gateway tools= channel ──────────────
 
 _TOOL_CATALOG = {
+    "render_document": {
+        "name": "render_document",
+        "description": (
+            "Render a PDF, PowerPoint, Word or Excel file and get a "
+            "downloadable artifact back. Write the content as blocks "
+            "(heading/paragraph/bullets/numbers/quote/table/pagebreak), not "
+            "as a blob of text: the layout follows the block structure. "
+            "Returns an artifact handle and filename - report the filename to "
+            "the user, and copy the handle EXACTLY as returned."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "format": {"type": "string", "enum": ["pdf", "pptx", "docx", "xlsx"],
+                           "description": "Output file type."},
+                "title": {"type": "string", "description": "Document title."},
+                "subtitle": {"type": "string", "description": "Optional subtitle."},
+                "author_name": {"type": "string", "description": "Optional author line."},
+                "toc": {"type": "boolean",
+                        "description": "Number the level 1 sections and add a "
+                                       "table of contents (pdf). Use for any "
+                                       "report long enough to navigate."},
+                "running_header": {
+                    "type": "string",
+                    "description": "Short text repeated in the page header."},
+                "page_size": {
+                    "type": "string",
+                    "enum": ["a4", "a3", "a5", "b5", "letter", "legal",
+                             "tabloid", "executive", "statement", "a6",
+                             "royal", "pocket", "digest", "quarto", "folio"],
+                    "description": "Paper size. a4 unless the user or the "
+                                   "audience implies otherwise; 'letter' for "
+                                   "US audiences."},
+                "orientation": {
+                    "type": "string", "enum": ["portrait", "landscape"],
+                    "description": "Page orientation. landscape for wide "
+                                   "tables and diagrams."},
+                "margins": {
+                    "type": "string",
+                    "enum": ["narrow", "normal", "moderate", "wide",
+                             "generous"],
+                    "description": "Margin preset. 'wide'/'generous' for "
+                                   "book-like documents, 'narrow' for dense "
+                                   "reference tables."},
+                "columns": {
+                    "type": "integer", "minimum": 1, "maximum": 3,
+                    "description": "Text columns. 2 suits a newsletter or a "
+                                   "dense comparison."},
+                "style": {
+                    "type": "string",
+                    "enum": ["report", "brief", "memo", "academic",
+                             "whitepaper", "manual", "newsletter",
+                             "technical", "book", "plain"],
+                    "description": "The typographic system - choose by what "
+                                   "the document IS, not how it looks: "
+                                   "report (default), brief, memo, academic, "
+                                   "whitepaper, manual, newsletter (2-col), "
+                                   "technical, book, plain."},
+                "citation_style": {
+                    "type": "string",
+                    "enum": ["apa", "mla", "chicago", "harvard", "ieee",
+                             "vancouver", "ama", "bluebook", "oscola",
+                             "plain"],
+                    "description": "Reference-list style. Use ieee for "
+                                   "engineering and technical reports, apa "
+                                   "for social science, vancouver/ama for "
+                                   "medical, mla/chicago for humanities, "
+                                   "bluebook for legal."},
+                "references": {
+                    "type": "array", "maxItems": 200,
+                    "description": "Sources behind the document. REQUIRED "
+                                   "whenever you used researcher/retriever "
+                                   "output: a researched document with no "
+                                   "reference list is the most visible "
+                                   "failure of quality.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "authors": {"type": "string"},
+                            "year": {"type": "string"},
+                            "title": {"type": "string"},
+                            "container": {
+                                "type": "string",
+                                "description": "Journal or publisher"},
+                            "volume": {"type": "string"},
+                            "issue": {"type": "string"},
+                            "pages": {"type": "string"},
+                            "url": {"type": "string"},
+                        },
+                        "required": ["title"],
+                    }},
+                "slide_size": {
+                    "type": "string",
+                    "enum": ["16:9", "4:3", "16:10", "a4", "letter",
+                             "square", "story"],
+                    "description": "pptx only. 16:9 unless the user asks for "
+                                   "a printed handout (a4/letter) or a 4:3 "
+                                   "legacy projector."},
+                "blocks": {
+                    "type": "array", "maxItems": 400,
+                    "description": "Content blocks, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string",
+                                     "enum": ["heading", "paragraph", "bullets",
+                                              "numbers", "quote", "table",
+                                              "chart", "image", "cover",
+                                              "pagebreak"]},
+                            "level": {"type": "integer", "description": "heading level 1-3"},
+                            "text": {"type": "string"},
+                            "items": {"type": "array", "items": {"type": "string"}},
+                            "header": {"type": "array", "items": {"type": "string"}},
+                            "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+                            # chart
+                            "kind": {"type": "string", "enum": ["bar", "line", "pie"],
+                                     "description": "chart only"},
+                            "categories": {"type": "array", "items": {"type": "string"},
+                                           "description": "chart only"},
+                            "series": {
+                                "type": "array", "description": "chart only",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "data": {"type": "array",
+                                                 "items": {"type": "number"}},
+                                    },
+                                    "required": ["name", "data"],
+                                }},
+                            # image - a figure from a document the USER uploaded
+                            "document": {"type": "string",
+                                         "description": "image only: the id of a "
+                                                        "document the user already "
+                                                        "uploaded. There is no URL "
+                                                        "fetching."},
+                            "page": {"type": "integer", "description": "image only"},
+                            "caption": {"type": "string", "description": "image/chart only"},
+                            "width_mm": {"type": "number", "description": "image only"},
+                            # cover
+                            "subtitle_block": {"type": "string"},
+                            "meta": {"type": "array", "items": {"type": "string"},
+                                     "description": "cover only"},
+                        },
+                        "required": ["type"],
+                    },
+                },
+                "sheets": {
+                    "type": "array",
+                    "description": "xlsx only: [{name, header, rows}].",
+                    "items": {"type": "object"},
+                },
+            },
+            "required": ["format", "title"],
+        },
+    },
+    "read_artifact": {
+        "name": "read_artifact",
+        "description": (
+            "Read the full text of an upstream result that was too large to "
+            "inline. INPUTS shows large results as an `artifact` handle with a "
+            "short preview; call this with that handle to get the whole thing "
+            "when you need the detail. Use offset/limit to page through a very "
+            "large artifact."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string",
+                                "description": "Handle like art:1a2b3c4d5e6f7890"},
+                "offset": {"type": "integer", "default": 0,
+                           "description": "Character offset to start from."},
+                "limit": {"type": "integer", "default": 20000,
+                          "description": "Max characters to return."},
+            },
+            "required": ["artifact_id"],
+        },
+    },
     "web_search": {
         "name": "web_search",
         "description": "Search the web (gateway chain: Tavily, optional Brave, DuckDuckGo, Marginalia). Hard-capped at 5 results.",
@@ -1026,8 +1758,15 @@ _TOOL_CATALOG = {
 }
 
 
-def _disabled_tools() -> set:
-    """Operator tool guard (Skills page). Live-read, no restart needed."""
+def _disabled_tools() -> "set | None":
+    """Operator tool guard (Skills page). Live-read, no restart.
+
+    Returns None when the state cannot be read: callers must
+    treat that as "every tool withheld" (fail CLOSED). The
+    write side is atomic, so our own writes cannot produce
+    the corrupt file — a None means the environment (a
+    locked or unreadable file) broke the guard, and running
+    tools that might be disabled is the wrong way to fail."""
     try:
         import json as _json
         from pathlib import Path as _P
@@ -1038,15 +1777,32 @@ def _disabled_tools() -> set:
             _data = _json.loads(_p.read_text(encoding="utf-8-sig"))
             if isinstance(_data, dict):
                 return set(_data.get("tools", []) or [])
-    except Exception:
-        pass
-    return set()
+        return set()
+    except Exception as e:
+        # Loud, not silent: a corrupt or locked file used to
+        # fail open — every withheld tool quietly came back —
+        # with no signal anywhere that the guard had stopped
+        # working. (The write side is atomic, so our own
+        # writes cannot produce the corrupt file.)
+        print(f"[skills] WARNING: could not read the tool guard "
+              f"({e!r}); withholding ALL tools until it reads")
+        return None
 
 
 def tool_payload(tool_names: list[str]) -> list[dict] | None:
     if not tool_names:
         return None
-    tool_names = [n for n in tool_names if n not in _disabled_tools()]
+    disabled = _disabled_tools()
+    if disabled is None:
+        # Guard state UNKNOWN: fail closed — withhold
+        # every tool rather than risk running one the
+        # operator disabled. The caller fails the node
+        # loudly (see run_skill), which is the signal
+        # the old fail-open path never gave.
+        print("[skills] WARNING: tool guard state unknown "
+              "— withholding all tools for this run")
+        return None
+    tool_names = [n for n in tool_names if n not in disabled]
     # Fail LOUD on unknown names (previously silently dropped, leaving the
     # model with fewer tools and no diagnostic anywhere).
     missing = [n for n in tool_names if n not in _TOOL_CATALOG]
@@ -1064,8 +1820,9 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
                     failure_report: str | None,
                     *, memory_hits: list | None = None,
                     prior_turns: list | None = None,
-                    policy_notes: list | None = None,
-                    budget_note: str = "") -> tuple[AgentResult, str]:
+policy_notes: list | None = None,
+                     doc_setup: dict | None = None,
+                     budget_note: str = "") -> tuple[AgentResult, str]:
     """Dispatch one node. Returns (result, rendered_prompt).
 
     `memory_hits` is the FAISS-ranked MemoryItem list captured once at
@@ -1081,6 +1838,13 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
     skills are LLM-backed and route through the V9 gateway with
     agent=<skill_name> so agent_routing.yaml + cost-by-agent kick in."""
     resolved = resolve_inputs(graph_nodes[node_id]["inputs"], graph_nodes, query)
+    # What the TOOL actually returned, per node. `None` means this skill never
+    # reached the tool loop at all (planner, retriever, most nodes) - which is
+    # not the same as "produced nothing", and is why the receipt checks the
+    # shape rather than truthiness. Function scope: every branch of this
+    # function reaches the final return, so binding it only inside the tools
+    # branch left every tool-less skill with an UnboundLocalError.
+    _authoritative: list[dict] | None = None
     # Per-node sub-question from the Planner's `metadata.question`. Travels
     # into the rendered prompt as a QUESTION: block so a fan-out worker
     # (e.g. one of three researchers spawned to cover three cities) can
@@ -1093,6 +1857,12 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
                              prior_turns=prior_turns,
                              policy_notes=policy_notes,
                              budget_note=budget_note)
+    # Writing skills get a concrete length target computed from the request.
+    # Without it the model resolved "length follows the request" toward the
+    # shortest document that technically answers, which is how a request for
+    # a 300-page whitepaper shipped 16 words.
+    if skill.name in ("author", "deck"):
+        rendered = rendered + length_contract(query, skill.name)
     started = time.time()
 
     if skill.name == "sandbox_executor":
@@ -1244,6 +2014,43 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
         ), rendered
 
     if skill.name == "computer":
+        # The operator tool guard (Skills page) filters
+        # `tools_allowed` inside `tool_payload` — but this
+        # branch hands off to the ComputerUseSkill cascade
+        # BEFORE that filter runs, so a withheld
+        # `computer_action` used to be ignored while the
+        # cascade still drove the desktop. Honour the guard
+        # here: a withheld tool refuses the node outright.
+        _disabled = _disabled_tools()
+        node_dict = graph_nodes[node_id]
+        node_meta = node_dict.get("metadata") or {}
+        if _disabled is None:
+            # Guard state UNKNOWN: fail closed — refuse
+            # the node, exactly as an unreadable guard
+            # withholds every tool in tool_payload.
+            return AgentResult(
+                success=False, agent_name=skill.name,
+                output={"goal": (node_meta.get("goal")
+                                 or node_meta.get("question")
+                                 or query)},
+                error=("tool guard could not be read — "
+                       "computer_action withheld until it does"),
+                error_code="tools_withheld",
+                elapsed_s=time.time() - started,
+            ), rendered
+        _withheld = [t for t in (skill.tools_allowed or [])
+                     if t in _disabled]
+        if _withheld:
+            return AgentResult(
+                success=False, agent_name=skill.name,
+                output={"goal": (node_meta.get("goal")
+                                 or node_meta.get("question")
+                                 or query)},
+                error=("tool(s) withheld on the Skills page: "
+                       + ", ".join(sorted(_withheld))),
+                error_code="tools_withheld",
+                elapsed_s=time.time() - started,
+            ), rendered
         # Same shape as browser: the Computer-Use skill owns its layered
         # cascade (L1 extract → L2a deterministic → L2b a11y → L3 vision)
         # over cua-driver and never touches the LLM tool/text channel — so
@@ -1291,6 +2098,147 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
         # and feeds the results back until the model produces final text.
         from mcp_runner import run_with_tools
         import outcomes as _outcomes
+
+        # The AUTHORITATIVE record of what the run actually produced.
+        #
+        # A run is told "report the filename to the user", so the model's JSON
+        # carries an `artifact` field - and the model will happily INVENT one.
+        # Observed for real: a node that never called render_document returned
+        # {"artifact": "art:doc-gen-pipeline", ...}, the receipt announced a
+        # created PDF, and the download button answered 400 "malformed artifact
+        # id" because nothing had been rendered at all. The model's own report
+        # is untrusted input, so the tool's return value is captured here and
+        # used to overwrite whatever the model claimed.
+        produced: list[dict] = []
+        render_errors: list[str] = []
+
+        # The user's setup panel is a DECISION, not a suggestion.
+        #
+        # It was passed to the prompt as an instruction and the model still
+        # rendered a PDF when Word was chosen - the instruction is advice, and
+        # a visible control that can be ignored is worse than no control. So
+        # it is applied here, on the way to the renderer, for BOTH paths: a
+        # render_document tool call and the harness fallback below.
+        _forced = dict(doc_setup or {})
+        # The console no longer sends doc_setup at all: the format travels in
+        # the user's own sentence ("... as a PDF"), because eleven controls
+        # before you had described the document was the wrong trade. But the
+        # brief is only ADVICE to the model, and the model got it wrong - a
+        # brief ending "As a PDF." produced a .docx with no warning anywhere.
+        # So an explicit format request in the brief is binding here, on the
+        # way to the renderer, for BOTH the tool call and the harness fallback.
+        if not _forced.get("format") or _forced.get("format") == "auto":
+            _asked = _format_requested_in(query or "")
+            if _asked:
+                _forced["format"] = _asked
+
+        def _force(fmt: str, blocks: list, sheets, title: str, subtitle: str,
+                   author_name: str, toc: bool, running_header: str,
+                   citation_style: str, references, slide_size: str,
+                   columns) -> dict:
+            return {
+                "format": fmt, "title": title, "subtitle": subtitle,
+                "author_name": author_name, "blocks": blocks,
+                "sheets": sheets, "toc": toc,
+                "running_header": running_header,
+                "citation_style": citation_style, "references": references,
+                "slide_size": slide_size, "columns": columns,
+            }
+
+        def _prepare(name, args):
+            """Rewrite the render arguments BEFORE the tool is called.
+
+            This used to live in on_outcome, which runs after the call has
+            already gone out over the MCP wire - so the arguments the tool
+            actually received were the model's own and the user's chosen
+            format, page and style were quietly discarded.
+            """
+            if name != "render_document" or not _forced or not isinstance(args, dict):
+                return args
+            try:
+                merged = dict(args)
+                f = _forced.get("format")
+                if f and f != "auto":
+                    merged["format"] = f
+                for key in ("page_size", "orientation", "margins",
+                            "style", "citation_style", "slide_size"):
+                    if _forced.get(key):
+                        merged[key] = _forced[key]
+                if _forced.get("running_header"):
+                    # The panel asked for a header, not for particular words:
+                    # use the document's own title, which is what a reader
+                    # wants in the corner anyway.
+                    merged["running_header"] = str(
+                        merged.get("title") or "Document")[:120]
+                if _forced.get("toc"):
+                    merged["toc"] = True
+                if _forced.get("cover"):
+                    # The cover is a block; add one if the model did not.
+                    bl = merged.get("blocks") or []
+                    if not any(isinstance(b, dict)
+                               and b.get("type") == "cover" for b in bl):
+                        merged["blocks"] = [{
+                            "type": "cover",
+                            "title": merged.get("title") or "",
+                            "subtitle": merged.get("subtitle") or "",
+                        }] + list(bl)
+                if _forced.get("columns"):
+                    merged["columns"] = _forced["columns"]
+                print(f"[skills] {skill.name}: applied the user's setup "
+                      f"{sorted(_forced)} to the render")
+                return merged
+            except Exception as e:
+                print(f"[skills] could not apply the setup: {e!r}")
+                return args
+
+        def _capture(name, args, ok, text, lat):
+            _outcomes.on_tool_outcome(
+                name=name, arguments=args, ok=ok, result_text=text,
+                latency_s=lat, session_id=session_id, run_id=session_id)
+            if name != "render_document":
+                return
+            if not ok:
+                # Keep the reason. A render that fails three times and is
+                # reported only as "the model apologised" is undebuggable:
+                # the tool's own message is the only clue.
+                render_errors.append(str(text)[:300])
+                print(f"[skills] render_document failed: {str(text)[:300]}")
+                return
+            try:
+                import json as _json
+                got = text if isinstance(text, dict) else _json.loads(text)
+            except Exception:
+                return
+            # The MCP dispatcher wraps the payload; accept either shape.
+            if isinstance(got, dict) and isinstance(got.get("result"), str):
+                try:
+                    got = _json.loads(got["result"])
+                except Exception:
+                    return
+            if not isinstance(got, dict) or not got.get("ok"):
+                # A tool that returns `{"ok": false, "error": ...}` is a
+                # FAILURE even though nothing was raised, and it was being
+                # dropped here — so a render that failed three times surfaced
+                # only as "the model apologised".
+                render_errors.append(
+                    f"tool returned {str(got.get('error') or got)[:250]}")
+                print(f"[skills] render_document returned an error: "
+                      f"{str(got.get('error') or got)[:250]}")
+                return
+            art = str(got.get("artifact") or "")
+            if not re.fullmatch(r"art:[0-9a-fA-F]{16}", art):
+                render_errors.append(
+                    f"tool returned an unusable artifact id {art!r}")
+                return
+            produced.append({
+                "artifact": art,
+                "filename": str(got.get("filename") or ""),
+                "format": str(got.get("format") or "").lower(),
+                "bytes": got.get("bytes"),
+                "blocks": got.get("blocks"),
+                "stats": got.get("stats") or {},
+            })
+
         reply = await run_with_tools(
             prompt=rendered,
             tools_payload=tools,
@@ -1304,11 +2252,52 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
             # remember(kind=tool_outcome) itself, so a tool that quietly
             # returned nothing taught the agent nothing. Queued off the
             # critical path in outcomes.py.
-            on_outcome=lambda name, args, ok, text, lat: _outcomes.on_tool_outcome(
-                name=name, arguments=args, ok=ok, result_text=text,
-                latency_s=lat, session_id=session_id, run_id=session_id),
+            on_outcome=_capture,
+            prepare_fn=_prepare,
         )
+        # Whatever the model said about the artifact, the receipt uses this.
+        _authoritative = produced
+    elif skill.tools_allowed:
+        # tools_allowed NAMED tools but none made it through:
+        # every one is disabled on the Skills page, unknown,
+        # or the guard itself could not be read. Answering
+        # with a plain no-tool LLM call would look like a
+        # completed run while quietly dropping every tool the
+        # node asked for — fail loudly instead, the way the
+        # computer branch does.
+        return AgentResult(
+            success=False,
+            agent_name=skill.name,
+            output={"error": (
+                "no tool made it through the guard for a skill "
+                "that lists tools — every entry of tools_allowed "
+                f"({', '.join(skill.tools_allowed)}) is disabled on "
+                "the Skills page, unknown, or the tool guard "
+                "could not be read; enable the tools or fix "
+                "agent_config.yaml")},
+            error="tools withheld: guard blocked every tool in tools_allowed",
+            cost=0.0,
+            elapsed_s=time.time() - started,
+        ), rendered
     else:
+        # Sectioned expansion: one focused call per upstream result, so a
+        # multi-source research run yields a multi-section report instead
+        # of the ~300 words a single call yields from these models.
+        if skill.sectioned and len([e for e in (resolved or [])
+                                    if isinstance(e, dict)]) >= 2:
+            assembled = await _sectioned_final_answer(
+                skill, rendered, resolved, query, session_id)
+            if assembled:
+                import re as _re
+                return AgentResult(
+                    success=True,
+                    agent_name=skill.name,
+                    output={"final_answer": assembled,
+                            "sectioned": True,
+                            "sections": len(_re.findall(r"(?m)^#{2,3} ",
+                                                        assembled))},
+                    elapsed_s=time.time() - started,
+                ), rendered
         # Python 3.8 compat: asyncio.to_thread was added in 3.9. Fall back to
         # run_in_executor with the default thread pool.
         if hasattr(asyncio, "to_thread"):
@@ -1340,6 +2329,25 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
     # empty output — a silent false-success.
     if reply.get("error") and not (reply.get("text") or "").strip() \
             and not reply.get("tool_calls"):
+        # The document EXISTS if the renderer ran, even when the model never
+        # got to describe it. Observed live: render_document stored a PDF and
+        # the loop then aborted, and this path threw the artifact away and
+        # reported failure - the user was told nothing was produced while a
+        # finished document sat in the store. Report what actually happened.
+        if _authoritative:
+            print(f"[skills] {skill.name}: model never summarised the "
+                  f"document, but {len(_authoritative)} file(s) were rendered")
+            return AgentResult(
+                success=True, agent_name=skill.name,
+                output={"produced": _authoritative,
+                        "filename": _authoritative[0].get("filename"),
+                        "format": _authoritative[0].get("format"),
+                        "artifact": _authoritative[0]["artifact"],
+                        "summary": ("The document was rendered, but the "
+                                    "assistant did not summarise it.")},
+                elapsed_s=time.time() - started,
+                provider=reply.get("provider", ""),
+            ), rendered
         return AgentResult(
             success=False, agent_name=skill.name,
             output={}, elapsed_s=time.time() - started,
@@ -1347,6 +2355,90 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
             error=str(reply.get("error"))[:500],
         ), rendered
     parsed = parse_skill_json(reply.get("text", ""))
+
+    # The model sometimes writes the tool call as DATA instead of making one:
+    # {"render_document": {"format": "pdf", "blocks": [...]}}. That parses as
+    # a perfectly good object, so the node reported success while nothing was
+    # rendered - a silent false success with a plausible-looking output.
+    # Unwrap it and render the spec the model actually wrote.
+    if (skill.name in ("author", "deck") and not parsed.get("blocks")
+            and isinstance(parsed.get("render_document"), dict)):
+        _inner = parsed["render_document"]
+        if isinstance(_inner.get("blocks"), list) and _inner["blocks"]:
+            print(f"[skills] {skill.name}: wrote the render as data; "
+                  f"recovering the spec")
+            parsed = dict(_inner)
+
+    # The tool loop came back with nothing at all - no text, no tool call.
+    # Observed live, repeatedly, on the author node: the prompt asks it to
+    # call render_document, the tool loop yields an empty completion, and the
+    # node dies having written nothing. But the SAME prompt asked WITHOUT
+    # tools reliably returns the document spec as JSON - verified directly.
+    # So make that the fallback: one plain call for the content, then render
+    # it from code below. One extra call, and the section produces a document
+    # instead of an apology.
+    if not parsed and skill.name in ("author", "deck") \
+            and not (reply.get("text") or "").strip() \
+            and not reply.get("error"):
+        try:
+            _plain = LLM().chat(
+                prompt=(rendered + "\n\n---\n\nThe tool call did not go "
+                        "through. Reply now with the DOCUMENT SPECIFICATION "
+                        "only: the title, the format, and every content block "
+                        "in the `blocks` array. No prose, no commentary."),
+                agent=skill.name, session=session_id,
+                max_tokens=skill.max_tokens,
+                temperature=skill.temperature)
+            _spec = parse_skill_json(_plain.get("text", ""))
+            if _spec:
+                parsed = _spec
+                reply = dict(reply)
+                reply["text"] = _plain.get("text", "")
+                print(f"[skills] {skill.name}: tool loop returned nothing; "
+                      f"recovered the document spec without tools "
+                      f"({len(_spec.get('blocks') or [])} blocks)")
+        except Exception as e:
+            print(f"[skills] {skill.name}: plain-spec fallback failed "
+                  f"{type(e).__name__}: {e}"[:200])
+
+    # An unparseable reply must fail LOUDLY. parse_skill_json returns {} for
+    # ANY malformed payload, and every skill has a documented output schema -
+    # so an empty object is never a valid result. Without this the node
+    # reported success=True with output={}, the planner saw a completed step,
+    # and the user got a run that quietly produced nothing: an `author` node
+    # that never called render_document (so no file, no artifact, no receipt)
+    # while the run log showed every node green.
+    if not parsed:
+        _raw = (reply.get("text") or "")
+        _why = ("empty reply" if not _raw.strip()
+                else f"reply was not JSON (starts {str(_raw.strip())[:60]!r})")
+        # If the renderer itself failed, that is the cause, and it is far
+        # more useful than the model's apology.
+        if render_errors:
+            _why += ("; render_document failed: "
+                     + render_errors[-1])
+        # Same rule as above: a rendered document outranks a missing summary.
+        if _authoritative:
+            print(f"[skills] {skill.name}: {_why}, but "
+                  f"{len(_authoritative)} file(s) were rendered")
+            return AgentResult(
+                success=True, agent_name=skill.name,
+                output={"produced": _authoritative,
+                        "filename": _authoritative[0].get("filename"),
+                        "format": _authoritative[0].get("format"),
+                        "artifact": _authoritative[0]["artifact"],
+                        "summary": ("The document was rendered, but the "
+                                    "assistant did not summarise it.")},
+                elapsed_s=time.time() - started,
+                provider=reply.get("provider", ""),
+            ), rendered
+        print(f"[skills] {skill.name}: {_why}")
+        return AgentResult(
+            success=False, agent_name=skill.name,
+            output={}, elapsed_s=time.time() - started,
+            provider=reply.get("provider", ""),
+            error=f"{skill.name} returned no usable JSON: {_why}",
+        ), rendered
 
     # Lift orchestrator-recognised fields out of the skill's JSON.
     # NOTES_RUNS feedback P0 #1: malformed successors used to be silently
@@ -1382,10 +2474,147 @@ async def run_skill(skill: Skill, node_id: str, graph_nodes,
             error=err,
         ), rendered
 
+
+    # The model writes the CONTENT; the harness guarantees the FILE.
+    #
+    # Observed live: with `render_document` offered and the prompt telling it
+    # to call that tool, the author called it on some runs and on others just
+    # emitted the receipt JSON describing a document it never rendered - which
+    # is the same failure as writing no document at all, only better disguised.
+    # So when the reply is a document SPEC rather than a receipt, render it
+    # here. The model cannot forget a step the code performs for it, and the
+    # artifact id can no longer be invented.
+    if (skill.name in ("author", "deck") and not _authoritative
+            and isinstance(parsed.get("blocks"), list) and parsed["blocks"]):
+        try:
+            import mcp_server as _mcp
+            fmt = str(parsed.get("format") or "").strip().lower() \
+                or ("pptx" if skill.name == "deck" else "pdf")
+            # The user's choice wins over the model's guess here too.
+            if _forced.get("format") and _forced["format"] != "auto":
+                fmt = str(_forced["format"]).strip().lower()
+            if fmt not in ("pdf", "pptx", "docx", "xlsx"):
+                fmt = "pptx" if skill.name == "deck" else "pdf"
+            _f = lambda k, d="": str(_forced.get(k) or d)   # noqa: E731
+            _want_cover = bool(_forced.get("cover"))
+            _blocks = [b for b in parsed["blocks"][:400]
+                       if isinstance(b, dict)]
+            if _want_cover and not any(b.get("type") == "cover"
+                                       for b in _blocks):
+                _blocks = [{"type": "cover",
+                            "title": str(parsed.get("title") or "")[:200],
+                            "subtitle": str(parsed.get("subtitle") or "")[:300],
+                            }] + _blocks
+            got = _mcp.render_document(
+                format=fmt,
+                title=str(parsed.get("title") or query or "Document")[:200],
+                subtitle=str(parsed.get("subtitle") or "")[:300],
+                author_name=str(parsed.get("author") or "")[:120],
+                toc=bool(_forced.get("toc")) or bool(parsed.get("toc")),
+                running_header=(str(parsed.get("title") or "Document")[:120]
+                               if _forced.get("running_header") else ""),
+                page_size=_f("page_size"),
+                orientation=_f("orientation"),
+                margins=_f("margins"),
+                columns=int(_forced.get("columns") or parsed.get("columns") or 0),
+                style=_f("style"),
+                citation_style=_f("citation_style"),
+                references=parsed.get("references") if isinstance(
+                    parsed.get("references"), list) else None,
+                slide_size=_f("slide_size"),
+                blocks=_blocks,
+                sheets=parsed.get("sheets") if isinstance(
+                    parsed.get("sheets"), list) else None,
+            )
+            if isinstance(got, dict) and got.get("ok") \
+                    and re.fullmatch(r"art:[0-9a-fA-F]{16}",
+                                     str(got.get("artifact") or "")):
+                _authoritative = [{
+                    "artifact": got["artifact"],
+                    "filename": got.get("filename") or "",
+                    "format": fmt,
+                    "bytes": got.get("bytes"),
+                    "blocks": got.get("blocks"),
+                    "stats": got.get("stats") or {},
+                }]
+                print(f"[skills] {skill.name}: rendered the model's spec from "
+                      f"code ({len(parsed['blocks'])} blocks, "
+                      f"{(got.get('stats') or {}).get('words')} words)")
+            else:
+                _why = (f"spec fallback render failed: "
+                        f"{str((got or {}).get('error') or got)[:250]}")
+                render_errors.append(_why)
+                # This used to be silent: the node then failed with "no file
+                # was produced", which reads like the model misbehaved, when in
+                # fact the renderer had already said why. One line here is the
+                # difference between a 20-minute hunt and an answer.
+                print(f"[skills] {skill.name}: {_why}")
+        except Exception as e:
+            _why = f"spec fallback render raised {type(e).__name__}: {e}"[:250]
+            render_errors.append(_why)
+            print(f"[skills] {skill.name}: {_why}")
+
+    # A writing skill that claims a document and never produced one produced
+    # nothing. Failing here is the whole point: the run must not reach the
+    # receipt stage with an invented filename in it. Runs AFTER the spec
+    # fallback above, so a model that wrote the content but skipped the tool
+    # still gets a real file.
+    if skill.name in ("author", "deck") and not _authoritative:
+        # Not "did it claim one" but "did it MAKE one". The live failure that
+        # forced this: a node returned `{"render_document": {...}}` as data,
+        # which parsed cleanly, reported success, and rendered nothing - so the
+        # receipt listed a document that never existed.
+        print(f"[skills] {skill.name}: completed without rendering a document")
+        return AgentResult(
+            success=False, agent_name=skill.name,
+            output=parsed, elapsed_s=time.time() - started,
+            provider=reply.get("provider", ""),
+            error=(f"{skill.name} finished without calling render_document"
+                   + (("; render_document failed: " + render_errors[-1])
+                      if render_errors else "")
+                   + " - no file was produced"),
+        ), rendered
+
+    _claimed = any(isinstance(parsed.get(k), str) and parsed.get(k)
+                   for k in ("artifact", "filename", "document_url"))
+    if skill.tools_allowed and not _authoritative and _claimed:
+        _detail = ("; render_document failed: " + render_errors[-1]
+                   if render_errors else "")
+        print(f"[skills] {skill.name}: reported a document but nothing was "
+              f"rendered")
+        return AgentResult(
+            success=False, agent_name=skill.name,
+            output=parsed, elapsed_s=time.time() - started,
+            provider=reply.get("provider", ""),
+            error=(f"{skill.name} reported a document "
+                   f"({str(parsed.get('filename'))[:80]}) but no file was "
+                   f"rendered{_detail}"),
+        ), rendered
+
+    out = dict(parsed)
+    if _authoritative:
+        # The receipt and produced_files.json read these. They come from the
+        # tool, so they cannot be a hallucination. Only set when there IS one:
+        # every tool-using skill reaches this code, and an empty `produced`
+        # on a researcher reads as "this produced nothing" rather than "this
+        # skill was never asked to produce anything".
+        out["produced"] = _authoritative
+        out.setdefault("filename", _authoritative[0].get("filename"))
+        out.setdefault("format", _authoritative[0].get("format"))
+        # Strip the model's self-reported handle so nothing downstream can
+        # read a fake one.
+        out["artifact"] = _authoritative[0]["artifact"]
+    elif _authoritative is not None:
+        # The tool loop ran and rendered nothing. If the model still claims a
+        # document, the claim is removed rather than left to be believed.
+        for k in ("artifact", "filename"):
+            if parsed.get(k):
+                out.pop(k, None)
+
     return AgentResult(
         success=True,
         agent_name=skill.name,
-        output=parsed,
+        output=out,
         successors=successors,
         elapsed_s=time.time() - started,
         provider=reply.get("provider", ""),

@@ -116,15 +116,96 @@ def test_hits_become_a_cited_block(monkeypatch):
     assert "5 business days" in text
 
 
-def test_empty_result_adds_nothing_and_says_nothing(monkeypatch):
-    """Silence, not "no documents found".
+def test_empty_result_says_retrieval_matched_nothing_and_names_the_documents(monkeypatch):
+    """A successful search that matched nothing must NOT be silent.
 
-    An injected "no results" line tells the model the corpus is empty, which is
-    a different claim from "the lookup found nothing" - and when retrieval is
-    merely broken it is a false one.
+    Silence was the worst failure observed in the wild: with no block in the
+    prompt there was no evidence the user had uploaded anything, so the model
+    read "I have nothing" as "it must be in their inbox", called Gmail and
+    Calendar, and reported THOSE credentials' expiry as the reason it could not
+    answer a question whose answer was sitting in an enabled document.
+
+    The wording is still careful, and the original objection still holds: this
+    must claim "your search matched nothing", never "you have no documents".
+    So the test asserts the absence of the empty-corpus claim as well.
     """
     _patch_gateway(monkeypatch, lambda u, b: _Resp(200, {"hits": []}))
+    monkeypatch.setattr(agent_server, "_gw_enabled_documents",
+                        lambda: [{"id": "doc-1", "filename": "Menu.pdf"}])
     text, n = asyncio.run(agent_server._doc_context("q", {"doc-1"}))
+    assert n == 0
+    assert "NO MATCH" in text
+    assert "Menu.pdf" in text, "the user must be told what they actually have"
+    for false_claim in ("you have no documents", "no documents found",
+                        "you have not uploaded"):
+        assert false_claim.lower() not in text.lower(), false_claim
+    assert "authentication" not in text.lower() or "not" in text.lower()
+
+
+def test_a_broken_or_empty_gateway_still_says_nothing(monkeypatch):
+    """The original objection, kept: a FAILED lookup must not claim anything.
+
+    `test_empty_result_*` fires only after a 200. If the gateway is down, or
+    returns 500, the honest statement is silence - we do not know what the user
+    has, so we must not assert an empty corpus either way.
+    """
+    _patch_gateway(monkeypatch, lambda u, b: _Resp(500, {"error": "boom"}))
+    monkeypatch.setattr(agent_server, "_gw_enabled_documents",
+                        lambda: [{"id": "doc-1", "filename": "Menu.pdf"}])
+    text, n = asyncio.run(agent_server._doc_context("q", {"doc-1"}))
+    assert (text, n) == ("", 0)
+
+
+def test_no_note_when_the_user_actually_has_no_documents(monkeypatch):
+    """Registry genuinely empty -> "you have not uploaded any documents".
+
+    This is the one case where an empty-corpus claim is TRUE, so stating it is
+    safe - and it is still where the substitution rule is needed most, because
+    a user asking about "the menu" with nothing uploaded is exactly who goes
+    hunting through their inbox.
+    """
+    _patch_gateway(monkeypatch, lambda u, b: _Resp(200, {"hits": []}))
+    monkeypatch.setattr(agent_server, "_gw_enabled_documents", lambda: [])
+    monkeypatch.setattr(agent_server, "_gw_all_documents", lambda: [])
+    text, n = asyncio.run(agent_server._doc_context("q", {"doc-1"}))
+    assert n == 0
+    assert "NOT UPLOADED ANY DOCUMENTS" in text
+    assert "email" in text and "Never report" in text
+
+
+def test_documents_that_are_all_disabled_are_named_not_hidden(monkeypatch):
+    """The gap that produced the reported failure.
+
+    A user switched their menu off, so no document was ENABLED, so the old
+    guard stayed silent - and the model read "I have nothing" as "it must be
+    in their inbox" and reported their expired Gmail token as the reason it
+    could not answer a question the menu contained. The document exists; the
+    prompt has to say so and say why it cannot answer.
+    """
+    _patch_gateway(monkeypatch, lambda u, b: _Resp(200, {"hits": []}))
+    monkeypatch.setattr(agent_server, "_gw_enabled_documents", lambda: [])
+    monkeypatch.setattr(agent_server, "_gw_all_documents", lambda: [
+        {"id": "d1", "filename": "Menu.pdf", "ready": True,
+         "enabled": False, "status": "ready"},
+        {"id": "d2", "filename": "Big.pdf", "ready": False,
+         "enabled": True, "status": "parsing"},
+    ])
+    text, n = asyncio.run(agent_server._doc_context("menu for monday", {"d1"}))
+    assert n == 0
+    assert "NONE OF THEM CAN ANSWER" in text
+    assert "Menu.pdf (disabled)" in text
+    assert "Big.pdf (parsing)" in text
+    # Still must not claim the corpus is empty.
+    assert "have not uploaded" not in text.lower()
+
+
+def test_documents_off_stays_silent(monkeypatch):
+    """An empty allow-list is a deliberate user choice, not a retrieval miss."""
+    _patch_gateway(monkeypatch, lambda u, b: _Resp(200, {"hits": []}))
+    monkeypatch.setattr(agent_server, "_gw_enabled_documents",
+                        lambda: [{"id": "doc-1", "filename": "Menu.pdf"}])
+    monkeypatch.setattr(agent_server, "_gw_all_documents", lambda: [])
+    text, n = asyncio.run(agent_server._doc_context("q", set()))
     assert (text, n) == ("", 0)
 
 
@@ -234,8 +315,15 @@ def test_block_is_inserted_before_the_question(monkeypatch):
     assert len(out) == 4
 
 
-def test_nothing_is_inserted_when_there_are_no_hits(monkeypatch):
+def test_the_no_match_turn_is_inserted_before_the_question(monkeypatch):
+    """The note is a system turn adjacent to the question, like the real block.
+
+    Anything else and it is either invisible (buried in the system prompt, where
+    the model treats it as boilerplate) or repeated on every later turn.
+    """
     _patch_gateway(monkeypatch, lambda u, b: _Resp(200, {"hits": []}))
+    monkeypatch.setattr(agent_server, "_gw_enabled_documents",
+                        lambda: [{"id": "doc-1", "filename": "Menu.pdf"}])
 
     async def go():
         msgs = [{"role": "system", "content": "sys"},
@@ -244,7 +332,9 @@ def test_nothing_is_inserted_when_there_are_no_hits(monkeypatch):
 
     out, n = asyncio.run(go())
     assert n == 0
-    assert len(out) == 2
+    assert len(out) == 3
+    assert out[1]["role"] == "system" and "NO MATCH" in out[1]["content"]
+    assert out[-1]["content"] == "q"
 
 
 def test_system_prompt_tells_the_model_what_the_block_is():

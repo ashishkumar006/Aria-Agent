@@ -53,6 +53,46 @@ def test_validate_rejects_bad_specs(apps):
                             "url": "https://x", "match": {"field": "a"}})
 
 
+def test_feed_url_guard_refuses_internal_targets(apps):
+    """A spec URL is fetched server-side, so it must not reach
+    loopback / link-local / private targets (the gateway, cloud
+    metadata, the LAN) or carry embedded credentials."""
+    from apps import _guard_feed_url
+    for bad in (
+        "http://127.0.0.1:8109/v1/providers",
+        "http://localhost/feed",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.5/feed",
+        "http://192.168.1.1/feed",
+        "http://[::1]/feed",
+        "https://user:pass@example.com/feed",
+        "ftp://example.com/feed",
+    ):
+        with pytest.raises(ValueError):
+            _guard_feed_url(bad)
+    # A public literal IP passes (no DNS involved).
+    _guard_feed_url("https://93.184.216.34/feed")
+
+
+def test_schedule_interval_floor(apps):
+    """"every 30s" is a valid scheduler interval but would fetch a
+    third-party feed every second of every day."""
+    with pytest.raises(ValueError, match=">= 60s"):
+        apps.validate_spec({"name": "Fast", "kind": "openrouter_free",
+                            "schedule": "every 30s"})
+    s = apps.validate_spec({"name": "OK", "kind": "openrouter_free",
+                            "schedule": "every 30m"})
+    assert s["schedule"] == "every 30m"
+
+
+def test_app_count_quota(apps, monkeypatch):
+    monkeypatch.setattr(apps, "_MAX_APPS", 2)
+    apps.create_app({"name": "One", "kind": "openrouter_free"})
+    apps.create_app({"name": "Two", "kind": "openrouter_free"})
+    with pytest.raises(ValueError, match="app limit"):
+        apps.create_app({"name": "Three", "kind": "openrouter_free"})
+
+
 def test_create_duplicate_and_manual_next(apps):
     s = apps.create_app({"name": "T", "kind": "openrouter_free",
                          "schedule": "manual"})

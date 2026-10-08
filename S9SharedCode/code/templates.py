@@ -44,7 +44,20 @@ def _save() -> None:
 
 
 def save(name: str, query: str, vars: list[str] | None = None) -> dict:
-    """Save (or overwrite) a template. `vars` lists placeholder names."""
+    """Save (or overwrite) a template. `vars` lists placeholder names.
+
+    Names and queries are bounded. An 8-million-character name was once
+    accepted and stored, after which every `GET /api/templates` returned 16 MB
+    in 18 s - and the object could never be deleted through the API, because
+    its 8 MB URL exceeded the HTTP parser's limit. Caps keep one bad input from
+    becoming permanent.
+    """
+    name = str(name or "")
+    query = str(query or "")
+    if not name or len(name) > 200:
+        raise ValueError("template name must be 1-200 characters")
+    if len(query) > 8192:
+        raise ValueError("template query must be at most 8192 characters")
     with _TPL_LOCK:
         _load()
         _TEMPLATES[name] = {"name": name, "query": query,

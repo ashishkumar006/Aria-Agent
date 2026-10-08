@@ -22,14 +22,21 @@ sys.path.insert(0, str(ROOT))
 class ToolRegistration(unittest.TestCase):
     """mcp_server.mcp registers all tools."""
 
-    def test_38_tools_registered(self):
+    def test_40_tools_registered(self):
         """Was 40. get_time and currency_convert were removed as redundant
         with the model's own clock and arithmetic — each was an extra round
-        trip for a trivial question."""
+        trip for a trivial question. read_artifact was then added so a node
+        can expand an upstream result that INPUTS spilled to a handle.
+
+        40 again: render_document was re-registered because it was never
+        actually registered - it was a bare function, so it was absent from the
+        advertised list and every model call returned "Unknown tool". Then
+        _doc_stats was dropped again: it is a private helper render_document
+        calls, not a tool a model should be able to reach."""
         import asyncio
         import mcp_server
         tools = asyncio.run(mcp_server.mcp.list_tools())
-        self.assertEqual(len(tools), 38)
+        self.assertEqual(len(tools), 40)
 
     def test_redundant_tools_are_gone(self):
         """They must not linger in the catalog or in the tool payload, or the

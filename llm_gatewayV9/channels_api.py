@@ -266,8 +266,39 @@ async def hook_receive(name: str, request: Request):
                 agent=f"channel:{name}", session=msg.chat_id or None,
                 channel=name, trust_level=msg.trust_level.value,
                 policy_verdict=verdict, policy_rule=rule)
+    paired_as = _auto_pair_inbound(name, msg)
     return {"ok": True, "message": msg.model_dump(),
+            "paired": paired_as,
             "policy": {"verdict": verdict, "rule": rule}}
+
+
+def _auto_pair_inbound(name: str, msg) -> str:
+    """Trust-on-first-contact, so a notification channel can be reached.
+
+    Without this, the pairing store was only ever written by a loopback-only
+    control call: a reminder had a configured bot and no destination, and no
+    way for a human to supply one from the channel itself. First contact on an
+    EMPTY store is recorded as `owner`.
+
+    Deliberately only on an empty store. Any later sender is recorded as
+    `paired`, never `owner`, and `resolve_notify_target` prefers `owner` - so
+    a stranger who finds the bot cannot redirect your reminders to themselves.
+    """
+    sender = str(getattr(msg, "sender_id", "") or getattr(msg, "chat_id", "") or "")
+    if not sender or not name:
+        return ""
+    try:
+        from adaptors import trust as _trust
+        first = not _trust.has_pairings(name)
+        if first:
+            _trust.pair(name, sender, "owner")
+            return "owner"
+        if not _trust.is_paired(name, sender):
+            _trust.pair(name, sender, "paired")
+            return "paired"
+    except Exception:
+        return ""
+    return ""
 
 
 # ── approvals (policy `approve` verdicts land here) ───────────────────────
@@ -382,6 +413,29 @@ async def control_presence():
     live = sum(1 for c in inv if c.get("configured"))
     return {"up": True, "version": "v9", "ts": time.time(),
             "channels_total": len(inv), "channels_live": live}
+
+
+@router.get("/v1/control/notify-target")
+async def control_notify_target(request: Request):
+    """Where a local notification should be delivered, unmasked.
+
+    Loopback-only, for the same reason `pair` is: it hands out a real chat id.
+    The display path (`/v1/control/presence` -> `trust.list_paired`) stays
+    masked, and this exists so a scheduled task can find a destination instead
+    of silently going nowhere.
+    """
+    _loopback_only(request)
+    channel = request.query_params.get("channel") or "telegram"
+    try:
+        from adaptors import trust as _trust
+        target = _trust.resolve_notify_target(channel)
+    except Exception as e:
+        raise HTTPException(500, f"trust store unavailable: {type(e).__name__}")
+    inventory = registry.inventory()
+    live = any(
+        str(c.get("name") or "") == channel and c.get("configured")
+        for c in (inventory or []) if isinstance(c, dict))
+    return {"channel": channel, "target": target or "", "configured": bool(live)}
 
 
 @router.post("/v1/control/pair")

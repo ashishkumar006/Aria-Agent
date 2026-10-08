@@ -26,6 +26,15 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "python-docx>=1.1",
     "openpyxl>=3.1",
+    # Document GENERATION (/v1/docgen). These are hard requirements of
+    # docgen.py, not nice-to-haves: build_pdf needs reportlab, build_pptx
+    # needs python-pptx, and charts/images need Pillow. They were previously
+    # absent here and present only because someone had pip-installed them
+    # into the venv by hand, so a clean `uv sync` produced a gateway where
+    # every render_document call failed at import.
+    "reportlab>=4.0",
+    "python-pptx>=0.6",
+    "Pillow>=10.0",
     # Voice services (lazy-loaded; gateway boots fine without them).
     "kokoro-onnx>=0.5.0",
     "soundfile>=0.14.0",
@@ -41,6 +50,20 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
+]
+
+# Mesh handling for the /v1/parts routes. Deliberately NOT in the main
+# dependency list: `parts/` ships native STL+OBJ readers and computes every
+# measurement in numpy, so validation, repair and reporting all work today with
+# no extra install. These two widen it:
+#   trimesh    - PLY/3MF ingest and a broader IO backend
+#   manifold3d - the topology oracle (non-manifold edge merge, watertight check)
+# Both are probed at runtime and reported as available/unavailable rather than
+# being required. Install with: uv sync --extra parts
+[project.optional-dependencies]
+parts = [
+    "trimesh>=4.0",
+    "manifold3d>=2.5",
 ]
 
 [tool.pytest.ini_options]

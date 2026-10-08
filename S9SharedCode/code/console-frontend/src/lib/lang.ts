@@ -337,6 +337,17 @@ const DEF = [
   /^\s*(?:public|private|protected|static|\s)*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/,
 ];
 
+/* Words that look like `name(...) {` but are control flow, so the last DEF
+   pattern swept `if`, `for`, `while`, `switch`, `catch` and every `else if`
+   into the outline as though they were functions. Users saw a jump list full
+   of `if` next to the real symbols, and "go to symbol" landed on statement
+   boundaries. Only these keywords can precede the paren group in JS/TS. */
+const NOT_A_SYMBOL = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'do', 'else', 'return', 'function',
+  'typeof', 'instanceof', 'new', 'delete', 'void', 'await', 'yield', 'in', 'of',
+  'case', 'with', 'throw', 'constructor',
+]);
+
 /** Outline of the file. Deliberately regex-based and deliberately shallow: it
     is a navigation aid, not a type checker. */
 export function symbols(text: string, lang: string): Symbol[] {
@@ -363,8 +374,12 @@ export function symbols(text: string, lang: string): Symbol[] {
       const m = l.match(re);
       if (!m || !m[1]) continue;
       /* The bare `name(...) {` pattern also matches calls; require that the
-         line does not start with a call-shaped expression. */
-      if (k === 5 && /^[\s]*[)\];,]/.test(l)) continue;
+         line does not start with a call-shaped expression, and that the name
+         is not a keyword. */
+      if (k === 5) {
+        if (/^[\s]*[)\];,]/.test(l)) continue;
+        if (NOT_A_SYMBOL.has(m[1])) continue;
+      }
       const kind: Symbol['kind'] =
         k === 0 ? (/^\s*def\s/.test(l) ? 'function' : 'method')
         : k === 2 ? 'class'

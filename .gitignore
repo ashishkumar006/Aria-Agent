@@ -36,6 +36,8 @@ Thumbs.db
 *.log
 *.err
 *.out
+*.out*
+logs/
 tmp/
 .cache/
 

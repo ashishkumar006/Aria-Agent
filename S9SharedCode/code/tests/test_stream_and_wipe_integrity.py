@@ -111,22 +111,41 @@ async def test_whitespace_only_session_id_is_refused():
 
 
 @pytest.mark.asyncio
-async def test_a_real_session_id_still_passes_the_guard():
+async def test_a_real_session_id_still_passes_the_guard(monkeypatch):
     """The fix must not break the legitimate scoped wipe: a real id is not
-    rejected as blank."""
+    rejected as blank. The gateway call is stubbed - running it would
+    delete a real session's rows from a live gateway."""
+    sent = []
+
+    async def _stub(path, method="GET", **kw):
+        sent.append((method, path))
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_server, "_gw_json", _stub)
     out = await agent_server.wipe_memory(session_id="ct-abc123", confirm="wipe")
-    # Whether the gateway call succeeds is not this test's concern; what matters
-    # is that the blank-id guard did not fire.
     assert not (isinstance(out, dict) and out.get("status") == "error"
                 and "empty" in str(out.get("message", "")).lower()), out
+    assert sent == [("DELETE",
+                     "/v1/memory?session_id=ct-abc123&confirm=wipe")], sent
 
 
 @pytest.mark.asyncio
-async def test_an_absent_session_id_still_allows_the_global_wipe():
+async def test_an_absent_session_id_still_allows_the_global_wipe(monkeypatch):
     """Omitting the parameter is the documented way to wipe everything, gated by
-    `confirm=wipe`. It must keep working."""
+    `confirm=wipe`. It must keep working - but the wipe itself must never
+    run here: it would erase every drawer of a live gateway, uploaded
+    documents included. The request the route would send is asserted
+    instead of executed."""
+    sent = []
+
+    async def _stub(path, method="GET", **kw):
+        sent.append((method, path))
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_server, "_gw_json", _stub)
     out = await agent_server.wipe_memory(session_id=None, confirm="wipe")
     assert not (isinstance(out, dict) and out.get("status") == "error"), out
+    assert sent == [("DELETE", "/v1/memory?confirm=wipe")], sent
 
 
 @pytest.mark.asyncio

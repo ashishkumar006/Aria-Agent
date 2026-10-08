@@ -29,7 +29,10 @@ planner:
   prompt: prompts/planner.md
   tools_allowed: []
   temperature: 0.4         # decompositions need a little breathing room
-  max_tokens: 1500
+  # A plan carries the facet list, per-worker questions and goals, plus the
+  # recovery subgraphs. 1500 truncated a broad plan mid-JSON (which the
+  # parser then rejected outright, losing the whole decomposition).
+  max_tokens: 3000
   description: Decomposes user queries into the initial DAG and synthesises recovery subgraphs on node failure.
 
 retriever:
@@ -41,7 +44,9 @@ retriever:
   # place it was said out loud.
   tools_allowed: [search_knowledge, recall_preferences, remember_preference]
   temperature: 0.2         # retrieval is mostly deterministic
-  max_tokens: 1200
+  # Chunk previews are the raw material the Formatter expands on, so this
+  # must hold enough of them to answer from.
+  max_tokens: 2000
   description: Searches Memory and the FAISS index for material relevant to a query.
 
 researcher:
@@ -49,24 +54,44 @@ researcher:
   # remember_preference: a research run is where "always give me the
   # publication date" and "no paywalled sources" get said out loud. Without a
   # write path here, preferences said during research were lost.
+  # verify_citations: it existed in the catalog and in the Skills page but
+  # was wired to nothing, so nothing ever checked a URL before the report
+  # cited it. read_artifact: a sibling's findings spill to a handle when
+  # they are long, and a spilled result is unreadable without this.
   tools_allowed: [web_search, fetch_url, arxiv_search, wikipedia_search,
                   openalex_search, news_search, fetch_pdf, extract_tables,
-                  wayback_fetch, remember_preference, recall_preferences]
+                  wayback_fetch, remember_preference, recall_preferences,
+                  verify_citations, read_artifact]
   temperature: 0.7         # exploratory; let the model choose phrasings
-  max_tokens: 2500
+  # `findings` is what every downstream node reads. At 2500 the fetched
+  # detail was cut to ~1,900 words before the Distiller or Formatter ever
+  # saw it, and the loss was invisible: the model had written more and the
+  # caller silently got less.
+  max_tokens: 6000
   description: Performs multi-step web research and produces normalised text outputs.
 
 distiller:
   prompt: prompts/distiller.md
   critic: true
   temperature: 0.1         # extraction; almost-zero
-  max_tokens: 1200
+  # One field per item, verbatim evidence lines: a 12-row comparison ran
+  # past 1200 and lost its tail rows (and the Critic then failed the
+  # truncation it was meant to catch).
+  max_tokens: 3000
+  # Large upstream results arrive in INPUTS as an artifact handle + preview;
+  # this is how a node expands one when the detail matters.
+  tools_allowed: [read_artifact]
   description: Extracts structured fields from raw text or page content.
 
 summariser:
   prompt: prompts/summariser.md
   temperature: 0.3
-  max_tokens: 1200
+  # The Summariser is UPSTREAM of the Formatter, so it is a ceiling on the
+  # final answer, not a courtesy: anything it drops cannot be written up.
+  # Its job is to drop redundancy and page chrome, not facts. 1200 capped
+  # the whole downstream report at ~900 words.
+  max_tokens: 4000
+  tools_allowed: [read_artifact]
   description: Condenses long content into a short form.
 
 critic:
@@ -75,10 +100,67 @@ critic:
   max_tokens: 500
   description: Evaluates an upstream node's output; emits pass or fail with rationale.
 
+# ── document authoring ──────────────────────────────────────────────────────
+# The user asks for a FILE ("write me a report", "build a deck", "export a
+# spreadsheet"). These two skills write the content as structured blocks and
+# call `render_document`, which renders a real PDF/PPTX/DOCX/XLSX through the
+# gateway (reportlab / python-pptx / python-docx / openpyxl) and returns an
+# artifact handle the console offers as a download.
+author:
+  prompt: prompts/author.md
+  # render_document is the deliverable, and read_artifact expands a spilled
+  # upstream result. Research is NOT this skill's job: `ensure_authoring_research`
+  # guarantees a retriever plus researcher fan-out runs BEFORE author, and their
+  # findings are handed in. Measured over 1,910 recorded tool uses:
+  #
+  #     author  render_document 185   web_search 31   everything else 0
+  #     deck    render_document  42   web_search  5   everything else 0
+  #
+  # So fetch_url, search_knowledge, recall_preferences, arxiv_search,
+  # wikipedia_search and news_search were carried on EVERY call and called
+  # NEVER - about 500 tokens of schema per call, re-sent on each of the ~4
+  # hops a single document takes. web_search is kept deliberately: it is the
+  # only thing that stops a document being written from nothing when the
+  # upstream researchers failed or were skipped, and it was used 31 times.
+  # Everything else is gone.
+  tools_allowed: [render_document, read_artifact, web_search]
+  temperature: 0.35        # structure must be exact; prose can breathe
+  # A whole document's worth of blocks. The default 2048 truncated the
+  # `blocks` array mid-document, which the renderer then renders as a
+  # half-empty file rather than failing loudly.
+  max_tokens: 16000
+  description: |
+    Writes a document (PDF, Word, or Excel) from a request and renders it as a
+    real file: reports, briefs, summaries, comparisons, spreadsheets. Use
+    whenever the user wants an artifact they can open, print or edit — not
+    for a question that a chat answer satisfies.
+
+deck:
+  prompt: prompts/deck.md
+  # Same reasoning as author, and the measurement agrees: deck called
+  # render_document 42 times and web_search 5, and nothing else at all. The
+  # fetch_url / search_knowledge / recall_preferences it carried were never
+  # called once.
+  tools_allowed: [render_document, read_artifact, web_search]
+  temperature: 0.4         # slide phrasing wants a little range
+  max_tokens: 16000
+  description: |
+    Builds a PowerPoint presentation: one idea per slide, short bullets,
+    tables for comparisons. Use for "make a deck", "slides for", "present
+    this to the team".
+
 formatter:
   prompt: prompts/formatter.md
-  temperature: 0.3
-  max_tokens: 1500
+  # THE FINAL ANSWER. This was 1500 tokens (~1,100 words), so a research
+  # report could never exceed a single page no matter what the prompt
+  # asked for — the answer was truncated mid-sentence by the API, not
+  # kept short by the model. Deep/broad research writes several pages.
+  max_tokens: 12000
+  # One focused call per upstream result, then assemble (see
+  # skills._sectioned_final_answer). The keyed models answer a single
+  # "write the report" request with ~300 words no matter how high the
+  # cap, so length has to come from splitting the work.
+  sectioned: true
   description: Renders the final answer for the user. Conventional terminal node — its output.final_answer is what the executor returns.
 
 sandbox_executor:

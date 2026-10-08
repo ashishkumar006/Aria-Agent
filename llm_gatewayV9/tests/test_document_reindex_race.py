@@ -44,8 +44,11 @@ class _Plane:
         def delete_one(self, rid):
             self.records.pop(rid, None)
 
-        def _persist_embedded(self, rec):
+        def _persist_embedded(self, rec, *, persist: bool = True):
             self.records[rec.id] = rec
+
+        def persist_index(self):
+            pass
 
     def __init__(self):
         self.drawers = {"document": self._Drawer()}
@@ -69,7 +72,8 @@ def _make(reg, filename, chunks, enabled=True):
     reads. Returns the Document."""
     doc = reg.add(filename=filename, doc_type="pdf", size_bytes=1)
     reg.update(doc.id, chunk_count=chunks, embedded_indices=[],
-               embedded_count=0, enabled=enabled, status=R.PENDING, error="")
+               embedded_count=0, enabled=enabled, status=R.PENDING,
+               error="", index_version=R.INDEX_FORMAT_VERSION)
     return reg.get(doc.id)
 
 

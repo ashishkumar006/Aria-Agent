@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Terminal } from 'lucide-react';
-import { Rail, TopBar, Empty, Stat } from '../components/ui';
+import { Rail, TopBar, Empty, Stat, SkipLink } from '../components/ui';
 import { api, CONF, type FeedEvent } from '../api';
 
 const LEVELS = ['all', 'run', 'sched', 'tool', 'info', 'err'] as const;
@@ -14,10 +14,17 @@ export default function Mission() {
   const sigRef = useRef('');
   const pausedRef = useRef(false);
   pausedRef.current = paused;
+  // Sequence guard: a slow poll can outlive its interval, and an
+  // older response landing after a newer one would step the feed
+  // (and its signature) backwards — the next identical fetch would
+  // then look "new" and re-render stale lines.
+  const reqRef = useRef(0);
 
   const tick = useCallback(async () => {
+    const req = ++reqRef.current;
     try {
       const d = await api.events(200);
+      if (req !== reqRef.current) return;
       const evs = d.events || [];
       // Signature over the FULL id list: first|last-only missed insertions
       // in the middle and skipped re-renders. It covers content as well as
@@ -54,6 +61,7 @@ export default function Mission() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
@@ -73,7 +81,7 @@ export default function Mission() {
         </div>
         <div className="mt-auto hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">poll {CONF.pollLiveMs / 1000}s · guarded</div>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Console">
           <span
             role="status"
@@ -130,7 +138,7 @@ export default function Mission() {
             </div>
           </section>
         </div>
-      </div>
+      </main>
     </div>
   );
 }

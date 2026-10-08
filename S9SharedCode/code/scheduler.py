@@ -39,7 +39,12 @@ def _load() -> None:
     try:
         data = json.loads(_SCHED_PATH.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
-        data = {}
+        # A transient read failure (locked file, torn write) must
+        # NOT wipe in-memory state: every public op calls _load()
+        # before _save(), so clobbering _SCHEDULES here lets one
+        # bad read destroy every persisted schedule. Keep the
+        # last-known-good state and let the caller proceed.
+        return
     if not isinstance(data, dict):
         data = {}
     _SCHEDULES = data
@@ -113,6 +118,11 @@ def _next_fire_from_cron(cron: str, base: float) -> float:
             raise ValueError(f"unparseable recurring interval: {cron!r} "
                              f"(want 'every 30m', 'every 2h' or 'every 45s')")
         n, unit = int(m.group(1)), m.group(2) or "m"
+        if n < 1:
+            # Zero would re-arm at "now" and fire in a ~1s loop
+            # forever, billing every iteration.
+            raise ValueError(f"recurring interval must be >= 1{unit}: "
+                             f"{cron!r}")
         return base + n * {"s": 1, "m": 60, "h": 3600}[unit]
     m = _re.fullmatch(r"tomorrow\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
     if m:
@@ -149,24 +159,58 @@ def schedule(query: str, when: str, *,
     """
     sid = f"sch-{uuid.uuid4().hex[:8]}"
     now = time.time()
+    import re as _re
+    # Dispatch case-insensitively. _next_fire_from_cron lowercases
+    # before parsing, so "DAILY@09:00" / "EVERY 30m" parsed fine in
+    # the branch below — but the case-sensitive startswith() here
+    # sent them to the one-shot else: a recurring job the operator
+    # asked for fired ONCE and never re-armed. Reachable via the MCP
+    # schedule_task tool, which passes LLM-generated text verbatim.
+    low_when = when.strip().lower()
     try:
-        if when.startswith("in "):
-            unit = when[3:].strip()
-            if unit.endswith("m"):
-                delay = int(unit[:-1]) * 60
-            elif unit.endswith("h"):
-                delay = int(unit[:-1]) * 3600
-            elif unit.endswith("s"):
-                delay = int(unit[:-1])
-            else:
-                delay = int(unit)
-            fire = now + delay
+        if low_when.startswith("in "):
+            # Relative delay: "in 30m", "in 1h", "in 45s" —
+            # plus the spelled-out units people actually type
+            # ("in 1 hour", "in 30 minutes"). The old parser
+            # only matched single letters, so every plural form
+            # fell through to int("1 hour") and failed.
+            m = _re.fullmatch(
+                r"(\d+)\s*(m|min|mins|minutes|minute|h|hr|hrs|"
+                r"hour|hours|s|sec|secs|second|seconds)?",
+                when[3:].strip().lower())
+            if not m:
+                raise ValueError(f"unparseable delay: {when!r}")
+            n, unit = int(m.group(1)), (m.group(2) or "m")
+            if n < 1:
+                # "in 0 seconds" used to schedule a job whose
+                # fire time is NOW — it executed immediately (and
+                # billed) while looking like a deferred task. The
+                # "every" branch has had this floor all along.
+                raise ValueError("delay must be at least 1 unit")
+            per = {"s": 1, "sec": 1, "secs": 1, "second": 1,
+                   "seconds": 1,
+                   "m": 60, "min": 60, "mins": 60,
+                   "minute": 60, "minutes": 60,
+                   "h": 3600, "hr": 3600, "hrs": 3600,
+                   "hour": 3600, "hours": 3600}[unit]
+            fire = now + n * per
             recurring = None
-        elif when.startswith("daily@") or when.startswith("every "):
+        elif low_when.startswith("tomorrow"):
+            # One-shot at that time tomorrow — NOT recurring
+            # (the word means the next day only; "daily@" is
+            # the recurring form).
+            fire = _next_fire_from_cron(when, now)
+            recurring = None
+        elif low_when.startswith("daily@") or low_when.startswith("every "):
             fire = _next_fire_from_cron(when, now)
             recurring = when
         else:
-            fire = float(when)
+            # ISO datetime or epoch seconds — _next_fire_from_cron
+            # parses both (fromisoformat, then bare float). The
+            # old code ran float(when) directly, so the ISO and
+            # "tomorrow" forms its own error message advertised
+            # were unreachable.
+            fire = _next_fire_from_cron(when, now)
             recurring = None
     except ValueError as e:
         # _next_fire_from_cron already names valid forms for recurring
@@ -180,6 +224,13 @@ def schedule(query: str, when: str, *,
     with _SCHED_LOCK:
         _load()
         for _esid, _job in _SCHEDULES.items():
+            if not isinstance(_job, dict):
+                # A hand-edited or torn schedules.json can hold
+                # non-dict entries. The heap build ignores them,
+                # but this scan called .get() on every entry and
+                # raised AttributeError — 500ing every POST
+                # /api/schedule until the file was hand-fixed.
+                continue
             if _job.get("enabled") and _job.get("query") == query \
                     and _job.get("when") == when:
                 return _esid
@@ -208,15 +259,26 @@ def list_schedules() -> list[dict]:
         _purge_locked(_PURGE_AFTER_S)
         # Return ALL schedules (enabled and disabled). Cancelled schedules
         # remain visible so callers can inspect the `enabled` flag; the UI
-        # layer decides whether to grey them out.
-        return [{"id": k, **v} for k, v in _SCHEDULES.items()]
+        # layer decides whether to grey them out. Non-dict entries (see
+        # schedule()) are dropped here too — `{**"garbage"}` raised
+        # TypeError on every GET /api/schedule.
+        return [{"id": k, **v} for k, v in _SCHEDULES.items()
+                if isinstance(v, dict)]
 
 
 def cancel(sid: str) -> bool:
     with _SCHED_LOCK:
         _load()
         if sid in _SCHEDULES:
-            _SCHEDULES[sid]["enabled"] = False
+            spec = _SCHEDULES[sid]
+            if not isinstance(spec, dict):
+                return False
+            spec["enabled"] = False
+            # Marker the worker checks between its snapshot and the
+            # fire: a cancel landing in that window used to return
+            # True while the captured still-enabled snapshot still
+            # ran — one stray agent turn after a successful cancel.
+            spec["_cancelled"] = True
             _save()
             _purge_locked(_PURGE_AFTER_S)
             return True
@@ -240,13 +302,26 @@ def remove(sid: str) -> bool:
 _PURGE_AFTER_S = 7 * 86400
 
 
+def _epoch_or(v, fallback: float) -> float:
+    """float() that treats a corrupt stored value as the fallback.
+
+    A hand-edited string `next_fire` can exist — _load() only
+    type-checks for the heap — and `float("soon")` raised ValueError
+    inside the purge sweep, 500ing every GET /api/schedule."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _purge_locked(max_age_s: float) -> int:
     """Drop stale disabled one-shots. Caller must hold _SCHED_LOCK."""
     now = time.time()
     dead = [sid for sid, s in _SCHEDULES.items()
             if isinstance(s, dict) and not s.get("enabled", True)
             and not s.get("recurring")
-            and (now - float(s.get("next_fire") or s.get("created") or now))
+            and (now - _epoch_or(s.get("next_fire"),
+                                 _epoch_or(s.get("created"), now)))
             > max_age_s]
     for sid in dead:
         del _SCHEDULES[sid]
@@ -257,9 +332,14 @@ def _purge_locked(max_age_s: float) -> int:
 
 def purge_disabled(max_age_days: float = 7) -> int:
     """Public entry: hard-delete disabled one-shots older than the cutoff."""
+    if max_age_days < 0:
+        # max(0, ...) used to clamp a negative to 0, making the age
+        # test true for EVERY past fire — a purge with max_age_days=-1
+        # deleted all disabled one-shots regardless of age.
+        raise ValueError("max_age_days must be >= 0")
     with _SCHED_LOCK:
         _load()
-        return _purge_locked(max(0, float(max_age_days)) * 86400)
+        return _purge_locked(float(max_age_days) * 86400)
 
 
 def _fire(sid: str, spec: dict | None = None) -> None:
@@ -276,7 +356,11 @@ def _fire(sid: str, spec: dict | None = None) -> None:
         return
     # Derive a stable session id without assuming the "sch-" prefix format.
     short = sid[4:] if sid.startswith("sch-") and len(sid) > 4 else sid
-    derived_sid = f"s8-{short}"
+    # A task scheduled FROM a conversation runs IN it. The
+    # conversation_id was accepted, persisted and then ignored —
+    # _fire always derived a blank session, so a reminder set
+    # mid-conversation answered with none of that context.
+    derived_sid = spec.get("conversation_id") or f"s8-{short}"
     import time as _t
     _start = _t.time()
     error: str | None = None
@@ -325,53 +409,100 @@ def _fire(sid: str, spec: dict | None = None) -> None:
     except Exception as e:
         _log(f"[{sid}] cost record failed (non-fatal): {e}")
     if spec.get("notify", True):
+        # ALWAYS record the result in the in-app feed first. Telegram may be
+        # unconfigured or unreachable, and a reminder whose outcome exists
+        # only in a Telegram message that never arrived is a reminder that
+        # did not happen.
+        try:
+            from agent_server import _notif_add
+            _notif_add("scheduled",
+                       f"{spec['query'][:160]} -> "
+                       f"{(answer or '').strip()[:400] or '(no answer)'}",
+                       derived_sid)
+        except Exception as e:
+            _log(f"[{sid}] in-app record failed: {e}")
         try:
             from agent_server import notify_task_done
             notify_task_done(spec["query"], answer or "",
-                             round(_t.time() - _start, 1), derived_sid)
+                             round(_t.time() - _start, 1), derived_sid,
+                             scheduled=True)
         except Exception as e:
             _log(f"[{sid}] notify failed: {e}")
 
 
 def _worker() -> None:
     while not _STOP.wait(timeout=1.0):
-        with _SCHED_LOCK:
-            if not _HEAP:
-                continue
-            fire, sid = _HEAP[0]
-            if time.time() < fire:
-                continue
-            heapq.heappop(_HEAP)
-            spec = _SCHEDULES.get(sid)
-            if not spec or not spec.get("enabled"):
-                continue
-            # CRITICAL: snapshot BEFORE mutating. The worker used to set
-            # enabled=False and then pass that same dict to _fire, whose
-            # own enabled guard aborted the run — so every ONE-SHOT
-            # schedule silently fired nothing. Capture the still-enabled
-            # spec first, then persist the disable (crash safety), then
-            # hand the untouched snapshot to _fire.
-            snap = dict(spec)
-            # Re-arm recurring schedules before firing.
-            if spec.get("recurring"):
+        try:
+            _worker_tick()
+        except Exception:
+            # One poison entry (an unparseable `recurring`, an
+            # unwritable state dir) used to raise out of the loop and
+            # kill the thread — and because _ensure_worker only
+            # restarts it on the NEXT schedule() call, which re-heaps
+            # the same entry from disk, every restarted worker died
+            # again immediately: one bad value silently stopped ALL
+            # scheduled work. Log, skip the tick, stay alive.
+            _log(f"worker tick failed, skipping: {traceback.format_exc()}")
+
+
+def _worker_tick() -> None:
+    with _SCHED_LOCK:
+        if not _HEAP:
+            return
+        fire, sid = _HEAP[0]
+        if time.time() < fire:
+            return
+        heapq.heappop(_HEAP)
+        spec = _SCHEDULES.get(sid)
+        if not spec or not isinstance(spec, dict) or not spec.get("enabled"):
+            return
+        # CRITICAL: snapshot BEFORE mutating. The worker used to set
+        # enabled=False and then pass that same dict to _fire, whose
+        # own enabled guard aborted the run — so every ONE-SHOT
+        # schedule silently fired nothing. Capture the still-enabled
+        # spec first, then persist the disable (crash safety), then
+        # hand the untouched snapshot to _fire.
+        snap = dict(spec)
+        # Re-arm recurring schedules before firing.
+        if spec.get("recurring"):
+            try:
                 spec["next_fire"] = _next_fire_from_cron(
                     spec["recurring"], time.time())
-                heapq.heappush(_HEAP, (spec["next_fire"], sid))
-                _save()
-            else:
-                # RELIABILITY FIX (one-shot re-fire): fired one-shot items
-                # used to stay enabled=True with a stale past next_fire, so
-                # any later _load() re-heaped them and they fired AGAIN.
-                # Disable + persist BEFORE executing so a crash mid-fire
-                # (or any reload) can never resurrect the schedule.
+            except (ValueError, OSError) as e:
+                # A corrupt `recurring` value used to raise HERE —
+                # inside the loop with no guard — killing the worker
+                # (see _worker). Disable the job itself so the
+                # scheduler keeps serving every OTHER job, and say
+                # why on the job's row.
                 spec["enabled"] = False
+                spec["last_error"] = f"unparseable recurring: {e}"[:400]
                 _save()
-        # Fire outside the lock, with the still-enabled snapshot.
-        try:
-            _fire(sid, snap)
-        except Exception as e:
-            _log(f"[{sid}] fire raised: {traceback.format_exc()}")
-            _record(sid, repr(e))
+                _log(f"[{sid}] disabled — unparseable recurring "
+                     f"{spec.get('recurring')!r}: {e}")
+                return
+            heapq.heappush(_HEAP, (spec["next_fire"], sid))
+            _save()
+        else:
+            # RELIABILITY FIX (one-shot re-fire): fired one-shot items
+            # used to stay enabled=True with a stale past next_fire, so
+            # any later _load() re-heaped them and they fired AGAIN.
+            # Disable + persist BEFORE executing so a crash mid-fire
+            # (or any reload) can never resurrect the schedule.
+            spec["enabled"] = False
+            _save()
+    # A cancel() that landed between the snapshot and here must not
+    # still fire — the snapshot predates the cancel and is still
+    # enabled (see cancel()).
+    with _SCHED_LOCK:
+        live = _SCHEDULES.get(sid)
+    if live is not None and isinstance(live, dict) and live.get("_cancelled"):
+        return
+    # Fire outside the lock, with the still-enabled snapshot.
+    try:
+        _fire(sid, snap)
+    except Exception as e:
+        _log(f"[{sid}] fire raised: {traceback.format_exc()}")
+        _record(sid, repr(e))
 
 
 def _ensure_worker() -> None:

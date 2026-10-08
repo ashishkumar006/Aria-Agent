@@ -23,10 +23,35 @@ from typing import Any, Optional
 DEFAULT_URL = os.getenv("LLM_GATEWAY_V9_URL", "http://localhost:8109")
 
 
+def _auth_headers() -> dict:
+    """Headers for the gateway's authenticated surface.
+
+    Every `/v1/*` route requires `X-Gateway-Token`. The server used to accept
+    unauthenticated calls on all of them, which let any local process wipe
+    memory, reload policy and spend real money - so this client now has to
+    present the shared token. It is read the same way the server writes it:
+    `GATEWAY_V9_TOKEN`, else `state/gateway.token`, which the server publishes
+    at start-up.
+
+    Returns `{}` rather than raising when no token is available, so the failure
+    is an explicit 401 from the server instead of an import-time crash.
+    """
+    tok = (os.getenv("GATEWAY_V9_TOKEN") or "").strip()
+    if not tok:
+        try:
+            from pathlib import Path
+            p = Path(__file__).resolve().parent / "state" / "gateway.token"
+            tok = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            tok = ""
+    return {"X-Gateway-Token": tok} if tok else {}
+
+
 class LLM:
     def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 600):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.headers = _auth_headers()
 
     def chat(self, prompt: str = None, *,
              messages: Optional[list] = None,
@@ -53,7 +78,7 @@ class LLM:
             "agent": agent, "session": session,
         }
         body = {k: v for k, v in body.items() if v is not None}
-        r = httpx.post(f"{self.base_url}/v1/chat", json=body, timeout=self.timeout)
+        r = httpx.post(f"{self.base_url}/v1/chat", json=body, timeout=self.timeout, headers=self.headers)
         r.raise_for_status()
         return r.json()
 
@@ -72,7 +97,7 @@ class LLM:
             "agent": agent, "session": session,
         }
         body = {k: v for k, v in body.items() if v is not None}
-        r = httpx.post(f"{self.base_url}/v1/vision", json=body, timeout=self.timeout)
+        r = httpx.post(f"{self.base_url}/v1/vision", json=body, timeout=self.timeout, headers=self.headers)
         r.raise_for_status()
         return r.json()
 
@@ -86,7 +111,7 @@ class LLM:
         body = {"prompt": prompt, "stream": True}
         body.update({k: v for k, v in kw.items() if v is not None})
         with httpx.stream("POST", f"{self.base_url}/v1/chat", json=body,
-                          timeout=self.timeout) as r:
+                      timeout=self.timeout, headers=self.headers) as r:
             r.raise_for_status()
             buf = ""
             for chunk in r.iter_text():
@@ -102,12 +127,12 @@ class LLM:
         list of responses in input order; failed calls are returned as
         `{"error": ..., "status_code": ...}` rather than raising."""
         body = {"calls": calls, "max_concurrency": max_concurrency}
-        r = httpx.post(f"{self.base_url}/v1/chat/batch", json=body, timeout=self.timeout)
+        r = httpx.post(f"{self.base_url}/v1/chat/batch", json=body, timeout=self.timeout, headers=self.headers)
         r.raise_for_status()
         return r.json().get("results", [])
 
     def capabilities(self):
-        return httpx.get(f"{self.base_url}/v1/capabilities", timeout=30).json()
+        return httpx.get(f"{self.base_url}/v1/capabilities", timeout=30, headers=self.headers).json()
 
     def cost_by_agent(self, session: Optional[str] = None,
                       agent: Optional[str] = None) -> dict:
@@ -116,7 +141,7 @@ class LLM:
             params["session"] = session
         if agent:
             params["agent"] = agent
-        r = httpx.get(f"{self.base_url}/v1/cost/by_agent", params=params, timeout=30)
+        r = httpx.get(f"{self.base_url}/v1/cost/by_agent", params=params, timeout=30, headers=self.headers)
         r.raise_for_status()
         return r.json()
 
@@ -133,7 +158,7 @@ class LLM:
             body["agent"] = agent
         if session:
             body["session"] = session
-        r = httpx.post(f"{self.base_url}/v1/embed", json=body, timeout=self.timeout)
+        r = httpx.post(f"{self.base_url}/v1/embed", json=body, timeout=self.timeout, headers=self.headers)
         r.raise_for_status()
         return r.json()
 

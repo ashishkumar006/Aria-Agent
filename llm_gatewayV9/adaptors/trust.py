@@ -64,6 +64,50 @@ def unpair(channel: str, sender_id: str) -> bool:
     return False
 
 
+def is_paired(channel: str, sender_id: str) -> bool:
+    """Is this sender already known on this channel?"""
+    with _LOCK:
+        return str(sender_id) in (_load().get(channel) or {})
+
+
+def has_pairings(channel: str) -> bool:
+    """Is anyone paired on this channel yet?
+
+    Trust-on-first-contact uses this to decide whether an inbound sender may
+    become the `owner`, so it needs the answer without the ids.
+    """
+    with _LOCK:
+        return bool((_load().get(channel) or {}))
+
+
+def resolve_notify_target(channel: str = "telegram",
+                          prefer: tuple[str, ...] = ("owner", "paired")
+                          ) -> str | None:
+    """The UNMASKED sender id a local notification should be delivered to.
+
+    `list_paired` deliberately masks ids (last 4 only) because it feeds a
+    display panel. A notification needs the real id, and there was no way to
+    get one: the pairing store was only ever written by a loopback-only
+    control call and read back masked, so a scheduled reminder had nowhere to
+    go even with a bot token configured.
+
+    Preference order is explicit, then newest. Returns "" for nothing, so
+    callers can treat "" and None the same.
+    """
+    with _LOCK:
+        data = _load()
+    entries = data.get(channel) or {}
+    for role in prefer:
+        for sid, r in entries.items():
+            if str(r or "").lower() == role:
+                return str(sid)
+    # No owner/paired role recorded: fall back to anything at all, so a chat
+    # that paired under a different role is still reachable.
+    for sid in entries:
+        return str(sid)
+    return ""
+
+
 def list_paired(channel: str | None = None) -> dict:
     """Return pairings with sender IDs masked (last 4) for safe display."""
     with _LOCK:

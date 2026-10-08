@@ -1,5 +1,6 @@
 import os, time, json
 import sys
+import asyncio
 from pathlib import Path
 from typing import Any, Optional
 from contextlib import asynccontextmanager
@@ -20,7 +21,8 @@ del _s
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.responses import (HTMLResponse, StreamingResponse, FileResponse,
+                               JSONResponse)
 from fastapi.staticfiles import StaticFiles
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -51,6 +53,7 @@ from channels_api import router as channels_router
 from voice_api import router as voice_router
 from integrations_api import router as integrations_router
 from memory_api import router as memory_router
+from docgen_api import router as docgen_router
 
 DEFAULT_ORDER = ["gemini35lite", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github", "kilo"]
 ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
@@ -238,6 +241,14 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
+    # Publish the owning loop so the document-indexing worker (a plain thread)
+    # can submit embed coroutines back here instead of building a second event
+    # loop and deadlocking the gateway. See memory_api.set_loop.
+    try:
+        import memory_api as _MA
+        _MA.set_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
     app.state.cache = GeminiCache(ttl_seconds=300)
     app.state.providers = P.build_providers(app.state.cache)
     # Gemini-only mode (GATEWAY_GEMINI_ONLY=true): the gateway touches
@@ -260,15 +271,90 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LLM Gateway V9", lifespan=lifespan,
               redirect_slashes=False)
-app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+
+# ── the gateway's own console pages ───────────────────────────────────────────
+# StaticFiles served the HTML raw, so the pages had no way to present the token
+# that /v1/* now requires: every panel fetched, got 401, and rendered empty.
+# HTML goes through `_console_asset`, which injects the meta tag + loader;
+# everything else (css, js, icons) is passed straight through.
+_STATIC_DIR = ROOT / "static"
+
+
+def _console_asset(name: str):
+    import gateway_auth as _ga
+    from fastapi.responses import FileResponse as _FR
+    base = _STATIC_DIR.resolve()
+    target = (_STATIC_DIR / name).resolve()
+    # Containment, not a string prefix. `str(target).startswith(str(base))`
+    # also accepts any sibling whose name *begins* with "static", so
+    # /static/../static_secrets/creds.txt returned 200 with the file body.
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    if not target.exists() or not target.is_file():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    if target.suffix.lower() not in (".html", ".htm"):
+        return _FR(str(target))
+    try:
+        html = target.read_text(encoding="utf-8")
+    except OSError:
+        return _FR(str(target))
+    return HTMLResponse(_ga.inject_into_html(html))
+
+
+@app.get("/static/{name:path}", include_in_schema=False)
+async def console_static(name: str):
+    return _console_asset(name)
+
+# ── auth on every /v1 route ───────────────────────────────────────────────────
+# The agent console is token-protected; the gateway's own surface was not, so
+# any process that could reach :8109 could wipe memory, reload policy, read the
+# configured-key inventory and spend real money via /v1/control/deploy-test.
+# See gateway_auth.py for the full account.
+#
+# Deliberately NOT exempt: /docs, /openapi.json and /redoc. They describe the
+# surface but change nothing, and leaving them open keeps the docs usable from a
+# browser while the routes themselves stay closed.
+_OPEN_PATHS = {"/", "/health", "/healthz", "/openapi.json", "/docs",
+               "/docs/oauth2-redirect", "/redoc", "/favicon.ico"}
+
+
+@app.middleware("http")
+async def _gateway_token_guard(request, call_next):
+    import gateway_auth as _auth
+    path = request.url.path
+    # Only /v1/* is guarded. The `/static` clause in this condition used to read
+    # `not path.startswith("/static")`, which required a path NOT to be static
+    # in order to skip the check - so every stylesheet, script and console page
+    # under /static was itself demanded a token and answered 401. The gateway's
+    # own UI then loaded no CSS and no JS, which is what "the gateway UI is
+    # broken" actually looked like: unstyled panels full of failed requests.
+    if not path.startswith("/v1/") or path in _OPEN_PATHS:
+        return await call_next(request)
+    if _auth.check_header_value(request.headers.get(_auth.TOKEN_HEADER)):
+        return await call_next(request)
+    from fastapi.responses import JSONResponse as _JR
+    return _JR(
+        status_code=401,
+        content={"error": f"missing or invalid {_auth.TOKEN_HEADER} header"},
+        headers={"WWW-Authenticate": _auth.TOKEN_HEADER},
+    )
 # V10 adaptor plane (channels/hooks/policy/spend/control) + voice services
 # + keyed third-party integrations (ex-agent Tier-1 tools).
 app.include_router(channels_router)
 app.include_router(voice_router)
 app.include_router(integrations_router)
 app.include_router(memory_router)
+app.include_router(docgen_router)
 from deploy_api import router as deploy_router
 app.include_router(deploy_router)
+# Mesh validation / repair / analysis. `parts.api` imports only fastapi and its
+# own package - never `main` - so there is no circular import; its own test
+# suite asserts that in a subprocess. The routes are loopback-only and run the
+# blocking numpy work in a threadpool.
+from parts.api import router as parts_router
+app.include_router(parts_router)
 
 
 def _normalize_messages(req: ChatRequest):
@@ -1057,6 +1143,15 @@ async def routers():
 
 @app.get("/v1/calls")
 async def calls(limit: int = 100, provider: Optional[str] = None, status: Optional[str] = None):
+    # A negative or absurd limit used to mean unbounded: `?limit=-1` served
+    # 20.7 MB in 5.5 s, and six concurrent callers moved 124 MB at 35 s each.
+    # The ledger grows forever, so the read must be bounded and offset-capable
+    # rather than trusting the client.
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 1000))
     return db.recent(limit=limit, provider=provider, status=status)
 
 
@@ -1073,18 +1168,48 @@ async def tools_usage():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return FileResponse(str(ROOT / "static" / "dashboard.html"))
+    return _console_asset("dashboard.html")
 
 
 @app.get("/help", response_class=HTMLResponse)
 async def help_page():
-    return FileResponse(str(ROOT / "static" / "help.html"))
+    return _console_asset("help.html")
+
+
+@app.get("/health")
+async def healthz():
+    """Liveness, deliberately unauthenticated.
+
+    The agent polls this to decide whether the gateway is up. It used to probe
+    `/v1/routers`, which now sits behind the gateway token, so a token-path
+    mistake made a perfectly healthy gateway look dead - and `ensure_gateway()`
+    responded by launching a second copy onto an occupied port and reporting
+    "failed to start within 45s". Liveness must never depend on authorisation.
+    """
+    return {"status": "ok", "service": "llm_gateway_v9", "port": PORT}
+
+
+@app.get("/healthz")
+async def healthz_alias():
+    return await healthz()
 
 
 if __name__ == "__main__":
     import os as _os
+    import sys as _sys
     import uvicorn
-    # Loopback by default (holds secrets + spend). Opt into LAN with
-    # GATEWAY_HOST=0.0.0.0 — and then put bearer auth in front.
+    # Loopback by default (holds secrets + spend). A LAN bind needs a real,
+    # configured token: the process-generated one cannot be known by a client,
+    # so binding 0.0.0.0 with it would leave every /v1 route open to the network.
+    # This instance WAS running on 0.0.0.0, which is how the unauthenticated
+    # memory wipe in gateway_auth.py's docstring was reachable.
     _host = _os.environ.get("GATEWAY_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    import gateway_auth as _ga
+    _safe, _why = _ga.assert_safe_bind(_host)
+    if not _safe:
+        print(f"[gateway] refusing to start: {_why}", file=_sys.stderr)
+        raise SystemExit(2)
+    _ga.publish_token_file()
+    print(f"[gateway] auth enabled on /v1/* ({_why}); "
+          f"token published to {_ga.token_file()}")
     uvicorn.run("main:app", host=_host, port=PORT, reload=False)

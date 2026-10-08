@@ -301,6 +301,37 @@ def _breadcrumb(path: tuple[str, ...]) -> str:
     return " > ".join(p for p in path if p)
 
 
+def _group_label_rows(rows: list[list]) -> dict[int, str]:
+    """Row indices that act as group headings inside a table.
+
+    A weekly menu has no `##` headings, so its structure - BREAKFAST, LUNCH,
+    SNACKS, DINNER - lives in a row that fills only the first column
+    (`Meal: BREAKFAST`) with every other cell empty. Without recognising that,
+    all four meals index as one undifferentiated blob and `heading_path` is
+    empty, so a retrieved fragment cannot say which meal it came from.
+
+    The pattern is deliberately narrow, because a false positive would invent
+    structure that is not there: the row must have exactly one non-empty cell,
+    that cell must be in the first column, it must be short, and it must look
+    like a label rather than data.
+    """
+    out: dict[int, str] = {}
+    for i, r in enumerate(rows):
+        if not r:
+            continue
+        cells = [str(c).strip() for c in r]
+        filled = [(j, v) for j, v in enumerate(cells) if v]
+        if len(filled) != 1:
+            continue
+        j, v = filled[0]
+        if j != 0:
+            continue
+        if len(v) > 60 or "\n" in v:
+            continue
+        out[i] = v.rstrip(":").strip() or v
+    return out
+
+
 def _chunk_section(
     blocks: list[Block],
     target: int,
@@ -374,11 +405,60 @@ def _chunk_section(
                     seen[n] = 0
                     uniq.append(n)
             names = uniq
-        rows_per = max(1, target // 12)  # a row is a handful of words
-        for i in range(0, len(body), rows_per):
-            group = body[i:i + rows_per]
+        # Rows per chunk, from the MEASURED width of this table's rows.
+        #
+        # This was `target // 12`, a hardcoded guess of 12 characters per row.
+        # A 7-column menu row is ~180 characters, so the estimate was out by
+        # roughly 15x: rows_per came out as 666, every real table fitted in one
+        # group, and the whole weekly menu indexed as a SINGLE chunk with an
+        # empty heading_path. Nothing was split, nothing was over the ceiling -
+        # the budget was simply never applied. Measuring costs one pass over
+        # cells that have already been parsed.
+        widths = []
+        for r in body[:64]:                      # a sample is enough
+            widths.append(sum(len(str(c)) for c in r) + 2 * max(1, len(r)) - 1)
+        avg_row = max(24, (sum(widths) // len(widths)) if widths else 24)
+        rows_per = max(1, target // avg_row)
+        # A group label row ("Meal: BREAKFAST") is a boundary of its own; a
+        # chunk holding four meals is as unretrievable as one holding four
+        # sections of prose, so the labelled form splits there too.
+        label_rows = _group_label_rows(body) if labelled else {}
+        # Split points: the size boundary, plus every group-label row, so a
+        # chunk never straddles two meals. Walking the boundaries in order
+        # replaces a plain stride - `range(0, len, rows_per)` could cut a group
+        # in half and drop the label away from the rows it introduces.
+        cuts = list(range(0, len(body), rows_per)) or [0]
+        for idx in sorted(label_rows):
+            if idx not in cuts:
+                cuts.append(idx)
+        cuts = sorted(set(cuts))
+        bounds = list(zip(cuts, cuts[1:] + [len(body)]))
+        for start, end in bounds:
+            i = start
+            group = body[i:end]
             if not group:
                 continue
+            # The label row belongs to the group it introduces, not the one
+            # before it, so it is prepended to its own chunk's text below.
+            group_label = label_rows.get(i, "")
+            # A pure label row is redundant - and wrong - when the
+            # rows it introduces carry their own row labels in
+            # column 0. A labelled data row already names itself
+            # ("Meal: LUNCH"), so a stray empty section header
+            # above it ("BREAKFAST" with no dishes of its own)
+            # would stamp a meal that has no data onto a chunk of
+            # another meal's dishes.
+            #
+            # The reverse is the reason the label exists at all: in
+            # a PURE-label table the dish rows' column 0 is empty,
+            # so the group label is the only place the meal name
+            # survives - it goes on the chunk's breadcrumb, which
+            # is prepended to the chunk text.
+            if group_label:
+                for r in group[1:]:
+                    if r and str(r[0]).strip():
+                        group_label = ""
+                        break
             # Build the whole group's text first, then split it on CHARACTERS
             # as well as rows. A row count alone cannot bound a chunk: 12 rows
             # of a 49-column export is ~12k chars against an 8000 ceiling, and
@@ -421,8 +501,16 @@ def _chunk_section(
                 lines.extend(" | ".join(str(c).strip() for c in r)
                              for r in group)
             for piece in _split_by_chars(lines, MAX_CHUNK_CHARS):
+                # A group label becomes part of the breadcrumb, so a retrieved
+                # fragment carries "BREAKFAST" as its heading instead of the
+                # meal name being trapped in the body text where a citation
+                # cannot see it.
+                path = b.heading_path
+                extra = group_label
+                if extra:
+                    path = tuple(path) + (extra,)
                 out.append(dict(kind="table", text=piece,
-                                path=b.heading_path, page=b.page, own=None))
+                                path=path, page=b.page, own=None))
 
 
 def _split_by_chars(lines: list[str], limit: int) -> list[str]:

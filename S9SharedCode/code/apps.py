@@ -67,6 +67,16 @@ def validate_spec(raw: dict) -> dict:
             _next_fire(schedule, time.time())
         except Exception:
             raise ValueError("schedule must be 'manual', 'daily@HH:MM', 'every Ns/Nm/Nh', 'in Nm/Nh', 'tomorrow HH:MM', ISO datetime or epoch seconds")
+        # "every 1s" is a valid recurring interval for the
+        # scheduler, but a tracker on it fetches a third-party
+        # feed every second of every day. The floor for app
+        # schedules is one minute.
+        _im = re.match(r"^every\s+(\d+)\s*([smh]?)$",
+                       schedule.strip().lower())
+        if _im:
+            _secs = int(_im.group(1)) * {"s": 1, "m": 60, "h": 3600}[_im.group(2) or "m"]
+            if _secs < 60:
+                raise ValueError("app schedule interval must be >= 60s")
     spec: dict = {
         "id": app_id,
         "name": name[:80],
@@ -118,6 +128,12 @@ def validate_spec(raw: dict) -> dict:
         url = (raw.get("url") or "").strip()
         if not re.match(r"^https?://", url):
             raise ValueError("url must be an http(s) URL")
+        # The SSRF guard used to run only at fetch time, so a
+        # loopback / link-private / metadata URL was accepted at
+        # CREATE, persisted into the spec and echoed by every
+        # read — the refusal only surfaced (as a 200 error body)
+        # on refresh. Refuse it where the spec is written.
+        _guard_feed_url(url)
         spec["url"] = url
         spec["items_path"] = (raw.get("items_path") or "data").strip() or "data"
         match = raw.get("match") or {}
@@ -183,11 +199,22 @@ def get_spec(app_id: str) -> dict | None:
     return spec if isinstance(spec, dict) else None
 
 
+# Board ceiling: one spec + one data file per app, and the
+# worker re-fetches every due app on every 30s tick.
+_MAX_APPS = 50
+
+
 def create_app(raw: dict) -> dict:
     spec = validate_spec(raw)
     with _lock:
         if _spec_path(spec["id"]).exists():
             raise ValueError(f"app '{spec['id']}' already exists")
+        # No ceiling existed: one small JSON file per app,
+        # forever, and every due one is fetched again each
+        # tick. Cap the board the way the scheduler caps
+        # its rows.
+        if len(list_specs()) >= _MAX_APPS:
+            raise ValueError(f"app limit is {_MAX_APPS}; delete one first")
         now = time.time()
         spec["created"] = now
         spec["updated"] = now
@@ -214,10 +241,80 @@ def delete_app(app_id: str) -> bool:
 
 # ── runner ────────────────────────────────────────────────────────────────
 
+# A spec's URL is operator-supplied, but specs are also
+# created through POST /api/apps — so the fetch must not
+# reach loopback / link-local / private targets: the agent
+# process can reach the gateway, cloud metadata endpoints
+# and other internal hosts a browser never could. Refuse
+# them up front, refuse credentials embedded in the URL,
+# and re-check after redirects (a public host can 302 to
+# an internal one).
+_MAX_FEED_BYTES = 8 * 1024 * 1024
+
+
+def _refuse_nonpublic_host(host: str) -> None:
+    import ipaddress
+    import socket
+    h = (host or "").strip().lower()
+    if not h:
+        raise ValueError("feed URL has no host")
+    if h == "localhost" or h.endswith(".localhost"):
+        raise ValueError(f"feed URL host {h!r} is loopback")
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_unspecified or ip.is_reserved):
+            raise ValueError(
+                f"feed URL host {h!r} is not a public address")
+        return
+    # A hostname: resolve it and check every address it
+    # maps to. Unresolvable here is not a refusal — the
+    # fetch itself fails on it, with the real error.
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except socket.gaierror:
+        return
+    for _fam, _type, _proto, _canon, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_unspecified or ip.is_reserved):
+            raise ValueError(
+                f"feed URL host {h!r} resolves to a "
+                f"non-public address")
+
+
+def _guard_feed_url(url: str) -> None:
+    import urllib.parse as _up
+    p = _up.urlsplit(url)
+    if p.scheme not in ("http", "https"):
+        raise ValueError(
+            f"feed URL scheme must be http/https, not {p.scheme!r}")
+    if p.username or p.password:
+        # Credentials in the URL are persisted into the spec
+        # file and echoed into error messages; keep them out
+        # of both.
+        raise ValueError("feed URLs must not embed credentials")
+    _refuse_nonpublic_host(p.hostname)
+
+
 def _http_get_json(url: str) -> dict:
     import httpx
-    r = httpx.get(url, timeout=25.0,
-                  headers={"User-Agent": "Aria-apps/1.0", "Accept": "application/json"})
+    _guard_feed_url(url)
+    r = httpx.get(url, timeout=25.0, follow_redirects=True,
+                  headers={"User-Agent": "Aria-apps/1.0",
+                           "Accept": "application/json"})
+    # A public host can redirect to an internal one —
+    # re-check the URL the request actually landed on.
+    _guard_feed_url(str(r.url))
+    if len(r.content) > _MAX_FEED_BYTES:
+        raise ValueError(
+            f"feed response exceeds {_MAX_FEED_BYTES // (1024 * 1024)}MB")
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, dict):

@@ -1213,7 +1213,7 @@
         const fire = s.next_fire ? new Date(s.next_fire * 1000).toLocaleString() : (s.when || "");
         li.append(el("span", "sched-when", `${s.enabled === false ? "paused · " : ""}${s.recurring || ""} ${fire}`));
         const del = el("button", "chip", "✕");
-        del.title = "Cancel task";
+        del.title = "Cancel task (pause)";
         del.onclick = async () => {
           try {
             await fetchJSON(`/api/schedule/${encodeURIComponent(s.id)}`, { method: "DELETE" });
@@ -1221,7 +1221,16 @@
             toast("Schedule cancelled", "success");
           } catch { toast("Failed to cancel", "error"); }
         };
-        li.append(del);
+        const hard = el("button", "chip", "🗑");
+        hard.title = "Delete permanently";
+        hard.onclick = async () => {
+          try {
+            await fetchJSON(`/api/schedule/${encodeURIComponent(s.id)}?hard=true`, { method: "DELETE" });
+            loadSched();
+            toast("Schedule deleted", "success");
+          } catch { toast("Failed to delete", "error"); }
+        };
+        li.append(del, hard);
         ul.append(li);
       });
     } catch { $("schedRows").innerHTML = '<li class="muted">schedule load failed</li>'; }

@@ -36,6 +36,11 @@ def put(blob: bytes, *, content_type: str, source: str, descriptor: str) -> str:
     art_id = f"art:{digest}"
     bin_path = STORE / f"{digest}.bin"
     meta_path = STORE / f"{digest}.json"
+    # `STORE.mkdir` only runs at import. Anything that repoints STORE at a
+    # fresh directory (a test's tmp_path, a state reset) then found a
+    # missing directory on the first write, so the spill path failed with
+    # FileNotFoundError instead of storing the bytes.
+    STORE.mkdir(parents=True, exist_ok=True)
     if not bin_path.exists():
         bin_path.write_bytes(blob)
     # Always (re)write meta: a same-bytes re-put with a new descriptor or

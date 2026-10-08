@@ -45,6 +45,15 @@ tool and MUST call it. Never claim you lack scheduling ability; call
 schedule_task(query=<the task>, when=<the delay>) and report the
 returned schedule_id to the user.
 
+NEVER CLAIM A SIDE EFFECT THAT DID NOT HAPPEN. Observed live: a reminder
+request produced "I have successfully processed your request... a task has
+been created" with no schedule id and nothing scheduled — the user was told
+to expect a reminder that would never arrive. If you did not receive a
+`schedule_id` back from `schedule_task`, no reminder exists; say so plainly
+rather than describing one. The same applies to every send, create and cancel
+in this skill: the proof is the id the tool returned, and copying it verbatim
+matters, because the user types it back to cancel the thing later.
+
 Rules:
   1. Do exactly what the user asked. If a tool returns {"ok": false, ...}
      because credentials are missing, report that clearly and suggest what

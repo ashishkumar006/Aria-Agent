@@ -25,8 +25,21 @@ import {
   PanelLeftOpen, Play, Search, Square, Terminal, TriangleAlert, WrapText, X,
   Keyboard, ListTree, CircleDot,
 } from 'lucide-react';
-import { Rail, TopBar, Empty, Pill } from '../components/ui';
+import { Rail, TopBar, Empty, Pill, SkipLink } from '../components/ui';
+import { useFocusTrap } from '../lib/a11y';
 import Editor from '../components/CodeEditor';
+
+/* A draft only ever exists in this browser - the server never receives it - so
+   before anything destructive touches it, the user gets a copy they can keep.
+   A revoke-style data URL rather than a blob URL: nothing to revoke, and it
+   cannot outlive the click. */
+function downloadText(name: string, text: string) {
+  const url = `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name.replace(/[\\/]/g, '_');
+  a.click();
+}
 import { foldRanges, symbols as symbolsOf, type Symbol } from '../lib/lang';
 import { useHistory, type Snapshot } from '../lib/useHistory';
 import {
@@ -56,10 +69,11 @@ function loadDrafts(): Record<string, string> {
   } catch { return {}; }
 }
 
-function saveDrafts(d: Record<string, string>) {
+function saveDrafts(d: Record<string, string>): boolean {
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify(d));
-  } catch { /* quota or private mode: drafts stay in memory */ }
+    return true;
+  } catch { return false; /* quota or private mode: drafts stay in memory */ }
 }
 
 /** Subsequence match with a bonus for consecutive runs and word starts, the
@@ -139,7 +153,12 @@ function Explorer({
     let live = true;
     api.codeRoots()
       .then((r) => { if (live && r?.roots) setRoots(r.roots.map((x) => x.name)); })
-      .catch(() => undefined);
+      .catch((e) => {
+        /* Swallowed before, so a failed root fetch left the
+           explorer on "reading workspace…" forever with no way
+           to tell broken from slow. */
+        if (live) setErr(e instanceof Error ? e.message : 'could not read the workspace');
+      });
     return () => { live = false; };
   }, []);
 
@@ -169,19 +188,39 @@ function Explorer({
     });
   }, [load]);
 
-  /* Auto-expand the folders on the path to the file the user just opened. */
+  /* Auto-expand the folders on the path to the file the user just
+     opened. Expanding alone is not enough: those dirs' entries
+     were never fetched, so each one rendered "empty" until the
+     user collapsed it and opened it again by hand. */
   useEffect(() => {
     if (!activePath) return;
     const parts = activePath.split('/');
+    /* Only auto-open paths that are actually reachable. The roots are
+       `S9SharedCode/code` and `llm_gatewayV9`, so a file at
+       `S9SharedCode/code/auth.py` yields the candidate `S9SharedCode` —
+       which is inside neither root. Requesting it returned "path outside
+       the code workspace", the error stuck forever (the dir never enters
+       `tree`, so `!(d in tree)` stayed true and every tree change re-fired
+       it), and it MASKED genuine failures: a 503 from /api/code/roots was
+       correctly shown until opening a file replaced it with this. */
+    const roots = Object.keys(tree);
     const need: string[] = [];
-    for (let i = 1; i < parts.length; i++) need.push(parts.slice(0, i).join('/'));
+    for (let i = 1; i < parts.length; i++) {
+      const d = parts.slice(0, i).join('/');
+      const reachable = roots.length === 0
+        || roots.some((r) => d === r || d.startsWith(`${r}/`));
+      if (reachable) need.push(d);
+    }
     setOpen((s) => {
       const n = new Set(s);
       let grew = false;
       for (const d of need) if (!n.has(d)) { n.add(d); grew = true; }
       return grew ? n : s;
     });
-  }, [activePath]);
+    for (const d of need) {
+      if (!(d in tree)) void load(d);
+    }
+  }, [activePath, tree, load]);
 
   useEffect(() => {
     for (const d of Object.keys(tree)) void load(d);
@@ -331,7 +370,7 @@ interface FindState { open: boolean; query: string; replace: string; cs: boolean
 function FindWidget({ state, setState, body, taRef, onReveal }: {
   state: FindState; setState: (s: FindState) => void;
   body: string; taRef: React.RefObject<HTMLTextAreaElement | null>;
-  onReveal: (needle: string, cs: boolean, backwards: boolean) => void;
+  onReveal: (needle: string, cs: boolean, backwards: boolean, moveFocus?: boolean) => void;
 }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -361,7 +400,14 @@ function FindWidget({ state, setState, body, taRef, onReveal }: {
           aria-label="Find"
           onChange={(e) => setState({ ...state, query: e.target.value })}
           onKeyDown={(e) => {
-            if (e.key === 'Escape') { e.stopPropagation(); setState({ ...state, open: false }); }
+            if (e.key === 'Escape') {
+              /* The window capture handler owns closing Find (see there) -
+               * it runs first and unmounts this input, so anything done
+               * here would never execute. Just stop the event reaching the
+               * editor's own Escape branch. */
+              e.stopPropagation();
+              return;
+            }
             if (e.key === 'Enter') {
               e.preventDefault();
               onReveal(state.query, state.cs, e.shiftKey);
@@ -415,6 +461,13 @@ function FindWidget({ state, setState, body, taRef, onReveal }: {
               window.HTMLTextAreaElement.prototype, 'value')?.set);
             setter?.call(el, next);
             el.dispatchEvent(new Event('input', { bubbles: true }));
+            /* Advance the caret past the replacement so the next
+               Replace walks on to the following match. The
+               selection used to stay put, so every click
+               re-found and re-replaced the SAME match and the
+               walk never moved. */
+            const end = Math.min(at + state.replace.length, next.length);
+            el.setSelectionRange(end, end);
           }}
           className="rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-300 disabled:opacity-40 hover:bg-glass-hover">
           Replace
@@ -465,15 +518,20 @@ function rankFiles(files: string[], q: string, limit = 60): string[] {
     .map((x) => x.f);
 }
 
-function Palette({ mode, files, onPick, onClose }: {
+function Palette({ mode, files, truncated, onPick, onClose }: {
   mode: 'file' | 'cmd';
   files: string[];
+  /** The server caps the file index; when that cap was hit the
+      palette must say so instead of silently missing files. */
+  truncated?: boolean;
   onPick: (v: string) => void;
   onClose: () => void;
 }) {
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(0);
   const ref = useRef<HTMLInputElement>(null);
+  const trapRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(trapRef, { onEscape: onClose });
 
   useEffect(() => { ref.current?.focus(); }, []);
 
@@ -485,6 +543,7 @@ function Palette({ mode, files, onPick, onClose }: {
 
   return (
     <div
+      ref={trapRef}
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 pt-[12vh]"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
@@ -535,6 +594,11 @@ function Palette({ mode, files, onPick, onClose }: {
           {!items.length && (
             <li className="px-3.5 py-3 text-[12px] text-zinc-muted">no matches</li>
           )}
+          {truncated && items.length > 0 && (
+            <li className="px-3.5 py-2 text-[11px] text-zinc-muted">
+              list truncated — refine the search to narrow it down
+            </li>
+          )}
         </ul>
       </div>
     </div>
@@ -569,15 +633,31 @@ export default function Code() {
   const [selLen, setSelLen] = useState(0);
   const [note, setNote] = useState<string | null>(null);
   const [known, setKnown] = useState<string[]>([]);
+  /* The file index is capped server-side; when it was, quick
+     open must say so instead of silently missing files. */
+  const [filesTruncated, setFilesTruncated] = useState(false);
   const [folded, setFolded] = useState<Set<number>>(new Set());
   const [outlineOn, setOutlineOn] = useState(false);
   const [problems, setProblems] = useState<CodeProblem[]>([]);
+  /* A fresh array literal in the JSX (`problems.map(...)`) gave <Editor> a new
+     prop identity on every parent render, which defeats its memo entirely - so
+     the editor re-rendered per keystroke no matter what. Derive it once. */
+  const problemLines = useMemo(
+    () => problems.map((p) => ({ line: p.line - 1 })),
+    [problems],
+  );
   const [checkNote, setCheckNote] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [shortcuts, setShortcuts] = useState(false);
   const [search, setSearch] = useState<{ open: boolean; q: string; hits: CodeMatch[]; busy: boolean }>(
     { open: false, q: '', hits: [], busy: false });
-  const [extraCursors, setExtraCursors] = useState<number[]>([]);
+  const searchTimer = useRef<number | undefined>(undefined);
+  const searchAbort = useRef<AbortController | null>(null);
+  const searchReq = useRef(0);
+  useEffect(() => () => {
+    window.clearTimeout(searchTimer.current);
+    searchAbort.current?.abort();
+  }, []);
   const [stale, setStale] = useState<string | null>(null);
   const [jump, setJump] = useState<{ path: string; line: number; col: number } | null>(null);
   const ta = useRef<HTMLTextAreaElement>(null);
@@ -590,9 +670,6 @@ export default function Code() {
   const dirty = !!pane && pane.body !== pane.base;
   const lines = useMemo(() => body.split('\n'), [body]);
 
-  /* Persist drafts so a reload keeps unsaved work. */
-  useEffect(() => { saveDrafts(drafts); }, [drafts]);
-
   /* The quick-open index: every servable file, not just open tabs. Ctrl+P
      originally listed only files already open, which made it a tab switcher
      wearing a file finder's clothes. */
@@ -600,7 +677,11 @@ export default function Code() {
     let live = true;
     const ac = new AbortController();
     api.codeFiles(ac.signal)
-      .then((r) => { if (live && r?.files) setKnown(r.files); })
+      .then((r) => {
+        if (!live || !r?.files) return;
+        setKnown(r.files);
+        setFilesTruncated(!!r.truncated);
+      })
       .catch(() => undefined);
     return () => { live = false; ac.abort(); };
   }, []);
@@ -615,11 +696,79 @@ export default function Code() {
     window.setTimeout(() => setNote((n) => (n === m ? null : n)), 2200);
   }, []);
 
-  const open = useCallback(async (path: string) => {
-    if (panes.some((p) => p.path === path)) { setActivePath(path); return; }
+  /* Persist drafts so a reload keeps unsaved work — DEBOUNCED:
+     every keystroke used to serialise the entire draft map (every
+     open buffer, not just the one being typed in) to localStorage
+     synchronously on the main thread. */
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+  const draftsTimer = useRef<number | undefined>(undefined);
+  const draftsWarned = useRef(false);
+  useEffect(() => {
+    window.clearTimeout(draftsTimer.current);
+    draftsTimer.current = window.setTimeout(() => {
+      if (saveDrafts(draftsRef.current) || draftsWarned.current) return;
+      draftsWarned.current = true;
+      flash('localStorage is full — drafts may not survive a reload');
+    }, 800);
+    return () => window.clearTimeout(draftsTimer.current);
+  }, [drafts, flash]);
+  useEffect(() => () => {
+    window.clearTimeout(draftsTimer.current);
+    /* Flush the final burst on the way out. */
+    saveDrafts(draftsRef.current);
+  }, []);
+
+  /* `reload` is what "Reload from server" needs. The staleness banner only
+     renders when the pane is clean, so the file is always already open - and
+     the `panes.some(...)` early return below made the only offered action a
+     guaranteed no-op: it set the active tab and returned without fetching.
+     Reload must therefore skip that guard and overwrite body AND base. */
+  const openReq = useRef(0);
+  const open = useCallback(async (path: string, opts?: { reload?: boolean }) => {
+    if (!opts?.reload && panes.some((p) => p.path === path)) {
+      setActivePath(path);
+      return;
+    }
+      const req = ++openReq.current;
     try {
-      const f = await api.codeFile(path);
-      if (!f) { flash(`cannot open ${path}`); return; }
+      const f = await api.codeFile(path).catch((e: unknown) => {
+        // The server's message is the useful one ("too large", "not text",
+        // "outside the roots"); do not flatten it to a generic failure.
+        const msg = (e as { message?: string })?.message || String(e);
+        throw new Error(msg.replace(/^HTTP \d+:\s*/, ''));
+      });
+      /* The user may have opened another file while this fetch
+         was in flight; the slower response must not steal the
+         active tab (or land its pane on top of a newer one). */
+      if (req !== openReq.current) return;
+      if (!f) { flash(`cannot open ${path} - the server returned nothing for it`); return; }
+      if (opts?.reload) {
+        /* Reload discards the local draft, and the draft is the ONLY copy of
+           that work - the server never received it. Confirm, and keep a
+           backup so "undo" is not the only way out. */
+        const hadDraft = path in drafts && drafts[path] !== panes.find((p) => p.path === path)?.base;
+        if (hadDraft) {
+          const keep = window.confirm(
+            `${path} has unsaved changes in this browser.\n\n` +
+            `Reloading replaces them with the server's copy and discards your edits.\n\n` +
+            `Save a copy first? OK saves your version as ${path}.recovered.txt and then reloads.`);
+          if (keep) downloadText(`${path}.recovered.txt`, drafts[path]);
+          else if (!window.confirm(`Discard your changes to ${path} and reload anyway?`)) return;
+        }
+        setPanes((ps) => ps.map((p) => (
+          p.path === path ? { ...p, file: f, body: f.text, base: f.text } : p
+        )));
+        setDrafts((d) => {
+          if (!(path in d)) return d;
+          const next = { ...d };
+          delete next[path];
+          return next;
+        });
+        setActivePath(path);
+        flash(`reloaded ${path}`);
+        return;
+      }
       const body = drafts[path] ?? f.text;
       setPanes((ps) => (ps.some((p) => p.path === path) ? ps : [...ps, { path, file: f, body, base: f.text }]));
       setActivePath(path);
@@ -674,7 +823,6 @@ export default function Code() {
     if (!el) return;
     setCursor(posOf(el.value, el.selectionStart));
     setSelLen(el.selectionEnd - el.selectionStart);
-    setExtraCursors((xs) => xs.filter((x) => x !== el.selectionStart));
   }, []);
 
   /* Undo history. `restore` puts a snapshot back into the textarea AND the
@@ -709,6 +857,23 @@ export default function Code() {
     applyTextRef.current?.(s.text, s.start, s.end);
   }, []));
   applyTextRef.current = applyText;
+
+  /* Undo history is PER-BUFFER. The stack holds bare snapshots
+     with no path, so switching tabs used to leave file A's
+     snapshots on it — Ctrl+Z in file B then wrote file A's text
+     into file B's textarea (and file A's selection with it).
+     VS Code keeps one undo stack per editor; the tab switch is
+     the boundary here. Folds are line numbers into the old
+     buffer, so they die with it too. */
+  const lastPath = useRef<string | null>(null);
+  useEffect(() => {
+    if (activePath === lastPath.current) return;
+    lastPath.current = activePath;
+    history.reset('');
+    lastBody.current = pane?.body ?? '';
+    setFolded(new Set());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePath]);
 
   const replaceRange = useCallback((from: number, to: number, text: string,
                                      selStart = from + text.length) => {
@@ -771,10 +936,24 @@ export default function Code() {
           setProblems(r.problems ?? []);
           setCheckNote(r.note ?? (r.checked ? null : 'check could not run'));
         })
-        .catch(() => undefined)
+        .catch((e) => {
+          /* A failed check used to be swallowed, and the empty
+             problems list then rendered "✓ No syntax errors" —
+             the exact opposite of what happened. */
+          if (ac.signal.aborted) return;
+          setProblems([]);
+          setCheckNote(`check failed: ${e instanceof Error ? e.message : 'error'}`);
+        })
         .finally(() => { if (!ac.signal.aborted) setChecking(false); });
     }, 450);
-    return () => { ac.abort(); window.clearTimeout(t); };
+    return () => {
+      ac.abort();
+      window.clearTimeout(t);
+      /* The debounce was cancelled before the check ever ran —
+         nothing is in flight, so the "checking…" pill must not
+         spin forever. */
+      setChecking(false);
+    };
   }, [pane, lang]);
 
   /* The source is read-only from the agent, so it can change underneath a
@@ -795,7 +974,8 @@ export default function Code() {
     return () => { live = false; ac.abort(); window.clearInterval(t); };
   }, [pane, dirty]);
 
-  const reveal = useCallback((needle: string, cs: boolean, backwards: boolean) => {
+  const reveal = useCallback((needle: string, cs: boolean, backwards: boolean,
+                            moveFocus = false) => {
     const el = ta.current;
     if (!el || !needle) return;
     const hay = cs ? el.value : el.value.toLowerCase();
@@ -809,7 +989,15 @@ export default function Code() {
       if (at === -1) at = hay.indexOf(n);
     }
     if (at === -1) return;
-    el.focus();
+    /* Do NOT steal focus here. `el.focus()` ran inside the Find box's Enter
+       handler, so focus moved DURING the keydown and the NEXT Enter was
+       consumed by the editor's own handler — whose Enter branch runs
+       auto-indent. Repeating "find next" therefore silently inserted a
+       newline each time: `import hmac` became `import \n\n\n\n\nhmac`,
+       shredding the statement across six lines with no warning. Focus stays
+       in the Find box so Enter keeps advancing matches; callers that really
+       want the caret in the editor pass moveFocus. */
+    if (moveFocus) el.focus();
     el.setSelectionRange(at, at + n.length);
     syncCursor();
     /* Scroll the match into view: measure against the line height the editor
@@ -972,7 +1160,7 @@ export default function Code() {
     { id: 'edit.moveDown', label: 'Move Line Down', run: () => lineOps('moveDown') },
     { id: 'edit.deleteLine', label: 'Delete Line', run: () => lineOps('deleteLine') },
     { id: 'edit.dupLine', label: 'Duplicate Line Down', run: () => lineOps('dupLine') },
-    { id: 'edit.selectNext', label: 'Add Selection to Next Occurrence', run: () => lineOps('selectNext') },
+    { id: 'edit.selectNext', label: 'Select Next Occurrence', run: () => lineOps('selectNext') },
     { id: 'edit.copyLineUp', label: 'Copy Line Up', run: () => lineOps('copyUp') },
     { id: 'edit.copyLineDown', label: 'Copy Line Down', run: () => lineOps('copyDown') },
     { id: 'edit.trim', label: 'Trim Trailing Whitespace (draft)', run: () => {
@@ -1006,13 +1194,61 @@ export default function Code() {
         && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA');
 
       if (e.key === 'Escape') {
-        if (shortcuts) { setShortcuts(false); return; }
-        if (palette) { setPalette(null); return; }
-        if (goto !== null) { setGoto(null); return; }
-        if (search.open) { setSearch((s) => ({ ...s, open: false })); return; }
-        if (find.open) { setFind((f) => ({ ...f, open: false })); return; }
-        if (extraCursors.length) { setExtraCursors([]); return; }
+        /* Exactly ONE overlay closes per Escape, and the event
+           stops here: without stopPropagation the same keypress
+           also reached the overlay's own focus-trap handler, so
+           two stacked overlays (a go-to box over an open find
+           panel, say) both closed on one press. */
+        if (shortcuts) {
+          e.preventDefault(); e.stopPropagation();
+          setShortcuts(false); return;
+        }
+        if (palette) {
+          e.preventDefault(); e.stopPropagation();
+          setPalette(null); return;
+        }
+        if (goto !== null) {
+          e.preventDefault(); e.stopPropagation();
+          setGoto(null); return;
+        }
+        if (search.open) {
+          e.preventDefault(); e.stopPropagation();
+          setSearch((s) => ({ ...s, open: false })); return;
+        }
+        if (find.open) {
+          e.preventDefault(); e.stopPropagation();
+          /* Escape from Find is the "take me to the match" gesture: close
+             the panel AND put the caret on the match. It has to happen HERE,
+             in the window capture handler: this runs before React's
+             onKeyDown on the input, so a handler inside FindWidget never got
+             the event — the panel was already unmounting, and focus fell to
+             <body> every time. Two frames, because the editor's restore
+             effect also runs on this state change and the last writer wins. */
+          const wasCs = find.cs;
+          const q = find.query;
+          setFind((f) => ({ ...f, open: false }));
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            reveal(q, wasCs, false, true);
+          }));
+          return;
+        }
+        /* Last resort, and the documented one: Escape leaves the editor. The
+           textarea is the only focusable thing in the view, so without this a
+           keyboard user who never discovers Shift+Tab has no way out. */
+        if (inField && ta.current && e.target === ta.current) {
+          e.preventDefault();
+          ta.current.blur();
+          return;
+        }
       }
+      /* While any overlay or panel owns the keyboard, the background
+         editor's shortcuts must not fire: Ctrl+Z inside the command
+         palette undid the editor behind it, and Ctrl+G could stack a
+         second modal under the first. Find/search are chrome, not
+         modals — their shortcuts stay live while the EDITOR itself
+         holds the focus. */
+      if (palette || shortcuts || goto !== null) return;
+      if ((search.open || find.open) && e.target !== ta.current) return;
       if (e.key === ',' && mod && !e.shiftKey) {
         e.preventDefault(); setShortcuts(true); return;
       }
@@ -1082,14 +1318,19 @@ export default function Code() {
         if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); lineOps('selectNext'); return; }
         if (e.shiftKey && e.altKey && e.key === 'ArrowUp') { e.preventDefault(); lineOps('copyUp'); return; }
         if (e.shiftKey && e.altKey && e.key === 'ArrowDown') { e.preventDefault(); lineOps('copyDown'); return; }
+        /* Move the caret to the line above/below, keeping the
+           column. The editor has no real multi-cursor support,
+           so these keys do exactly this — they no longer also
+           push a marker into a cursor count that nothing
+           rendered. */
         if (e.altKey && e.key === 'ArrowUp' && ta.current) {
-          /* Add a caret on the line above, VS Code style. */
           e.preventDefault();
           const el = ta.current;
           const ln = posOf(el.value, el.selectionStart).line;
           if (ln > 1) {
-            const off = offsetOf(el.value, { line: ln - 1, col: el.selectionStart - offsetOf(el.value, { line: ln, col: 1 }) + 1 });
-            setExtraCursors((xs) => [...xs, off]);
+            const col = el.selectionStart - offsetOf(el.value, { line: ln, col: 1 }) + 1;
+            const off = offsetOf(el.value, { line: ln - 1, col });
+            el.focus();
             el.setSelectionRange(off, off);
           }
           syncCursor();
@@ -1100,8 +1341,9 @@ export default function Code() {
           const el = ta.current;
           const ln = posOf(el.value, el.selectionStart).line;
           if (ln < lines.length) {
-            const off = offsetOf(el.value, { line: ln + 1, col: 1 });
-            setExtraCursors((xs) => [...xs, off]);
+            const col = el.selectionStart - offsetOf(el.value, { line: ln, col: 1 }) + 1;
+            const off = offsetOf(el.value, { line: ln + 1, col });
+            el.focus();
             el.setSelectionRange(off, off);
           }
           syncCursor();
@@ -1109,7 +1351,12 @@ export default function Code() {
         }
         if (mod && e.shiftKey && e.key.toLowerCase() === 'k') { e.preventDefault(); lineOps('deleteLine'); return; }
       }
-      if (e.key === 'Tab' && e.target === ta.current) {
+      /* Tab inserts an indent, but ONLY the unmodified one. Both Tab and Shift+Tab
+         used to be swallowed and turned into four spaces, so keyboard focus could
+         never leave the textarea at all - a hard keyboard trap (WCAG 2.1.2 No
+         Keyboard Trap). Shift+Tab now falls through to the browser, which is the
+         standard way out; Escape is a second escape hatch below. */
+      if (e.key === 'Tab' && !e.shiftKey && !mod && e.target === ta.current) {
         e.preventDefault();
         const el = ta.current!;
         replaceRange(el.selectionStart, el.selectionEnd, '    ');
@@ -1180,7 +1427,7 @@ export default function Code() {
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [active, allFolds, body, close, cursor.line, doRedo, doUndo, extraCursors.length,
+  }, [active, allFolds, body, close, cursor.line, doRedo, doUndo,
       find.open, flash, goto, lang, lineOps, offsetOf, outline, palette, panes.length,
       replaceRange, search.open, shortcuts, syncCursor]);
 
@@ -1207,8 +1454,9 @@ export default function Code() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         {!zen && (
           <TopBar crumb="Code">
             {dirty && <Pill tone="info">browser draft</Pill>}
@@ -1270,6 +1518,16 @@ export default function Code() {
                   className="flex flex-none items-center px-2 text-zinc-muted hover:bg-glass-hover hover:text-zinc-200">
                   <PlusIcon />
                 </button>
+              </div>
+            )}
+
+            {/* Zen mode hides the top bar and the tab strip —
+                which also hid any trace of WHICH file is being
+                edited. A one-line crumb keeps the user oriented
+                without giving zen mode back its chrome. */}
+            {zen && pane && (
+              <div className="flex-none truncate border-b border-glass-border bg-surface-0 px-3 py-1 text-[11px] text-zinc-muted">
+                {pane.path}
               </div>
             )}
 
@@ -1335,8 +1593,9 @@ export default function Code() {
                   caretOffset={ta.current?.selectionStart ?? -1}
                   selectionStart={ta.current?.selectionStart ?? 0}
                   selectionEnd={ta.current?.selectionEnd ?? 0}
-                  problems={problems.map((p) => ({ line: p.line - 1 }))}
+                  problems={problemLines}
                   ariaLabel={`Editor for ${pane.path}`}
+                  wrap={wrap}
                   onChange={onType}
                   onCursor={syncCursor}
                   onFoldToggle={(line) => setFolded((s) => {
@@ -1427,9 +1686,32 @@ export default function Code() {
                   setSearch((s) => ({ ...s, q }));
                   if (q.trim().length < 3) { setSearch((s) => ({ ...s, hits: [] })); return; }
                   setSearch((s) => ({ ...s, busy: true }));
-                  api.codeSearch(q, 200)
-                    .then((r) => setSearch((s) => ({ ...s, hits: r?.matches ?? [], busy: false })))
-                    .catch(() => setSearch((s) => ({ ...s, hits: [], busy: false })));
+                  /* Debounce, cancel, and drop out-of-order replies.
+                     This used to fire on every keystroke with no debounce and
+                     no AbortSignal, so typing "DOCUMENT_EMBED" queued ~10 full
+                     workspace scans; the server walked ~2100 files per request,
+                     and because those handlers are `async def` doing blocking
+                     I/O, every keystroke stalled every other /api route too.
+                     Responses also landed out of order, so an older query's
+                     results overwrote a newer one's. */
+                  searchReq.current += 1;
+                  const seq = searchReq.current;
+                  window.clearTimeout(searchTimer.current);
+                  searchAbort.current?.abort();
+                  const ac = new AbortController();
+                  searchAbort.current = ac;
+                  searchTimer.current = window.setTimeout(() => {
+                    api.codeSearch(q, 200, ac.signal)
+                      .then((r) => {
+                        if (seq !== searchReq.current) return;
+                        setSearch((s) => ({ ...s, hits: r?.matches ?? [], busy: false }));
+                      })
+                      .catch(() => {
+                        if (seq !== searchReq.current) return;
+                        if (ac.signal.aborted) return;
+                        setSearch((s) => ({ ...s, hits: [], busy: false }));
+                      });
+                  }, 250);
                 }}
                 onKeyDown={(e) => { if (e.key === 'Escape') setSearch((s) => ({ ...s, open: false })); }}
                 placeholder="Search across the workspace (Ctrl+Shift+F)"
@@ -1461,7 +1743,7 @@ export default function Code() {
                         setJump({ path: h.path, line: h.line, col: h.col });
                       }}
                       className="flex w-full items-baseline gap-2 px-3 py-1 text-left text-[11.5px] hover:bg-glass-hover">
-                      <span className="flex-none truncate text-zinc-500">{h.path}</span>
+                      <span className="flex-none truncate text-zinc-muted">{h.path}</span>
                       <span className="flex-none tabular-nums text-zinc-muted">{h.line}</span>
                       <span className="min-w-0 flex-1 truncate text-zinc-300">{h.text}</span>
                     </button>
@@ -1480,7 +1762,7 @@ export default function Code() {
               {stale} changed on the server since it was opened here.
             </span>
             <button type="button"
-              onClick={() => open(stale)}
+              onClick={() => open(stale, { reload: true })}
               className="flex-none rounded border border-amber-500/40 px-1.5 py-0.5 hover:bg-amber-500/20">
               Reload from server
             </button>
@@ -1494,9 +1776,6 @@ export default function Code() {
           </span>
           <span>Ln {cursor.line}, Col {cursor.col}</span>
           {selLen > 0 && <span>({selLen} selected)</span>}
-          {extraCursors.length > 0 && (
-            <span className="text-accent">{extraCursors.length + 1} cursors</span>
-          )}
           {folded.size > 0 && <span>{folded.size} folded</span>}
           {problems.length > 0 && (
             <span className="text-rose-400">{problems.length} error{problems.length === 1 ? '' : 's'}</span>
@@ -1536,7 +1815,7 @@ export default function Code() {
             className={`rounded px-1 ${zen ? 'text-accent' : 'hover:text-zinc-300'}`}>
             <Square size={9} />
           </button>
-          <span className="ml-auto flex items-center gap-1.5">
+          <span className="ml-auto flex items-center gap-1.5" role="status">
             {note && <span className="text-accent/90">{note}</span>}
             {!note && <span>draft stays in this browser — nothing is written to disk</span>}
           </span>
@@ -1544,7 +1823,8 @@ export default function Code() {
 
         {/* Overlays */}
         {palette === 'file' && (
-          <Palette mode="file" files={known} onClose={() => setPalette(null)}
+          <Palette mode="file" files={known} truncated={filesTruncated}
+            onClose={() => setPalette(null)}
             onPick={(f) => { setPalette(null); void open(f); }} />
         )}
         {palette === 'cmd' && (
@@ -1580,11 +1860,11 @@ const SHORTCUTS: string[][] = [
   ['Ctrl+Tab', 'Next tab'],
   ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
   ['Ctrl+/', 'Toggle line comment'],
-  ['Ctrl+D', 'Add selection to next occurrence'],
+  ['Ctrl+D', 'Select next occurrence'],
   ['Ctrl+Shift+K', 'Delete line'],
   ['Alt+Shift+Up/Down', 'Copy line up / down'],
-  ['Alt+Up/Down', 'Add a caret on the line above / below'],
-  ['Escape', 'Collapse to a single caret, or close a panel'],
+  ['Alt+Up/Down', 'Move the caret to the line above / below'],
+  ['Escape', 'Close a panel, or leave the editor'],
   ['Ctrl+Shift+[ / ]', 'Fold / unfold the region at the caret'],
   ['Tab / Shift+Tab', 'Indent / outdent'],
   ['Enter', 'Keep indentation, and open a block after ":" or "{"'],
@@ -1592,8 +1872,12 @@ const SHORTCUTS: string[][] = [
   ['Backspace', 'Delete a matching bracket pair'],
 ];
 function ShortcutSheet({ onClose }: { onClose: () => void }) {
+  const trapRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(trapRef, { onEscape: onClose });
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+    <div
+      ref={trapRef}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
          onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"
            className="max-h-[80vh] w-[min(560px,94vw)] overflow-hidden rounded-lg border border-glass-border bg-surface-1 shadow-2xl">
@@ -1625,9 +1909,13 @@ function GotoBox({ initial, max, onGo, onCancel }: {
 }) {
   const [v, setV] = useState(initial);
   const ref = useRef<HTMLInputElement>(null);
+  const trapRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(trapRef, { onEscape: onCancel });
   useEffect(() => { ref.current?.focus(); ref.current?.select(); }, []);
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 pt-[12vh]"
+    <div
+      ref={trapRef}
+      className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 pt-[12vh]"
          onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
       <div role="dialog" aria-modal="true" aria-label="Go to line"
            className="w-[min(420px,92vw)] overflow-hidden rounded-lg border border-glass-border bg-surface-1 shadow-2xl">
@@ -1636,8 +1924,15 @@ function GotoBox({ initial, max, onGo, onCancel }: {
           <input ref={ref} value={v} inputMode="numeric"
             onChange={(e) => setV(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') onGo(v);
-              if (e.key === 'Escape') onCancel();
+              // preventDefault on every branch. Without it, `onGo`
+              // unmounts this box, `useFocusTrap`'s cleanup returns
+              // focus to the textarea, and Chromium then applies the
+              // Enter default to that newly focused textarea —
+              // INSERTING A NEWLINE into the file. The corruption was
+              // then persisted to the localStorage draft. The palette's
+              // handler already did this; GotoBox did not.
+              if (e.key === 'Enter') { e.preventDefault(); onGo(v); }
+              if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
             }}
             aria-label="Line number"
             className="ml-auto w-28 rounded border border-glass-border bg-surface-0 px-2 py-1 font-mono text-[12px] text-zinc-100 outline-none focus:border-accent/50" />

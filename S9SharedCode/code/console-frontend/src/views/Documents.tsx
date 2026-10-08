@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { FileText, Upload, RefreshCw, Trash2, Search } from 'lucide-react';
-import { Rail, TopBar, Empty, Stat, Pill, Skel } from '../components/ui';
+import { FileText, Upload, RefreshCw, Trash2, Search, Eye, Download } from 'lucide-react';
+import { Rail, TopBar, Empty, Stat, Pill, Skel, SkipLink } from '../components/ui';
+import { useFocusTrap } from '../lib/a11y';
 import { api, type DocItem } from '../api';
 
 /* Statuses the gateway reports. A document may only be ENABLED when it is
@@ -29,6 +30,8 @@ export default function Documents() {
   const [q, setQ] = useState('');
   const [hits, setHits] = useState<any[] | null>(null);
   const [searching, setSearching] = useState(false);
+  const [preview, setPreview] = useState<{ doc: DocItem; url: string } | null>(null);
+  const [previewing, setPreviewing] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
   const reqRef = useRef(0);
 
@@ -68,20 +71,34 @@ export default function Documents() {
     if (!list.length) return;
     setUploading(true);
     setNote('');
-    try {
-      for (const f of list) {
+    /* Per-file outcome collection. The old loop threw out of the WHOLE
+       batch on the first rejection, so selecting [bad.exe, good.txt]
+       uploaded neither and reported only the .exe error — the good file
+       vanished with no mention. Collect every result, then report the
+       successes AND the failures together. */
+    const ok: string[] = [];
+    const bad: string[] = [];
+    for (const f of list) {
+      try {
         const r = await api.uploadDocument(f);
         const nw = (r.warnings || []).length;
         const w = nw ? ` (${nw} warning(s))` : '';
-        setNote(`uploaded ${r.document.filename}${w} — indexing has started`);
+        ok.push(`${r.document.filename}${w}`);
+      } catch (e) {
+        const why = String((e as Error)?.message || e);
+        bad.push(`${f.name}: ${why}`);
       }
-      await load();
-    } catch (e) {
-      setNote(`upload failed: ${String((e as Error)?.message || e)}`);
-    } finally {
-      setUploading(false);
-      if (fileRef.current) fileRef.current.value = '';
     }
+    if (ok.length) await load().catch(() => { /* keep the notes */ });
+    const parts: string[] = [];
+    if (ok.length) {
+      parts.push(`uploaded ${ok.length === 1 ? '' : `${ok.length} files: `}`
+        + ok.join(', ').slice(0, 200) + ' — indexing has started');
+    }
+    if (bad.length) parts.push(`upload failed: ${bad.join('; ').slice(0, 240)}`);
+    setNote(parts.join(' | ') || 'nothing uploaded');
+    setUploading(false);
+    if (fileRef.current) fileRef.current.value = '';
   };
 
   const toggle = async (d: DocItem) => {
@@ -120,6 +137,39 @@ export default function Documents() {
     finally { setBusy(''); }
   };
 
+  /* The preview renders the browser's own viewer over a blob URL,
+     so PDFs open inline with page navigation, zoom and download
+     and no extra dependency. Blob URLs must be revoked or the
+     document bytes leak for the life of the page. */
+  const previewDoc = async (d: DocItem) => {
+    setPreviewing(d.id);
+    try {
+      const blob = await api.documentContent(d.id);
+      setPreview((p) => { if (p) URL.revokeObjectURL(p.url); return null; });
+      setPreview({ doc: d, url: URL.createObjectURL(blob) });
+    } catch (e) {
+      setNote(String((e as Error)?.message || e));
+    } finally { setPreviewing(''); }
+  };
+
+  const downloadDoc = async (d: DocItem) => {
+    setPreviewing(d.id);
+    try {
+      const blob = await api.documentContent(d.id);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = d.filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    } catch (e) {
+      setNote(String((e as Error)?.message || e));
+    } finally { setPreviewing(''); }
+  };
+
+  const closePreview = () => {
+    setPreview((p) => { if (p) URL.revokeObjectURL(p.url); return null; });
+  };
+
   const search = async () => {
     const query = q.trim();
     if (!query) { setHits(null); return; }
@@ -138,10 +188,22 @@ export default function Documents() {
   const ready = docs.filter((d) => d.status === 'ready');
   const enabled = docs.filter((d) => d.enabled);
 
+  /* Both overlays are modal: a backdrop covers the page behind
+     them, so the keyboard must not be able to tab out onto the
+     covered content, and Escape closes them like the × button
+     does. Focus returns to the row that opened each one when it
+     unmounts. */
+  const closeDetail = () => { setSel(null); setDetail(null); };
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+  const previewRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(drawerRef, { active: !!sel, onEscape: closeDetail });
+  useFocusTrap(previewRef, { active: !!preview, onEscape: closePreview });
+
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Documents">
           <input
             value={q}
@@ -193,7 +255,7 @@ export default function Documents() {
             </button>
             <p className="mt-2 text-[11.5px] text-zinc-muted">
               Drop files here or click to choose. PDF, DOCX, Markdown, text, HTML,
-              CSV and Excel. No size limit — chunks are embedded in the background.
+              CSV and Excel, up to 25 MB each — chunks are embedded in the background.
             </p>
             {note && <p role="status" className="mt-2 text-[12px] text-amber-200">{note}</p>}
           </div>
@@ -219,8 +281,16 @@ export default function Documents() {
                 </p>
               ) : hits.map((h, i) => (
                 <div key={`${h.id}-${i}`} className="border-b border-white/5 px-3.5 py-2 last:border-0">
+                  {/* Provenance the API already returns. The row used to
+                      print only `chunk N · doc-<hex>`, so a hit could not
+                      be attributed without looking the id up by hand.
+                      Filename + page + heading is what makes a result
+                      usable. */}
                   <div className="font-mono text-[10.5px] text-zinc-muted">
-                    chunk {h.chunk_index} · {h.doc_id}
+                    <span className="text-zinc-300">{h.filename || h.doc_id}</span>
+                    {' · '}chunk {h.chunk_index}
+                    {h.page != null ? ` · p.${h.page}` : ''}
+                    {h.heading_path?.length ? ` · ${h.heading_path.join(' > ')}` : ''}
                     {h.embed_model ? ` · ${h.embed_model}` : ''}
                   </div>
                   <div className="text-[12.5px] text-zinc-200">{h.chunk}</div>
@@ -286,6 +356,18 @@ export default function Documents() {
                     className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400 disabled:opacity-40">
                     Re-index
                   </button>
+                  <button onClick={() => previewDoc(d)}
+                    disabled={busy === d.id || previewing === d.id}
+                    aria-label={`Preview ${d.filename}`}
+                    className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400 disabled:opacity-40">
+                    <Eye size={12} className="inline" /> preview
+                  </button>
+                  <button onClick={() => downloadDoc(d)}
+                    disabled={busy === d.id || previewing === d.id}
+                    aria-label={`Download ${d.filename}`}
+                    className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400 disabled:opacity-40">
+                    <Download size={12} className="inline" /> download
+                  </button>
                   <button onClick={() => remove(d)} disabled={busy === d.id}
                     aria-label={`Delete ${d.filename}`}
                     className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] text-zinc-400 hover:border-red-400/50 hover:text-red-200 disabled:opacity-40">
@@ -299,10 +381,10 @@ export default function Documents() {
 
         {/* Detail drawer: click a document to see exactly what was indexed. */}
         {sel && (
-          <div className="fixed inset-0 z-40 flex justify-end bg-black/60"
-            onClick={() => { setSel(null); setDetail(null); }}
+          <div ref={drawerRef} className="fixed inset-0 z-40 flex justify-end bg-black/60"
+            onClick={closeDetail}
             role="presentation">
-            <aside role="dialog" aria-label={`Details for ${sel.filename}`}
+            <aside role="dialog" aria-modal="true" aria-label={`Details for ${sel.filename}`}
               onClick={(e) => e.stopPropagation()}
               className="flex h-full w-full max-w-[560px] flex-col border-l border-white/10 bg-[#0b0b0e]">
               <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
@@ -354,7 +436,33 @@ export default function Documents() {
             </aside>
           </div>
         )}
-      </div>
+
+        {/* Inline preview: the browser's own viewer renders the
+            blob URL, so PDFs get page navigation, zoom and
+            download without any extra dependency. */}
+        {preview && (
+          <div ref={previewRef} className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4"
+            onClick={closePreview} role="presentation">
+            <div role="dialog" aria-modal="true" aria-label={`Preview of ${preview.doc.filename}`}
+              onClick={(e) => e.stopPropagation()}
+              className="flex h-full w-full max-w-5xl flex-col rounded-[10px] border border-white/10 bg-[#0b0b0e]">
+              <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
+                <FileText size={15} className="text-zinc-muted" />
+                <span className="flex-1 truncate text-[14px] font-bold">{preview.doc.filename}</span>
+                <a href={preview.url} download={preview.doc.filename}
+                  aria-label={`Download ${preview.doc.filename}`}
+                  className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400">
+                  <Download size={12} className="inline" /> download
+                </a>
+                <button onClick={closePreview} aria-label="Close preview"
+                  className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5">×</button>
+              </div>
+              <iframe src={preview.url} title={`Preview of ${preview.doc.filename}`}
+                className="min-h-0 flex-1 w-full rounded-b-[10px] bg-white" />
+            </div>
+          </div>
+        )}
+      </main>
     </div>
   );
 }

@@ -122,11 +122,18 @@ def test_fanout_three_researchers():
     }
     answer, fake = _run("Compare populations of London, Paris, Berlin", script)
     assert "compared" in answer
-    # Exactly 3 researcher calls, 1 formatter call.
+    # Exactly 3 researcher calls.
     researchers = [c for c in fake.calls if c[0] == "researcher"]
     assert len(researchers) == 3
+    # The formatter is `sectioned`: with 3 upstream results it makes one
+    # focused call per section plus a short lead (skills.
+    # _sectioned_final_answer), so a multi-source run produces a
+    # multi-section report instead of the ~300 words a single call
+    # yields from these models. 3 sections + 1 lead = 4 calls, all the
+    # formatter. (The fake records only the first 60 prompt chars, so
+    # the count is what can be asserted here.)
     formatters = [c for c in fake.calls if c[0] == "formatter"]
-    assert len(formatters) == 1
+    assert len(formatters) == 4, [c[0] for c in fake.calls]
 
 
 # ── 3. transient failure is classified and skipped ──────────────────────────

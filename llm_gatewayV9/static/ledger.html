@@ -88,8 +88,8 @@
       <div class="side">
         <select id="led-prov" onchange="renderLedgerCalls()"><option value="">all providers</option></select>
         <select id="led-role" onchange="renderLedgerCalls()"><option value="">all roles</option></select>
-        <div class="seg" id="led-status-seg">
-          <button data-v="" class="on">All</button><button data-v="ok">OK</button><button data-v="error">Errors</button>
+        <div class="seg" id="led-status-seg" role="group" aria-label="Filter calls by status">
+          <button data-v="" class="on" aria-pressed="true">All</button><button data-v="ok" aria-pressed="false">OK</button><button data-v="error" aria-pressed="false">Errors</button>
         </div>
       </div>
     </div>
@@ -114,12 +114,18 @@
 <footer>LLM Gateway V9 · operator console · ledger reads gateway_v8.db via /v1/calls + /v1/spend<br>API: <a href="/v1/calls?limit=100">calls</a> · <a href="/v1/spend">spend</a> · <a href="/v1/cost/by_agent">cost</a></footer>
 </div>
 <script>
+const escH = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 let LED_ROWS = [];
 document.addEventListener('click', (e) => {
   const b = e.target.closest ? e.target.closest('#led-status-seg button') : null;
   if (!b) return;
-  document.querySelectorAll('#led-status-seg button').forEach((x) => x.classList.remove('on'));
+  document.querySelectorAll('#led-status-seg button').forEach((x) => {
+    x.classList.remove('on');
+    x.setAttribute('aria-pressed', 'false');
+  });
   b.classList.add('on');
+  b.setAttribute('aria-pressed', 'true');
   renderLedgerCalls();
 });
 function ledFiltered() {
@@ -147,6 +153,12 @@ async function testLedger() {
   } catch (e) { out.textContent = '❌ ' + e.message; }
 }
 async function loadLedger() {
+  /* The 15s interval can fire while a slow run is still
+     awaiting /v1/calls — two interleaved runs wrote
+     LED_ROWS in completion order and the newest-first
+     table could show older data. */
+  if (loadLedger._busy) return;
+  loadLedger._busy = true;
   const out = document.getElementById('led-out');
   try {
     const rows = await fetch('/v1/calls?limit=1000').then(r => r.json());
@@ -204,7 +216,7 @@ async function loadLedger() {
     }).join('') || '<tr><td colspan="7">no calls logged yet</td></tr>';
     document.querySelector('#led-role-table tbody').innerHTML = Object.keys(byR).sort().map((p) => {
       const v = byR[p];
-      return `<tr><td class="prov">${p}</td><td>${v.n}</td>` +
+      return `<tr><td class="prov">${escP(p)}</td><td>${v.n}</td>` +
         `<td class="${v.ok === v.n ? 'ok' : 'warn'}">${v.n ? Math.round(v.ok / v.n * 100) : 0}%</td><td>—</td></tr>`;
     }).join('');
     try {
@@ -212,14 +224,15 @@ async function loadLedger() {
       const tools = tu.tools || [];
       document.getElementById('led-tools').textContent = `${tu.total_uses || 0} uses · ${tu.total_tools || 0} tools`;
       document.querySelector('#led-tool-table tbody').innerHTML = tools.map((t) =>
-        `<tr><td class="prov">${t.tool}</td><td>${t.uses}</td>` +
+        `<tr><td class="prov">${escP(t.tool)}</td><td>${t.uses}</td>` +
         `<td class="${t.errors ? 'warn' : 'ok'}">${t.ok}</td>` +
-        `<td>${(t.providers || []).join(', ') || '—'}</td>` +
-        `<td>${(t.agents || []).join(', ') || '—'}</td>` +
+        `<td>${(t.providers || []).map(escP).join(', ') || '—'}</td>` +
+        `<td>${(t.agents || []).map(escP).join(', ') || '—'}</td>` +
         `<td>${t.last_ts ? new Date(t.last_ts * 1000).toLocaleString() : '—'}</td></tr>`
       ).join('') || '<tr><td colspan="6">no tool completions logged yet — they appear when models call tools</td></tr>';
     } catch (e) {
-      document.querySelector('#led-tool-table tbody').innerHTML = '<tr><td colspan="6">tool usage load failed: ' + e.message + '</td></tr>';
+      document.querySelector('#led-tool-table tbody').innerHTML =
+        '<tr><td colspan="6">tool usage load failed: ' + escH(e.message) + '</td></tr>';
     }
     const escH = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -237,21 +250,29 @@ async function loadLedger() {
     renderLedgerCalls();
     out.textContent = '';
   } catch (e) { out.textContent = 'ledger load failed: ' + e.message; }
+  finally { loadLedger._busy = false; }
 }
 function renderLedgerCalls() {
   const tb = document.querySelector('#led-calls-table tbody');
   const rows = ledFiltered().slice(0, 200);
   tb.innerHTML = rows.map((c) => {
     const dt = new Date(c.ts * 1000).toLocaleTimeString();
-    return `<tr><td>${dt}</td><td>${c.call_role || 'worker'}</td><td class="prov">${c.provider}</td>` +
-      `<td>${c.model}</td><td class="${c.status === 'ok' ? 'ok' : 'err'}">${c.status}</td>` +
+    return `<tr><td>${dt}</td><td>${escH(c.call_role || 'worker')}</td><td class="prov">${escH(c.provider)}</td>` +
+      `<td>${escH(c.model)}</td><td class="${c.status === 'ok' ? 'ok' : 'err'}">${escH(c.status)}</td>` +
       `<td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td><td>${c.latency_ms}ms</td>` +
-      `<td class="err-msg">${c.error || (c.attempted || '—')}</td></tr>`;
+      `<td class="err-msg">${escH(c.error || (c.attempted || '—'))}</td></tr>`;
   }).join('') || '<tr><td colspan="9">no rows match the filters</td></tr>';
 }
 function exportLedgerCSV() {
   const rows = ledFiltered();
-  const q = (x) => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"';
+  /* CSV formula injection: a field starting with = + - @
+     evaluates as a formula when the export is opened in
+     Excel/Sheets — prefix those values with an apostrophe. */
+  const q = (x) => {
+    const s = String(x == null ? '' : x);
+    const safe = /^[=+\-@]/.test(s) ? "'" + s : s;
+    return '"' + safe.replace(/"/g, '""') + '"';
+  };
   const csv = ['ts,time,role,provider,model,status,in,out,latency_ms,error,attempted']
     .concat(rows.map((c) => [c.ts, new Date(c.ts * 1000).toISOString(), c.call_role || 'worker',
       c.provider, c.model, c.status, c.input_tokens || 0, c.output_tokens || 0,

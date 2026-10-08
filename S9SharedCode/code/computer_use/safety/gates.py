@@ -26,11 +26,32 @@ AUDIT_PATH = ROOT / "state" / "computer_use.log"
 AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Patterns that ALWAYS require human approval, even in live mode.
+# Shell/script/interpreter binaries are approval-worthy as SHAPES:
+# any invocation can run arbitrary commands (the token-boundary
+# match plus the literal-phrase fallback below cover their flags
+# and args). Destructive PowerShell cmdlets are hyphenated, so
+# they are single tokens under the boundary rule.
 DEFAULT_APPROVAL_PATTERNS = (
     "rm ", "del ", "format", "mkfs", "shutdown", "reboot", "restart",
     "sudo", "runas", "reg ", "sc delete", "taskkill", "net user",
     "curl ", "wget ", "powershell -enc", "Invoke-WebRequest",
     "kill_app", "rmdir", "rd ", "format ", "diskpart",
+    # Shells and interpreters (arbitrary-command escape hatches).
+    # NB: no bare "sh "/"dd " patterns — the literal-phrase
+    # fallback below does substring matching, so they would
+    # match ordinary words ending in -sh ("push ", "crash ")
+    # and "add ". "sh -c" and the bare "dd" token (boundary-
+    # matched, so "added" can't hit) cover the real shapes.
+    "powershell", "pwsh", "cmd", "bash", "sh -c",
+    "python", "python3", "node", "mshta", "regsvr32",
+    "certutil", "bitsadmin", "schtasks", "takeown", "icacls",
+    "chmod", "chown", "dd", "mklink", "ssh ", "scp ",
+    "xcopy", "robocopy", "move ",
+    # Destructive PowerShell cmdlets.
+    "remove-item", "stop-process", "start-process",
+    "invoke-expression", "invoke-command", "new-item",
+    "set-item", "clear-item", "move-item", "copy-item",
+    "rename-item", "wipe-volume", "format-volume",
 )
 # Paths that are NEVER allowed to be touched (defence in depth).
 DEFAULT_DENY_PATHS = (
@@ -190,6 +211,39 @@ class SafetyGates:
         if self.allow_cmds and not any(a.lower() in c for a in self.allow_cmds):
             return "not on the command allow-list"
         return None
+
+    def record_action(self, action: str, params: dict, outcome: str,
+                      ref: str = "") -> None:
+        """Public audit hook for the dispatch paths (engine, gated
+        shell). Every gated action that actually executed — approved
+        or not — must leave a line: an approval-only log can
+        reconstruct what the agent ASKED about, never what it DID.
+        """
+        self._audit(action, params, outcome, ref=ref)
+
+    def already_approved(self, action: str, params: dict) -> bool:
+        """True when a matching action was approved earlier in this
+        process. Approval is meant to be granted ONCE, after which
+        the action may run; `needs_approval` re-matches the same
+        pattern on every turn and minted a FRESH approval each time,
+        so an approved command was skipped forever — the approval
+        control was a permanent block with a no-op UI. The operand
+        (command / path / app / element / value) is stable across
+        rephrasings, so it carries the match.
+        """
+        with self._lock:
+            for a in self._approvals.values():
+                if a.status != "approved" or a.action != action:
+                    continue
+                if a.params == params:
+                    return True
+                for key in ("command", "path", "app", "element",
+                            "element_index", "value", "name",
+                            "x", "y", "keys"):
+                    if (key in a.params and key in params
+                            and str(a.params[key]) == str(params[key])):
+                        return True
+        return False
 
     # ── approval store ────────────────────────────────────
     def create_approval(self, action: str, params: dict) -> str:

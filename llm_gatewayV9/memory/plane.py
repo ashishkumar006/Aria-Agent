@@ -311,10 +311,21 @@ class MemoryPlane:
         conversation with documents turned off) stops being visible."""
         if not (query or "").strip():
             return []
+        # A request for zero results returns zero results. This used to read
+        # `max(1, min(int(top_k or 8), 100))`, so an explicit `top_k: 0` was
+        # coerced through `0 or 8` to 8 and then floored to 1 - the caller's
+        # "give me nothing" came back with hits. The API layer already passes
+        # 0 through; the plane must honour it rather than re-coerce.
+        try:
+            want = int(top_k if top_k is not None else 8)
+        except (TypeError, ValueError):
+            want = 8
+        if want <= 0:
+            return []
         # Bound the fan-out: absurd top_k values would otherwise multiply
         # into per-drawer fetches (fetch = 2×top_k each). The panel caps at
         # 100; anything above is clamped, never trusted.
-        top_k = max(1, min(int(top_k or 8), 100))
+        top_k = min(want, 100)
         svcs, include_legacy = self._sources(drawers)
         # Phase 2 routing: never touch drawers that were never written (no
         # store file and no vectors) — no JSON parse, no FAISS call. The

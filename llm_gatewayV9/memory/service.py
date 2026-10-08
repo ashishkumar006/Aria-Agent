@@ -150,6 +150,10 @@ class MemoryService:
         self.store = MemoryStore(self.state_dir / "memory.json")
         self._embed = embed_fn
         self._write_lock = threading.Lock()
+        # Serialises index-file writes (and an add vs a persist).
+        # Separate from _write_lock on purpose: see
+        # _persist_embedded. Lock order is always persist → write.
+        self._persist_lock = threading.Lock()
         try:
             self.index: VectorIndex | None = VectorIndex(
                 self.state_dir, expected_dim=expected_dim)
@@ -189,7 +193,12 @@ class MemoryService:
                     self.index.add(item.id, item.embedding)
                 except ValueError as e:
                     print(f"[memory] skipping unindexable item {item.id}: {e}")
-        self.index.persist()
+        # Same persist_lock as _persist_embedded, so a rebuild's
+        # index-file write cannot interleave with a per-record
+        # write (caller already holds _write_lock: order
+        # write → persist, as everywhere else).
+        with self._persist_lock:
+            self.index.persist()
 
     def delete_one(self, memory_id: str):
         """Delete a single record by id. Rebuilds the vector index when the
@@ -206,6 +215,27 @@ class MemoryService:
             with self._write_lock:
                 self._rebuild_locked()
         return removed[0] if removed else None
+
+    def delete_where(self, predicate) -> int:
+        """Delete every record matching `predicate`, rebuilding the index ONCE.
+
+        `delete_one` rebuilds the whole vector index per record, so a caller
+        removing a 40-chunk document one id at a time forced 40 full FAISS
+        rebuilds. Deleting a document while it was still indexing then took 31
+        seconds and took the whole gateway with it - the request thread, the
+        indexer and N rebuilds were all contending on the same write lock, and
+        a port check still reported the process as alive, so health checks
+        believed a dead service was fine.
+
+        One `store.remove` plus at most one rebuild makes this proportional
+        again. Returns the number removed.
+        """
+        removed = self.store.remove(predicate)
+        if removed and self.index is not None and any(
+                r.embedding for r in removed):
+            with self._write_lock:
+                self._rebuild_locked()
+        return len(removed)
 
     def sweep_expired(self) -> int:
         """Delete expired records (working TTL). Rebuilds the index when a
@@ -307,16 +337,49 @@ class MemoryService:
                 f"the lifetime of an index."
             )
 
-    def _persist_embedded(self, item: MemoryRecord) -> MemoryRecord:
-        with self._write_lock:
-            if item.embedding is not None and item.kind in EMBEDDABLE_KINDS:
-                self._check_dim(item.embedding)
-            self.store.append(item)
-            if (item.embedding is not None and item.kind in EMBEDDABLE_KINDS
-                    and self.index is not None):
-                self.index.add(item.id, item.embedding)
-                self.index.persist()
+    def _persist_embedded(self, item: MemoryRecord,
+                          *, persist: bool = True) -> MemoryRecord:
+        # `_write_lock` covers ONLY the in-memory FAISS mutation:
+        # `index.add` is unsafe concurrent with `index.search`, and
+        # search takes the same lock. The store append and the
+        # index-file persist used to run under it too, so every
+        # vector search serialised behind each write's full JSONL
+        # rewrite (the document drawer rewrites every record -
+        # vectors included - once per chunk) and behind the index
+        # file's write. The store guards its own consistency with
+        # its lock; `_persist_lock` keeps two index-file writes
+        # (and an add vs a persist) from interleaving. Lock order
+        # is always persist → write.
+        if item.embedding is not None and item.kind in EMBEDDABLE_KINDS:
+            self._check_dim(item.embedding)
+        self.store.append(item)
+        if (item.embedding is not None and item.kind in EMBEDDABLE_KINDS
+                and self.index is not None):
+            # Lock order is write → persist everywhere (the bulk
+            # rebuild path takes it in this order too), so no
+            # thread ever waits on a lock a persist-only holder
+            # is holding.
+            with self._write_lock:
+                with self._persist_lock:
+                    self.index.add(item.id, item.embedding)
+            # A bulk loader (the document indexer) passes
+            # persist=False and flushes once at the end via
+            # persist_index(): one index-file write instead of
+            # one per record — the ~1370-chunk Bluebook
+            # re-index wrote the whole FAISS file 1370 times.
+            if persist:
+                with self._persist_lock:
+                    self.index.persist()
         return item
+
+    def persist_index(self) -> None:
+        """Flush the in-memory FAISS index to disk. Call once
+        after a bulk `_persist_embedded(..., persist=False)`
+        loop; a no-op when no index is loaded."""
+        if self.index is None:
+            return
+        with self._persist_lock:
+            self.index.persist()
 
     async def remember(self, *, kind: str, descriptor: str,
                        keywords: list[str] | None = None,

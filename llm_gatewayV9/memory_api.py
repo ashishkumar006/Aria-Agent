@@ -17,6 +17,7 @@ State dir: ``state/`` next to this file, overridable via
 from __future__ import annotations
 
 import os
+import re
 import time
 import json
 import threading
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import db
@@ -39,6 +40,7 @@ from documents.registry import (
     # doing their job - and an error handler that raises NameError reports
     # "Internal Server Error" with no cause.
     BLOCKED, CHUNKING, EMBEDDING, FAILED, PARSING, PENDING, READY,
+    INDEX_FORMAT_VERSION,
     EmbedderUnavailable, Indexer, Registry, Document,
 )
 from memory.models import (
@@ -129,13 +131,48 @@ def _docs() -> Registry:
     return _registry
 
 
+# The event loop that owns the embedders' async resources (the shared httpx
+# client, the provider locks). The indexing worker runs on a plain thread, so it
+# must submit coroutines back to THIS loop rather than calling `asyncio.run`,
+# which built a second loop in the worker thread and left the two fighting over
+# the same resources - the gateway's event loop starved and `/health` stopped
+# answering while the listener stayed open, so a port check reported a dead
+# service as healthy.
+_LOOP: "asyncio.AbstractEventLoop | None" = None
+
+
+_DOC_EMBED_TIMEOUT_S = 120.0
+# Largest accepted upload. A 50 MB file was accepted, then took the whole
+# gateway down for 10+ minutes while /health stayed green.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# Search responses ship a bounded preview of each hit's chunk text,
+# not the full chunk (which the chunker caps at 8000 chars). 50 hits
+# × 1500 chars keeps the worst-case payload in the low hundreds of KB
+# instead of the multi-MB responses an unbounded field produced.
+_SEARCH_CHUNK_PREVIEW_CHARS = 1500
+
+
+
+def set_loop(loop: "asyncio.AbstractEventLoop | None") -> None:
+    """Called from the app lifespan. Tests may leave it unset."""
+    global _LOOP
+    _LOOP = loop
+
+
 def _doc_embedder(app_state_embedders) -> "Callable[[list[str]], dict]":
     """Bridge the gateway's batch endpoint for the indexing worker."""
     def _embed(texts: list[str]) -> dict:
         async def _go():
             return await E.embed_batch_with_failover(
                 app_state_embedders, texts, "retrieval_document")
+        loop = _LOOP
         try:
+            if loop is not None and loop.is_running():
+                # Hand the coroutine to the loop that owns the embedders and
+                # block this worker thread on the result. Bounded so a wedged
+                # provider surfaces as an error rather than hanging forever.
+                fut = asyncio.run_coroutine_threadsafe(_go(), loop)
+                return fut.result(timeout=_DOC_EMBED_TIMEOUT_S)
             return asyncio.run(_go())
         except E.EmbedderError as e:
             raise EmbedderUnavailable(str(e)) from e
@@ -147,13 +184,48 @@ def _doc_embedder(app_state_embedders) -> "Callable[[list[str]], dict]":
 def _doc_chunks(reg: Registry, doc: Document) -> list:
     """Re-parse the stored source to get chunk texts, matching the order the
     indexer embedded them. Chunking is deterministic, so index N here is the
-    same chunk that was embedded at index N."""
-    from documents.chunker import chunk_blocks
+    same chunk that was embedded at index N.
+
+    PURE CPU and potentially slow - a 120 KB document spends tens of seconds in
+    `split_sentences`. It used to run inline on the event loop from
+    `documents_detail`, which wedged the entire gateway for that long: every
+    route including the pure `/health` timed out, while the TCP listener stayed
+    open, so a port check reported a dead service as healthy. Confirmed with a
+    live stack dump:
+
+        documents_detail (memory_api.py)
+          _doc_chunks -> chunk_blocks -> _chunk_section -> split_sentences
+
+    Memoised per (doc_id, source size) because the detail route and the indexer
+    ask for the same chunk list repeatedly while a document is indexing.
+    """
+    key = (doc.id, _SOURCE_TOKEN(doc))
+    hit = _CHUNK_CACHE.get(key)
+    if hit is not None:
+        return hit
     data = reg.read_source(doc.id)
     if data is None:
+        _CHUNK_CACHE[key] = []
         return []
+    from documents.chunker import chunk_blocks
     parsed = parsers.parse(doc.filename, data)
-    return chunk_blocks(parsed.blocks)
+    chunks = chunk_blocks(parsed.blocks)
+    if len(_CHUNK_CACHE) >= _CHUNK_CACHE_MAX:
+        _CHUNK_CACHE.clear()
+    _CHUNK_CACHE[key] = chunks
+    return chunks
+
+
+def _SOURCE_TOKEN(doc: Document) -> int:
+    """Cheap identity for a document's source bytes."""
+    try:
+        return len(doc.filename) + int(getattr(doc, "size_bytes", 0) or 0)
+    except Exception:                               # noqa: BLE001
+        return 0
+
+
+_CHUNK_CACHE: dict[tuple, list] = {}
+_CHUNK_CACHE_MAX = 8
 
 
 class _PlaneIndexer(Indexer):
@@ -212,14 +284,30 @@ class _PlaneIndexer(Indexer):
         existing = {r.value.get("chunk_index"): r
                     for r in svc.store.load()
                     if (r.doc and r.doc.doc_id == doc_id)}
+        # Overwrite on re-index rather than append, so a resumed run that
+        # re-does one batch does not duplicate those chunks. The window's
+        # prior records go in ONE pass: `delete_one` rebuilds the whole
+        # vector index per record, so a 40-chunk batch forced 40 full
+        # rebuilds, and a 1370-chunk document spent most of its index
+        # time rebuilding instead of embedding.
+        doomed = [existing[idx].id for idx in indices if idx in existing]
+        if doomed:
+            svc.delete_where(
+                lambda i, _d=set(doomed): i.id in _d)
+        self.registry.set_status(doc_id, EMBEDDING)
+        stored = skipped_none = skipped_bounds = 0
         for idx, vec in zip(indices, vectors):
-            if vec is None or idx >= len(chunks):
+            if vec is None:
+                skipped_none += 1
+                continue
+            if idx >= len(chunks):
+                # `run`'s `ok` list marks these embedded (it has no
+                # bounds check) while this loop skips them - the one
+                # path that can leave the registry claiming chunks the
+                # drawer never received. Count them loudly.
+                skipped_bounds += 1
                 continue
             c = chunks[idx]
-            prior = existing.get(idx)
-            if prior is not None:
-                svc.delete_one(prior.id)
-            self.registry.set_status(doc_id, EMBEDDING)
             rec = MemoryRecord(
                 id=f"mem:doc-{doc_id}-{idx}",
                 kind="fact",
@@ -237,13 +325,30 @@ class _PlaneIndexer(Indexer):
                 embed_dim=len(vec) if vec else None,
                 principal=Principal(id="indexer", role="indexer"),
             )
-            svc._persist_embedded(rec)
+            svc._persist_embedded(rec, persist=False)
+            stored += 1
+        if stored:
+            # One index-file write for the whole batch instead
+            # of one per chunk.
+            svc.persist_index()
+        if skipped_none or skipped_bounds or stored != len(indices):
+            print(f"[index] {doc_id} batch {indices[0]}-{indices[-1]}: "
+                  f"stored={stored} skipped_none={skipped_none} "
+                  f"skipped_bounds={skipped_bounds} "
+                  f"chunks={len(chunks)} vectors={len(vectors)}",
+                  flush=True)
 
 
 _doc_jobs: dict[str, threading.Thread] = {}
 # Per-document generation counter. A worker whose generation is stale has been
 # superseded by a reindex and must abandon its work - see `_start_index`.
 _doc_generation: dict[str, int] = {}
+# One document indexes at a time. `_doc_jobs` is keyed per document, so the
+# "one document at a time" promise was never enforced: N concurrent uploads
+# launched N indexers that all drove the shared embedder at once, every batch
+# slowed and gateway latency spiked. The lock is held inside the worker
+# thread, so request threads never block on it.
+_DOC_SERIAL_LOCK = threading.Lock()
 # How long a reindex waits for the in-flight worker to notice it was superseded.
 # Long enough for one embed batch (a batch yields between calls), short enough
 # that the request does not hang.
@@ -276,6 +381,15 @@ def _start_index(request: Request, doc_id: str) -> None:
     gen = _doc_generation[doc_id]
 
     def _work():
+        # Queue behind any in-flight document indexer. The wait is
+        # polled (not a bare acquire) so a worker superseded while
+        # queued exits instead of running a full parse it will then
+        # abandon on its first batch.
+        while True:
+            if _doc_generation.get(doc_id) != gen:
+                return
+            if _DOC_SERIAL_LOCK.acquire(timeout=2.0):
+                break
         try:
             _PlaneIndexer(reg, plane,
                           _doc_embedder(request.app.state.embedders),
@@ -286,34 +400,190 @@ def _start_index(request: Request, doc_id: str) -> None:
             # now; do not stamp a terminal state over it.
             return
         except Exception as e:                      # noqa: BLE001
+            # A worker that dies here used to be silent: the document sat
+            # at whatever status it had, with no trace of why. Print
+            # before the (possibly suppressed) FAILED stamp.
+            print(f"[index] {doc_id} worker failed: {type(e).__name__}: "
+                  f"{e}", flush=True)
             if _doc_generation.get(doc_id) != gen:
                 return
             reg.set_status(doc_id, FAILED, str(e)[:200])
+        finally:
+            _DOC_SERIAL_LOCK.release()
 
     t = threading.Thread(target=_work, daemon=True)
     _doc_jobs[doc_id] = t
     t.start()
 
 
+# ── registry ↔ drawer reconciliation ──────────────────────────────────
+# The registry's `embedded_indices`/`chunk_count` record what WAS
+# embedded; the plane's document drawer holds what IS recallable.
+# Anything that clears the drawer without touching the registry (an
+# unscoped memory wipe, a state wipe, a manual edit) leaves documents
+# marked `ready`/`enabled` with zero recallable chunks, and because
+# `pending_indices()` reads the registry, a re-drive is a no-op that
+# never re-stores anything: search silently returns nothing forever.
+# The check below compares the drawer's live record count per document
+# against the registry's `chunk_count` and, on a shortfall, resets the
+# document to `pending` (embedded state zeroed) and re-drives the
+# indexer, which re-parses and re-stores every chunk. `enabled` is left
+# untouched so the document comes back online by itself once the
+# re-index reaches `ready` (`enabled_ids()` requires READY, so it can
+# never serve the half-embedded window in between).
+#
+# This runs on EVERY document API request, not once per process: the
+# drift it heals appears mid-process too. An unscoped `DELETE
+# /v1/memory?confirm=wipe` - which a test suite once sent against a
+# live gateway - emptied every drawer while the registry still said
+# ready/1370-embedded, and the once-per-process guard had already
+# fired, so nothing noticed until a user searched. The check is one
+# store load (cached on (mtime, size), so free when nothing wrote in
+# between) plus an O(records) count.
+# Statuses in which an indexer may legitimately be mid-flight. A
+# shortfall there is work in progress, not drift.
+_INDEXING_STATUSES = {PARSING, CHUNKING, EMBEDDING}
+
+
+def _reconcile_registry_with_plane(request: Request) -> None:
+    """Heal registry ↔ document-drawer drift. Cheap enough to run
+    per request: one cached store load, one O(records) count."""
+    try:
+        reg = _docs()
+        svc = _plane(request).drawers["document"]
+        live: dict[str, int] = {}
+        for r in svc.store.load():
+            if r.doc and r.doc.doc_id:
+                live[r.doc.doc_id] = live.get(r.doc.doc_id, 0) + 1
+        jobs = _doc_jobs
+        for doc in reg.list():
+            if doc.index_version != INDEX_FORMAT_VERSION:
+                if doc.id in jobs and jobs[doc.id].is_alive():
+                    # An indexer owns this document; its run()
+                    # stamps the current format version when it
+                    # records the chunk count. Resetting
+                    # underneath it would restart the parse on
+                    # every request.
+                    continue
+                # Its chunks were embedded under an older
+                # parser/chunker, so the stored chunk list no
+                # longer matches a fresh parse. `Indexer.run`
+                # resets the registry on the mismatch but knows
+                # nothing about the plane, so the old records
+                # would survive as orphans; clear them here,
+                # where both systems are in reach.
+                print(f"[documents] {doc.id} ({doc.filename}): "
+                      f"indexed under parser format "
+                      f"{doc.index_version}, current is "
+                      f"{INDEX_FORMAT_VERSION} - re-indexing")
+                try:
+                    svc.delete_where(
+                        lambda r, _id=doc.id: bool(
+                            r.doc and r.doc.doc_id == _id))
+                except Exception as e:               # noqa: BLE001
+                    print(f"[documents] could not clear stale "
+                          f"chunks for {doc.id}: {e!r}")
+                reg.update(doc.id, chunk_count=0, embedded_indices=[],
+                           embedded_count=0, status=PENDING, error="")
+                _start_index(request, doc.id)
+                continue
+            if doc.status in _INDEXING_STATUSES:
+                # Resume a document whose indexer died with its
+                # process: an indexing status with no live worker
+                # means a crash left it there, and nothing else
+                # would ever re-drive it (the registry's
+                # `pending_indices` make the re-run idempotent).
+                if doc.id not in jobs or not jobs[doc.id].is_alive():
+                    print(f"[documents] {doc.id} ({doc.filename}): "
+                          f"status {doc.status} with no live indexer "
+                          f"- resuming")
+                    _start_index(request, doc.id)
+                continue  # an indexer owns this document right now
+            # Only a READY document can claim chunks the drawer does
+            # not hold. A failed or blocked document is simply not
+            # done; re-driving it here would loop (parse fails,
+            # reset, parse fails...) on every request. Its healing
+            # path is the manual re-index button.
+            if doc.status != READY:
+                continue
+            have = live.get(doc.id, 0)
+            if doc.chunk_count and have < doc.chunk_count:
+                print(f"[documents] {doc.id} ({doc.filename}): registry "
+                      f"claims {doc.chunk_count} chunks but the document "
+                      f"drawer holds {have} — resetting and re-indexing")
+                reg.update(doc.id, chunk_count=0, embedded_indices=[],
+                           embedded_count=0, status=PENDING, error="")
+                _start_index(request, doc.id)
+    except Exception as e:                           # noqa: BLE001
+        print(f"[documents] reconciliation failed: {e!r}")
+
+
 @_doc_router.get("/v1/documents")
-async def documents_list():
+async def documents_list(request: Request):
+    # The reconcile can retire a live indexer, and retirement
+    # joins the worker thread (bounded, but up to 30s). That
+    # must not run ON the event loop - it blocked every route
+    # in the gateway, /health included, for the whole join.
+    await asyncio.to_thread(_reconcile_registry_with_plane, request)
     return {"documents": [d.to_dict() for d in _docs().list()]}
 
 
 @_doc_router.post("/v1/documents")
 async def documents_upload(request: Request):
-    """Accept an upload. No size cap: pacing the indexing worker is what
-    protects the shared embedding model, not a limit."""
-    form = await request.form()
+    """Accept an upload.
+
+    Size-capped: a 50 MB upload used to be accepted, then wedged the gateway
+    for 10+ minutes while `/health` stayed green - the parse ran the request
+    off the loop only after the whole body was already buffered, and the
+    listener eventually disappeared while the process stayed alive. The cap is
+    named in the 413 body so the caller knows exactly which limit it hit.
+    """
+    # The reconcile can retire a live indexer, and retirement
+    # joins the worker thread (bounded, but up to 30s). That
+    # must not run ON the event loop - it blocked every route
+    # in the gateway, /health included, for the whole join.
+    await asyncio.to_thread(_reconcile_registry_with_plane, request)
+    try:
+        form = await request.form()
+    except Exception as e:
+        # A malformed multipart body (a part header past python-
+        # multipart's ~4KB cap — a ~5KB FILENAME was enough)
+        # raised out of request.form() as an unhandled exception:
+        # a bare 500 on the upload path. It is a client error.
+        return JSONResponse(status_code=400, content={
+            "error": f"malformed multipart body: {type(e).__name__}"})
     up = form.get("file")
     if up is None or not hasattr(up, "filename"):
         return JSONResponse(status_code=400,
                             content={"error": "a file part is required"})
+    # The client-supplied filename is persisted verbatim and echoed
+    # by every listing: strip any directory component (a "../evil"
+    # name was stored as-is) and control characters, and cap the
+    # length so it can never blow a URL or header limit.
     name = str(getattr(up, "filename", "") or "upload.bin")
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(c for c in name
+                   if ord(c) >= 0x20 and ord(c) != 0x7f).strip()
+    name = name.lstrip(".") or "upload"
+    # Cap the STEM, not the whole name: `name[:200]` cut mid-extension,
+    # so a valid 201-char "report.txt" was detected as ".tx" and rejected
+    # with a file-TYPE error for what is really a name-length problem.
+    if len(name) > 200:
+        stem, dot, ext = name.rpartition(".")
+        if dot and 0 < len(ext) <= 12:
+            keep = 200 - len(dot) - len(ext)
+            name = (stem[:max(1, keep)] if len(stem) > keep else stem) + dot + ext
+        else:
+            name = name[:200]
     data = await up.read()
     if not data:
         return JSONResponse(status_code=400,
                             content={"error": "the uploaded file is empty"})
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(status_code=413, content={
+            "error": f"file is {len(data)} bytes; limit is {MAX_UPLOAD_BYTES} "
+                     f"({MAX_UPLOAD_BYTES // (1024 * 1024)} MB). Split the "
+                     f"document or raise the limit server-side."})
     try:
         kind = parsers.detect_type(name)
     except parsers.UnsupportedDocument as e:
@@ -321,12 +591,19 @@ async def documents_upload(request: Request):
     reg = _docs()
     doc = reg.add(filename=name, doc_type=kind, size_bytes=len(data))
     reg.write_source(doc.id, data)
-    _start_index(request, doc.id)
+    # Off the event loop: _start_index joins any in-flight
+    # indexer for this document (bounded, but up to 30s).
+    await asyncio.to_thread(_start_index, request, doc.id)
     return {"document": reg.get(doc.id).to_dict()}
 
 
 @_doc_router.get("/v1/documents/{doc_id}")
 async def documents_detail(doc_id: str, request: Request):
+    # The reconcile can retire a live indexer, and retirement
+    # joins the worker thread (bounded, but up to 30s). That
+    # must not run ON the event loop - it blocked every route
+    # in the gateway, /health included, for the whole join.
+    await asyncio.to_thread(_reconcile_registry_with_plane, request)
     reg = _docs()
     doc = reg.get(doc_id)
     if doc is None:
@@ -334,24 +611,103 @@ async def documents_detail(doc_id: str, request: Request):
                             content={"error": f"no such document {doc_id}"})
     out = doc.to_dict()
     # Chunk previews let the console show what was actually indexed, and a
-    # test-search box can use the same source.
+    # test-search box can use the same source. Re-parsing is tens of seconds on
+    # a large document, so it runs in a thread: inline on the event loop it
+    # blocked every route in the gateway, `/health` included, while the listener
+    # stayed open and health checks kept reporting success.
     try:
-        chunks = _doc_chunks(reg, doc)
+        chunks = await asyncio.to_thread(_doc_chunks, reg, doc)
     except Exception as e:                          # noqa: BLE001
         chunks = []
         out["chunk_error"] = str(e)[:200]
+    embedded = set(doc.embedded_indices)
     out["chunks"] = [
         {"index": i, "kind": c.kind, "heading_path": list(c.heading_path),
          "page": c.page, "words": len(c.text.split()),
-         "embedded": i in set(doc.embedded_indices),
+         "embedded": i in embedded,
          "preview": c.text[:400]}
         for i, c in enumerate(chunks)]
     return {"document": out}
 
 
+# Upload media types the console's inline preview can hand to the
+# browser's native viewer. Anything unmapped still serves, just as
+# an opaque download.
+_SOURCE_CONTENT_TYPES = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "md": "text/markdown",
+    "markdown": "text/markdown",
+    "txt": "text/plain",
+    "text": "text/plain",
+    "log": "text/plain",
+    "html": "text/html",
+    "htm": "text/html",
+    "csv": "text/csv",
+    "tsv": "text/tab-separated-values",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+}
+
+
+@_doc_router.get("/v1/documents/{doc_id}/source")
+async def documents_source(doc_id: str, request: Request):
+    """Serve the stored upload bytes for the console's preview.
+
+    The registry keeps every upload as `{doc_id}.source` next to the
+    registry file; this route hands those bytes back with the upload's
+    original media type, so the console can render the file inline
+    instead of only showing its chunks. `Range` is honoured so a viewer
+    can stream a large file instead of buffering it whole; a request
+    without one gets the full body.
+    """
+    reg = _docs()
+    doc = reg.get(doc_id)
+    if doc is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"no such document {doc_id}"})
+    path = reg.source_path(doc_id)
+    if path is None or not path.is_file():
+        return JSONResponse(status_code=404,
+                            content={"error": "source file is missing"})
+    size = path.stat().st_size
+    ctype = _SOURCE_CONTENT_TYPES.get(doc.doc_type, "application/octet-stream")
+    rng = (request.headers.get("range") or "").strip()
+    if rng.startswith("bytes="):
+        m = re.fullmatch(r"(\d*)-(\d*)", rng[6:].strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                # `bytes=N-` (open-ended) or `bytes=N-M`.
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else size - 1
+            else:
+                # `bytes=-N`: the last N bytes, a suffix range.
+                start = max(0, size - int(m.group(2)))
+                end = size - 1
+            if 0 <= start <= end < size:
+                def _slice(path=path, start=start, end=end):
+                    with path.open("rb") as f:
+                        f.seek(start)
+                        return f.read(end - start + 1)
+                data = await asyncio.to_thread(_slice)
+                return Response(content=data, status_code=206,
+                                media_type=ctype, headers={
+                                    "Content-Range": f"bytes {start}-{end}/{size}",
+                                    "Accept-Ranges": "bytes",
+                                })
+    data = await asyncio.to_thread(path.read_bytes)
+    return Response(content=data, media_type=ctype,
+                    headers={"Accept-Ranges": "bytes"})
+
+
 @_doc_router.post("/v1/documents/{doc_id}/enabled")
 async def documents_set_enabled(doc_id: str, request: Request):
     """Enable/disable. Refuses to enable anything not fully embedded."""
+    # The reconcile can retire a live indexer, and retirement
+    # joins the worker thread (bounded, but up to 30s). That
+    # must not run ON the event loop - it blocked every route
+    # in the gateway, /health included, for the whole join.
+    await asyncio.to_thread(_reconcile_registry_with_plane, request)
     try:
         body = await request.json()
     except Exception:
@@ -372,24 +728,50 @@ async def documents_set_enabled(doc_id: str, request: Request):
     return {"document": doc.to_dict()}
 
 
+def _retire_index(doc_id: str) -> None:
+    """Stop any in-flight indexer for this document and wait for it to notice.
+
+    Bumping the generation makes the worker's between-batch check raise
+    `_IndexSuperseded`, so it abandons its stale work instead of continuing to
+    write chunks against state that is being torn down. The join is bounded so
+    a wedged worker cannot hold up the caller's request.
+    """
+    job = _doc_jobs.get(doc_id)
+    _doc_generation[doc_id] = _doc_generation.get(doc_id, 0) + 1
+    if job is not None and job.is_alive():
+        job.join(timeout=5.0)
+
+
 @_doc_router.post("/v1/documents/{doc_id}/reindex")
 async def documents_reindex(doc_id: str, request: Request):
+    # The reconcile can retire a live indexer, and retirement
+    # joins the worker thread (bounded, but up to 30s). That
+    # must not run ON the event loop - it blocked every route
+    # in the gateway, /health included, for the whole join.
+    await asyncio.to_thread(_reconcile_registry_with_plane, request)
     reg = _docs()
     doc = reg.get(doc_id)
     if doc is None:
         return JSONResponse(status_code=404,
                             content={"error": f"no such document {doc_id}"})
-    # Drop chunk records so the next index writes them cleanly.
+    # Retire any in-flight indexer before clearing state, for the same reason as
+    # delete: a worker holding a pre-delta work list would otherwise keep writing
+    # against a `chunk_count` that no longer exists.
+    # Off the event loop: the join inside is bounded but real.
+    await asyncio.to_thread(_retire_index, doc_id)
+    # Drop chunk records so the next index writes them cleanly. One pass and one
+    # index rebuild rather than one full rebuild per chunk.
     try:
         svc = _plane(request).drawers["document"]
-        for r in list(svc.store.load()):
-            if r.doc and r.doc.doc_id == doc_id:
-                svc.delete_one(r.id)
+        svc.delete_where(
+            lambda r: bool(r.doc and r.doc.doc_id == doc_id))
     except Exception:                               # noqa: BLE001
         pass
-    reg.update(doc_id, chunk_count=0, embedded_indices=[], embedded_count=0,
-               status=PENDING, error="")
-    _start_index(request, doc_id)
+    reg.update(doc_id, chunk_count=0, embedded_indices=[],
+               embedded_count=0, status=PENDING, error="")
+    # Off the event loop: _start_index joins any in-flight
+    # indexer for this document (bounded, but up to 30s).
+    await asyncio.to_thread(_start_index, request, doc_id)
     return {"document": reg.get(doc_id).to_dict()}
 
 
@@ -399,13 +781,24 @@ async def documents_delete(doc_id: str, request: Request):
     if reg.get(doc_id) is None:
         return JSONResponse(status_code=404,
                             content={"error": f"no such document {doc_id}"})
+    # Retire any in-flight indexer BEFORE deleting. It writes this document's
+    # chunks from a work list it built earlier, so deleting underneath it left
+    # orphans re-persisted after the delete had already returned 200 - retrieval
+    # then kept serving a document that no longer existed.
+    # Off the event loop: the join inside is bounded but real.
+    await asyncio.to_thread(_retire_index, doc_id)
     try:
         svc = _plane(request).drawers["document"]
-        for r in list(svc.store.load()):
-            if r.doc and r.doc.doc_id == doc_id:
-                svc.delete_one(r.id)
-    except Exception:                               # noqa: BLE001
-        pass
+        # One pass, one index rebuild. This used to call `delete_one` per chunk
+        # and each call rebuilt the entire vector index, so a 40-chunk document
+        # meant 40 FAISS rebuilds while an indexer was writing - a 31s block
+        # that left the gateway wedged and still passing port-based health
+        # checks.
+        svc.delete_where(
+            lambda r: bool(r.doc and r.doc.doc_id == doc_id))
+    except Exception as e:                           # noqa: BLE001
+        return JSONResponse(status_code=502, content={
+            "error": f"could not delete document chunks: {e}"[:200]})
     reg.delete(doc_id)
     return {"status": "ok", "id": doc_id}
 
@@ -413,13 +806,20 @@ async def documents_delete(doc_id: str, request: Request):
 def _document_hit_payload(h, reg) -> dict:
     """Shape one retrieval hit for the response, with its provenance.
 
-    Split out of the route so the field mapping is directly testable - the page
-    bug below survived because this was anonymous code inside a handler that the
+    Split out of the route so the field mapping is directly testable - the
+    page bug below survived because this was anonymous code inside a handler that the
     suite called only with prose documents, which have no page to report.
+
+    Bounded: `chunk` carried the FULL chunk text (up to 8000 chars each),
+    so a 50-hit response shipped megabytes - 8.68 MB observed live - for
+    an endpoint whose callers only verify provenance. The console and the
+    chat path (which reads the plane directly, not this payload) are
+    unaffected; full text stays available per chunk via the detail route.
     """
     doc_id = h.doc.doc_id if h.doc else ""
     doc = reg.get(doc_id) if doc_id else None
     value = h.value or {}
+    heading = value.get("heading_path") or []
     return {
         "id": h.id, "doc_id": doc_id,
         # Without the filename a chat answer quoting a chunk cannot say WHICH
@@ -431,8 +831,9 @@ def _document_hit_payload(h, reg) -> dict:
         # `hasattr(h, "page")` was always False and every hit reported
         # `page: null` - a citation with no page number on a paged source.
         "page": value.get("page", getattr(h, "page", None)),
-        "heading_path": value.get("heading_path") or [],
-        "descriptor": h.descriptor, "chunk": value.get("chunk", ""),
+        "heading_path": [str(x)[:120] for x in heading[:8]],
+        "descriptor": (h.descriptor or "")[:200],
+        "chunk": (value.get("chunk", "") or "")[:_SEARCH_CHUNK_PREVIEW_CHARS],
         "embed_model": h.embed_model,
     }
 
@@ -454,20 +855,44 @@ async def documents_search(request: Request):
     q = str(body.get("query") or "").strip()
     if not q:
         return JSONResponse(status_code=400, content={"error": "query required"})
+    # The reconcile can retire a live indexer, and retirement
+    # joins the worker thread (bounded, but up to 30s). That
+    # must not run ON the event loop - it blocked every route
+    # in the gateway, /health included, for the whole join.
+    await asyncio.to_thread(_reconcile_registry_with_plane, request)
+    # `body.get("top_k") or 8` treated an explicit 0 as absent and answered a
+    # request for no results with EIGHT - `top_k: 0` returned 8 hits on a live
+    # 260-chunk document. The count must be monotone non-decreasing in k, and
+    # k=0 must mean zero.
+    raw_k = body.get("top_k")
+    if raw_k is None:
+        raw_k = 8
     try:
-        top_k = max(1, min(int(body.get("top_k") or 8), 50))
+        top_k = max(0, min(int(raw_k), 50))
     except (TypeError, ValueError):
         top_k = 8
-    enabled = body.get("doc_ids")
-    if enabled is None:
-        enabled = _docs().enabled_ids()
-    elif not isinstance(enabled, list):
-        return JSONResponse(status_code=400,
-                            content={"error": "doc_ids must be an array"})
+    # `doc_ids` scopes the search but must never EXPAND it past what the user
+    # enabled. It used to replace the enabled set outright, so passing
+    # `doc_ids=[disabled]` returned that document's full content - a caller
+    # with a scope allowlist (including the agent's own conversation scope)
+    # could read documents the user had switched off, while the endpoint's own
+    # docstring promised "retrieval-only search over ENABLED documents".
+    allowed = set(_docs().enabled_ids())
+    if body.get("doc_ids") is not None:
+        if not isinstance(body.get("doc_ids"), list):
+            return JSONResponse(status_code=400,
+                                content={"error": "doc_ids must be an array"})
+        allowed &= set(body["doc_ids"])
     hits = await _plane(request).search(
-        q, drawers=["document"], top_k=top_k, doc_ids=set(enabled))
+        q, drawers=["document"], top_k=top_k, doc_ids=allowed)
     reg = _docs()
-    return {"hits": [_document_hit_payload(h, reg) for h in hits]}
+    # One registry read per response: Registry.get re-reads and
+    # re-scans documents.json on every call, so shaping N hits
+    # cost N full file reads for at most a handful of distinct
+    # documents. A dict exposes the same .get(doc_id) interface
+    # the payload shaper already uses.
+    by_id = {d.id: d for d in reg.list()}
+    return {"hits": [_document_hit_payload(h, by_id) for h in hits]}
 
 
 def _value_depth(obj, limit: int = MAX_VALUE_DEPTH, _d: int = 0) -> int:
@@ -607,6 +1032,13 @@ async def memory_search(req: SearchRequest, request: Request):
 async def memory_remember(req: RememberRequest, request: Request):
     plane = _plane(request)
     t0 = time.time()
+    if not (req.descriptor or "").strip():
+        # The agent route rejects an empty descriptor; the gateway
+        # accepted it and stored an empty-fact record the Memory
+        # panel then showed as a blank row.
+        _log_mem("remember", t0, status="error",
+                 error="empty descriptor", prompt_chars=0)
+        raise HTTPException(400, "descriptor is required")
     if _value_depth(req.value) > MAX_VALUE_DEPTH:
         # pydantic's serialiser raises "Circular reference detected (depth
         # exceeded)" past ~100 levels. That ValueError was reported as

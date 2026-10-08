@@ -62,6 +62,15 @@
     } catch (e) { out.textContent = '❌ ' + e.message; }
   }
 
+  async function deleteJob(sid) {
+    const out = document.getElementById('job-out');
+    try {
+      const d = await fetch('/api/schedule/' + encodeURIComponent(sid) + '?hard=true', {method: 'DELETE'}).then((r) => r.json());
+      out.textContent = d.status === 'ok' ? `deleted ${sid}` : JSON.stringify(d).slice(0, 160);
+      loadJobs();
+    } catch (e) { out.textContent = '❌ ' + e.message; }
+  }
+
   async function loadJobs() {
     const box = document.getElementById('jobs');
     const tb = document.querySelector('#job-table tbody');
@@ -103,7 +112,8 @@
         `<td><span class="cron">${esc(j.when || '')}</span></td>` +
         `<td class="num" style="text-align:left;">${esc(fmtFire(j.next_fire))}</td>` +
         `<td><span class="pill ${j.enabled ? 'ok' : 'muted'}">${j.enabled ? 'active' : 'off'}</span></td>` +
-        `<td class="num">${j.enabled ? `<button class="icon-btn danger" onclick="cancelJob('${esc(j.id)}')" title="Cancel">✕</button>` : ''}</td></tr>`
+        `<td class="num">${j.enabled ? `<button class="icon-btn danger" onclick="cancelJob('${esc(j.id)}')" title="Cancel (pause)">✕</button>` : ''}` +
+        `<button class="icon-btn danger" onclick="deleteJob('${esc(j.id)}')" title="Delete permanently">🗑</button></td></tr>`
       ).join('') || '<tr><td colspan="5"><div class="empty"><span class="e-ico">◷</span><div class="e-t">No jobs</div></div></td></tr>';
     } catch (e) {
       box.innerHTML = '<div class="empty"><span class="e-ico">⚠</span><div class="e-t">Scheduler unavailable</div></div>';
@@ -117,6 +127,7 @@
   window.loadJobs = loadJobs;
   window.createJob = createJob;
   window.cancelJob = cancelJob;
+  window.deleteJob = deleteJob;
   health();
   loadJobs();
   setInterval(health, 15000);

@@ -74,11 +74,40 @@ class TestRunToolLoop:
         stall = {"text": "", "tool_calls": [_tc("verify_result")],
                  "provider": "f"}
         chat = _Script([stall])
+        # A FAILING tool is a genuine stall and must still abort.
+        async def _boom(name, args):
+            dispatched.append((name, args))
+            raise RuntimeError("nope")
+
         out = asyncio.run(mr.run_tool_loop(
-            messages=[], chat_fn=chat, dispatch_fn=_dispatch))
+            messages=[], chat_fn=chat, dispatch_fn=_boom))
         assert "error" in out and "verifier stall" in out["error"]
         assert len(dispatched) == mr.MAX_SAME_CALL_REPEATS
         assert chat.calls == mr.MAX_SAME_CALL_REPEATS + 1
+
+    def test_repeating_a_successful_call_keeps_the_result(self):
+        """Not a stall: the model already has what it needs.
+
+        Observed live - render_document returned 200 and stored the PDF, the
+        model called it again unchanged, and the old guard aborted the loop.
+        The node then died holding a real document and the receipt reported
+        nothing. Repeating a call that succeeded must stop the loop quietly and
+        keep the result.
+        """
+        dispatched: list = []
+
+        async def _dispatch(name, args):
+            dispatched.append((name, args))
+            return "rendered ok"
+
+        stall = {"text": "", "tool_calls": [_tc("render_document")],
+                 "provider": "f"}
+        chat = _Script([stall])
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=chat, dispatch_fn=_dispatch))
+        assert "error" not in out, out
+        assert "already-successful" in (out.get("note") or "")
+        assert len(dispatched) <= mr.MAX_SAME_CALL_REPEATS + 1
 
     def test_varying_args_do_not_trip_stall(self):
         """Pagination-style varying args must keep working."""
@@ -143,8 +172,11 @@ class TestRunToolLoop:
             messages=[], chat_fn=chat, dispatch_fn=_dispatch,
             on_event=lambda k, p: events.append((k, p))))
         assert out["text"] == "here you go"
-        assert events == [("tool_call", {"name": "web_search"}),
-                          ("tool_result", {"name": "web_search", "ok": True})]
+        assert events == [("tool_call", {"name": "web_search",
+                                          "arguments": {}}),
+                          ("tool_result", {"name": "web_search",
+                                            "ok": True,
+                                            "result": "tool-result"})]
 
     def test_on_event_survives_callback_error(self):
         """A broken progress callback must never break the tool loop —

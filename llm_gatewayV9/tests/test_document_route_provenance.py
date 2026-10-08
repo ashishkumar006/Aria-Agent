@@ -174,6 +174,11 @@ def test_parse_pdf_sets_page_on_every_table_block(monkeypatch):
     import documents.parsers as P
 
     class _Page:
+        # The ruled-table path only runs where the page carries
+        # ruling lines; a mock without them is a prose page.
+        lines = [object()] * 10
+        rects: list = []
+
         def extract_tables(self, settings):
             # The header must win the "row with the most short cells" heuristic,
             # so the data rows carry at least one blank cell and the header is
@@ -198,5 +203,5 @@ def test_parse_pdf_sets_page_on_every_table_block(monkeypatch):
 
     import pdfplumber
     monkeypatch.setattr(pdfplumber, "open", lambda *a, **k: _PDF())
-    blocks, _warn = P._pdf_table_blocks(b"%PDF-1.4 fake")
+    blocks, _pages, _warn = P._pdf_table_blocks(b"%PDF-1.4 fake")
     assert [b.page for b in blocks] == [1, 2], [b.page for b in blocks]

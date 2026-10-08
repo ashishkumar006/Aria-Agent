@@ -185,7 +185,15 @@ def test_a_prefix_of_the_token_is_refused():
                      headers={"X-Aria-Token": auth._token[:8]}).status_code == 403
 
 
-def test_the_correct_token_is_accepted():
+def test_the_correct_token_is_accepted(monkeypatch):
+    # The route proxies to the live gateway, which now needs its own token.
+    # These are agent-auth tests, not gateway-integration tests, so the proxy
+    # is stubbed: otherwise the assertion below tests the gateway's mood, not
+    # the agent's auth layer.
+    async def _docs_ok(*a, **k):
+        return {"documents": []}
+
+    monkeypatch.setattr(agent_server, "_gw_json", _docs_ok)
     with token_on() as c:
         r = c.get("/api/documents", headers={"X-Aria-Token": auth._token})
         assert r.status_code == 200, r.text
@@ -203,10 +211,15 @@ def test_a_cross_origin_post_with_a_valid_token_is_still_refused():
         assert "cross-origin" in r.json()["error"]
 
 
-def test_a_cross_origin_get_with_a_valid_token_is_allowed():
+def test_a_cross_origin_get_with_a_valid_token_is_allowed(monkeypatch):
     """The origin check targets writes. A cross-origin GET cannot exfiltrate
     anything, because the response body is unreadable without CORS - so
     blocking it would only break things."""
+
+    async def _docs_ok(*a, **k):
+        return {"documents": []}
+
+    monkeypatch.setattr(agent_server, "_gw_json", _docs_ok)
     with token_on() as c:
         r = c.get("/api/documents", headers={"X-Aria-Token": auth._token,
                                              "Origin": "https://elsewhere"})
@@ -238,3 +251,85 @@ def test_enforcement_does_not_leak_into_the_next_test():
     with token_on():
         pass
     assert auth.is_enabled() is False
+
+
+# ── prefab iframe pass ────────────────────────────────────────────────
+# The prefab view is embedded as an <iframe src>: a browser
+# navigation cannot carry the custom header, so the view needs
+# its own narrow door. These tests are the contract on it.
+
+def test_prefab_pass_round_trips():
+    auth.configure(force=True)
+    try:
+        exp, sig = auth.prefab_pass("my-app")
+        assert exp > 0 and sig
+        assert auth.valid_prefab_pass(
+            "/api/apps/my-app/prefab",
+            {"t": sig, "exp": str(exp)})
+        # A pass minted for one board must not open another's view.
+        assert not auth.valid_prefab_pass(
+            "/api/apps/other/prefab",
+            {"t": sig, "exp": str(exp)})
+        # A forged signature.
+        assert not auth.valid_prefab_pass(
+            "/api/apps/my-app/prefab",
+            {"t": "deadbeef", "exp": str(exp)})
+        # Missing parameters.
+        assert not auth.valid_prefab_pass(
+            "/api/apps/my-app/prefab", {})
+        # Not the prefab path.
+        assert not auth.valid_prefab_pass(
+            "/api/apps/my-app", {"t": sig, "exp": str(exp)})
+    finally:
+        auth.disable()
+
+
+def test_prefab_pass_expires():
+    auth.configure(force=True)
+    try:
+        exp, sig = auth.prefab_pass("my-app", ttl_s=-1)
+        assert not auth.valid_prefab_pass(
+            "/api/apps/my-app/prefab",
+            {"t": sig, "exp": str(exp)})
+    finally:
+        auth.disable()
+
+
+def test_prefab_pass_path_traversal_is_not_an_app_id():
+    auth.configure(force=True)
+    try:
+        exp, sig = auth.prefab_pass("x")
+        # A segment containing a slash cannot name an app.
+        assert not auth.valid_prefab_pass(
+            "/api/apps/a/b/prefab", {"t": sig, "exp": str(exp)})
+    finally:
+        auth.disable()
+
+
+def test_the_prefab_iframe_loads_with_a_signed_pass():
+    """The refusal that motivated the pass: an <iframe src> is a
+    browser navigation and cannot carry the custom header, so the
+    prefab view 403'd inside its own frame. A valid signed pass
+    loads it; no pass — or a pass minted for another app — does not."""
+    import apps as _apps
+    import tempfile
+    with token_on() as client, tempfile.TemporaryDirectory() as td:
+        real_dir = _apps.APPS_DIR
+        _apps.APPS_DIR = Path(td) / "apps"
+        try:
+            _apps.create_app({"name": "Board", "kind": "openrouter_free",
+                              "schedule": "manual"})
+            exp, sig = auth.prefab_pass("board")
+            r = client.get("/api/apps/board/prefab",
+                           params={"t": sig, "exp": exp})
+            assert r.status_code == 200, r.text
+            assert r.headers["content-type"].startswith("text/html")
+            # No pass: the gate still refuses the navigation.
+            assert client.get("/api/apps/board/prefab").status_code == 403
+            # A pass minted for another board does not open this one.
+            exp2, sig2 = auth.prefab_pass("other-board")
+            r = client.get("/api/apps/board/prefab",
+                           params={"t": sig2, "exp": exp2})
+            assert r.status_code == 403
+        finally:
+            _apps.APPS_DIR = real_dir

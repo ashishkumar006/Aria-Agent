@@ -27,10 +27,10 @@ Output schema (JSON, no prose, no markdown fences):
   {
     "found": <bool>,
     "chunks": [
-      {"source": "<source label>", "preview": "<first 200 chars>"},
+      {"source": "<source label>", "preview": "<first 600 chars>"},
       ...
     ],
-    "summary": "<one paragraph summarising what was found, or why nothing was>"
+    "summary": "<a detailed summary (2–4 paragraphs) of what was found, carrying the key figures, dates and names — or why nothing was>"
   }
 
 You do NOT produce the final user-facing answer. A downstream formatter

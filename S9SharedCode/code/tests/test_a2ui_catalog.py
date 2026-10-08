@@ -136,8 +136,18 @@ def test_all_catalog_components_are_accepted_at_the_shape_level():
                 props[pname] = "x"
             elif ptype == "number":
                 props[pname] = 0.5
+            elif ptype == "list<{key,label}>":
+                # A Table with no columns is not a valid instance - it would
+                # render an empty grid - so the shape fixture has to supply a
+                # real column. `[]` is the right value for the other list props
+                # (DataList rows, FilterChips options) and wrong for this one.
+                props[pname] = [{"key": "a", "label": "A"}]
+            elif ptype == "list<scalar>":
+                props[pname] = [{"a": "1"}]
             elif ptype.startswith("list<"):
                 props[pname] = []
+            elif ptype == "bool":
+                props[pname] = True
             elif ptype.startswith("enum:"):
                 props[pname] = ptype.split(":", 1)[1].split("|")[0]
         root = {"id": "root", "component": name, **props}
@@ -266,6 +276,60 @@ def test_a_component_cycle_is_rejected_not_hung_on():
         assert "cycle" in str(e)
     else:
         raise AssertionError("a cycle must be rejected")
+
+
+def test_a_cycle_through_a_non_first_child_is_rejected():
+    """The depth walker used to follow only _children[0], so a cycle
+    hiding behind a second child was invisible."""
+    comps = [
+        {"id": "root", "component": "Column", "children": ["a", "x"]},
+        {"id": "a", "component": "Column", "children": ["b"]},
+        {"id": "b", "component": "Column", "children": []},
+        # x is root's SECOND child; the cycle runs through it.
+        {"id": "x", "component": "Column", "children": ["y"]},
+        {"id": "y", "component": "Column", "children": ["root"]},
+    ]
+    try:
+        C.validate_surface({"surfaceId": "s", "components": comps})
+    except C.CatalogError as e:
+        assert "cycle" in str(e)
+    else:
+        raise AssertionError("a cycle through a non-first child must "
+                             "be rejected")
+
+
+def test_deep_nesting_behind_a_second_child_is_rejected():
+    """Depth hiding behind a second child: the first-child-only walk
+    never saw it, so a deep chain slipped past MAX_DEPTH."""
+    depth = C.MAX_DEPTH + 6
+    comps = [{"id": "root", "component": "Column",
+              "children": ["decoy0", "n0"]}]
+    for i in range(depth):
+        kids = ([f"decoy{i + 1}", f"n{i + 1}"]
+                if i + 1 < depth else [])
+        comps.append({"id": f"n{i}", "component": "Column",
+                      "children": kids})
+        comps.append({"id": f"decoy{i}", "component": "Text",
+                      "text": "x"})
+    try:
+        C.validate_surface({"surfaceId": "s", "components": comps})
+    except C.CatalogError as e:
+        assert "nesting" in str(e)
+    else:
+        raise AssertionError("deep nesting behind a second child must "
+                             "be rejected")
+
+
+def test_a_converging_dag_is_not_a_cycle():
+    """Two branches meeting at one node is a legal DAG, not a cycle —
+    the walker must not read re-visit as a loop."""
+    comps = [
+        {"id": "root", "component": "Column", "children": ["a", "b"]},
+        {"id": "a", "component": "Column", "children": ["d"]},
+        {"id": "b", "component": "Column", "children": ["d"]},
+        {"id": "d", "component": "Text", "text": "shared"},
+    ]
+    C.validate_surface({"surfaceId": "s", "components": comps})
 
 
 def test_oversized_text_is_rejected():

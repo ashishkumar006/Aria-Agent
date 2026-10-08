@@ -38,22 +38,64 @@ GATEWAY_URL = "http://127.0.0.1:8109"
 _CLIENT: "httpx.Client | None" = None
 
 
+def _gateway_token() -> str:
+    """The shared gateway token, or "" when none is reachable yet.
+
+    The gateway now requires `X-Gateway-Token` on every `/v1/*` route - its own
+    surface had been reachable with no credential at all, which let an
+    unauthenticated caller wipe memory, reload policy and spend real money. The
+    two processes start independently, so the gateway publishes its token to
+    `state/gateway.token` at launch; an operator can instead set
+    `GATEWAY_V9_TOKEN` for both sides. Never raise here: a missing token must
+    produce a clear 401 from the gateway, not an import error at agent start-up.
+    """
+    import os as _os
+    from pathlib import Path as _P
+    env = (_os.environ.get("GATEWAY_V9_TOKEN") or "").strip()
+    if env:
+        return env
+    # Same base GATEWAY_V9_DIR is built from (parents[2] = repo root); an
+    # off-by-one here silently yields "" and every gateway call 401s.
+    p = _P(__file__).resolve().parents[2] / "llm_gatewayV9" / "state" \
+        / "gateway.token"
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _client() -> "httpx.Client":
     global _CLIENT
+    token = _gateway_token()
+    headers = {"X-Gateway-Token": token} if token else {}
     if _CLIENT is None:
         _CLIENT = httpx.Client(timeout=30.0, follow_redirects=True,
                                limits=httpx.Limits(max_keepalive_connections=4,
-                                                   max_connections=16))
+                                                   max_connections=16),
+                               headers=headers)
+    elif token and "X-Gateway-Token" not in _CLIENT.headers:
+        # Token file appeared after the client was built (gateway started late).
+        _CLIENT.headers["X-Gateway-Token"] = token
     return _CLIENT
 
 
 def _is_up() -> bool:
-    try:
-        r = _client().get(f"{GATEWAY_URL}/v1/routers", timeout=2.0)
-        r.raise_for_status()
-        return True
-    except Exception:
-        return False
+    """Liveness, not authorisation.
+
+    This probes an endpoint that is deliberately unauthenticated. It used to
+    hit `/v1/routers`, which now sits behind the gateway token - so before the
+    token path was right, every probe 401'd, the running gateway was reported
+    down, and `ensure_gateway()` tried to launch a second copy on a port already
+    in use and then failed with "failed to start within 45s".
+    """
+    for path in ("/health", "/healthz", "/v1/routers"):
+        try:
+            r = _client().get(f"{GATEWAY_URL}{path}", timeout=2.0)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def ensure_gateway() -> None:

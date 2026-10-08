@@ -44,7 +44,8 @@ function statusOf(st?: string): 'run' | 'ok' | 'err' | 'idle' | 'skip' {
   return 'idle';
 }
 
-function toFlow(g: GraphPayload, running: boolean, selectedId: string | null) {
+function toFlow(g: GraphPayload, running: boolean, selectedId: string | null,
+  onSelect: (id: string) => void) {
   // layered layout by topological depth (same algorithm as the classic UI)
   const byId = new Map(g.nodes.map((n) => [n.id, n]));
   const children = new Map<string, string[]>();
@@ -118,6 +119,7 @@ function toFlow(g: GraphPayload, running: boolean, selectedId: string | null) {
           status: statusOf(n.status),
           state: (n.status || '').slice(0, 12),
           selected: n.id === selectedId,
+          onSelect: () => onSelect(n.id),
         },
       });
     });
@@ -174,7 +176,7 @@ export default function DagCanvas({
   useEffect(() => {
     if (!graph || sig === lastSig.current) return; // signature guard — no churn
     lastSig.current = sig;
-    const f = toFlow(graph, running, selectedId);
+    const f = toFlow(graph, running, selectedId, onSelect);
     // Preserve user-dragged positions for nodes we already placed.
     for (const n of f.nodes) {
       const p = posRef.current.get(n.id);

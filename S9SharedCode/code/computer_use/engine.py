@@ -490,7 +490,9 @@ class ComputerUseSkill:
         if self.safety.mode == "dry-run":
             self._dry_run_plan.append(f"[dry-run] would vision-click icon for '{app_hint}'")
             return False
-        if self.safety.needs_approval("vision_launch", {"app": app_hint}):
+        if (self.safety.needs_approval("vision_launch", {"app": app_hint})
+                and not self.safety.already_approved(
+                    "vision_launch", {"app": app_hint})):
             aid = self.safety.create_approval("vision_launch", {"app": app_hint})
             # Don't block the cascade on approval plumbing; record and skip.
             self._dry_run_plan.append(f"[pending {aid}] vision-click for '{app_hint}'")
@@ -534,8 +536,13 @@ class ComputerUseSkill:
             x, y = int(verdict["x"]), int(verdict["y"])
             daemon.call("click", {"x": x, "y": y, "scope": "desktop"},
                         timeout=15)
+            self.safety.record_action("vision_launch",
+                                          {"app": app_hint}, "done")
             return True
-        except Exception:
+        except Exception as e:
+            self.safety.record_action("vision_launch",
+                                          {"app": app_hint},
+                                          f"error: {type(e).__name__}")
             return False
 
     def _acquire_target(self, app_hint: str | None):
@@ -562,9 +569,17 @@ class ComputerUseSkill:
         if not wins:
             return None, None
 
-        # Electron escape hatch: if the hinted app is a known Electron app,
-        # relaunch with a debugging port and drive via CDP.
-        if app_hint and apps.electron.is_electron(app_hint):
+        # Electron escape hatch: if the hinted app is a known Electron
+        # app, relaunch with a debugging port and drive via CDP.
+        # The relaunch is a REAL launch plus an unauthenticated
+        # CDP endpoint (arbitrary JS execution inside the app), so
+        # it passes the same dry-run/approval gates as any other
+        # launch - a gated path that skipped only the plain launches
+        # would still open the debug port.
+        if (app_hint and apps.electron.is_electron(app_hint)
+                and self.safety.mode != "dry-run"
+                and not self.safety.needs_approval(
+                    "launch_app", {"name": app_hint})):
             try:
                 launched = apps.electron.launch_with_debug_port(app_hint, port=9222)
                 pid = launched["pid"]
@@ -578,6 +593,18 @@ class ComputerUseSkill:
                 return pid, window_id
             except Exception:
                 pass  # fall through to normal launch below
+        elif app_hint and apps.electron.is_electron(app_hint):
+            # Gated: record the intended relaunch on the plan.
+            if self.safety.mode == "dry-run":
+                self._dry_run_plan.append(
+                    f"[dry-run] would relaunch '{app_hint}' with a CDP "
+                    f"debug port")
+            else:
+                aid = self.safety.create_approval(
+                    "launch_app", {"name": app_hint})
+                self._dry_run_plan.append(
+                    f"[pending {aid}] CDP relaunch of '{app_hint}' "
+                    f"skipped awaiting approval")
 
         # Match by hint against the window title (app name usually present).
         target = None
@@ -592,19 +619,29 @@ class ComputerUseSkill:
         #    the desktop and click it. Re-scan after each attempt; only fall
         #    back to the first window if every launch path fails.
         if target is None and app_hint:
-            launched = False
-            # (1) cua-driver launch_app
-            try:
-                daemon.call("launch_app", {"name": app_hint}, timeout=20)
-                launched = True
-            except Exception:
-                pass
-            # (2) OS shell start — covers names launch_app doesn't know
-            if not launched:
-                launched = self._launch_by_shell(app_hint)
-            # (3) vision-locate + click the icon (works for pinned apps)
-            if not launched:
-                self._launch_by_vision(app_hint)
+            if self.safety.mode == "dry-run":
+                # DRY-RUN: `launch_app` and the OS-shell start are
+                # real launches (they spawn processes); only the
+                # vision path below carries its own gate. Record
+                # the intended launch and leave the target unset -
+                # the cascade then falls back to the first window,
+                # which is what a failed launch already does.
+                self._dry_run_plan.append(
+                    f"[dry-run] would launch '{app_hint}'")
+            else:
+                launched = False
+                # (1) cua-driver launch_app
+                try:
+                    daemon.call("launch_app", {"name": app_hint}, timeout=20)
+                    launched = True
+                except Exception:
+                    pass
+                # (2) OS shell start — covers names launch_app doesn't know
+                if not launched:
+                    launched = self._launch_by_shell(app_hint)
+                # (3) vision-locate + click the icon (works for pinned apps)
+                if not launched:
+                    self._launch_by_vision(app_hint)
             # Re-scan for the new window (give it a moment to appear).
             time.sleep(1.5)
             try:
@@ -623,7 +660,9 @@ class ComputerUseSkill:
         # window is not yet built in the AX hierarchy, so the first scan
         # returns the system menu bar and zero app buttons. AppleScript
         # activation realises the window; bring_to_front is Windows-only.
-        if sys.platform == "darwin" and app_hint:
+        # Both are real desktop mutations - skip them in dry-run.
+        if (sys.platform == "darwin" and app_hint
+                and self.safety.mode != "dry-run"):
             try:
                 import subprocess
                 subprocess.run(["osascript", "-e",
@@ -633,7 +672,8 @@ class ComputerUseSkill:
             except Exception:
                 pass
         # Windows: bring to front (the spec's Windows-only call).
-        if pid and window_id is not None:
+        if (pid and window_id is not None
+                and self.safety.mode != "dry-run"):
             try:
                 daemon.call("bring_to_front", {"pid": pid, "window_id": window_id}, timeout=10)
             except Exception:
@@ -720,7 +760,23 @@ class ComputerUseSkill:
             except Exception:
                 act = {}
         if act.get("type") == "click" and "x" in act and "y" in act:
-            # Click by pixel coordinates (desktop scope).
+            # DRY-RUN/APPROVAL: this path dispatches a raw pixel
+            # click OUTSIDE `_dispatch_action`, so it must carry the
+            # same gates — otherwise the identical physical action is
+            # gated in one path and executed ungated in the other.
+            if self.safety.mode == "dry-run":
+                self._dry_run_plan.append(
+                    f"[dry-run] would vision-click ({act['x']}, {act['y']})")
+                return ComputerResult(True, "L3", output=verdict)
+            click_args = {"x": act["x"], "y": act["y"]}
+            if (self.safety.needs_approval("click", click_args)
+                    and not self.safety.already_approved(
+                        "click", click_args)):
+                aid = self.safety.create_approval("click", click_args)
+                self._dry_run_plan.append(
+                    f"[pending {aid}] vision-click skipped awaiting approval")
+                return ComputerResult(False, "L3",
+                                       error="vision click awaiting approval")
             try:
                 args = {"pid": pid, "x": act["x"], "y": act["y"]}
                 if window_id is not None:
@@ -728,8 +784,11 @@ class ComputerUseSkill:
                 if state.get("snapshot_id"):
                     args["snapshot_id"] = state["snapshot_id"]
                 daemon.call("click", args, timeout=15)
+                self.safety.record_action("click", args, "done")
                 return ComputerResult(True, "L3", output=verdict)
             except Exception as e:
+                self.safety.record_action(
+                    "click", args, f"error: {type(e).__name__}")
                 return ComputerResult(False, "L3", error=str(e))
         return ComputerResult(False, "L3", error="vision returned no clickable target")
 
@@ -749,7 +808,8 @@ class ComputerUseSkill:
         # otherwise the same click is gated in one path and ungated in the
         # other. Like vision-launch above: record and skip, don't block the
         # cascade on approval plumbing.
-        if self.safety.needs_approval(t or "", dict(act)):
+        if (self.safety.needs_approval(t or "", dict(act))
+                and not self.safety.already_approved(t or "", dict(act))):
             aid = self.safety.create_approval(t or "", dict(act))
             self._dry_run_plan.append(f"[pending {aid}] {t} skipped awaiting approval")
             return False
@@ -915,9 +975,12 @@ class ComputerUseSkill:
                 self._last_dispatch_error = f"unsupported action type {t!r}"
                 return False
             self._last_dispatch_error = ""
+            self.safety.record_action(t or "", dict(act), "done")
             return True
         except Exception as e:
             self._last_dispatch_error = f"{type(e).__name__}: {e}"[:300]
+            self.safety.record_action(t or "", dict(act),
+                                          f"error: {type(e).__name__}")
             return False
 
     # ── L0 gated-shell fallback (no daemon) ─────────────

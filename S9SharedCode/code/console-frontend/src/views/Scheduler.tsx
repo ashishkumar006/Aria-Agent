@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { CalendarClock, Trash2, X } from 'lucide-react';
-import { Rail, TopBar, Empty, Skel, Pill, Stat } from '../components/ui';
+import { Rail, TopBar, Empty, Skel, Pill, Stat, SkipLink } from '../components/ui';
 import { api, ago, fmtFire, CONF, type ScheduleJob } from '../api';
 
 function asList(s: ScheduleJob[] | Record<string, ScheduleJob> | undefined): (ScheduleJob & { key: string })[] {
@@ -104,6 +104,7 @@ export default function Scheduler() {
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
+      <SkipLink />
       <Rail />
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
@@ -135,7 +136,7 @@ export default function Scheduler() {
           ))}
         </div>
       </div>
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Scheduler" />
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
@@ -196,7 +197,7 @@ export default function Scheduler() {
             </table>
           </section>
         </div>
-      </div>
+      </main>
     </div>
   );
 }

@@ -494,3 +494,75 @@ def test_log_bursts_fold_into_one_feed_row():
     # A lone exception line is a real message, not a burst to be summarised.
     solo = agent_server._fold_log_block(["[scheduler] job failed: ValueError: bad when"])
     assert solo == [("[scheduler] job failed: ValueError: bad when", 0)], solo
+
+
+def test_tools_config_writes_the_file_the_guard_reads():
+    """POST /api/config/tools must persist under $S9_STATE_DIR —
+    the same file skills._disabled_tools live-reads. A hardcoded
+    ROOT/state path made every toggle a silent no-op whenever
+    S9_STATE_DIR was set, and a non-atomic write could leave a
+    truncated JSON that the guard's fail-open path turned into
+    "nothing is withheld"."""
+    import json
+    import skills
+
+    state = Path(agent_server.STATE_DIR)
+    guard = state / "tools_disabled.json"
+    if guard.exists():
+        guard.unlink()
+    try:
+        with TestClient(app) as client:
+            r = client.post("/api/config/tools",
+                            json={"tool": "web_search", "enabled": False})
+            assert r.status_code == 200, r.text
+            assert r.json() == {"tool": "web_search",
+                                "enabled": False,
+                                "disabled": ["web_search"]}
+            # The file the endpoint wrote is the file the guard reads.
+            assert json.loads(
+                guard.read_text(encoding="utf-8")) == {
+                    "tools": ["web_search"]}
+            assert "web_search" in skills._disabled_tools()
+            # Re-enabling removes it again.
+            r = client.post("/api/config/tools",
+                            json={"tool": "web_search", "enabled": True})
+            assert r.status_code == 200
+            assert "web_search" not in skills._disabled_tools()
+            # Unknown tool names are refused, not persisted.
+            r = client.post("/api/config/tools",
+                            json={"tool": "not_a_real_tool",
+                                  "enabled": False})
+            assert r.status_code == 400
+    finally:
+        if guard.exists():
+            guard.unlink()
+
+
+def test_tool_guard_fails_closed_when_unreadable():
+    """A corrupt guard file must withhold EVERY tool, not
+    none. The old fail-open returned set() on a read
+    failure, so a tool the operator disabled ran anyway —
+    and the API answered 200 {"disabled": []}, an
+    authoritative all-clear derived from a read that never
+    happened."""
+    import skills
+
+    state = Path(agent_server.STATE_DIR)
+    guard = state / "tools_disabled.json"
+    guard.write_text("{corrupt json", encoding="utf-8")
+    try:
+        assert skills._disabled_tools() is None
+        # tool_payload withholds everything when the guard
+        # state is unknown, and says so.
+        assert skills.tool_payload(["web_search"]) is None
+        # And the API reports the unknown state instead of
+        # an empty list.
+        with TestClient(app) as client:
+            r = client.get("/api/config/tools")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["disabled"] is None
+            assert body.get("error")
+    finally:
+        if guard.exists():
+            guard.unlink()
