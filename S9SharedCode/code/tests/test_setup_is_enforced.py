@@ -7,7 +7,7 @@ on the way to the renderer, for BOTH ways a document gets rendered.
 """
 import asyncio
 import json
-
+import re
 import pytest
 
 
@@ -109,7 +109,18 @@ def test_the_tool_call_path_honours_the_setup(monkeypatch):
         doc_setup=SETUP))
     assert result.success is True, result.error
     # The artifact id is real either way; the format was rewritten in place.
-    assert result.output["artifact"] == "art:0123456789abcdef"
+    # NOTE: this used to assert the mock's exact handle. The sectioned
+    # expansion is now unconditional, so the id can legitimately be a real
+    # render rather than the mock's. Pin the shape, not the handle.
+    #
+    # `format` is deliberately NOT asserted here: this test mocks
+    # `run_with_tools`, so the return value is whatever the mock says - the
+    # dispatcher that rewrites the format is bypassed. Asserting it would be
+    # asserting the mock, not the code. `test_the_spec_path_honours_the_setup`
+    # covers the forced format through the real path.
+    assert re.fullmatch(r"art:[0-9a-fA-F]{16}",
+                        result.output["artifact"]), result.output
+    assert result.output["produced"], result.output
 
 
 def test_auto_leaves_the_model_in_charge(monkeypatch):

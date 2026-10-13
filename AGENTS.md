@@ -15,7 +15,10 @@
 - Agent tests: `uv run python -m pytest tests/ -q` from `S9SharedCode/code`
   (NOT bare `uv run pytest` — the shim resolves the wrong interpreter and
   fails on `numpy`). Full suite ≈ 5–6 min; targeted files are fine.
-- Gateway tests: `uv run python -m pytest tests/ -q` from `llm_gatewayV9`.
+- Gateway tests: `uv run python -m pytest -q` from `llm_gatewayV9` — NOT
+  `tests/`. 14 of the 16 adaptor suites, plus `policy/` and
+  `integrations/`, live outside `tests/`, so `pytest tests/ -q` passes
+  happily while skipping 344 tests. Full suite ≈ 1.5 min.
 - Frontend: `npx tsc --noEmit` then `npm run build` from `console-frontend/`.
 - Live: `GET /api/health` must show `gateway_up: true`.
 

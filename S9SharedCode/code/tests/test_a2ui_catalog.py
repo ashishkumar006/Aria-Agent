@@ -460,3 +460,57 @@ def test_pointer_resolution_is_bounded_and_safe():
     assert C._resolve({"a": {"b": {"c": 1}}}, "/a/b/../../secret") is None
     # A very long path must terminate rather than grind.
     assert C._resolve({"a": 1}, "/" + "/".join(["a"] * 200)) is None
+
+
+# ── enum enforcement ──────────────────────────────────────────────────────
+
+def test_enum_properties_are_enforced_not_merely_described():
+    """`enum:` type strings were only ever prose. `Link.target` claimed to be
+    validated to `enum:console`, so a surface could name any URL and pass
+    validation — harmless only while the client renders a <span> rather than a
+    real anchor, which is exactly the trap the comment invited."""
+    def _surface(**props):
+        return [{"id": "root", "component": "Column", "children": ["l"]},
+                {"id": "l", "component": "Link", **props}]
+
+    try:
+        C.validate_components(
+            _surface(label="x", target="https://evil.example"))
+    except C.CatalogError as e:
+        assert "not one of" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "Link.target accepted an out-of-range value; the enum is decoration")
+
+    C.validate_components(_surface(label="x", target="console"))
+
+
+def test_every_declared_enum_is_actually_enforced():
+    """Guards the guard: if a property is declared `enum:...`, an out-of-range
+    value must be refused. Otherwise the declaration is decoration."""
+    checked = 0
+    for name, spec in C.CATALOG.items():
+        for prop, declared in spec["props"].items():
+            if not declared.startswith("enum:"):
+                continue
+            checked += 1
+            comp = {"id": "x", "component": name, prop: "zzz-not-a-member"}
+            try:
+                C.validate_components(
+                    [{"id": "root", "component": "Column", "children": ["x"]},
+                     comp])
+            except C.CatalogError:
+                continue
+            raise AssertionError(
+                f"{name}.{prop} is declared {declared} but accepted "
+                f"'zzz-not-a-member'")
+    assert checked >= 5, f"only {checked} enum properties found — too few to be sure"
+
+
+def test_the_enum_rule_does_not_constrain_free_text():
+    def _text(value):
+        return [{"id": "root", "component": "Column", "children": ["t"]},
+                {"id": "t", "component": "Text", "text": value}]
+
+    C.validate_components(_text("tight normal loose — whatever else"))
+    C.validate_components(_text(""))

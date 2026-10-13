@@ -32,7 +32,10 @@ planner:
   # A plan carries the facet list, per-worker questions and goals, plus the
   # recovery subgraphs. 1500 truncated a broad plan mid-JSON (which the
   # parser then rejected outright, losing the whole decomposition).
-  max_tokens: 3000
+  # The facet count is the research budget: 4 facets produced 17.7k chars of
+  # findings, 3 produced 13.4k, and the author inherited that difference as a
+  # document that either had substance or read as a stub.
+  max_tokens: 65536
   description: Decomposes user queries into the initial DAG and synthesises recovery subgraphs on node failure.
 
 retriever:
@@ -46,7 +49,10 @@ retriever:
   temperature: 0.2         # retrieval is mostly deterministic
   # Chunk previews are the raw material the Formatter expands on, so this
   # must hold enough of them to answer from.
-  max_tokens: 2000
+  # Raised to the provider ceiling: the retriever selects what every
+  # downstream node reads first, so a narrow cap silently bounds the whole
+  # research base before the researchers ever run.
+  max_tokens: 65536
   description: Searches Memory and the FAISS index for material relevant to a query.
 
 researcher:
@@ -63,11 +69,19 @@ researcher:
                   wayback_fetch, remember_preference, recall_preferences,
                   verify_citations, read_artifact]
   temperature: 0.7         # exploratory; let the model choose phrasings
-  # `findings` is what every downstream node reads. At 2500 the fetched
-  # detail was cut to ~1,900 words before the Distiller or Formatter ever
-  # saw it, and the loss was invisible: the model had written more and the
-  # caller silently got less.
-  max_tokens: 6000
+  # `findings` is what every downstream node reads, and this was the single
+  # tightest constraint in the whole DAG: 6000 tokens had to cover the
+  # findings PLUS up to 12 evidence entries each carrying a verbatim quote,
+  # plus conflicts and caveats. Downstream, the INPUTS block allows 400k
+  # chars — roughly 5x what the researcher could emit, so the budget sat
+  # unused while the producer ran out of room.
+  #
+  # 65536 is the provider's own accepted maxOutputTokens, verified live
+  # (6000 / 16384 / 24576 / 32768 / 65536 all accepted, stop_reason
+  # end_turn). Not an arbitrary "make it big": it is the ceiling, so the
+  # model writes until it is done rather than until a local constant runs out.
+  # Cost scales with what is actually written, not with the ceiling.
+  max_tokens: 65536
   description: Performs multi-step web research and produces normalised text outputs.
 
 distiller:
@@ -76,8 +90,10 @@ distiller:
   temperature: 0.1         # extraction; almost-zero
   # One field per item, verbatim evidence lines: a 12-row comparison ran
   # past 1200 and lost its tail rows (and the Critic then failed the
-  # truncation it was meant to catch).
-  max_tokens: 3000
+  # truncation it was meant to catch). Raised to match the researcher: the
+  # Distiller re-emits the researcher's findings, so a cap here discards the
+  # very text the higher researcher budget just paid to produce.
+  max_tokens: 65536
   # Large upstream results arrive in INPUTS as an artifact handle + preview;
   # this is how a node expands one when the detail matters.
   tools_allowed: [read_artifact]
@@ -90,7 +106,10 @@ summariser:
   # final answer, not a courtesy: anything it drops cannot be written up.
   # Its job is to drop redundancy and page chrome, not facts. 1200 capped
   # the whole downstream report at ~900 words.
-  max_tokens: 4000
+  # Raised to the provider ceiling: the Distiller emits one field per row
+  # with a verbatim evidence line each, so a narrow cap truncates the tail
+  # rows and the Critic then cannot see the truncation it exists to catch.
+  max_tokens: 65536
   tools_allowed: [read_artifact]
   description: Condenses long content into a short form.
 
@@ -98,6 +117,14 @@ critic:
   prompt: prompts/critic.md
   temperature: 0.0         # pass/fail; we want determinism
   max_tokens: 500
+  # The Critic is auto-inserted on every outgoing edge of a `critic: true`
+  # skill and is handed that node's output verbatim. It had NO tools, so the
+  # moment the INPUTS spill started working (it never had — the spill loop
+  # never looked inside an upstream node's `output` dict) it would have
+  # passed or failed a node on 1,500 characters of preview with no way to
+  # fetch the rest, and its rejection would send the run into a replan loop
+  # for a reason that was invisible.
+  tools_allowed: [read_artifact]
   description: Evaluates an upstream node's output; emits pass or fail with rationale.
 
 # ── document authoring ──────────────────────────────────────────────────────
@@ -128,7 +155,13 @@ author:
   # A whole document's worth of blocks. The default 2048 truncated the
   # `blocks` array mid-document, which the renderer then renders as a
   # half-empty file rather than failing loudly.
-  max_tokens: 16000
+  # Raised to the provider ceiling: a 12-page document is ~5,400 words, and
+  # every block carries JSON escaping overhead on top of the prose. 16000
+  # tokens ran out mid-`blocks`, which renders as a document that stops
+  # halfway rather than one that fails loudly. Same reasoning as the
+  # researcher: this is a ceiling, not a target, and cost scales with what is
+  # actually written.
+  max_tokens: 65536
   description: |
     Writes a document (PDF, Word, or Excel) from a request and renders it as a
     real file: reports, briefs, summaries, comparisons, spreadsheets. Use
@@ -143,7 +176,9 @@ deck:
   # called once.
   tools_allowed: [render_document, read_artifact, web_search]
   temperature: 0.4         # slide phrasing wants a little range
-  max_tokens: 16000
+  # Raised to the provider ceiling, same reasoning as author: a deck's
+  # `blocks` carry the same JSON overhead as a document's.
+  max_tokens: 65536
   description: |
     Builds a PowerPoint presentation: one idea per slide, short bullets,
     tables for comparisons. Use for "make a deck", "slides for", "present
@@ -155,7 +190,9 @@ formatter:
   # report could never exceed a single page no matter what the prompt
   # asked for — the answer was truncated mid-sentence by the API, not
   # kept short by the model. Deep/broad research writes several pages.
-  max_tokens: 12000
+  # Raised to the provider ceiling: with the researcher's own cap lifted,
+  # a summariser that re-emits the same text becomes the new bottleneck.
+  max_tokens: 65536
   # One focused call per upstream result, then assemble (see
   # skills._sectioned_final_answer). The keyed models answer a single
   # "write the report" request with ~300 words no matter how high the
@@ -166,7 +203,9 @@ formatter:
 sandbox_executor:
   prompt: prompts/sandbox_executor.md
   temperature: 0.0
-  max_tokens: 400
+  # Raised from 400. 400 tokens truncated stdout capture metadata and any
+  # explanation of a failure to stderr, so a crashed run reported only a code.
+  max_tokens: 4000
   description: Runs code from a Coder node in the sandbox and returns stdout, stderr, exit code, and any generated files.
 
 coder:
@@ -174,12 +213,21 @@ coder:
   # The sandbox file tools had NO skill wired to them (present in the MCP
   # server + catalog, callable by nothing). The coder writes code FOR the
   # sandbox, so it reads/greps first, then emits.
-  tools_allowed: [read_file, list_dir, search_files, create_file,
-                  update_file, edit_file, delete_file, index_document]
+  #
+  # run_checks / git_inspect / find_symbol are what turn this from "writes a
+  # file" into a coding agent: without them `create_file` returned ok:true for
+  # code that does not compile and the node reported success.
+  tools_allowed: [read_file, list_dir, search_files, find_symbol,
+                  create_file, update_file, edit_file, delete_file,
+                  run_checks, git_inspect, index_document]
   internal_successors: [sandbox_executor]
   temperature: 0.2
-  max_tokens: 1500
-  description: Emits Python code for a task; the orchestrator hands it to sandbox_executor next.
+  # Was 1500. A real file edit - a new endpoint with types, error handling and
+  # tests - is several thousand tokens, so the node was truncated mid-function
+  # and the tail was lost silently. Raised to the provider ceiling, same as
+  # every other content-producing skill.
+  max_tokens: 65536
+  description: Implements changes against the real project - reads it first, edits it, then runs the project's own checks and fixes what fails.
 
 browser:
   prompt: prompts/browser.md
@@ -208,7 +256,12 @@ action:
                   calendar_query, gmail_query, github_query, slack_message, slack_refresh_token, slack_history,
                   discord_message, notion_query,
                   web_search, fetch_url,
-                  schedule_task, list_scheduled, cancel_scheduled]
+                  schedule_task, list_scheduled, cancel_scheduled, enable_scheduled,
+                  # The action prompt tells the model to call list_channels()
+                  # and check_channel() before picking a delivery target. It
+                  # could not: neither was in this list, so the instruction
+                  # was a description of a capability the node did not have.
+                  list_channels, check_channel, save_as_document]
   temperature: 0.2
   max_tokens: 1500
   description: |

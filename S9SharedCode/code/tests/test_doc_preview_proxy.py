@@ -6,7 +6,11 @@ store lives here, not in the gateway, so a gateway-side lookup would find
 nothing and the preview would silently fall back to a re-render.
 """
 import base64
+import contextlib
 import json
+import shutil
+import tempfile
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,6 +25,25 @@ def client(monkeypatch):
     # written. Set the module value instead.
     monkeypatch.setattr(auth, "_token", "test-token", raising=False)
     return TestClient(agent_server.app), {"X-Aria-Token": "test-token"}
+
+
+@contextlib.contextmanager
+def tmp_session_root():
+    """Point the session store at a temp dir for the duration of a block.
+
+    SESSIONS_ROOT is imported *inside* the endpoint, so patching the module
+    attribute of agent_server would do nothing; persistence is what has to be
+    redirected.
+    """
+    import persistence
+    root = Path(tempfile.mkdtemp(prefix="aria-sessions-"))
+    old = persistence.SESSIONS_ROOT
+    persistence.SESSIONS_ROOT = root
+    try:
+        yield root
+    finally:
+        persistence.SESSIONS_ROOT = old
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_a_spec_preview_is_proxied_to_the_gateway(client, monkeypatch):
@@ -200,8 +223,20 @@ def test_node_failures_group_into_a_fixed_vocabulary():
     import agent_server
 
     cases = [
+        # Empty and prose replies stay distinct: skills.py:2413 separates them
+        # because they need opposite fixes (upstream completion vs prompt
+        # format), and one collapsed row hid a 52/13 split.
         ("researcher returned no usable JSON: empty reply",
-         "reply not parseable as the required JSON (empty or prose)"),
+         "provider returned an empty reply"),
+        ("researcher returned no usable JSON: reply was not JSON "
+         "(starts 'Here is my analysis')",
+         "reply was prose, not the required JSON"),
+        # A renderer crash is ours, not the model's. This exact string was a
+        # live NameError being reported as model misbehaviour.
+        ("author finished without calling render_document; "
+         "render_document failed: spec fallback render failed: "
+         "NameError: name 'title' is not defined - no file was produced",
+         "document renderer failed (agent bug, not the model)"),
         ("author finished without calling render_document - no file was produced",
          "claimed a document but never called render_document"),
         ("author reported a document (x.pdf) but never called render_document",
@@ -219,13 +254,68 @@ def test_node_failures_group_into_a_fixed_vocabulary():
 
 
 def test_node_health_reports_rate_against_each_skills_own_nodes():
-    """`author failed 38% of its nodes` is actionable; "4 nodes failed" is not."""
+    """`author failed 38% of its nodes` is actionable; "4 nodes failed" is not.
+
+    This used to assert on the source TEXT of the function, which passes even
+    if the code is unreachable or inside a comment - and worse, it pinned the
+    literal expression of a line that was wrong: the denominator was every
+    node, including nodes that were never dispatched. It now exercises the
+    real endpoint with synthetic graphs and asserts the arithmetic.
+    """
     import agent_server
-    import inspect
-    src = inspect.getsource(agent_server.nodes_health)
-    # the percentage must divide by that skill's node count
-    assert '"fail_pct": round(failed / n * 100, 1)' in src, \
-        "fail_pct is not computed per-skill"
-    assert 'sorted(key=lambda r: (-r["fail_pct"]' in src or \
-        'rows.sort(key=lambda r: (-r["fail_pct"]' in src, \
-        "worst-reliable skill should sort first"
+    import networkx as nx
+    from fastapi.testclient import TestClient
+
+    def _graph(dirp, nodes):
+        # Must be written in node_link form, which is a LIST of node objects,
+        # because read_graph hands it to nx.node_link_graph. A bare dict of
+        # id -> attrs parses fine as JSON and then fails to load as a graph,
+        # which the endpoint swallows as "no nodes".
+        g = nx.DiGraph()
+        for nid, attrs in nodes.items():
+            g.add_node(nid, **attrs)
+        (dirp / "graph.json").write_text(
+            json.dumps(nx.node_link_data(g)), encoding="utf-8")
+
+    with tmp_session_root() as root:
+        s1 = root / "s8-health-a"
+        s1.mkdir(parents=True)
+        _graph(s1, {
+            "n1": {"skill": "author", "status": "failed",
+                   "result": {"error": "boom"}},
+            "n2": {"skill": "author", "status": "complete"},
+            # never dispatched: must NOT dilute the rate
+            "n3": {"skill": "author", "status": "pending"},
+            "n4": {"skill": "formatter", "status": "pending"},
+        })
+        s2 = root / "s8-health-b"
+        s2.mkdir(parents=True)
+        _graph(s2, {
+            "n1": {"skill": "author", "status": "complete"},
+            "n2": {"skill": "author", "status": "complete"},
+        })
+
+        client = TestClient(agent_server.app)
+        r = client.get("/api/nodes/health",
+                       headers={"X-Aria-Token": "test-token"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        rows = {row["skill"]: row for row in body["rows"]}
+
+        author = rows["author"]
+        # 2 attempted author nodes, 1 failed => 50%, NOT 20% (1/5)
+        assert author["attempted"] == 4, author
+        assert author["failed"] == 1, author
+        assert author["fail_pct"] == 25.0, author
+        assert author["never_run"] == 1, author
+        assert author["nodes"] == 5, author
+
+        # A skill whose only node never ran reports 0.0% and says so.
+        fmt = rows["formatter"]
+        assert fmt["attempted"] == 0, fmt
+        assert fmt["never_run"] == 1, fmt
+        assert fmt["fail_pct"] == 0.0, fmt
+
+        # Worst skill sorts first.
+        assert body["rows"][0]["skill"] == "author", body["rows"]
+        assert body["totals"]["attempted"] == 4, body["totals"]

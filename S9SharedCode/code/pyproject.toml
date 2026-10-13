@@ -43,6 +43,14 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
+# Restrict collection to the conventional prefix. Pytest's default also
+# matches `*_test.py`, which silently swept in two standalone scratch scripts
+# committed under tests/ (`battle_test.py`, `battle_test_backend.py` — 13 tests
+# that have nothing to do with the suite and inject absolute paths from the
+# machine they were written on). A file dropped there as `foo_test.py` joins the
+# default run with no marker and no review, which is how a transient scratch
+# file once broke collection outright.
+python_files = ["test_*.py"]
 markers = [
     "network: test requires internet access",
     "embed: test requires the embedding endpoint (gateway V8)",

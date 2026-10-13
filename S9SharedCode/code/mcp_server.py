@@ -385,8 +385,8 @@ _inflight: dict[str, "asyncio.Future"] = {}
 
 
 async def _extract_page(url: str, timeout_s: int = 20,
-                      max_chars: int = 20000) -> dict:
-    """Fetch one URL and return clean markdown text (capped).
+                      max_chars: int = 300_000) -> dict:
+    """Fetch one URL and return its clean markdown text.
 
     Engine is trafilatura (plain HTTP + parsing, no browser): importing it
     takes 0.6s and pages resolve in 3-5s. The previous engine (crawl4ai
@@ -395,6 +395,13 @@ async def _extract_page(url: str, timeout_s: int = 20,
     hung fetch burned the full 120s MCP tool timeout, which is what turned
     ordinary 3-node research runs into 400s stalls. JS-rendered pages that
     need interaction remain the browser SKILL's job, not this tool's.
+
+    `max_chars` was 20,000 and truncated MID-SENTENCE with a marker the
+    researcher never sees, so a long article silently arrived as its opening
+    paragraphs. That is where "each research node transfers a small amount of
+    data" came from. The cap now sits far above any real article and exists
+    only as a runaway guard; when it does fire, `truncated` says so in the
+    payload so the caller is never misled about what it received.
     """
     import asyncio as _aio
 
@@ -428,8 +435,14 @@ async def _extract_page(url: str, timeout_s: int = 20,
             text = soup.get_text("\n", strip=True)
         truncated = len(text) > max_chars
         if truncated:
+            # State the omission INSIDE the text too, not only in the flag: a
+            # researcher that reads only `text` must still know it is holding
+            # a partial page rather than a whole one.
             text = (text[:max_chars]
-                    + f"\n\n…[truncated at {max_chars} chars]")
+                    + f"\n\n…[TRUNCATED at {max_chars:,} chars - the rest of "
+                      f"this page was NOT retrieved. If the detail you need "
+                      f"is below this point, say so in `caveats` rather than "
+                      f"guessing.]")
         # Remote content is attacker-controllable: neutralise before it can
         # reach a model turn. See neutralize_untrusted.
         safe = neutralize_untrusted(text, url)
@@ -477,8 +490,11 @@ async def fetch_url(url: str, timeout: int = 20, refresh: bool = False) -> dict:
     """Fetch clean markdown from a URL (trafilatura: fast, no browser).
     `timeout` (seconds) bounds the fetch — a page that can't resolve in
     time fails fast with a timeout error instead of hanging the research
-    loop. Text is capped at ~20k chars. JS-rendered pages needing
-    interaction belong to the browser skill, not this tool.
+    loop. You get the COMPLETE cleaned text of the page — HTML, CSS and JS
+    already stripped — so read all of it; the specific figures you are
+    after are usually below the fold, not in the opening paragraphs. Only a
+    pathological page hits the runaway guard, and `truncated` says so.
+    JS-rendered pages needing interaction belong to the browser skill.
     Served from a 7-day on-disk cache when the URL is one we have fetched
     before; set `refresh: true` to force the network.
     Example: fetch_url("https://example.com")."""
@@ -1239,7 +1255,7 @@ async def wayback_fetch(url: str, timestamp: str = "") -> dict:
     snap_ts, original = data[0][0], data[0][1]
     snap_url = f"https://web.archive.org/web/{snap_ts}id_/{original}"
     try:
-        d = await _extract_page(snap_url, timeout_s=20, max_chars=20000)
+        d = await _extract_page(snap_url, timeout_s=20)
     except Exception as e:
         return {"ok": False, "snapshot_url": snap_url,
                 "error": f"snapshot fetch failed: {type(e).__name__}: {e}"}
@@ -1276,18 +1292,30 @@ def read_artifact(artifact_id: str, offset: int = 0,
     except Exception:
         pass
     total = len(raw)
-    start = max(0, int(offset or 0))
+    # `offset` is a CHARACTER offset, so the slice must be taken on the
+    # decoded text. Slicing the BYTES and decoding with errors="replace"
+    # (the previous behaviour) split multi-byte characters at every page
+    # boundary and turned them into U+FFFD permanently — the model was served
+    # corrupted research text on any artifact over one page. Verified: a
+    # 2520-byte / 2040-char artifact did not reassemble across pages.
+    full = raw.decode("utf-8", errors="replace")
+    start = max(0, min(int(offset or 0), len(full)))
     cap = max(200, min(int(limit or 20000), 200_000))
-    text = raw[start:start + cap].decode("utf-8", errors="replace")
+    text = full[start:start + cap]
+    end = start + len(text)
     return {
         "ok": True,
         "artifact_id": artifact_id,
         "title": (getattr(meta, "descriptor", "") or ""),
         "size_bytes": total,
+        "total_chars": len(full),
         "offset": start,
         "returned_chars": len(text),
-        "truncated": start + cap < total,
-        "next_offset": (start + cap) if start + cap < total else None,
+        "truncated": end < len(full),
+        # Derived from the returned CHARACTER count, not from `cap`. The old
+        # code advanced by bytes while the field was named offset, so a
+        # multi-byte page advanced too far and skipped text.
+        "next_offset": end if end < len(full) else None,
         "content": text,
     }
 
@@ -1326,6 +1354,227 @@ def list_dir(path: str = ".") -> dict:
         })
         names.append(child.name)
     return {"path": path, "count": len(entries), "names": names, "entries": entries}
+
+
+# ── the verification tools a coding agent actually needs ──────────────────
+# The Coder skill could read, search and write files, and that was the whole
+# surface: it could not CHECK anything it wrote. `create_file` returned
+# "ok: true" for a file that does not compile, and the node reported success.
+# Writing code you cannot run a checker against is not a coding agent.
+#
+# These three close that loop: run the project's own checks, see what changed,
+# and find a symbol's definition and usages across the tree.
+
+_CHECK_TIMEOUT_S = 180
+_CHECK_OUTPUT_CAP = 24_000
+
+# Detected from what the project actually contains, not from a language guess.
+# Each entry: (marker file, resolved executable name, argv AFTER that exe).
+#
+# The argv is for the RESOLVED EXECUTABLE, not for `python -m X`. This had
+# `("-m", "pytest", ...)` for pytest, and since `shutil.which("pytest")`
+# resolves to the pytest console script, that ran
+# `pytest -m pytest` - a MARKER filter. It matched nothing and exited 5, which
+# read as "tests failed" rather than "you invoked me wrongly".
+_CHECK_PROFILES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("pyproject.toml", "pytest", ("-q", "--no-header")),
+    ("pytest.ini", "pytest", ("-q", "--no-header")),
+    ("setup.cfg", "pytest", ("-q", "--no-header")),
+    ("tox.ini", "pytest", ("-q", "--no-header")),
+    ("package.json", "npm", ("test", "--silent")),
+    ("tsconfig.json", "tsc", ("--noEmit",)),
+    ("ruff.toml", "ruff", ("check", "--no-cache")),
+    (".ruff.toml", "ruff", ("check", "--no-cache")),
+    ("Cargo.toml", "cargo", ("check", "--quiet")),
+    ("go.mod", "go", ("vet", "./...")),
+)
+
+
+@mcp.tool()
+def run_checks(path: str = ".", timeout: int = 0) -> dict:
+    """Run this project's own lint / typecheck / test suite and report.
+
+    THE tool a coding agent is missing without it. It detects the checker from
+    what the project actually contains (pyproject.toml -> pytest, tsconfig.json
+    -> tsc, package.json -> npm test, ruff.toml -> ruff, Cargo.toml -> cargo
+    check, go.mod -> go vet) rather than from a language guess, runs it, and
+    returns the real exit code, stdout and stderr.
+
+    Use it AFTER every edit, and read the output: a check that fails tells you
+    what to fix, and a check you did not run tells you nothing. `ok` is true
+    only when the command exited 0.
+
+    `target` narrows the run to one command when a project has several (e.g.
+    "tsc" or "pytest"). Example: run_checks(".", "tsc")."""
+    import shlex
+    import shutil
+    import subprocess
+
+    root = _safe(path or ".")
+    if not root.is_dir():
+        return {"ok": False, "error": f"'{path}' is not a directory"}
+
+    to = int(timeout) if timeout else _CHECK_TIMEOUT_S
+    to = max(10, min(int(to), 900))
+
+    found: list[dict] = []
+    for marker, tool, args in _CHECK_PROFILES:
+        if not (root / marker).exists():
+            continue
+        exe = shutil.which(tool)
+        if not exe:
+            # A marker exists but the tool is not installed. Say so rather
+            # than reporting "no checks configured" and implying it passed.
+            found.append({"marker": marker, "tool": tool, "available": False})
+            continue
+        found.append({"marker": marker, "tool": tool, "available": True,
+                      "argv": [exe, *args]})
+    if not found:
+        return {"ok": False,
+                "error": "no checker detected: this project has none of "
+                         "pyproject.toml, pytest.ini, setup.cfg, tox.ini, "
+                         "package.json, tsconfig.json, ruff.toml, "
+                         "Cargo.toml or go.mod",
+                "path": path}
+
+    results = []
+    all_ok = True
+    for f in found:
+        if not f.get("available"):
+            all_ok = False
+            results.append({"tool": f["tool"], "available": False,
+                            "error": f"{f['tool']} is not installed; the "
+                                      f"project has {f['marker']} but the "
+                                      f"runner is missing from PATH"})
+            continue
+        argv = f["argv"]
+        try:
+            proc = subprocess.run(argv, cwd=str(root), capture_output=True,
+                                  text=True, timeout=to)
+        except subprocess.TimeoutExpired:
+            all_ok = False
+            results.append({"tool": f["tool"], "ok": False, "exit_code": None,
+                            "error": f"timed out after {to}s"})
+            continue
+        except Exception as e:
+            all_ok = False
+            results.append({"tool": f["tool"], "ok": False, "exit_code": None,
+                            "error": f"{type(e).__name__}: {e}"})
+            continue
+        out = (proc.stdout or "")[-_CHECK_OUTPUT_CAP:]
+        err = (proc.stderr or "")[-_CHECK_OUTPUT_CAP:]
+        rc = proc.returncode
+        ok = rc == 0
+        all_ok = all_ok and ok
+        results.append({"tool": f["tool"], "ok": ok, "exit_code": rc,
+                        "command": shlex.join(argv[1:]),
+                        "stdout": out, "stderr": err})
+    return {"ok": all_ok, "path": path,
+            "checks_run": len(results),
+            "results": results,
+            "note": ("Every check exited 0." if all_ok else
+                     "At least one check FAILED - read stdout/stderr, fix the "
+                     "cause, and run this again. Do not report the work as "
+                     "done until this returns ok.")}
+
+
+@mcp.tool()
+def git_inspect(path: str = ".", target: str = "status",
+                max_chars: int = 20_000) -> dict:
+    """See what changed: `status`, `diff`, or `log`.
+
+    A coding agent that cannot see its own change set cannot review it. After
+    editing, call git_inspect(target="diff") and read your own work before
+    declaring it finished.
+
+    target: "status" (short list of changed files), "diff" (the patch),
+    "log" (recent commits). Returns ok=False with an explanation if this is
+    not a git repository, or if git is not installed."""
+    import shutil
+    import subprocess
+
+    root = _safe(path or ".")
+    t = (target or "status").strip().lower()
+    if t not in ("status", "diff", "log"):
+        return {"ok": False, "error": f"target must be status, diff or log; "
+                                      f"got {target!r}"}
+    exe = shutil.which("git")
+    if not exe:
+        return {"ok": False, "error": "git is not installed"}
+    if not (root / ".git").exists() and not (root.parent / ".git").exists():
+        return {"ok": False, "error": f"'{path}' is not inside a git "
+                                      f"repository - nothing to review"}
+
+    argv = [exe, "-C", str(root)]
+    if t == "status":
+        argv += ["status", "--porcelain=v1"]
+    elif t == "diff":
+        argv += ["diff", "--no-color"]
+    else:
+        argv += ["log", "--oneline", "-n", "20"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    cap = max(1_000, min(int(max_chars or 20_000), 200_000))
+    out = (proc.stdout or "")[:cap]
+    return {"ok": proc.returncode == 0, "target": t,
+            "exit_code": proc.returncode, "output": out,
+            "truncated": len(proc.stdout or "") > cap,
+            "stderr": (proc.stderr or "")[:2_000]}
+
+
+@mcp.tool()
+def find_symbol(name: str, path: str = ".", max_hits: int = 40) -> dict:
+    """Find where a function/class is DEFINED and every place it is USED.
+
+    Regex search cannot tell a definition from a call site, so the same text
+    matched imports, comments and strings. This does both: it reports
+    definitions (def/class/function/interface/type) separately from usages,
+    with line numbers.
+
+    Example: find_symbol("length_target", ".")."""
+    import re as _re
+
+    try:
+        n = max(1, min(int(max_hits or 40), 200))
+    except (TypeError, ValueError):
+        n = 40
+    root = _safe(path or ".")
+    rx_def = _re.compile(
+        r"^\s*(?:export\s+)?(?:async\s+)?"
+        r"(?:def|class|function|interface|type|enum|struct|impl|trait)\s+"
+        + _re.escape(str(name or "")) + r"\b")
+    rx_use = _re.compile(r"\b" + _re.escape(str(name or "")) + r"\b")
+
+    defs, uses = [], []
+    if not root.exists():
+        return {"ok": False, "error": f"'{path}' does not exist"}
+    for f in sorted(root.rglob("*")):
+        if len(defs) + len(uses) >= n * 2:
+            break
+        if not f.is_file() or f.suffix.lower() in (
+                ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".bin",
+                ".woff", ".woff2", ".mp4", ".pyc"):
+            continue
+        try:
+            if f.stat().st_size > 1_500_000:
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        rel = f.relative_to(root).as_posix()
+        for i, line in enumerate(text.splitlines(), 1):
+            if not rx_use.search(line):
+                continue
+            entry = {"file": rel, "line": i, "text": line.strip()[:200]}
+            if rx_def.match(line):
+                if len(defs) < n:
+                    defs.append(entry)
+            elif len(uses) < n:
+                uses.append(entry)
+    return {"symbol": name, "definitions": defs, "usages": uses,
+            "definition_count": len(defs), "usage_count": len(uses)}
 
 
 @mcp.tool()
@@ -1686,6 +1935,65 @@ def recall_preferences(k: int = 10) -> list[dict]:
         return [{"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}]
 
 
+@mcp.tool()
+def recall_observations(k: int = 10, min_confidence: float = 0.0) -> list[dict]:
+    """What you have noticed about how this user works, with the evidence.
+
+    Behavioural only: requests, corrections, how they like answers framed.
+    Never a personality type, a motive, or a mental-health observation - the
+    store rejects those rather than keeping them.
+
+    Each entry carries the user's own words. Treat an observation as a
+    hypothesis, not a fact: if the user does something that contradicts one,
+    they win and the observation is stale.
+
+    Example: recall_observations(10)"""
+    try:
+        return _memory.recall_observations(k=k, min_confidence=min_confidence)
+    except Exception as e:
+        return [{"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}]
+
+
+@mcp.tool()
+def record_observation(observation: str, evidence: str,
+                       keywords: list[str] | None = None,
+                       confidence: float = 0.8) -> dict:
+    """Note something durable about how the user works, with their own words.
+
+    Use when the user corrects you, states how they want things done, or
+    pushes back on something: "always give me the date", "stop with the
+    preamble", "shorter". Those are worth keeping; a passing mood is not.
+
+    A background extractor already reads every chat turn, so you will often
+    find this unnecessary — if it is, say so and move on rather than calling
+    it anyway. Both paths go through one gate, so a correction noted here is
+    never stored twice.
+
+    `evidence` MUST be copied verbatim from what the user actually said. The
+    store checks the quote against the conversation and discards anything it
+    cannot find, so a paraphrase fails and only a real quote survives.
+
+    Refuses personality labels, mental-health observations and inferences
+    about motive - write the behaviour instead ("prefers short answers",
+    not "impatient" or "anxious").
+
+    Example: record_observation("wants a date on every factual claim",
+                               "from now on always give me the date")"""
+    try:
+        verdict = _memory.submit_observation(
+            observation, evidence, keywords=keywords, confidence=confidence)
+        if verdict.get("status") == "rejected":
+            return {"ok": False, "error": verdict.get("reason", "rejected")}
+        if verdict.get("status") == "reinforced":
+            return {"ok": True, "status": "reinforced",
+                    "observation": verdict.get("observation"),
+                    "note": "already on file; counted as another sighting"}
+        return {"ok": True, "status": "new", "id": verdict.get("id"),
+                "observation": verdict.get("observation")}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]}
+
+
 def _doc_allowlist():
     """Which uploaded documents this run may read.
 
@@ -1823,17 +2131,177 @@ def gmail_refresh_token(write_env: bool = True) -> dict:
 # no MCP tools exposed it. These three close that gap.
 
 @mcp.tool()
-def schedule_task(query: str, when: str, conversation_id: str = "") -> dict:
-    """Schedule a task/reminder to run at a future time. `when` accepts
-    natural language ('in 1h', 'tomorrow 9am') or an ISO datetime.
-    Example: schedule_task("remind me to stretch", "in 30m")"""
+def schedule_task(query: str, when: str, conversation_id: str = "",
+                  channel: str = "",
+                  lead_s: str = "",
+                  lead_message: str = "",
+                  message: str = "",
+                  wait_for_ack: bool = False,
+                  snooze_s: str = "",
+                  ack_timeout_s: str = "",
+                  max_follow_ups: int = 3) -> dict:
+    """Schedule a task/reminder to run at a future time, optionally notifying
+    the user over a chat channel — including BEFORE it runs.
+
+    `when` accepts natural language ('in 1h', 'tomorrow 9am', 'daily@09:00')
+    or an ISO datetime.
+
+    Notification arguments (all optional; without them the task just runs and
+    records locally, which is what it always did):
+
+    - `channel`: 'telegram' (default when any notification is asked for),
+      or 'slack', 'discord', 'gmail', 'webhook', ... Use list_channels() to
+      see what the gateway can actually reach. Anything else is refused with
+      the list of valid names.
+    - `lead_s`: how long BEFORE the task to warn the user, e.g. '10m', '2h',
+      or a number of seconds. Set it when the user would want to prepare, not
+      just be told. lead_message is the text sent at that moment; `message` is
+      the text sent when the task actually fires. They are independent, so
+      write a useful warning for one and a useful summary for the other.
+    - `message`: THE NUDGE DISCRIMINATOR, and it is load-bearing. If you supply
+      it, this is a NUDGE: the text you wrote is sent verbatim at the fire
+      time and NO agent runs - no research DAG, no model cost, no session. Use
+      it for "remind me to stretch", "stand up in 5", anything where you are
+      only passing your own words along. Leave `message` EMPTY when the task
+      must actually produce something (a search, a document, a summary); then
+      the agent runs and the text it writes becomes the message. Getting this
+      backwards is what made a reminder spawn a pointless research run.
+    - `wait_for_ack`: make the warning a conversation instead of an
+      announcement. The user is expected to reply; their reply is sent to the
+      agent, which decides whether it needs a response and may reply back up
+      to `max_follow_ups` times. Use it for reminders the user must not miss.
+      Without it the warning is sent once and forgotten.
+    - `snooze_s`: how long to wait before nudging again if the user has not
+      replied. Requires wait_for_ack and a follow-up budget; 0 disables it.
+    - `ack_timeout_s`: give up on the conversation after this long.
+      Defaults to 15 minutes.
+    - `max_follow_ups`: how many times the agent may re-message (0-10,
+      default 3). This is a hard cap, not a suggestion: the agent cannot
+      exceed it however insistent it decides to be.
+
+    Example — warn 15 minutes ahead over Telegram and wait to be acknowledged:
+        schedule_task("Board briefing", "tomorrow 9am",
+                      channel="telegram", lead_s="15m",
+                      lead_message="Board briefing in 15 minutes - anything to add?",
+                      message="Board briefing starting now.",
+                      wait_for_ack=True, max_follow_ups=2, snooze_s="5m")
+
+    Example — plain reminder, no messaging:
+        schedule_task("remind me to stretch", "in 30m")
+    """
     try:
         import scheduler
         sid = scheduler.schedule(
             query, when,
             conversation_id=conversation_id or None,
+            channel=channel or "",
+            lead_s=lead_s,
+            lead_message=lead_message or "",
+            message=message or "",
+            wait_for_ack=bool(wait_for_ack),
+            snooze_s=snooze_s,
+            ack_timeout_s=ack_timeout_s,
+            max_follow_ups=max_follow_ups,
         )
-        return {"ok": True, "schedule_id": sid}
+        out = {"ok": True, "schedule_id": sid}
+        # Tell the caller what will actually happen, so the model can tell the
+        # user rather than assuming delivery. A schedule that silently cannot
+        # notify is the failure this whole path exists to make visible.
+        try:
+            with scheduler._SCHED_LOCK:  # noqa: SLF001 - same package
+                spec = scheduler._SCHEDULES.get(sid) or {}
+            pol = spec.get("notify_policy") or {}
+            if pol:
+                out["notification"] = {
+                    "channel": pol.get("channel") or "",
+                    "pre_warning_at": pol.get("lead_fire") or None,
+                    "fires_at": spec.get("next_fire"),
+                    "waits_for_acknowledgement": bool(pol.get("wait_for_ack")),
+                    "max_follow_ups": pol.get("max_follow_ups"),
+                }
+                if not pol.get("channel"):
+                    out["notification"]["warning"] = (
+                        "a pre-warning or custom message was requested but no "
+                        "channel was named, so nothing will be sent")
+                else:
+                    import notify as _notify
+                    if not _notify.resolve_target(str(pol.get("channel"))):
+                        out["notification"]["warning"] = (
+                            f"no destination is paired for "
+                            f"{pol['channel']}; the task will still run and "
+                            f"be recorded, but the message will not arrive")
+        except Exception:
+            pass
+        return out
+    except ValueError as e:
+        # An unparseable or past date must reach the model as an ordinary tool
+        # result it can act on. The accepted forms are listed because the model
+        # wrote `2025-10-12T09:00:00` for "tomorrow at 9am" and had no way to
+        # know that was a year out — with only the bare error it either gave
+        # up or scheduled a second copy.
+        return {"ok": False, "error": str(e),
+                "accepted_when": ["in 30m", "in 1h", "tomorrow 9am",
+                                  "daily@09:00", "every 30m",
+                                  "an ISO datetime or epoch seconds in the "
+                                  "FUTURE"]}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def list_channels() -> dict:
+    """Chat channels a notification can be delivered on, and what each needs.
+
+    Read from the gateway, so it cannot drift from what actually works. Each
+    entry reports whether the gateway holds a credential ('configured'), what
+    kind of destination it needs, and - for the ones that can be paired by
+    simply messaging the bot - whether anyone is paired yet. A channel that is
+    configured with no destination is the one that looks fine and delivers
+    nothing.
+    Example: list_channels()"""
+    try:
+        import notify as _notify
+        return {"ok": True, **_notify.channel_health()}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def check_channel(channel: str) -> dict:
+    """Verify whether a chat channel's credential still works.
+
+    Separate from list_channels on purpose: that reports what is configured,
+    this reports whether the credential is still accepted. Use it when a
+    scheduled notification has stopped arriving - a revoked bot token leaves
+    the channel looking configured while every send fails.
+
+    Never returns the token itself. If re-authentication needs a human it says
+    so and names the environment variable.
+    Example: check_channel("telegram")"""
+    try:
+        import notify as _notify
+        return _notify.refresh_channel_token(channel)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def enable_scheduled(schedule_id: str, enabled: bool = True) -> dict:
+    """Turn a scheduled task back on, or off, without deleting it.
+
+    Use this when the user says a reminder is "disabled", "greyed out" or asks
+    you to "enable it". Scheduling the same thing again instead creates a
+    DUPLICATE row and leaves the original disabled, which is not what they
+    asked for - so enable the existing id first.
+
+    The id comes from list_scheduled. A one-shot whose time has already passed
+    cannot be re-armed and will say so; cancel it and schedule a new one with a
+    future time.
+    Example: enable_scheduled("sch-1d666791")
+    Example: enable_scheduled("sch-1d666791", enabled=False)"""
+    try:
+        import scheduler
+        return scheduler.set_enabled(schedule_id, bool(enabled))
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -2015,7 +2483,35 @@ def render_document(format: str, title: str, blocks: list = None,
         spec["sheets"] = [s for s in sheets[:20] if isinstance(s, dict)]
     if not spec.get("blocks") and not spec.get("sheets") and not spec["title"]:
         return {"ok": False, "error": "nothing to render: pass a title, blocks "
-                                     "or sheets"}
+                                      "or sheets"}
+
+    # A title alone is not a document. This guard used to accept one, so a
+    # model that put its whole spec in a "render_document" key instead of
+    # calling the tool produced a cover + TOC + blank page + references and
+    # called it success - 9 words across 4 pages. The block list it DID pass
+    # contained only a `cover`, so counting blocks was not enough; these are
+    # the types that carry no body text.
+    _chrome = ("cover", "pagebreak", "heading", "toc")
+    _body = [b for b in (spec.get("blocks") or [])
+             if isinstance(b, dict)
+             and str(b.get("type") or "").lower() not in _chrome]
+    if not _body and not spec.get("sheets"):
+        seen = sorted({str(b.get("type") or "?").lower()
+                       for b in (spec.get("blocks") or [])
+                       if isinstance(b, dict)}) or ["none"]
+        return {"ok": False,
+                "error": ("no content blocks: the document would render as a "
+                          "blank shell. Pass real content - at least one "
+                          'paragraph, bullets, numbers, table, quote, chart or '
+                          f"image block (got only: {', '.join(seen)}). Call "
+                          "render_document again with the full document.")}
+    # Front matter with nothing to index is what produced the literal
+    # "0 Placeholder for table of contents" page and the blank page after it.
+    if spec.get("toc") and not _body:
+        # Unreachable while the guard above is in place, kept so the two never
+        # drift: the TOC is what rendered as "0 Placeholder for table of
+        # contents" with no headings behind it.
+        spec.pop("toc")
 
     try:
         with httpx.Client(timeout=120, follow_redirects=True,
@@ -2061,6 +2557,83 @@ def render_document(format: str, title: str, blocks: list = None,
                     "as a download. `stats.words` is what you actually "
                     "delivered — if it is far below the length you were asked "
                     "for, expand the content and render again."}
+
+
+@mcp.tool()
+def save_as_document(path: str, filename: str = "") -> dict:
+    """Save a file you already produced into the user's Documents section.
+
+    Use this when the user says "save that to my docs", "keep this for later",
+    or "put it in my documents" — about a file that already exists in the
+    sandbox. It is the bridge the console needs: `render_document` produces a
+    downloadable artifact, and `create_file` writes into the sandbox, but
+    neither of those appears in the Documents list, which is a separate store
+    on the gateway.
+
+    `path` is a sandbox path, or an `art:<id>` handle from render_document.
+    The file is indexed for search afterwards, so say so rather than implying
+    it is only filed away.
+
+    Example: save_as_document("art:a1b2c3d4e5f6a7b8")
+    Example: save_as_document("out/report.md", filename="report.md")"""
+    src = (path or "").strip()
+    if not src:
+        return {"ok": False, "error": "path is required"}
+    blob, name, err = _read_blob(src)
+    if err:
+        return {"ok": False, "error": err}
+    name = (filename or "").strip() or name or "document"
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True,
+                          headers=_gw_headers()) as client:
+            r = client.post(f"{_GW}/v1/documents",
+                            files={"file": (name, blob)})
+    except Exception as e:
+        return {"ok": False,
+                "error": f"gateway unreachable: {type(e).__name__}: {e}"}
+    if r.status_code >= 400:
+        try:
+            detail = (r.json() or {}).get("error") or r.text[:200]
+        except Exception:
+            detail = r.text[:200]
+        return {"ok": False, "status": r.status_code, "error": detail}
+    try:
+        doc = (r.json() or {}).get("document") or {}
+    except Exception:
+        doc = {}
+    return {"ok": True, "document_id": doc.get("id", ""), "filename": name,
+            "bytes": len(blob),
+            "note": "Saved to the user's Documents and indexed for search. "
+                    "Tell them the filename, not the document id."}
+
+
+def _read_blob(src: str) -> tuple[bytes, str, str]:
+    """Bytes + filename for a sandbox path or an `art:` handle.
+
+    Returns (b"", "", error) rather than raising, so every caller can report a
+    bad path the same way instead of each inventing a message.
+    """
+    try:
+        if src.startswith("art:"):
+            import artifacts as _arts
+            blob = _arts.get_bytes(src)
+            name = ""
+            # The descriptor doubles as the download filename, and carries the
+            # extension ("Quarterly review (pdfx)"); strip that so the registry
+            # detects the type from the name rather than from nothing.
+            try:
+                desc = (_arts.get_meta(src).descriptor or "").strip()
+                m = re.match(r"^(.*?)\s*\(([a-z0-9]+)\)$", desc, re.I)
+                name = f"{m.group(1).strip()}.{m.group(2)}" if m else desc
+            except Exception:
+                name = ""
+            return blob, name, ""
+        p = _safe(src)
+        if not p.exists() or not p.is_file():
+            return b"", "", f"no such file: {src}"
+        return p.read_bytes(), p.name, ""
+    except Exception as e:
+        return b"", "", f"{type(e).__name__}: {e}"
 
 
 if __name__ == "__main__":

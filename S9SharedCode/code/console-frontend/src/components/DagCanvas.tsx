@@ -253,8 +253,14 @@ export default function DagCanvas({
         onInit={setRfInstance}
         nodeTypes={nodeTypes}
         fitView
-        fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
-        minZoom={0.15}
+fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+    /* The floor, not the aesthetic minimum. fitView caps at maxZoom 1 so the
+       graph is never magnified, but it was free to shrink to 0.15 - which
+       turned 11px node labels into roughly 7px and the 9px status chip into
+       5px on a wide run. "The information flow is too small" is this. The
+       trade is explicit: a very wide graph now overflows and pans instead of
+       shrinking into illegibility, which is the better failure. */
+    minZoom={0.5}
         maxZoom={1.75}
         proOptions={{ hideAttribution: false }}
         colorMode="dark"

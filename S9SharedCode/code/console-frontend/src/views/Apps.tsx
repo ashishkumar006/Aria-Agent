@@ -141,6 +141,13 @@ export default function Apps() {
     setItemFilter('');
     setViewSel('auto');
     setShowPrefab(false);
+    // The A2UI toggle was not reset here, so one board's rows rendered under
+    // the next board's name: openApp nulls `detail` and refetches the app
+    // while the effect below refetches the *surface* in parallel, and the
+    // surface build is strictly the slower of the two — so app A's table was
+    // briefly on screen under app B's breadcrumb, with the Table component
+    // still holding its own search/sort/page state.
+    setShowA2ui(false);
     try {
       const d = await api.trackerApp(id);
       if (detailReq.current !== req) return;

@@ -18,11 +18,23 @@ def client(timeout: float = DEFAULT_TIMEOUT) -> httpx.Client:
 
 def post(url: str, *, json: dict | None = None, data: dict | None = None,
          headers: dict[str, str] | None = None,
+         files: dict | None = None,
          timeout: float = DEFAULT_TIMEOUT) -> httpx.Response:
+    """POST a request.
+
+    `files` switches the body to multipart/form-data, which Telegram's upload
+    methods (sendDocument, sendPhoto, ...) require: they reject a JSON body
+    outright, so `json=` cannot be coerced into working.
+    """
     h = {"User-Agent": USER_AGENT}
     if headers:
         h.update(headers)
     with client(timeout) as c:
+        if files is not None:
+            # httpx sets the multipart boundary itself; a hand-written
+            # Content-Type here would omit it and the server would not be
+            # able to find the boundary to parse against.
+            return c.post(url, data=data, files=files, headers=h)
         return c.post(url, json=json, data=data, headers=h)
 
 

@@ -1119,7 +1119,7 @@
       if (memKind) items = items.filter((m) => m.kind === memKind);
       box.replaceChildren();
       const bar = el("div", "meta-row");
-      ["", "fact", "preference", "tool_outcome", "scratchpad"].forEach((k) => {
+      ["", "fact", "preference", "observation", "tool_outcome", "scratchpad"].forEach((k) => {
         const b = el("button", "chip" + (memKind === k ? " active" : ""), k || "all");
         b.onclick = () => { memKind = k; loadMem(); };
         bar.append(b);

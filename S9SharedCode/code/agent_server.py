@@ -36,6 +36,7 @@ import re
 import sys
 import threading
 import time as _time
+import datetime as _dt
 from pathlib import Path, PurePosixPath
 
 # Stdio is UTF-8, unconditionally (same fix as the gateway and MCP server:
@@ -331,10 +332,40 @@ def resolve_session(conversation_id: str | None, *,
 # failure is swallowed.
 _NOTIFY_CHAT = os.environ.get("AGENT_NOTIFY_CHAT_ID")
 _GW_NOTIFY = os.environ.get("LLM_GATEWAY_V9_URL", "http://localhost:8109").rstrip("/")
+
+
+def _self_token() -> str:
+    """The agent's own per-launch token, for loopback self-calls.
+
+    `channel_chat` drives a channel turn by calling the chat route on this very
+    process, and that route requires `X-Aria-Token` like every other. Prefer
+    the in-process token, which is what a call from inside the server gets.
+
+    Fall back to `state/agent.token` when this process is not the server (a
+    CLI, a worker): `configure()` ran in the server's process, not here, and
+    that file exists precisely so a second Aria process can authenticate to
+    the running one. Returns "" when neither is available, which is correct
+    under `ARIA_AUTH=off` — the header is simply absent, and the endpoint does
+    not check it.
+    """
+    try:
+        import auth as _auth
+        if _auth.is_enabled():
+            return _auth.token()
+        # Not configured here: this process is not the server (a CLI, a
+        # worker). Read the file `configure()` writes on launch, using the
+        # module's own state-dir resolution so S9_STATE_DIR is honoured.
+        return (_auth.state_dir() / "agent.token") \
+            .read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
 # Resolved destination, cached briefly. Resolving costs a loopback call, and
 # the answer only changes when someone pairs a new chat.
 _NOTIFY_RESOLVED: tuple[str, bool, float] | None = None   # (chat, ok, at)
-_NOTIFY_TTL_S = 60.0
+# How long a MISS (no destination resolved) is remembered, so a burst of
+# chat replies cannot hammer the gateway. A hit is never cached — see
+# `resolve_notify_chat` for why that distinction is load-bearing.
+_NOTIFY_MISS_TTL_S = 15.0
 
 
 def resolve_notify_chat(channel: str = "telegram") -> str:
@@ -347,13 +378,25 @@ def resolve_notify_chat(channel: str = "telegram") -> str:
     silently, which is the worst possible failure for a reminder.
 
     Order: an explicit id wins, then the gateway's paired chat for the
-    channel. Cached, because a fire should not wait on the gateway.
+    channel.
+
+    A MISS is cached for a moment so a burst of chat replies does not hammer
+    the gateway, but a hit is not: a paired chat changes only when someone
+    pairs, and re-reading it is one cheap loopback call. The old code cached
+    both alike for 60s, so a single 401 — the gateway restarting, or its token
+    rotating under a long-lived agent — poisoned the cache and every reminder
+    that fired in that window was recorded as "no notification destination is
+    paired". That message is a lie: a destination WAS paired, and the agent
+    simply could not read it for a moment. Verified live — that is exactly
+    what silently ate every channel-less reminder.
+
+    A 401 is retried once with freshly-read credentials, matching `_gw_json`.
     """
     global _NOTIFY_RESOLVED
     if _NOTIFY_CHAT:
         return _NOTIFY_CHAT
     now = _time.time()
-    if _NOTIFY_RESOLVED and (now - _NOTIFY_RESOLVED[2]) < _NOTIFY_TTL_S:
+    if _NOTIFY_RESOLVED and (now - _NOTIFY_RESOLVED[2]) < _NOTIFY_MISS_TTL_S:
         return _NOTIFY_RESOLVED[0]
     chat = ""
     try:
@@ -361,32 +404,65 @@ def resolve_notify_chat(channel: str = "telegram") -> str:
         with _hx.Client(timeout=8.0, headers=_gw_auth_headers()) as c:
             r = c.get(f"{_GW_NOTIFY}/v1/control/notify-target",
                       params={"channel": channel})
+            if r.status_code == 401:
+                # The gateway rotated its token, or this agent was started
+                # before the gateway existed. Re-read and try once.
+                c.headers.update(_gw_auth_headers())
+                r = c.get(f"{_GW_NOTIFY}/v1/control/notify-target",
+                          params={"channel": channel})
             if r.status_code == 200:
                 chat = str((r.json() or {}).get("target") or "")
-    except Exception:
+            elif r.status_code >= 400:
+                print(f"[notify] notify-target -> HTTP {r.status_code}; "
+                      f"no destination resolved for {channel}")
+    except Exception as e:
+        print(f"[notify] notify-target unreachable: {type(e).__name__}: {e}")
         chat = ""
-    _NOTIFY_RESOLVED = (chat, bool(chat), now)
+    # Cache a MISS briefly (burst protection). Do NOT cache a hit: it costs
+    # one loopback call and is the only thing standing between a reminder and
+    # a silent drop.
+    _NOTIFY_RESOLVED = (chat, bool(chat), now) if not chat else None
     return chat
 
 
-def _notify_telegram(text: str, chat: str | None = None) -> None:
+def _notify_telegram(text: str, chat: str | None = None) -> bool:
+    """Send one Telegram message. Returns whether the gateway accepted it.
+
+    The gateway requires `X-Gateway-Token` on every `/v1/*` route. This post
+    used to omit it, so it came back **401** — and the bare `except: pass`
+    plus an unchecked status code swallowed that completely. A reminder set
+    without an explicit channel runs through here, so every such reminder
+    fired, billed its agent run, recorded an in-app entry, and then went
+    nowhere: no Telegram message, no log line, no error anywhere. Reproduced
+    live before this fix.
+
+    Now it sends the header, checks the status, and logs a failure instead of
+    discarding it. Returns True/False so callers can record the outcome."""
     to = chat if chat is not None else resolve_notify_chat()
     if not to:
-        return
+        return False
     try:
         import httpx as _hx
-        _hx.post(
+        r = _hx.post(
             f"{_GW_NOTIFY}/v1/channels/telegram/send",
             json={"to": to, "text": text[:4096],
                   "agent": "notify"},
+            headers=_gw_auth_headers(),
             timeout=15,
         )
-    except Exception:
-        pass
+        if r.status_code >= 400:
+            print(f"[notify] telegram send failed: HTTP {r.status_code} "
+                  f"{r.text[:160]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[notify] telegram send failed: {type(e).__name__}: {e}")
+        return False
 
 
 def notify_task_done(query: str, answer: str, cost: float,
-                     session_id: str, *, scheduled: bool = False) -> None:
+                     session_id: str, *, scheduled: bool = False,
+                     message: str = "") -> None:
     """Send a Telegram summary of a finished run.
 
     `scheduled=True` (a fired reminder) notifies whenever a destination
@@ -402,6 +478,14 @@ def notify_task_done(query: str, answer: str, cost: float,
     Either way the in-app notification feed is written, so there is always
     somewhere the result is recorded even if Telegram is unreachable.
 
+    `message` is the text the AGENT wrote when it scheduled the task — the
+    words it chose for this particular reminder. It is sent verbatim. This
+    used to be discarded on the no-channel path, so a reminder set through
+    Telegram arrived as a fixed template regardless of what the agent wanted
+    to say: a green tick, a wall-clock line, a session id, and the raw run
+    output. The agent already decided what the user should be told at
+    scheduling time; that decision was being overwritten by a formatter.
+
     `cost` is the wall-clock time of the run in seconds (named `cost` for
     backwards-compat with the public API / wiring check)."""
     if not scheduled and os.environ.get(
@@ -409,21 +493,36 @@ def notify_task_done(query: str, answer: str, cost: float,
         return
     chat = resolve_notify_chat()
     if not chat:
+        # Say which of the two it was. "No destination is paired" tells the
+        # user to message the bot, and that advice is wrong when the real
+        # cause was an unreachable or unauthorised gateway — which is how a
+        # transient 401 masqueraded as a pairing problem for an entire
+        # release, and sent the user off to fix something that was fine.
         _notif_add("scheduled", f"scheduled task finished but no "
-                                  f"notification destination is paired: "
-                                  f"{query[:120]}")
+                                  f"notification destination could be read "
+                                  f"from the gateway: {query[:120]}")
         return
-    snippet = (answer or "").strip().replace("\n", " ")
-    snippet = snippet[:280] + ("…" if len(snippet) > 280 else "")
-    headline = "Reminder" if scheduled else "Agent task complete"
-    msg = (
-        f"✅ {headline}\n"
-        f"time ± {cost:.1f}s · session {session_id}\n"
-        f"query {query[:120]}\n"
-        f"🎙 {snippet}"
-    )
-    threading.Thread(target=_notify_telegram, args=(msg, chat),
-                     daemon=True).start()
+    authored = (message or "").strip()
+    if authored:
+        # The agent's own words, unchanged. No prefix, no decoration.
+        msg = authored
+    else:
+        # No authored text: say plainly what happened, in a sentence. A bare
+        # answer with no framing is worse than a short lead-in, but a wall
+        # clock and a session id are not what a person asked for.
+        snippet = (answer or "").strip()
+        snippet = snippet[:600] + ("…" if len(snippet) > 600 else "")
+        msg = (f"{query[:200]}\n\n{snippet}" if snippet
+               else f"{query[:200]}")
+    # Sent inline, not on a daemon thread. A daemon thread detached the
+    # outcome from the caller entirely: the fire logged "ok", the thread
+    # failed for whatever reason, and nothing downstream could ever record
+    # that the reminder was not delivered. This is the path a channel-less
+    # reminder depends on, and its whole job is to report honestly.
+    if not _notify_telegram(msg, chat):
+        _notif_add("scheduled",
+                   f"scheduled task finished but the notification could not "
+                   f"be delivered: {query[:120]}", session_id)
 
 
 # ── notification log (in-memory + on-disk) ──────────────────────────────────
@@ -477,10 +576,19 @@ def add_notification(kind: str, text: str, session_id: str = "",
 
 
 def list_notifications(limit: int = 50) -> list:
-    """Return the most recent notifications (newest first)."""
+    """Return the most recent notifications (newest first).
+
+    `limit` is clamped at 0 and treated as "everything". A negative value used
+    to be passed straight into `items[-limit:]`, where `items[--1]` is
+    `items[1:]` - so `?limit=-1` quietly dropped the OLDEST record instead of
+    being rejected, and the caller got a short list with no indication that a
+    window had been applied.
+    """
     with _NOTIF_LOCK:
         items = _notif_load()
-    return list(reversed(items[-limit:]))
+    if limit is None or limit <= 0:
+        return list(reversed(items))
+    return list(reversed(items[-int(limit):]))
 
 
 # ── static UI ──────────────────────────────────────────────────────────────
@@ -1356,7 +1464,7 @@ async def session_produced(session_id: str):
         g = None
     if g is None:
         return JSONResponse(status_code=404, content={"error": "no such session"})
-    from flow import take_produced_files
+    from flow import take_produced_files, read_run_status
     files = take_produced_files(session_id)
     live = _run_is_live([str(d.get("status", "")) for _, d in g.nodes(data=True)])
     # The final answer, once a formatter has produced one.
@@ -1366,8 +1474,19 @@ async def session_produced(session_id: str):
         if isinstance(out, dict) and isinstance(out.get("final_answer"), str):
             answer = out["final_answer"]
             break
+    # How the run ENDED. The answer recovered above is the formatter node's own
+    # output, which never carries the "this answer is incomplete" warning or
+    # the operator's stop notice - both existed only in the SSE frame that
+    # delivered them once. Reopening a finished run therefore showed a
+    # complete-looking report with no hint that a branch was missing.
+    status = read_run_status(session_id)
+    degraded = bool(status.get("degraded"))
+    detail = [str(x) for x in (status.get("detail") or [])]
+    stopped = any(str(d.get("status", "")).lower() == "skipped"
+                  for _, d in g.nodes(data=True)) and not answer
     return {"session_id": session_id, "files": files, "answer": answer,
-            "live": live,
+            "live": live, "degraded": degraded, "incomplete_detail": detail,
+            "stopped": bool(stopped),
             "nodes": [{"id": nid, "skill": d.get("skill", ""),
                        "status": d.get("status", "")}
                       for nid, d in g.nodes(data=True)]}
@@ -1581,8 +1700,24 @@ _FAILURE_REASONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Ordered most-specific first: the first pattern that matches wins, so a
     # message naming two things is filed under the one that actually stopped
     # the node.
-    ("reply not parseable as the required JSON (empty or prose)",
-     ("no usable json",)),
+    # The empty/prose split is deliberate and must stay above the generic
+    # "no usable json" bucket: skills.py:2413 goes to great lengths to
+    # distinguish them, because they have different fixes (an upstream
+    # completion problem vs a prompt/format problem). Collapsing them hid a
+    # 52/13 split behind a single row, so the first pattern to match must be
+    # the specific one.
+    ("provider returned an empty reply", ("no usable json: empty reply",)),
+    ("reply was prose, not the required JSON",
+     ("no usable json: reply was not json",)),
+    ("reply not parseable as the required JSON", ("no usable json",)),
+    # A renderer crash is OUR bug, not the model's behaviour, and the two have
+    # opposite fixes. Without this bucket a live
+    # `NameError: name 'title' is not defined` in the spec-fallback render
+    # path was reported to the user as "claimed a document but never called
+    # render_document" - blaming the model for our NameError.
+    ("document renderer failed (agent bug, not the model)",
+     ("render_document failed", "spec fallback render failed",
+      "renderer failed", "nameerror", "attributeerror")),
     ("claimed a document but never called render_document",
      ("without calling render_document", "no file was rendered",
       "never called render_document")),
@@ -1623,11 +1758,20 @@ async def nodes_health(limit: int = 200, conversation_id: str | None = None):
     from persistence import SessionStore, SESSIONS_ROOT as _SESS_ROOT
     from persistence import list_sessions as persistence_list_sids
     sids: list[str] = []
+    # A caller-supplied id must be a plain session id. Without this check
+    # `conversation_id=../../..` resolved to the repo root, `is_dir()` was
+    # true, and the endpoint reported `sessions: 1` - a phantom run examined.
+    # Same rule the session routes use.
+    def _plain(s: str) -> bool:
+        return bool(s) and not s.startswith(".") and "/" not in s \
+            and "\\" not in s and len(s) <= 128 \
+            and all(ord(ch) >= 0x20 and ord(ch) != 0x7F for ch in s)
+
     if conversation_id:
         convs = _conv_load()
         inv = {v: k for k, v in convs.items()}
         sid = inv.get(conversation_id) or conversation_id
-        if sid and (_SESS_ROOT / sid).is_dir():
+        if isinstance(sid, str) and _plain(sid) and (_SESS_ROOT / sid).is_dir():
             sids = [sid]
     else:
         def _mtime(sid: str) -> float:
@@ -1638,10 +1782,19 @@ async def nodes_health(limit: int = 200, conversation_id: str | None = None):
         sids = sorted(persistence_list_sids(), key=_mtime, reverse=True)[:limit]
 
     per: dict[str, dict] = {}
+    # A graph that cannot be parsed is not a run with zero nodes. The endpoint
+    # used to `continue` silently, so a corrupt graph.json left the count of
+    # sessions examined claiming it had been read, and with EVERY graph
+    # unreadable the response was `{"sessions": N, "rows": []}` - which the UI
+    # renders as "No completed nodes in the recent runs", the exact
+    # "nothing happened" vs "could not tell" conflation the rest of the page
+    # goes to lengths to avoid.
+    unreadable = 0
     for sid in sids:
         try:
             g = SessionStore(sid, create=False).read_graph()
         except Exception:
+            unreadable += 1
             continue
         if g is None:
             continue
@@ -1649,17 +1802,27 @@ async def nodes_health(limit: int = 200, conversation_id: str | None = None):
         try:
             items = list(nodes(data=True)) if callable(nodes) else list(nodes)
         except Exception:
+            unreadable += 1
             continue
         for _nid, d in items:
             skill = str(d.get("skill") or "?")
             slot = per.setdefault(skill, {
-                "skill": skill, "nodes": 0, "failed": 0, "skipped": 0,
-                "reasons": {},
+                "skill": skill, "nodes": 0, "attempted": 0, "failed": 0,
+                "skipped": 0, "never_run": 0, "reasons": {},
             })
             slot["nodes"] += 1
             st = str(d.get("status") or "").lower()
             if st == "skipped":
                 slot["skipped"] += 1
+            # A node that never ran cannot have failed, so it must not sit in
+            # the denominator. Including `pending` and `interrupted` made the
+            # failure rate look better than the truth: formatter showed
+            # "256 nodes, 0 failed, 0.0%" while 90 of those nodes had never
+            # been dispatched at all.
+            if st in ("failed", "error", "complete"):
+                slot["attempted"] += 1
+            elif st in ("pending", "interrupted"):
+                slot["never_run"] += 1
             if st in ("failed", "error"):
                 slot["failed"] += 1
                 res = d.get("result")
@@ -1669,7 +1832,10 @@ async def nodes_health(limit: int = 200, conversation_id: str | None = None):
 
     rows = []
     for slot in per.values():
-        n = slot["nodes"] or 1
+        # Denominator is nodes ATTEMPTED. `or 1` keeps the division safe when
+        # a skill's every node was never run, and the row then reports
+        # fail_pct 0.0 alongside a never_run count that says why.
+        n = slot["attempted"] or 1
         failed = slot["failed"]
         reasons = sorted(
             ({"reason": k, "count": v,
@@ -1684,13 +1850,16 @@ async def nodes_health(limit: int = 200, conversation_id: str | None = None):
     rows.sort(key=lambda r: (-r["fail_pct"], -r["nodes"]))
     return {
         "sessions": len(sids),
+        # >0 means the table below is a partial view, not the whole truth.
+        "unreadable": unreadable,
         "rows": rows,
         "totals": {
             "nodes": sum(r["nodes"] for r in rows),
+            "attempted": sum(r["attempted"] for r in rows),
             "failed": sum(r["failed"] for r in rows),
             "fail_pct": round(
                 sum(r["failed"] for r in rows)
-                / max(1, sum(r["nodes"] for r in rows)) * 100, 1),
+                / max(1, sum(r["attempted"] for r in rows)) * 100, 1),
         },
     }
 
@@ -2127,6 +2296,19 @@ async def runs_summary(limit: int = 200):
                 mtime = store.graph_path.stat().st_mtime if store.graph_path.exists() else 0
             except Exception:
                 mtime = 0
+            # A run with no graph still has an age. `mtime` deliberately stays
+            # 0 so `_reconcile_status` keeps treating the graph as absent, but
+            # the DISPLAY timestamp falls back to the session directory mtime.
+            # Reporting `updated: 0` made the client print "0s ago" for runs
+            # that were up to 119 hours old (measured), and because the list
+            # sorts by directory mtime while the pill used graph mtime, those
+            # rows sorted to the very top of the page claiming "queued".
+            updated_at = mtime
+            if not updated_at:
+                try:
+                    updated_at = (_SESS_ROOT / sid).stat().st_mtime
+                except OSError:
+                    updated_at = 0.0
             for _st, _n in status_counts.items():
                 by_status[_st] = by_status.get(_st, 0) + _n
             for _sk in skills:
@@ -2142,8 +2324,13 @@ async def runs_summary(limit: int = 200):
                 "status_counts": _reconcile_status(status_counts, mtime, _t.time()),
                 "skills": skills[:8],
                 "usd": round(usd, 6),
-                "updated": mtime,
-                "updated_ago": round(_t.time() - mtime, 1) if mtime else None,
+                "updated": updated_at,
+                "updated_ago": round(_t.time() - updated_at, 1) if updated_at else None,
+                # False means "there is no graph to show", which is a different
+                # thing from a run that is queued. Nine of the graph-less rows
+                # carry run_status.json with degraded=true - real failed runs
+                # that the client was labelling as fresh queued work.
+                "has_graph": bool(mtime),
             })
         except Exception:
             continue
@@ -2700,6 +2887,140 @@ async def get_notifications(limit: int = 50):
     return {"notifications": list_notifications(limit=limit)}
 
 
+@app.get("/api/ack/threads")
+async def get_ack_threads(limit: int = 50):
+    """Acknowledgement conversations opened by pre-notifications.
+
+    Exposed because the records exist and are otherwise invisible: a reminder
+    that is waiting on a reply looks identical to one that was delivered and
+    ignored until you can see which.
+    """
+    try:
+        import ack as _ack
+        return {"threads": _ack.list_threads(limit=limit)}
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/ack/inbound")
+async def post_ack_inbound(body: dict):
+    """Route an inbound channel message: an acknowledgement thread first, then
+    an ordinary chat turn.
+
+    The gateway's webhook handler calls this after normalizing a message. It is
+    also reachable directly so the flow can be exercised without a live chat
+    platform. Returns what happened either way — an unroutable message is a
+    normal outcome, not an error, because most inbound traffic is not a reply
+    to any reminder.
+
+    This route and `/api/channel/inbound` are the same router: a reply to a
+    live reminder belongs to that thread whatever it says, and everything else
+    is a person talking to the agent.
+    """
+    channel = str(body.get("channel") or "telegram")
+    sender = str(body.get("sender") or body.get("sender_id") or "")
+    text = str(body.get("text") or "")
+    if not sender or not text:
+        return JSONResponse(status_code=400,
+                            content={"error": "sender and text are required"})
+    try:
+        import channel_chat
+        return channel_chat.route_inbound(channel, sender, text)
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/channel/inbound")
+async def post_channel_inbound(body: dict):
+    """A message from a chat channel (Telegram today), answered back on it.
+
+    Returns immediately; the turn runs on a daemon thread, because a chat
+    platform retries a slow webhook and a reply that arrives twice is worse
+    than one that arrives late.
+
+    Routing order: an open acknowledgement thread for this sender owns the
+    message outright (see `channel_chat.route_inbound`); otherwise it becomes a
+    chat turn, subject to the trust gate — a channel the agent can be talked to
+    is also a channel a stranger can type into. Both refusals are normal
+    outcomes rather than errors, reported in the body so the caller can log
+    them rather than treating the request as failed.
+    """
+    channel = str(body.get("channel") or "telegram")
+    sender = str(body.get("sender") or body.get("sender_id") or "")
+    text = str(body.get("text") or "")
+    attachments = body.get("attachments") or []
+    # A file-only message has no text. Refusing it as malformed was correct
+    # when files were dropped by the adaptor anyway; now the file is the
+    # request, and "sender and text are required" would 400 the user's upload.
+    if not sender or (not text and not attachments):
+        return JSONResponse(status_code=400, content={
+            "error": "sender and (text or attachments) are required"})
+    try:
+        import channel_chat
+        return channel_chat.route_inbound(channel, sender, text,
+                                         attachments=attachments)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/channel/threads")
+async def get_channel_threads():
+    """Who has talked to the agent over a channel, and which conversation
+    each one maps to.
+
+    Exposed because the mapping is otherwise invisible: a channel turn is a
+    real chat conversation with its own history, and there is no way to see
+    that from the console today.
+    """
+    try:
+        import channel_chat
+        with channel_chat._LOCK:  # noqa: SLF001 - same repo, read-only
+            data = channel_chat._load_map()
+        return {"conversations": data}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/notify/channels")
+async def get_notify_channels():
+    """Which channels a notification could use right now, and what is missing.
+
+    Three separate questions per channel, because conflating them is how a
+    channel ends up looking alive in the inventory while delivering nothing:
+    configured (does the gateway hold a credential), destination (is anyone
+    paired to receive it), and the last delivery attempt.
+    """
+    try:
+        import notify as _notify
+        return {"health": _notify.channel_health(),
+                "recent": _notify.delivery_log(10)}
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/notify/refresh")
+async def post_notify_refresh(body: dict):
+    """Verify (and where possible refresh) a channel credential.
+
+    Verification is the part that actually helps: it distinguishes "the
+    gateway holds a token" from "that token still works", which the inventory
+    cannot do. Supplying `token` sets it for this process only — it is never
+    written to disk from here.
+    """
+    try:
+        import notify as _notify
+        return _notify.refresh_channel_token(
+            str(body.get("channel") or ""), str(body.get("token") or ""))
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+
+
 @app.post("/api/notifications")
 async def post_notification(req: Request):
     """Append a notification entry. Body: {kind, text, session_id?, conversation_id?}."""
@@ -2754,6 +3075,13 @@ async def list_memories(q: str | None = None, limit: int = 50,
             d["superseded_by"] = h.superseded_by
         if getattr(h, "drawer", None):
             d["drawer"] = h.drawer
+        # How well-supported the record is. Until observations existed nothing
+        # ever wrote a non-default confidence, so this always read 1.0 and the
+        # UI had nothing honest to show; an observation carrying its score is
+        # how a user judges whether to trust an entry.
+        conf = getattr(h, "confidence", None)
+        if conf is not None:
+            d["confidence"] = conf
         return d
 
     try:
@@ -2793,6 +3121,50 @@ async def list_memories(q: str | None = None, limit: int = 50,
         return JSONResponse(status_code=502, content={
             "status": "error",
             "message": f"memory backend unavailable: {e}"[:200]})
+
+
+@app.post("/api/profile/document")
+async def profile_document():
+    """Write the whole profile - observations AND standing preferences - into
+    the Documents section as a markdown file.
+
+    Both stores, because they answer different questions and a person checking
+    "what does the agent think it knows about me" needs both. Far easier to
+    argue with on paper than in a list of rows.
+    """
+    try:
+        import memory as _mem
+        out = _mem.save_profile_document()
+        if not out.get("ok"):
+            return JSONResponse(status_code=502, content=out)
+        return out
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
+
+
+@app.get("/api/profile")
+async def profile_observations(limit: int = 50):
+    """The behavioural profile: what has been noticed, and the quote behind it.
+
+    Separate from /api/memory because the evidence is the point. In the
+    generic list an observation is a row of text like any other; here every
+    entry carries the user's own words and a confidence, so a wrong one is
+    visibly a guess and the user can delete it knowing what it was based on.
+    """
+    try:
+        import memory as _mem
+        enabled = _mem.observations_enabled()
+        rows = _mem.list_observations(k=max(1, min(int(limit), 200))) \
+            if enabled else []
+        return {"enabled": enabled, "observations": rows,
+                "note": "" if enabled else
+                        "Off. Turn on the memory.observations flag to start "
+                        "recording."}
+    except Exception as e:
+        return JSONResponse(status_code=502, content={
+            "status": "error",
+            "message": f"profile unavailable: {e}"[:200]})
 
 
 _MAX_VALUE_DEPTH = 24
@@ -3149,6 +3521,141 @@ async def _with_doc_context(messages: list[dict], query: str,
     return out, n
 
 
+def _chat_memory_block(query: str, session_id: str | None) -> str:
+    """Standing user facts for the chat prompt, as its own system turn.
+
+    Chat had no memory at all: `flow.py` reads hits once per run and skills
+    receive them as MEMORY HITS, but `chat_simple`/`chat_simple_stream` only
+    ever called `_with_doc_context`. So a preference the user saved was
+    invisible in the one surface where they most expect to be obeyed — the
+    chat they use to ask "what do you know about me?" That tool
+    (`recall_preferences`) exists and works, but a model cannot answer
+    correctly about the user by choosing to call a tool to fetch the very
+    facts it should already have been given.
+
+    Fail-soft, and deliberately shaped like the skill-side block: these are
+    cross-session facts, never conversation history, and must not be woven
+    into the answer unasked. Documents are filtered by the same enabled set
+    `flow.py` uses so a disabled upload cannot leak through chat.
+    """
+    try:
+        import memory as _mem
+        from skills import _format_memory_hits
+        doc_ids = None
+        try:
+            doc_ids = _gw_enabled_doc_ids()
+        except Exception:
+            doc_ids = set()
+        hits = _mem.read(query, drawers=[d for d in _mem.SESSION_DRAWERS
+                                         if d != "profile"],
+                         top_k=6, session_id=session_id,
+                         doc_ids=doc_ids) or []
+        if not hits:
+            return ""
+        rendered = _format_memory_hits(hits)
+        if not rendered:
+            return ""
+        return (
+            f"MEMORY HITS ({len(hits)} from FAISS) - standing facts about "
+            "the user accumulated across ALL conversations, not part of this "
+            "conversation's history. Honour them where they are relevant "
+            "(preferences, corrections, ongoing work). Never present them as "
+            "something the user said in THIS conversation, and never mention "
+            "that you have a memory unless asked:\n" + rendered)
+    except Exception as e:
+        # Recall must never fail a chat turn.
+        print(f"[chat.memory] recall skipped: {e!r}")
+        return ""
+
+
+def _read_profile_for_block() -> list[dict]:
+    """Observation rows for the chat block. A seam, so the rendering can be
+    tested without a live gateway."""
+    try:
+        import memory as _mem
+        return _mem.recall_observations(k=8) or []
+    except Exception as e:
+        print(f"[chat.profile] recall skipped: {e!r}")
+        return []
+
+
+def _chat_profile_block() -> str:
+    """The behavioural profile, with the evidence attached to every line.
+
+    Rendered separately from the fact hits because it must be read differently.
+    A fact is something true; an observation is a pattern *drawn* from past
+    conversations, and the quote under it is the only reason to believe it.
+    Showing the evidence is what stops the model treating a low-confidence
+    guess as an established fact about the user - and it means a wrong entry
+    is visibly wrong rather than invisibly steering the answer.
+    """
+    try:
+        import memory as _mem
+        if not _mem.observations_enabled():
+            return ""
+        rows = [r for r in _read_profile_for_block() if r.get("observation")]
+        if not rows:
+            return ""
+        lines = []
+        for r in rows:
+            seen = int(r.get("seen_count") or 1)
+            line = f"- {r['observation']}"
+            # Say how many times this has actually been seen. A claim recorded
+            # once is an anecdote and must not be obeyed like a standing
+            # preference; confidence alone hides that, because the extractor
+            # grades a single incident highly.
+            line += ("  (seen ONCE - a single incident, not a standing preference; "
+                     "treat as a maybe, not a rule)"
+                     if seen <= 1 else
+                     f"  (seen {seen} times)")
+            if r.get("evidence"):
+                line += f"\n    they said: \"{r['evidence'][:160]}\""
+            lines.append(line)
+        return (
+            "WHAT YOU HAVE NOTICED ABOUT THIS USER (behavioural, evidence-"
+            "backed, gathered across past conversations). Treat these as "
+            "hypotheses about how they like to work, NOT as facts they "
+            "asserted and NOT as a judgement about them. They are never a "
+            "diagnosis, and this is not a psychological profile: they record "
+            "observable requests and corrections. Anything marked 'seen once' "
+            "is a single incident - do not treat it as a standing preference. "
+            "Follow the rest where relevant; ignore any that is wrong for "
+            "the current task; never quote them back as if the user had just "
+            "told you. If one is contradicted by what they say now, they win "
+            "and it is stale.\n"
+            + "\n".join(lines))
+    except Exception as e:
+        print(f"[chat.profile] recall skipped: {e!r}")
+        return ""
+
+
+async def _with_chat_memory(messages: list[dict], query: str,
+                            session_id: str | None) -> list[dict]:
+    """Insert the memory block just before the final user message.
+
+    Placed adjacent to the question for the same reason as document context,
+    and inserted once per turn so a long thread does not accumulate every
+    earlier turn's hits.
+
+    The `async def` was misleading: both helpers are synchronous and both make
+    blocking gateway round-trips — an enabled-document listing (30s timeout),
+    a memory search that embeds and runs FAISS (60s), and a profile read (30s)
+    — three in sequence, on the event loop, on every chat turn. So a slow
+    gateway froze the whole console mid-answer. They now run in one worker
+    thread, which also costs one thread hop instead of three blocking ones.
+    """
+    import asyncio as _aio
+    blocks = await _aio.to_thread(
+        lambda: [b for b in (_chat_memory_block(query, session_id),
+                             _chat_profile_block()) if b])
+    if not blocks:
+        return messages
+    out = list(messages)
+    for block in blocks:
+        out.insert(max(0, len(out) - 1), {"role": "system", "content": block})
+    return out
+
+
 @app.get("/api/capabilities")
 async def api_capabilities():
     """What this agent supports, in AG-UI's capability shape.
@@ -3162,6 +3669,16 @@ async def api_capabilities():
         enabled = bool(_flag_on("chat.agui", True))
     except Exception:
         enabled = True
+    # The capability document must describe what chat can ACTUALLY do. The
+    # `chat.tools` kill-switch strips the payload from both chat endpoints, so
+    # advertising 21 tools here while the model is handed none is the same
+    # class of lie as inventing an artifact handle: a client that trusts this
+    # builds a UI offering actions that will never fire.
+    try:
+        from flags import is_enabled as _flag_on
+        chat_tools_on = bool(_flag_on("chat.tools", True))
+    except Exception:
+        chat_tools_on = True
     try:
         from skills import tool_payload as _tp
         # Aria's tool payload shape is a top-level `name` + `input_schema`,
@@ -3169,13 +3686,15 @@ async def api_capabilities():
         # nested form silently yielded an empty list, so the capability
         # document claimed toolCalling: false while chat was calling tools on
         # every request.
-        names = [t.get("name") for t in (_tp(
+        names = ([t.get("name") for t in (_tp(
             _CHAT_TOOLS) or []) if isinstance(t, dict) and t.get("name")]
+            if chat_tools_on else [])
     except Exception:
         names = []
     import agui as _agui
     caps = _agui.capabilities(streaming=True, tools=names)
     caps["custom"] = {"aguiEndpointEnabled": enabled,
+                      "chatToolsEnabled": chat_tools_on,
                       "conversationEndpoints": ["/api/chat/threads"]}
     return caps
 
@@ -3196,6 +3715,10 @@ async def agui_endpoint(req: Request):
     identical: message assembly, document retrieval, thread persistence and
     cost accounting. Everything below the SSE boundary is native here.
     """
+    # Bound here, not where it was first needed: `await _aio...` with no
+    # binding in scope is a NameError, and it took the whole route down with it.
+    import asyncio as _aio
+
     try:
         from flags import is_enabled as _flag_on
         if not _flag_on("chat.agui", True):
@@ -3264,10 +3787,10 @@ async def agui_endpoint(req: Request):
         # own transcript (no top-level query was sent): appending
         # it to the history again would send the turn to the
         # model twice and answer it twice.
-        messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
+        messages = ([{"role": "system", "content": _chat_system_now()}]
                     + history_messages)
     else:
-        messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
+        messages = ([{"role": "system", "content": _chat_system_now()}]
                     + history_messages
                     + [{"role": "user", "content": query}])
     try:
@@ -3280,12 +3803,13 @@ async def agui_endpoint(req: Request):
 
     try:
         from gateway import LLM, ensure_gateway
-        ensure_gateway()
+        await _aio.to_thread(ensure_gateway)
     except Exception as e:
         return JSONResponse(status_code=502, content={
             "error": f"gateway unavailable: {e}"})
 
-    cost_before = _session_cost_breakdown(thread_id)
+    cost_before = await _aio.to_thread(_session_cost_breakdown,
+                                         thread_id)
     pending: list[dict] = []
     call_seq = 0
     # The id of the tool call currently awaiting its result. This is kept in a
@@ -4213,6 +4737,312 @@ def _check_braces(text: str, lines: list[str]) -> dict:
             "note": "delimiter balance only - not a compiler"}
 
 
+@app.get("/api/code/git")
+async def code_git(target: str = "status"):
+    """Show what changed in the workspace: status, diff, or recent log.
+
+    Read-only, and it is the review step for anything that edited a file. The
+    Code view's own edits live in the browser until saved, so this shows what
+    is actually on disk - which is the thing that has to be reviewed before it
+    is trusted.
+
+    No write verb is offered: this cannot stage, commit or revert."""
+    import asyncio as _aio
+
+    t = (target or "status").strip().lower()
+    if t not in ("status", "diff", "log"):
+        return JSONResponse(status_code=400, content={
+            "error": f"target must be status, diff or log; got {target!r}"})
+
+    root = _CODE_ROOT.resolve()
+
+    def _run():
+        # Deliberately NOT mcp_server.git_inspect: that tool is sandbox-
+        # relative by design, and asking it for "." resolves to the sandbox,
+        # which is not a repository - so it answered "nothing to review" for a
+        # workspace that is one. This route is about the CODE ROOTS, so it runs
+        # git against _CODE_ROOT directly.
+        import shutil
+        import subprocess
+
+        exe = shutil.which("git")
+        if not exe:
+            return {"ok": False, "error": "git is not installed"}
+        if not (root / ".git").exists():
+            return {"ok": False,
+                    "error": "this workspace is not a git repository - "
+                             "nothing to review"}
+        argv = [exe, "-C", str(root)]
+        argv += {"status": ["status", "--porcelain=v1"],
+                 "diff": ["diff", "--no-color"],
+                 "log": ["log", "--oneline", "-n", "20"]}[t]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=60)
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return {"ok": proc.returncode == 0, "target": t,
+                "exit_code": proc.returncode,
+                "output": (proc.stdout or "")[:200_000],
+                "truncated": len(proc.stdout or "") > 200_000,
+                "stderr": (proc.stderr or "")[:2_000]}
+
+    return await _aio.to_thread(_run)
+
+
+@app.post("/api/code/ask")
+async def code_ask(req: Request):
+    """Ask the agent about the code in the editor, with the real project around it.
+
+    The Code view had no way to talk to the agent: it could read, search and
+    edit files, but every question about the code had to leave the page. This
+    makes the editor an AI editor by giving one question a real context - the
+    active buffer (unsaved edits included), any explicitly attached files, and
+    a bounded slice of the surrounding project so the answer is grounded rather
+    than from memory.
+
+    Read-only by design. It answers, it does not edit: a question typed into a
+    panel should not be able to rewrite files behind the user's back. The agent
+    can still find definitions (`find_symbol`) and read them, but it writes
+    nothing. Applying a change is the user's next step, in the editor, where
+    they can see it.
+
+    Returns SSE frames so a long answer streams: `status`, `delta`, `done`.
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+
+    question = str(body.get("question") or "").strip()
+    if not question:
+        return JSONResponse(status_code=400,
+                            content={"error": "question is required"})
+    if len(question) > 8000:
+        return JSONResponse(status_code=413,
+                            content={"error": "question is too long"})
+
+    import asyncio as _aio
+
+    cursor = str(body.get("path") or "").strip()
+    buffer_text = body.get("text")
+    if not isinstance(buffer_text, str):
+        buffer_text = ""
+    if len(buffer_text.encode("utf-8", "replace")) > _CODE_MAX_BYTES:
+        return JSONResponse(status_code=413, content={
+            "error": f"buffer is over the {_CODE_MAX_BYTES} byte limit"})
+    attached = [str(p) for p in (body.get("paths") or [])
+                if isinstance(p, str)][:6]
+
+    def _gather():
+        """Read the context on a thread: every one of these is blocking I/O."""
+        files: list[dict] = []
+        if cursor and _code_abs(cursor) is not None:
+            try:
+                files.append({"path": cursor, "role": "active file"})
+            except Exception:
+                pass
+        for rel in attached:
+            p = _code_abs(rel)
+            if p is None or not p.is_file() or p.stat().st_size > _CODE_MAX_BYTES:
+                continue
+            try:
+                files.append({"path": rel,
+                              "content": p.read_text(encoding="utf-8",
+                                                     errors="replace")})
+            except Exception:
+                continue
+        # A bounded slice of the project so answers are grounded in the real
+        # tree rather than in memory. File NAMES only - the contents are
+        # reachable one explicit request at a time.
+        listing: list[str] = []
+        try:
+            for rel in _code_files_all().get("files", [])[:400]:
+                listing.append(rel)
+        except Exception:
+            pass
+        return files, listing
+
+    files, listing = await _aio.to_thread(_gather)
+
+    async def gen():
+        yield _sse("status", text="reading the project…")
+        try:
+            import gateway as _gw
+            from gateway import LLM
+        except Exception as e:
+            yield _sse("error", text=f"gateway unavailable: {e}")
+            return
+
+        prompt_parts = [
+            "You are answering a question about a real codebase, inside that "
+            "codebase's own editor. Be specific and concrete: name files, "
+            "functions and line numbers. If the answer is not in the context "
+            "below, say so plainly instead of guessing.",
+            f"\nQUESTION: {question}\n",
+        ]
+        if cursor:
+            head = (f"\nACTIVE FILE: {cursor} (unsaved edits included)\n"
+                    f"{buffer_text[:_CODE_MAX_BYTES]}")
+            prompt_parts.append(head)
+        for f in files:
+            if "content" in f:
+                prompt_parts.append(
+                    f"\nATTACHED FILE: {f['path']}\n{f['content'][:120_000]}")
+        if listing:
+            prompt_parts.append(
+                "\nPROJECT FILES (names only - ask for any of these to be "
+                f"read if you need it):\n" + "\n".join(listing[:300]))
+
+        try:
+            # `LLM.chat` is BLOCKING and returns a dict - so it goes through
+            # to_thread. Awaiting it fails with "object dict can't be used in
+            # 'await' expression"; calling it inline blocks the event loop.
+            reply = await _aio.to_thread(
+                LLM().chat,
+                prompt="".join(prompt_parts),
+                agent="code", session=f"code-{cursor or 'scratch'}",
+                max_tokens=8000, temperature=0.2)
+        except Exception as e:
+            yield _sse("error", text=f"{type(e).__name__}: {e}")
+            return
+        if not isinstance(reply, dict):
+            yield _sse("error",
+                       text=f"gateway returned {type(reply).__name__}, "
+                            f"not a reply object")
+            return
+
+        if reply.get("error") and not (reply.get("text") or "").strip():
+            yield _sse("error", text=str(reply.get("error"))[:400])
+            return
+
+        answer = str(reply.get("text") or "")
+        for i in range(0, len(answer), 240):
+            yield _sse("delta", text=answer[i:i + 240])
+            await _aio.sleep(0)
+        yield _sse("done", answer=answer, path=cursor,
+                    provider=reply.get("provider", ""),
+                    context_files=[f["path"] for f in files])
+
+    return StreamingResponse(gen(), **_SSE_HEADERS)
+
+
+@app.post("/api/code/checks")
+async def code_checks(req: Request):
+    """Run the project's real lint / typecheck / tests for the editor.
+
+    `/api/code/check` judges the BUFFER with `ast.parse` - fast, and honest
+    about being a parser. This runs the project itself: pytest / tsc / npm
+    test / ruff / cargo / go vet, whichever the project actually has. It is
+    slow by nature (a test suite takes what it takes) and it is what makes the
+    panel a real feedback loop rather than a spell-checker.
+
+    The path is confined to the Code roots exactly like every other code
+    endpoint, and the working directory is fixed to a root rather than taken
+    from the request.
+    """
+    import asyncio as _aio
+    import shutil
+    import subprocess
+
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be a JSON object"})
+
+    rel = str(body.get("path") or "").strip()
+    cwd = _code_abs(rel) if rel else None
+    if cwd is None:
+        # Default to the first Code root that exists.
+        root = _CODE_ROOT.resolve()
+        for r in _CODE_ROOTS:
+            cand = (root / r).resolve()
+            if cand.is_dir():
+                cwd = cand
+                break
+    if cwd is None or not cwd.is_dir():
+        return JSONResponse(status_code=400, content={
+            "error": "path must be a directory inside the Code roots"})
+
+    def _detect(d: Path):
+        # Imported rather than duplicated: the editor and the agent's
+        # run_checks tool must agree on what counts as "this project has a
+        # checker", or the panel reports green while the agent reports fail.
+        try:
+            from mcp_server import _CHECK_PROFILES
+        except Exception:
+            return []
+        out = []
+        for marker, tool, args in _CHECK_PROFILES:
+            if not (d / marker).exists():
+                continue
+            exe = shutil.which(tool)
+            if not exe:
+                out.append({"marker": marker, "tool": tool, "available": False})
+                continue
+            out.append({"marker": marker, "tool": tool, "available": True,
+                        "argv": [exe, *args]})
+        return out
+
+    def _run_checks():
+        found = _detect(cwd)
+        results = []
+        all_ok = True
+        for f in found:
+            if not f.get("available"):
+                all_ok = False
+                results.append({
+                    "tool": f["tool"], "available": False, "ok": False,
+                    "error": f"{f['tool']} is not installed; the project has "
+                             f"{f['marker']} but the runner is missing"})
+                continue
+            try:
+                proc = subprocess.run(f["argv"], cwd=str(cwd),
+                                      capture_output=True, text=True,
+                                      timeout=240)
+            except subprocess.TimeoutExpired:
+                all_ok = False
+                results.append({"tool": f["tool"], "ok": False,
+                                "exit_code": None,
+                                "error": "timed out after 240s"})
+                continue
+            except Exception as e:
+                all_ok = False
+                results.append({"tool": f["tool"], "ok": False,
+                                "exit_code": None,
+                                "error": f"{type(e).__name__}: {e}"})
+                continue
+            ok = proc.returncode == 0
+            all_ok = all_ok and ok
+            results.append({
+                "tool": f["tool"], "ok": ok, "exit_code": proc.returncode,
+                "stdout": (proc.stdout or "")[-24_000:],
+                "stderr": (proc.stderr or "")[-24_000:]})
+        return all_ok, results, found
+
+    ran, results, found = await _aio.to_thread(_run_checks)
+
+    if not found:
+        return {"ok": False, "checks_run": 0, "results": [],
+                "cwd": str(cwd),
+                "error": "no checker detected: this project has none of "
+                         "pyproject.toml, pytest.ini, setup.cfg, tox.ini, "
+                         "package.json, tsconfig.json, ruff.toml, "
+                         "Cargo.toml or go.mod"}
+    return {"ok": ran, "checks_run": len(results), "results": results,
+            "cwd": str(cwd),
+            "note": ("Every check exited 0." if ran else
+                     "At least one check FAILED.")}
+
+
 @app.get("/api/code/search")
 async def code_search(q: str = "", limit: int = 200):
     """Bounded literal search across the servable workspace.
@@ -4330,7 +5160,8 @@ async def remember_memory(req: Request):
                             content={"error": "descriptor must be a string"})
     kind = (raw_kind or "fact").strip()
     descriptor = (raw_desc or "").strip()
-    if kind not in ("fact", "preference", "tool_outcome", "scratchpad") or not descriptor:
+    if kind not in ("fact", "preference", "tool_outcome", "scratchpad",
+                    "observation") or not descriptor:
         return JSONResponse(status_code=400, content={"error": "kind + descriptor required"})
     value = body.get("value")
     if value is not None and not isinstance(value, dict):
@@ -4492,7 +5323,13 @@ async def add_policy(req: Request):
 async def schedule_task(req: Request):
     """Schedule a query to run later. Body:
     {"query": str, "when": "in 10m"|"daily@09:00"|"every 30m"|<epoch>,
-     "conversation_id"?: str, "notify"?: bool}."""
+     "conversation_id"?: str, "notify"?: bool,
+     "channel"?: str, "lead_s"?: "15m"|900, "lead_message"?: str,
+     "message"?: str, "wait_for_ack"?: bool, "snooze_s"?: "5m",
+     "ack_timeout_s"?: "15m", "max_follow_ups"?: int}
+
+    The notification arguments are all optional; without them a task behaves
+    exactly as it always has: run, then record the outcome locally."""
     from scheduler import schedule
 
     try:
@@ -4520,13 +5357,52 @@ async def schedule_task(req: Request):
     _notify = body.get("notify", True)
     if isinstance(_notify, str):
         _notify = _notify.strip().lower() not in ("false", "0", "no", "off")
+
+    def _as_bool(v, default=False):
+        """bool("false") is True - a string from LLM-generated JSON or a
+        curl body without a content-type silently enables whatever it gates."""
+        if v is None:
+            return default
+        if isinstance(v, str):
+            return v.strip().lower() not in ("false", "0", "no", "off", "")
+        return bool(v)
+
+    try:
+        _follow_ups = int(body.get("max_follow_ups", 3) or 0)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={
+            "error": "max_follow_ups must be an integer 0-10"})
     try:
         sid = schedule(query, when,
                        conversation_id=body.get("conversation_id"),
-                       notify=bool(_notify))
+                       notify=bool(_notify),
+                       channel=_body_str(body, "channel") or "",
+                       lead_s=body.get("lead_s") or "",
+                       lead_message=_body_str(body, "lead_message") or "",
+                       message=_body_str(body, "message") or "",
+                       wait_for_ack=_as_bool(body.get("wait_for_ack")),
+                       snooze_s=body.get("snooze_s") or "",
+                       ack_timeout_s=body.get("ack_timeout_s") or "",
+                       max_follow_ups=_follow_ups)
     except ValueError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)[:200]})
-    return {"status": "ok", "id": sid}
+        # 400, not 500: a rejected lead time or an unknown channel is the
+        # caller's input being wrong, and the message says which.
+        return JSONResponse(status_code=400, content={"error": str(e)[:300]})
+    out = {"status": "ok", "id": sid}
+    try:
+        from scheduler import _SCHED_LOCK, _SCHEDULES
+        with _SCHED_LOCK:
+            pol = (_SCHEDULES.get(sid) or {}).get("notify_policy") or {}
+        if pol:
+            out["notification"] = {
+                "channel": pol.get("channel"),
+                "pre_warning_at": pol.get("lead_fire") or None,
+                "waits_for_acknowledgement": bool(pol.get("wait_for_ack")),
+                "max_follow_ups": pol.get("max_follow_ups"),
+            }
+    except Exception:
+        pass
+    return out
 
 
 @app.get("/api/schedule")
@@ -4535,6 +5411,13 @@ async def list_scheduled():
     from scheduler import list_schedules
 
     return {"schedules": list_schedules()}
+
+
+def scheduler_set_enabled(sid: str, enabled: bool) -> dict:
+    """Thin wrapper so the route and the MCP tool share one implementation."""
+    from scheduler import set_enabled as _set
+
+    return _set(sid, enabled)
 
 
 @app.delete("/api/schedule/{sid}")
@@ -4547,6 +5430,81 @@ async def cancel_scheduled(sid: str, hard: bool = False):
     from scheduler import cancel
 
     return {"status": "ok" if cancel(sid) else "not_found"}
+
+
+def _chat_tool_payload() -> list[dict] | None:
+    """Chat's tool schema, with the write methods cut out of multi-call tools.
+
+    `_CHAT_TOOLS_REFUSED` lists `github_create_issue` and `notion_create_page`
+    to deny, but neither name is a real tool — the actual write lives inside
+    `github_query` / `notion_query`, whose `api_method` enum contains them.
+    Chat was handed that enum verbatim, so it could open issues and write to
+    Notion while the refusal set said it could not, and the guard test passes
+    because it compares names only.
+
+    Narrowing the enum is the enforcement: the model is not told a write
+    method exists, so it cannot ask for one. `_CHAT_WRITE_METHODS` stays as the
+    readable statement of intent.
+    """
+    from skills import tool_payload as _tp
+    try:
+        specs = _tp(_CHAT_TOOLS) or []
+    except Exception as e:
+        print(f"[chat.tools] payload build failed: {e!r}")
+        return None
+    blocked = _CHAT_WRITE_METHODS
+    if not blocked:
+        return specs
+    out = []
+    for spec in specs:
+        name = str(spec.get("name") or "")
+        deny = blocked.get(name)
+        if not deny:
+            out.append(spec)
+            continue
+        schema = spec.get("input_schema") or {}
+        params = schema.get("properties") or {}
+        method = params.get("api_method") or {}
+        enum = list(method.get("enum") or [])
+        kept = [m for m in enum if m not in deny]
+        if len(kept) == len(enum):
+            out.append(spec)
+            continue
+        spec = dict(spec)
+        spec["input_schema"] = dict(schema)
+        spec["input_schema"]["properties"] = dict(params)
+        spec["input_schema"]["properties"]["api_method"] = {
+            **method, "enum": kept,
+            "description": (str(method.get("description") or
+                                 "operation").rstrip(".") +
+                            ". Chat is read-only here; writing happens on the "
+                            "Research path."),
+        }
+        out.append(spec)
+    return out
+
+
+
+@app.post("/api/schedule/{sid}/enabled")
+async def set_scheduled_enabled(sid: str, req: Request):
+    """Arm or disarm a scheduled task without deleting it.
+
+    The counterpart to DELETE /api/schedule/{sid}. Before this existed the only
+    thing a caller could do with a greyed-out row was delete it, so "turn that
+    reminder back on" had no action behind it anywhere - not in the console and
+    not for the agent, which is why it got answered by scheduling a second copy
+    and leaving the original dead.
+
+    The refusal is returned as a 200 with ok:false, not an HTTP error: a
+    one-shot whose time has passed is a real answer the caller should show to
+    the user ("it is for last year, schedule a new one"), not a transport
+    failure to retry.
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    return scheduler_set_enabled(sid, bool(body.get("enabled", True)))
 
 
 @app.post("/api/schedule/purge")
@@ -5037,6 +5995,23 @@ def _warm_gateway():
 _GATEWAY_WARMUP_THREAD = _warm_gateway()
 
 
+async def _acost_breakdown(session_id: str) -> dict | None:
+    """`_session_cost_breakdown` without blocking the event loop.
+
+    It is a synchronous httpx call to the gateway with a 5s timeout, and it
+    was being called directly from `async def` handlers on the chat path. Every
+    other request in the process waits while it runs, so a slow gateway read
+    stalled /api/health for seconds — a chat turn made the whole console look
+    hung. Off-thread, and it yields to the loop while it waits.
+    """
+    import asyncio as _a
+    try:
+        return await _a.to_thread(_session_cost_breakdown, session_id)
+    except Exception as e:
+        print(f"[cost] breakdown failed: {e!r}")
+        return None
+
+
 def _session_cost_breakdown(session_id: str) -> dict | None:
     """Return the gateway's cost ledger for a session, broken down PER AGENT:
     {agent: {usd, in_tok, out_tok, calls}}. Used both to snapshot the
@@ -5414,22 +6389,63 @@ _CHAT_TOOLS = [
     "notion_query",
     # memory
     "recall_preferences", "remember_preference",
-    # reminders: list, create, cancel
+    # reminders: list, create, cancel, re-enable — plus channel discovery
     "list_scheduled", "schedule_task", "cancel_scheduled",
+    "enable_scheduled",
+    "list_channels", "check_channel",
     # workspace files: read, then create/edit
     "read_file", "list_dir", "search_files",
     "create_file", "update_file", "edit_file",
     # documents the chat itself can produce
     "render_document", "read_artifact",
+    # filing an existing file into the console's Documents section
+    "save_as_document",
+    # the behavioural profile is READ-only for chat; see the note on the
+    # prompt paragraph below for why recording is not offered here.
+    "recall_observations",
 ]
 # Tools chat deliberately does NOT get, with the reason, so the next person does
 # not "fix" the gap by adding them.
+#
+# NAMES ALONE DO NOT ENFORCE THIS. `github_query` and `notion_query` are
+# multi-call tools whose `api_method` enum contains create_issue / create_page /
+# append_text — the exact writes `github_create_issue`, `notion_create_page`
+# and `notion_append` were listed here to deny. Those three names match no MCP
+# tool at all, so the set looked like a working guard while chat could still
+# open issues and write to Notion through the wrapper, and the test that checks
+# it compares set names only. `_CHAT_WRITE_METHODS` closes the hole; the
+# phantom names are kept so the intent is still on the record.
 _CHAT_TOOLS_REFUSED = {
     "send_email", "send_telegram", "slack_message", "discord_message",
     "github_create_issue", "notion_create_page", "notion_append",
     "create_calendar_event",
     "delete_file", "computer_action", "index_document",
 }
+
+# (tool, api_method) pairs chat must never call, checked where the payload is
+# built rather than by name. A refused capability that is reachable through a
+# general-purpose wrapper is not refused.
+_CHAT_WRITE_METHODS: dict[str, frozenset] = {
+    "github_query": frozenset({"create_issue"}),
+    "notion_query": frozenset({"create_page", "append_text"}),
+    # `calendar_query` and `gmail_query` are deliberately absent: neither has
+    # an `api_method` selector at all. calendar_query only ever calls
+    # calendar/list, and gmail_query's enum is list|read. Adding them here
+    # would imply a hole that does not exist.
+}
+
+
+def chat_write_method_allowed(tool: str, api_method: str | None) -> bool:
+    """Can chat use this tool with this method? Read methods are always fine.
+
+    This is the layer that actually enforces the refusal. Without it the
+    refusal is documentation: the model picks `github_query` with
+    `api_method: create_issue` and the write happens.
+    """
+    blocked = _CHAT_WRITE_METHODS.get(tool)
+    if not blocked or not api_method:
+        return True
+    return str(api_method) not in blocked
 
 _CHAT_SYSTEM = (
     "You are Aria, a concise chat assistant. Answer directly in Markdown. "
@@ -5438,7 +6454,8 @@ _CHAT_SYSTEM = (
     "calendar_query, gmail_query, github_query, slack_history, notion_query, "
     "recall_preferences, remember_preference, list_scheduled, "
     "schedule_task, cancel_scheduled, read_file, list_dir, search_files, "
-    "create_file, update_file, edit_file, render_document, read_artifact) "
+    "create_file, update_file, edit_file, render_document, read_artifact, "
+    "save_as_document, enable_scheduled, recall_observations) "
     "— use them instead of guessing. The user's OWN accounts are among them: "
     "if they ask what is on "
     "their calendar, what is in their inbox, what reminders exist, what is in "
@@ -5451,13 +6468,60 @@ _CHAT_SYSTEM = (
     "call schedule_task with their words as `query` and the time as `when`. "
     "Then tell them the schedule id. To remove one, call list_scheduled first, "
     "confirm which entry you mean, then cancel_scheduled with its id. "
+    # The channel half, which the prompt used to omit entirely: schedule_task
+    # accepts `channel`, `lead_s` and `wait_for_ack`, but a model that is only
+    # told about query/when will never use them — and it will tell the user it
+    # cannot notify them anywhere, which is a lie it did not choose.
+    "NOTIFICATIONS: schedule_task can also PUSH a message to a chat channel. "
+    "When the user wants to be told somewhere other than this console — "
+    "'text me on telegram', 'ping me on slack', 'warn me 10 minutes before' — "
+    "call list_channels first and use a channel that reports a paired "
+    "destination, then set `channel`, and `lead_s` with `lead_message` for a "
+    "pre-warning and `message` for the fire-time text. Set `wait_for_ack` when "
+    "the reminder must not be missed: the user is then expected to reply, their "
+    "reply comes back to you, and you decide whether to answer it. If a "
+    "notification has stopped arriving, call check_channel to see whether the "
+    "credential still works. If the channel they asked for reports no "
+    "destination, say so plainly and tell them to message the bot once to pair "
+    "it — do not promise a delivery you cannot see happening. "
+    # Telegram is also a way IN, not only a way out.
+    "TELEGRAM AS A CHAT: if the user messages you from Telegram, the reply "
+    "goes back to Telegram on the same chat. Treat it as an ordinary chat "
+    "turn: their message is the query, tools work as normal, and your reply is "
+    "the answer. "
     # Files and documents, because asking for a document in chat previously
     # produced markdown instead of a file.
     "FILES AND DOCUMENTS: to edit or create a workspace file, read it first "
     "with read_file, then change it with edit_file or update_file. To produce "
     "a real PDF, deck, Word or Excel file, call render_document with the whole "
     "document as blocks - never just paste the document into the chat, because "
-    "a pasted document is text and cannot be downloaded. "
+    "a pasted document is text and cannot be downloaded. To keep an existing "
+    "file in the user's Documents section - 'save that to my docs', 'keep this "
+    "for later' - call save_as_document with its path or artifact handle; that "
+    "is the only way a file reaches that list, and it makes the file "
+    "searchable. "
+    # The behavioural profile. The rules here are about honesty, not caution:
+    # an observation is a pattern drawn from past conversations, and the quote
+    # under it is the only reason to believe it.
+    "If the user corrects you or says how they want things done — 'always "
+    "give me the date', 'stop with the preamble', 'shorter' — do nothing "
+    "special. A background pass already reads every turn you see, records "
+    "the correction with their exact words, and re-reads it back to you. "
+    "You have strictly less information than that pass - the same message, "
+    "and no way to verify a quote is verbatim - so do not try to record it "
+    "yourself: two writers double-count every correction, and a paraphrased "
+    "quote overwrites the real one. "
+    "You may also be given WHAT YOU HAVE NOTICED about this user: treat each "
+    "line as a hypothesis, not a fact, and if they contradict one now, they "
+    "win and it is stale. Never quote the profile back at them or tell them "
+    "what you have noticed. "
+    # Reminders, continued: re-enabling a greyed-out row used to have no tool,
+    # so the only way to satisfy "turn that back on" was to schedule a second
+    # copy and leave the original dead.
+    "If they ask you to re-enable, resume or switch on a reminder that is "
+    "off, call list_scheduled, then enable_scheduled with that id. Never "
+    "answer it by scheduling the same thing again — that leaves a duplicate "
+    "and the original still disabled. "
     # Retrieved documents. The retrieval is done by the server before this
     # prompt is even sent; without saying so, the model treats the block as an
     # unexplained wall of text and tends to ignore it in favour of a confident
@@ -5484,6 +6548,33 @@ _CHAT_SYSTEM = (
     "fact about the world, a one-off instruction about the current task, or "
     "anything secret this way."
 )
+
+
+def _chat_system_now() -> str:
+    """_CHAT_SYSTEM plus the one thing it cannot state as a constant: today.
+
+    The prompt is a module-level string, so it can never carry a date. That
+    mattered little until it mattered completely: "remind me tomorrow at 9am"
+    was answered with `2025-10-12T09:00:00` because nothing told the model the
+    year. A model has no clock - its sense of "now" is its training data, so
+    absent a date it guesses, and a reminder is exactly where a stale guess
+    is expensive: the row looks scheduled and never fires.
+
+    Resolved per call rather than at import, so a long-running process does not
+    freeze the date at whatever day it booted on. Local time with an explicit
+    UTC offset, because `when` values are resolved against the same clock and a
+    date with no zone is how "tomorrow 9am" drifts by a day.
+    """
+    now = _dt.datetime.now().astimezone()
+    stamp = now.strftime("%A %d %B %Y, %H:%M %Z (UTC%z)").strip()
+    return (
+        _CHAT_SYSTEM
+        + f"\n\nTODAY IS {stamp}. Any date the user gives as 'today', "
+          "'tomorrow', 'tonight' or 'next week' is relative to that, not to "
+          "your training data. When you compute a date yourself, count the "
+          "days forward from it and write the result as an ISO datetime "
+          "including the correct year. Never guess the year."
+    )
 
 
 def _capture_preference_bg(text: str, conversation_id: str | None) -> None:
@@ -5513,6 +6604,31 @@ def _capture_preference_bg(text: str, conversation_id: str | None) -> None:
         pass
 
 
+def _capture_observation_bg(text: str, conversation_id: str | None) -> None:
+    """Extract durable behavioural observations from a chat turn, off the path.
+
+    Gated on `memory.observations`, which is OFF by default: this is the only
+    path that retains conversation text the user did not ask to be retained,
+    so it must be turned on deliberately rather than discovered later.
+
+    Background thread and quiet on failure, for the same reasons as
+    `_capture_preference_bg`: one extractor call plus a write must not add
+    latency to a reply, and a memory outage must never become a chat error.
+    """
+    try:
+        import memory as _mem
+        if not _mem.observations_enabled():
+            return
+        if not text or len(text) > 4000:
+            return
+        threading.Thread(target=_mem.extract_observations,
+                         args=(text,), kwargs={"session_id": conversation_id,
+                                               "source": "chat"},
+                         daemon=True).start()
+    except Exception:
+        pass
+
+
 def _chat_threads_load() -> dict:
     return _read_json(_CHAT_THREADS_PATH, dict)
 
@@ -5522,6 +6638,56 @@ def _chat_threads_save(data: dict) -> None:
         _write_json_atomic(_CHAT_THREADS_PATH, data)
     except Exception:
         pass
+
+
+_ART_HANDLE = re.compile(r"art:[0-9a-fA-F]{16}")
+
+
+def _chat_produced_files(conversation_id: str, answer: str) -> list[dict]:
+    """Artifacts the model rendered during a chat turn.
+
+    The DAG path reports its files from a `produced_files.json` sidecar. Chat
+    has no such sidecar, so the `done` frame carried no file list at all and
+    the Chat view was left scraping `art:` handles out of the answer prose —
+    which only works if the model volunteers the handle in its text, and can
+    never render a chart, because a chart lives inside the document rather
+    than in the reply.
+
+    So the handle is read back out of the answer (the same source of truth the
+    view was using), and every id is resolved against the artifact store before
+    it is reported: an unresolvable handle becomes a download button that fails
+    with an opaque 400, which is worse than showing nothing.
+    """
+    if not conversation_id or not _plain_id_ok(conversation_id):
+        return []
+    handles = []
+    for h in _ART_HANDLE.findall(answer or ""):
+        if h not in handles:
+            handles.append(h)
+    if not handles:
+        return []
+
+    out = []
+    try:
+        import artifacts as _arts
+    except Exception:
+        return []
+    for art in handles[:20]:
+        try:
+            meta = _arts.get_meta(art)
+        except Exception:
+            continue
+        if not meta:
+            continue
+        descriptor = getattr(meta, "descriptor", "") or ""
+        content_type = getattr(meta, "content_type", "") or ""
+        out.append({
+            "artifact": art,
+            "filename": descriptor or "document",
+            "format": content_type.split("/")[-1] if content_type else "",
+            "skill": "chat",
+        })
+    return out
 
 
 @app.get("/api/chat/threads")
@@ -5577,6 +6743,10 @@ async def delete_chat_thread(conversation_id: str):
 async def chat_simple(req: Request):
     """One direct gateway LLM call (with read-only tools), billed to the
     thread. No Executor, no graph."""
+    # Bound here, not where it was first needed: `await _aio...` with no
+    # binding in scope is a NameError, and it took the whole route down.
+    import asyncio as _aio
+
     try:
         body = await req.json()
     except Exception:
@@ -5633,12 +6803,13 @@ async def chat_simple(req: Request):
                                      "messages": []}
             _chat_threads_save(_pre)
     _capture_preference_bg(query, conversation_id)
+    _capture_observation_bg(query, conversation_id)
 
     # Snapshot this thread's gateway spend BEFORE the call so the ledger can
     # record exactly this reply. Lightweight chat used to be invisible to
     # the Ledger ("no cost ledger") — which silently under-reported spend on
     # the very path the Chat view uses by default.
-    cost_before = _session_cost_breakdown(conversation_id)
+    cost_before = await _acost_breakdown(conversation_id)
 
     # Build the message list under the lock, then RELEASE it before the model
     # call. This used to hold a threading.Lock across a blocking sync HTTP
@@ -5653,7 +6824,7 @@ async def chat_simple(req: Request):
                                      "messages": []}
         thread = data[conversation_id]
         history = thread.get("messages") or []
-        messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
+        messages = ([{"role": "system", "content": _chat_system_now()}]
                     + history[-(_CHAT_MAX_TURNS * 2):]
                     + [{"role": "user", "content": query}])
     # Deterministic document retrieval. This happens before the model sees the
@@ -5661,6 +6832,7 @@ async def chat_simple(req: Request):
     # the model choosing to call `search_knowledge`.
     messages, _doc_hits = await _with_doc_context(
         messages, query, _conversation_doc_ids(conversation_id, body))
+    messages = await _with_chat_memory(messages, query, conversation_id)
     try:
         # Read-only tools so chat can answer current/external facts
         # (web_search, fetch_url, get_time, search_knowledge,
@@ -5677,8 +6849,11 @@ async def chat_simple(req: Request):
         except Exception:
             _chat_tools_on = True
         # The single list. Everything absent is unreachable, so this array is
-        # the whole of chat's capability.
-            _tools = _tool_payload(_CHAT_TOOLS) if _chat_tools_on else None
+        # the whole of chat's capability. Assigned at the try level, NOT inside
+        # the except above: when the flags import succeeds (the normal case) a
+        # nested assignment never runs and the `if _tools` below raises
+        # UnboundLocalError, which is a 502 on every one-shot chat.
+        _tools = _chat_tool_payload() if _chat_tools_on else None
         if _tools:
             try:
                 from mcp_runner import run_with_tools as _run_with_tools
@@ -5735,12 +6910,14 @@ async def chat_simple(req: Request):
     # Persist this reply's spend under the thread id (threads/ tree), outside
     # the thread lock so a gateway round-trip can't stall other chat saves.
     try:
-        delta = _session_cost_delta(conversation_id, cost_before)
+        delta = await _aio.to_thread(_session_cost_delta,
+                                       conversation_id, cost_before)
         if delta:
             _record_turn_cost(conversation_id, query, delta)
     except Exception:
         pass
-    return {"answer": answer, "conversation_id": conversation_id}
+    return {"answer": answer, "conversation_id": conversation_id,
+            "files": _chat_produced_files(conversation_id, answer)}
 
 
 def _chat_chunks(text: str, words_per_chunk: int = 4):
@@ -5876,6 +7053,10 @@ async def chat_simple_stream(req: Request):
     Thread persistence + cost accounting are identical to chat_simple.
     `media_type` must stay `text/event-stream` or gzip buffers the stream.
     """
+    # Bound here, not where it was first needed: `await _aio...` with no
+    # binding in scope is a NameError, and it took the whole route down.
+    import asyncio as _aio
+
     try:
         body = await req.json()
     except Exception:
@@ -5918,7 +7099,7 @@ async def chat_simple_stream(req: Request):
     # as an error, rather than opening a stream that immediately errors.
     try:
         from gateway import LLM, ensure_gateway as _ensure_gateway
-        _ensure_gateway()
+        await _aio.to_thread(_ensure_gateway)
     except Exception as e:
         return JSONResponse(status_code=502, content={
             "error": f"gateway unavailable: {e}"})
@@ -5943,10 +7124,10 @@ async def chat_simple_stream(req: Request):
     # Same deterministic preference capture as chat_simple (see
     # _capture_preference_bg for why it does not rely on the model).
     _capture_preference_bg(query, conversation_id)
-    cost_before = _session_cost_breakdown(conversation_id)
+    _capture_observation_bg(query, conversation_id)
+    cost_before = await _acost_breakdown(conversation_id)
 
     async def gen():
-        import asyncio as _aio
         import time as _t
         _t0 = _t.monotonic()
         pending: list[str] = []
@@ -5965,6 +7146,12 @@ async def chat_simple_stream(req: Request):
                                     text=f"{payload.get('name', 'tool')} failed, continuing…"))
 
         yield _sse("started", conversation_id=conversation_id)
+        # Wall-clock for the whole turn, reported on `done`. Measured here
+        # rather than in the UI: the client cannot know when the request
+        # actually reached the model, and a number computed from
+        # render-start would flatter the server by however long the SSE
+        # connection took to open.
+        _turn_t0 = _time.perf_counter()
         with _CHAT_THREADS_LOCK:
             data = _chat_threads_load()
             if conversation_id not in data:
@@ -5972,13 +7159,16 @@ async def chat_simple_stream(req: Request):
                                          "messages": []}
             thread = data[conversation_id]
             history = thread.get("messages") or []
-            messages = ([{"role": "system", "content": _CHAT_SYSTEM}]
+            messages = ([{"role": "system", "content": _chat_system_now()}]
                         + history[-(_CHAT_MAX_TURNS * 2):]
                         + [{"role": "user", "content": query}])
         # Same deterministic retrieval as the non-streaming path; a streamed
         # answer must not be less grounded than a buffered one.
         messages, _doc_hits = await _with_doc_context(
             messages, query, _conversation_doc_ids(conversation_id, body))
+        # Same recall as the non-streaming path; a streamed answer must not be
+        # less informed about the user than a buffered one.
+        messages = await _with_chat_memory(messages, query, conversation_id)
         try:
             from skills import tool_payload as _tool_payload
             try:
@@ -5989,7 +7179,7 @@ async def chat_simple_stream(req: Request):
             # Must match chat_simple's list exactly — the streaming twin and
             # the one-shot endpoint otherwise give the model different
             # capabilities, which is its own kind of lie.
-            _tools = _tool_payload(_CHAT_TOOLS) if _chat_tools_on else None
+            _tools = _chat_tool_payload() if _chat_tools_on else None
 
             async def _work() -> dict:
                 """The whole model turn: tool loop if tools are on, else a
@@ -6096,7 +7286,9 @@ async def chat_simple_stream(req: Request):
         except Exception as e:
             yield _sse("error", text=f"answer delivered but could not be saved: {e}")
             return
-        yield _sse("done", answer=answer, conversation_id=conversation_id)
+        yield _sse("done", answer=answer, conversation_id=conversation_id,
+                   elapsed_ms=int((_time.perf_counter() - _turn_t0) * 1000),
+                   files=_chat_produced_files(conversation_id, answer))
 
     return StreamingResponse(gen(), **_SSE_HEADERS)
 
@@ -6315,6 +7507,42 @@ def _stream_run(query: str, conversation_id: str | None,
     """
 
     async def gen():
+        # (the flag itself lives in _gen_body, which is the function that
+        # reads and writes it - see the note there)
+        # Belt and braces for the claim: the two explicit releases below cover
+        # the pre-thread exits, and the tail covers the post-thread ones, but a
+        # generator closed at any other `yield` would leak. The claim is what
+        # makes a second identical submit refuse rather than double-bill, so
+        # leaking it blocks the user's own topic for 10 minutes. One finally
+        # around the whole body beats enumerating every exit.
+        try:
+            async for _frame in _gen_body():
+                yield _frame
+        finally:
+            if idem_key:
+                _inflight_run_release(idem_key)
+
+    async def _gen_body():
+        # Declared at the top, not further down. It was first imported ~120
+        # lines below the warmup joins that need it, so `await _aio.to_thread`
+        # there raised "cannot access local variable '_aio'" and the run died
+        # with a gateway-unavailable error before the first real frame.
+        import asyncio as _aio  # noqa: F811 - local alias used for to_thread
+
+        # `disconnected` is INITIALISED HERE, in the function that uses it.
+        #
+        # It was initialised in `gen()` instead, one function up. `gen()` and
+        # `_gen_body()` are SIBLING closures, not nested, so that assignment
+        # did nothing for this scope. The drain loop below both reads
+        # `disconnected` (to decide whether to emit a heartbeat) and assigns
+        # it (once the client is seen to be gone), and the read comes first -
+        # so `disconnected` became a local of _gen_body with no initial value,
+        # and the first read raised UnboundLocalError. That killed the SSE
+        # stream server-side on the first heartbeat, roughly a second after
+        # `started`, so a research run appeared to freeze: the worker thread
+        # kept going and kept billing, the client saw "connection closed
+        # before the run finished", and the canvas stopped updating. Confirmed
+        # in logs/agent.err.
         disconnected = False
 
         async def _client_gone() -> bool:
@@ -6347,22 +7575,38 @@ def _stream_run(query: str, conversation_id: str | None,
         except BaseException:
             _unregister_run(session_id, conversation_id,
                             cancel_ev=cancel_ev)
+            # Release the idempotency claim too. This is the "user pressed
+            # Stop during gateway warmup" path: the generator is closed
+            # before the worker thread below exists, so the thread's own
+            # release never runs. The key then survived the full 600s TTL
+            # while no run existed, and re-submitting the same topic answered
+            # "an identical run is already in progress" with nothing in
+            # /runs to watch.
+            if idem_key:
+                _inflight_run_release(idem_key)
             raise
         # Make sure the gateway (and its client) are available. The warmup
         # thread launched at import time is already starting V9 concurrently,
-        # so we join it (non-blocking on the event loop — this runs in the
-        # generator, not the event loop) rather than re-launching. If warmup
-        # already finished, this returns immediately.
+        # so we join it rather than re-launching. If warmup already
+        # finished, this returns immediately.
+        #
+        # The joins go through `asyncio.to_thread`. A comment here used to
+        # claim this "runs in the generator, not the event loop" — it does
+        # not. An async generator's body executes ON the loop between
+        # yields, so two `join(timeout=60)` calls here froze every other
+        # request in the process for up to two minutes: /api/health went
+        # from ~15ms to ~3s, and the console looked wedged for the whole
+        # warmup. Joining a thread is blocking work by definition.
         try:
             if _GATEWAY_WARMUP_THREAD is not None and _GATEWAY_WARMUP_THREAD.is_alive():
-                _GATEWAY_WARMUP_THREAD.join(timeout=60)
+                await _aio.to_thread(_GATEWAY_WARMUP_THREAD.join, 60)
             # Also join the embedder warmup so the first memory.read embed
             # doesn't race a still-loading Ollama model (cold load = 30-40s).
             if _EMBEDDER_WARMUP_THREAD is not None and _EMBEDDER_WARMUP_THREAD.is_alive():
-                _EMBEDDER_WARMUP_THREAD.join(timeout=60)
+                await _aio.to_thread(_EMBEDDER_WARMUP_THREAD.join, 60)
             from gateway import ensure_gateway
 
-            ensure_gateway()
+            await _aio.to_thread(ensure_gateway)
         except Exception as e:  # pragma: no cover - environment issue
             # Local-model fallback (Todo 11): if the gateway is down but the
             # query is a pure read-only shell-intent (disk/ip/os/...), answer
@@ -6380,6 +7624,10 @@ def _stream_run(query: str, conversation_id: str | None,
             yield _sse("error", text=f"gateway unavailable: {e}")
             _unregister_run(session_id, conversation_id,
                             cancel_ev=cancel_ev)
+            # No run was ever created, so the claim must go back, or this
+            # topic is refused as a duplicate until the TTL expires.
+            if idem_key:
+                _inflight_run_release(idem_key)
             return
 
         # The orchestrator runs its own asyncio loop internally via
@@ -6393,7 +7641,7 @@ def _stream_run(query: str, conversation_id: str | None,
         # and concurrent chats all hang). The worker thread pushes via
         # call_soon_threadsafe so `await log_q.get()` yields control.
         loop = asyncio.get_running_loop()
-        import asyncio as _aio  # noqa: F811 - local alias used for to_thread
+        # noqa: F811 - local alias used for to_thread
         # Bounded: a chatty run can't grow the queue without limit while a
         # slow/disconnected client lags behind. Overflow lines are dropped
         # (the full log still lands in the session dir via prints).
@@ -6450,6 +7698,8 @@ def _stream_run(query: str, conversation_id: str | None,
         except BaseException:
             _unregister_run(session_id, conversation_id,
                             cancel_ev=cancel_ev)
+            if idem_key:
+                _inflight_run_release(idem_key)
             raise
         thread = threading.Thread(target=_run_and_drain, daemon=True)
         thread.start()
@@ -6510,7 +7760,8 @@ def _stream_run(query: str, conversation_id: str | None,
             # so the delta covers the WHOLE run, not just the
             # pre-disconnect snapshot.
             try:
-                _d = _session_cost_delta(session_id, _cost_before)
+                _d = await _aio.to_thread(_session_cost_delta,
+                                             session_id, _cost_before)
                 if _d is not None:
                     _record_turn_cost(session_id, query, _d)
             except Exception:
@@ -6530,13 +7781,23 @@ def _stream_run(query: str, conversation_id: str | None,
         # Smart notification: push a completion summary to Telegram if the
         # operator opted in (fire-and-forget, never blocks the response).
         if answer_box["answer"] and not cancel_ev.is_set():
-            notify_task_done(query, answer_box["answer"], elapsed, session_id)
+            # Fire and forget on a daemon thread, the same way
+            # _capture_preference_bg does. This posts to the gateway
+            # synchronously (15s timeout) and would otherwise stall the loop at
+            # the exact moment a run finishes. A plain thread, not
+            # run_in_executor: the executor keeps a future on the loop that
+            # outlives the request.
+            threading.Thread(target=notify_task_done,
+                             args=(query, answer_box["answer"], elapsed,
+                                   session_id),
+                             daemon=True, name="notify-done").start()
         # Per-response cost: report ONLY this run's spend. The session_id is
         # reused across every turn of a conversation (that reuse is what gives
         # memory/audit continuity), so the raw session total is the whole
         # conversation's lifetime — not one answer. Subtract the snapshot we
         # took before the run to isolate just this response's cost.
-        delta = _session_cost_delta(session_id, _cost_before)
+        delta = await _aio.to_thread(_session_cost_delta,
+                                       session_id, _cost_before)
         if delta is None:
             # Gateway cost API unreachable: report unknown, record nothing.
             # A $0 entry here would be fabricated ledger data.
@@ -6650,6 +7911,11 @@ async def chat(req: Request):
             return StreamingResponse(_dedup_stream(existing),
                                      **_SSE_HEADERS)
         _inflight_run_claim(idem_key, conversation_id)
+    # This is the endpoint the Research and Authoring pages use, and it was
+    # the one place a long, discursive exchange could happen without the
+    # profile ever seeing it. "Walk me through how you decided" is exactly the
+    # kind of turn worth recording, and it arrives here.
+    _capture_observation_bg(query, conversation_id)
     try:
         # `doc_setup` is validated in chat() and consumed in _stream_run, which
         # is where the orchestrator is actually driven. Threading it as an

@@ -18,7 +18,7 @@ const PACKS = [
   { id: 'plan', name: 'Calendar & Scheduling', ico: '◷',
     desc: 'Calendar events plus the built-in job scheduler the Scheduler page drives.',
     tools: ['create_calendar_event', 'calendar_query', 'calendar_refresh_token',
-      'schedule_task', 'list_scheduled', 'cancel_scheduled'] },
+      'schedule_task', 'list_scheduled', 'cancel_scheduled', 'enable_scheduled'] },
   { id: 'files', name: 'Workspace Files', ico: '▤',
     desc: 'List, read, create, edit and delete files in the agent workspace.',
     tools: ['read_file', 'list_dir', 'create_file', 'update_file', 'edit_file', 'delete_file'] },

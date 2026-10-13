@@ -48,7 +48,12 @@ from .vector import VectorIndex
 
 # Kinds for which an embedding is computed at write time. Scratchpad items
 # are run-scoped and skip the vector path.
-EMBEDDABLE_KINDS = {"fact", "preference", "tool_outcome"}
+# `observation` was missing here, so the profile drawer was keyword-only:
+# every record came back with embed_model=None and never entered the FAISS
+# index. A behavioural profile is the most semantically retrievable thing in
+# the store — "who is this" is exactly what an embedding is good at — and it
+# was the one kind that could not be found by meaning.
+EMBEDDABLE_KINDS = {"fact", "preference", "tool_outcome", "observation"}
 
 # Descriptors are one human-readable line; cap defensively so a runaway
 # classifier reply can never bloat the store or the prompt.
@@ -394,7 +399,8 @@ class MemoryService:
                        sources: list[SourceRef] | None = None,
                        expires_at: datetime | None = None,
                        supersedes: str | None = None,
-                       doc: DocSpan | None = None) -> MemoryRecord:
+                       doc: DocSpan | None = None,
+                       confidence: float = 1.0) -> MemoryRecord:
         """Structured write. The caller (agent) has already classified
         free-form content; ``kind`` arrives decided. ``drawer`` defaults to
         the kind→drawer route (the plane passes it explicitly after
@@ -427,6 +433,9 @@ class MemoryService:
             embed_model=embed_model, embed_dim=embed_dim,
             goal_id=goal_id, session_id=session_id,
             expires_at=expires_at, supersedes=supersedes, doc=doc,
+            # Clamped: a caller that sends 99 or -3 must not be able to write
+            # a nonsense score that later reads as certainty.
+            confidence=min(1.0, max(0.0, float(confidence))),
         ))
 
     async def add_fact(self, descriptor: str, *,

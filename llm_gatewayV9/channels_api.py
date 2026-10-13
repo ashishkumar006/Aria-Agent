@@ -259,17 +259,139 @@ async def hook_receive(name: str, request: Request):
         msg = await asyncio.to_thread(inst.normalize, payload)
     except Exception as e:
         raise HTTPException(422, f"normalize failed: {type(e).__name__}")
+    # In a worker thread, never on the event loop. `_record_inbound` makes a
+    # BLOCKING call into the agent, and the agent calls straight back into this
+    # same server to ask whether the sender is paired. Inline, that deadlocks
+    # itself: the loop is blocked waiting on the agent, the agent is waiting on
+    # the loop, and the trust lookup times out into `unknown` — so every
+    # message was refused as untrusted while the webhook answered a cheerful
+    # 200. It stayed invisible until the forward actually started working.
+    return await asyncio.to_thread(_record_inbound, name, msg)
+
+
+def _record_inbound(name: str, msg) -> dict:
+    """The shared tail of inbound delivery: policy, ledger, pair, forward.
+
+    Both the webhook route and the Telegram poller land here. The poller needs
+    it because a webhook was never registered for Telegram (`setWebhook`
+    appears nowhere in this repo, and Telegram cannot reach 127.0.0.1 anyway),
+    which left the whole inbound-facing feature — including pairing, and
+    therefore every channel chat turn — unreachable on a local install.
+
+    Returns the same envelope the webhook route always returned, so callers
+    cannot tell which transport delivered the message.
+    """
     verdict, rule, _dry = _policy_check({"trust": msg.trust_level.value,
-                                          "tool": "inbound", "channel": name})
+                                         "tool": "inbound", "channel": name})
     db.log_call(provider=f"channel:{name}", model=name, status="ok",
                 prompt_chars=len(msg.text or ""), call_role="channel",
                 agent=f"channel:{name}", session=msg.chat_id or None,
                 channel=name, trust_level=msg.trust_level.value,
                 policy_verdict=verdict, policy_rule=rule)
     paired_as = _auto_pair_inbound(name, msg)
+    forward = _forward_to_agent(name, msg, paired_as)
+    ok = bool(forward.get("status") == 200 or forward.get("ok"))
+    if not ok:
+        # The agent is what turns a message into an answer. Pairing it and
+        # dropping it is the failure this whole path is built to avoid, so it
+        # is reported rather than swallowed.
+        try:
+            db.log_call(provider=f"channel:{name}", model="agent-forward",
+                        status="error",
+                        error=str(forward.get("error")
+                                  or forward.get("skipped")
+                                  or f"HTTP {forward.get('status')}")[:300],
+                        call_role="channel", agent="channel-forward")
+        except Exception:
+            pass
     return {"ok": True, "message": msg.model_dump(),
-            "paired": paired_as,
+            "paired": paired_as, "forwarded": ok,
+            "forward": forward,
             "policy": {"verdict": verdict, "rule": rule}}
+
+
+def _forward_to_agent(name: str, msg, paired_as: str) -> dict:
+    """Hand an inbound message to the agent, which decides what to do with it.
+
+    Until this existed the webhook was a dead end: it verified, normalized,
+    classified, paired and logged the message, and then returned it to
+    Telegram's HTTP response. Nothing on the agent side ever heard about it,
+    so a user replying to a reminder was typing into a void.
+
+    The agent owns the decision. A message belonging to an acknowledgement
+    thread is handled there; anything else becomes an ordinary chat turn and
+    the reply goes back over the same channel. This function therefore does
+    not branch on which it is — it forwards and forgets.
+
+    Fire-and-forget and deliberately quiet. A channel webhook must answer its
+    platform fast, and a local agent that is restarting must not turn someone
+    else's chat into an error. Failures are recorded on the ledger so a
+    silently-dropped reply is at least visible afterwards.
+    """
+    agent = os.environ.get("ARIA_AGENT_URL", "http://127.0.0.1:8500")
+    try:
+        import httpx
+        # PLAIN TEXT, not JSON. The agent writes this file with
+        # `path.write_text(token)` (auth._write_token_file), so parsing it as
+        # JSON fails on the bare token and every forward was silently skipped —
+        # messages arrived, paired, and went nowhere.
+        try:
+            tok = _agent_token_path().read_text(encoding="utf-8").strip()
+        except OSError:
+            tok = ""
+        if not tok:
+            # Loud, not silent: this exact skip went unnoticed for a whole
+            # release because the caller ignored the return value.
+            try:
+                db.log_call(provider=f"channel:{name}", model="agent-forward",
+                            status="error", error="no agent token at "
+                            f"{_agent_token_path()}", call_role="channel",
+                            agent="channel-forward")
+            except Exception:
+                pass
+            return {"skipped": "no agent token"}
+        # Attachments are passed as metadata (kind/name/size/file_id), never
+        # as bytes: the file itself was already downloaded and registered in
+        # the Documents store by the poller, so the agent only needs to know
+        # one exists and what to call it. Inlining the bytes here would put a
+        # multi-megabyte blob in a JSON body on the hot path.
+        atts = []
+        for a in list(getattr(msg, "attachments", None) or [])[:4]:
+            atts.append({k: a.get(k) for k in
+                         ("kind", "name", "mime", "size", "file_id")})
+        r = httpx.post(f"{agent.rstrip('/')}/api/channel/inbound",
+                       headers={"X-Aria-Token": tok},
+                       json={"channel": name,
+                             "sender": msg.chat_id or "",
+                             "text": (msg.text or "")[:4000],
+                             "attachments": atts,
+                             "paired_as": paired_as},
+                       timeout=20.0)
+        return {"status": r.status_code, "body": r.text[:300]}
+    except Exception as e:
+        try:
+            db.log_call(provider=f"channel:{name}", model="agent-forward",
+                        status="error", error=f"{type(e).__name__}: {e}"[:300],
+                        call_role="channel", agent="channel-forward")
+        except Exception:
+            pass
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _agent_token_path():
+    from pathlib import Path
+    # The agent writes its per-launch token here; the gateway only ever reads
+    # it, and only over loopback.
+    #
+    # Two levels up from this file is the repo root (llm_gatewayV9/ -> root),
+    # NOT three: `parent.parent.parent` landed in the parent of the repo, so
+    # the file was never found and every forward was skipped as "no agent
+    # token" — which is why an inbound message could be received, paired, and
+    # still reach nobody.
+    base = Path(os.environ.get("S9_STATE_DIR")
+                or (Path(__file__).resolve().parent.parent
+                    / "S9SharedCode" / "code" / "state"))
+    return base / "agent.token"
 
 
 def _auto_pair_inbound(name: str, msg) -> str:
@@ -436,6 +558,59 @@ async def control_notify_target(request: Request):
         str(c.get("name") or "") == channel and c.get("configured")
         for c in (inventory or []) if isinstance(c, dict))
     return {"channel": channel, "target": target or "", "configured": bool(live)}
+
+
+@router.get("/v1/control/trust")
+async def control_trust(request: Request):
+    """Trust level for one sender on one channel.
+
+    The agent needs this before it will act on an inbound message: a channel
+    the agent can be talked to is also a channel a stranger can type into, and
+    the pairing store is the only thing that tells the two apart. Loopback-only
+    for the same reason `pair` is — this classifies a sender, and a remote
+    caller could otherwise probe who is paired.
+    """
+    _loopback_only(request)
+    channel = request.query_params.get("channel") or "telegram"
+    sender = request.query_params.get("sender") or ""
+    if not sender:
+        return {"channel": channel, "sender": "", "trust": "untrusted"}
+    try:
+        from adaptors import trust as _trust
+        level = _trust.classify(channel, sender).value
+    except Exception as e:
+        raise HTTPException(500, f"trust store unavailable: {type(e).__name__}")
+    return {"channel": channel, "sender": sender, "trust": level}
+
+
+@router.get("/v1/control/telegram")
+async def control_telegram(request: Request):
+    """Is the inbound Telegram listener alive, and how far has it read?
+
+    Exposed because "the bot never answers" is otherwise indistinguishable
+    from "the bot is broken": this says whether polling is running, whether it
+    stood down (a registered webhook takes the queue over), and which update it
+    has consumed. Loopback-only for the same reason `trust` is — it describes
+    the deployment's ingress.
+    """
+    _loopback_only(request)
+    try:
+        import telegram_poller as _TGP
+        out = _TGP.status()
+    except Exception as e:
+        raise HTTPException(500, f"poller status unavailable: {type(e).__name__}")
+    try:
+        from adaptors import trust as _trust
+        paired = sorted((_trust._load().get("telegram") or {}).keys())  # noqa: SLF001
+        out["paired_senders"] = len(paired)
+        out["has_owner"] = any(
+            (_trust._load().get("telegram") or {}).get(s) == "owner"  # noqa: SLF001
+            for s in paired)
+        target = _trust.resolve_notify_target("telegram")
+        out["notify_target"] = (target[:3] + "…" + target[-2:]) if target else ""
+    except Exception:
+        pass
+    return out
 
 
 @router.post("/v1/control/pair")

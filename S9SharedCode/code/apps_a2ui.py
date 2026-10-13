@@ -121,7 +121,12 @@ def surface_for(app: dict[str, Any]) -> dict[str, Any]:
         row = {c["key"]: _text(it.get(c["key"])) for c in cols}
         row["_new"] = "yes" if str(it.get(id_field) or it.get("id")) in added_ids else ""
         rows.append(row)
-    if cols and "_new" not in cols[0]:
+    # `"_new" not in cols[0]` tested the first column's dict KEYS ("key",
+    # "label"), not its key value, so it was always True and the marker column
+    # was always appended. For an app whose own fields include one literally
+    # named `_new`, the validator then rejected the duplicate key and the whole
+    # board failed with a 502 "A2UI surface unavailable".
+    if cols and "_new" not in [c.get("key") for c in cols]:
         cols = cols + [{"key": "_new", "label": "new"}]
 
     series = [float(h.get("count", 0) or 0)

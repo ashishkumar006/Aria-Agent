@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { CalendarClock, Trash2, X } from 'lucide-react';
+import { CalendarClock, Play, Trash2, X } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, Stat, SkipLink } from '../components/ui';
 import { api, ago, fmtFire, CONF, type ScheduleJob } from '../api';
 
@@ -15,6 +15,40 @@ function asList(s: ScheduleJob[] | Record<string, ScheduleJob> | undefined): (Sc
 function lastFire(ts?: number): string {
   if (!ts) return '';
   return `ran ${ago(Date.now() / 1000 - ts)}`;
+}
+
+type Job = ScheduleJob & { key: string };
+
+/* Order the list the way the user reads it: what is about to happen first,
+   and what already happened last.
+
+   The backend returns rows in JSON-key order, so before this the table was
+   effectively unordered - a reminder created last week could sit above one
+   due in ten minutes.
+
+   There is no `status` field on a schedule, so "finished" is derived:
+   `enabled: false` means either cancelled or an already-fired one-shot, and
+   either way it is not going to fire again. A non-recurring job that is
+   still enabled but whose `next_fire` is behind the clock is overdue - it
+   is still armed, so it stays up with the live rows rather than being filed
+   away with the dead ones.
+
+   Recurring rows never "finish": they re-arm, so they stay in the live
+   group forever. */
+export function orderJobs(jobs: Job[]): Job[] {
+  const isLive = (j: Job) => !!j.enabled;
+  const dueOf = (j: Job) => (j.next_fire || j.created || 0);
+  // Within the dead group, most recently active first: the one you just ran
+  // should be the first finished thing you see, not the oldest.
+  const doneOf = (j: Job) => (j.last_fire || j.next_fire || j.created || 0);
+
+  return [...jobs].sort((a, b) => {
+    const la = isLive(a);
+    const lb = isLive(b);
+    if (la !== lb) return la ? -1 : 1;
+    if (la) return dueOf(a) - dueOf(b);
+    return doneOf(b) - doneOf(a);
+  });
 }
 
 export default function Scheduler() {
@@ -100,7 +134,20 @@ export default function Scheduler() {
     finally { setBusy(false); }
   };
 
-  const active = jobs.filter((j) => j.enabled).sort((a, b) => (a.next_fire || 0) - (b.next_fire || 0));
+  const toggle = async (id: string, enabled: boolean) => {
+    setBusy(true);
+    try {
+      const d = await api.scheduleToggle(id, enabled);
+      setOut(d.ok ? (d.error ? `${d.schedule_id}: ${d.error}` : `${enabled ? 'enabled' : 'disabled'} ${id}`)
+                  : 'failed');
+      load();
+    } catch (e) { setOut(String((e as Error).message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const ordered = orderJobs(jobs);
+  const active = ordered.filter((j) => j.enabled);
+  const finished = ordered.length - active.length;
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
@@ -119,8 +166,15 @@ export default function Scheduler() {
             </div>
           )}
           {loaded && !loadError && !jobs.length && <Empty icon={<CalendarClock size={30} />} title="No jobs" sub="Schedule a reminder or a recurring agent run." />}
-          {jobs.map((j) => (
+          {ordered.map((j, i) => (
             <div key={j.key} className="rounded-[10px] border border-white/10 bg-[#0e0e12] p-2.5">
+              {/* Divider between the armed group and the finished group, so
+                  the ordering reads as two lists rather than one flat wall. */}
+              {i === active.length && i > 0 && (
+                <div className="mb-2 mt-1 border-t border-dashed border-white/15 pt-3 text-[10px] font-bold tracking-[0.14em] text-zinc-muted">
+                  FINISHED · {finished}
+                </div>
+              )}
               <div className="flex items-center gap-2">
                 <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">{(j.query || '(no query)').slice(0, 90)}</span>
                 <Pill tone={j.enabled ? 'info' : 'muted'}>{j.enabled ? 'scheduled' : 'off'}</Pill>
@@ -170,8 +224,16 @@ export default function Scheduler() {
                 </tr>
               </thead>
               <tbody>
-                {jobs.map((j) => (
-                  <tr key={j.key} className="border-b border-white/5 hover:bg-white/[0.02]">
+                {ordered.map((j, i) => (
+                  <>
+                    {i === active.length && i > 0 && (
+                      <tr key={`__div-${j.key}`}>
+                        <td colSpan={5} className="border-b border-dashed border-white/15 pb-1 pt-4 text-[10px] font-bold tracking-[0.14em] text-zinc-muted">
+                          FINISHED · {finished} · will not fire again
+                        </td>
+                      </tr>
+                    )}
+                    <tr key={j.key} className="border-b border-white/5 hover:bg-white/[0.02]">
                     <td className="px-2.5 py-2">{(j.query || '').slice(0, 80)}</td>
                     <td className="px-2.5 py-2"><span className="rounded border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 font-mono text-[10.5px] text-violet-200">{j.when || j.recurring || ''}</span></td>
                     <td className="px-2.5 py-2 tabular-nums">{j.enabled ? fmtFire(j.next_fire) : lastFire(j.last_fire) || '—'}</td>
@@ -186,11 +248,13 @@ export default function Scheduler() {
                     </td>
                     <td className="px-2.5 py-2 text-right">
                       <div className="flex items-center justify-end gap-1.5">
+                        {!j.enabled && j.id && <button onClick={() => toggle(j.id, true)} title="Enable" aria-label={`Enable job ${j.query || j.key}`} className="rounded-md border border-white/15 px-2 py-1 hover:border-ok hover:text-ok"><Play size={13} /></button>}
                         {j.enabled && j.id && <button onClick={() => cancel(j.id)} title="Cancel" aria-label={`Cancel job ${j.query || j.key}`} className="rounded-md border border-white/15 px-2 py-1 hover:border-red-400 hover:text-red-300"><X size={13} /></button>}
                         {!j.enabled && j.id && <button onClick={() => remove(j.id)} title="Delete" aria-label={`Delete job ${j.query || j.key}`} className="rounded-md border border-white/15 px-2 py-1 hover:border-red-400 hover:text-red-300"><Trash2 size={13} /></button>}
                       </div>
                     </td>
-                  </tr>
+                    </tr>
+                  </>
                 ))}
                 {!jobs.length && loaded && <tr><td colSpan={5}><Empty icon={<CalendarClock size={30} />} title={loadError ? "Couldn't load" : "No jobs"} sub={loadError || undefined} /></td></tr>}
               </tbody>

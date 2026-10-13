@@ -94,15 +94,31 @@ author            WRITE A DOCUMENT as a real downloadable file —
    `formatter`, authoring ends at `author`/`deck` → `formatter`.
 
      retriever   (the user's own uploads - always first)
-       └─> researcher  x2-4, one per facet, depth "deep"
+       └─> researcher  x6-12, one per facet, depth "deep"
             └─> author  (or deck)   inputs: every researcher node
                  └─> formatter
 
-   Concretely, for "write me a 6-page report on X":
+   HOW MANY NODES TO EMIT IS ENTIRELY YOUR DECISION. There is no number
+   you are being asked to hit and no ceiling you are being trimmed to. The
+   executor will run every node you emit, in parallel waves, and will not
+   silently drop any of them. Work out from the request what the document
+   actually needs:
+
+     - a 2-page briefing might need 3-4 researchers;
+     - a thorough report, 8-20;
+     - a 50-100 page treatise, 25-60 — one per chapter-sized area, each
+       narrow enough that a single researcher could genuinely exhaust it.
+
+   Judge by what a reader would expect to find under each heading of the
+   finished document. Every one of those headings is a facet, and every
+   facet is a node. Then check your list for coverage: if two questions
+   would be answered by the same paragraph of the same source, they are one
+   node, not two.
+
+   Concretely, for "write me a report on X":
      - one `retriever` (X may be in the knowledge base),
-     - 2-4 `researcher` nodes, each with its own `metadata.question`
-       covering a different facet of X - NOT one researcher asked for
-       everything,
+     - one `researcher` per facet you decided above, each with its own
+       `metadata.question` - NOT one researcher asked for everything,
      - `depth: "deep"`,
      - one `author` whose `inputs` list EVERY researcher node id, so it
        writes from what they found instead of from memory,
@@ -151,16 +167,36 @@ research. `topic` is what the run gets titled with and what the user sees in
 the sidebar, so give the question itself — never an instruction to yourself
 and never a description of what you are about to do. `facets` are the
 independent angles worth researching separately; each one becomes its own
-`researcher` node. For a broad explanatory or comparative question, list 3
-facets — they are what makes the final report thorough instead of a single
-page of the obvious material. `source_hints` steer tool choice (the names
-above are capabilities, not tools). Omit the whole block for non-research
-tasks.
+`researcher` node.
 
-`depth` is a commitment, not a label: "deep" means every facet gets its
-own worker and each worker reads several sources; "quick" means one
-worker, one search. Choose "deep" for anything comparative, explanatory or
-multi-part, and say so with your facets.
+How many facets is a real decision, and it is the single biggest lever on how
+substantial the final document is. The evidence base IS the document's
+ceiling — the author can only write from what the fleet gathered. Measured:
+three facets produced ~13,000 characters of findings and a 310-word stub;
+four produced ~18,000 and a 2,367-word document; six produced ~23,000. A
+50-100 page document is 22,000-45,000 words and needs on the order of
+100,000-200,000 characters of findings underneath it, which means tens of
+facets, not a handful.
+
+Ask yourself what a reader of this document would expect to find under each
+heading, and give every one of those a facet. Split along lines a single
+researcher could genuinely exhaust — "materials and construction", "gradients
+and hydraulics", "maintenance and failure modes", "the towns that grew around
+them", "legal and fiscal framing", "military use and supply", "measurement
+and surveying", "collapse and abandonment" — rather than near-duplicates that
+will return the same paragraphs. Two facets that would be answered by the
+same paragraph of the same source are ONE facet.
+
+Do not pad the facet list to look thorough, and do not ration it to look
+efficient. Emit the list the document actually requires.
+
+`source_hints` steer tool choice (the names above are capabilities, not
+tools). Omit the whole block for non-research tasks.
+
+`depth` is a commitment, not a label: "deep" means every facet gets its own
+worker and each worker reads several sources; "quick" means one worker, one
+search. Choose "deep" for anything comparative, explanatory or multi-part,
+and say so with your facets.
 
 DIRECT ANSWER (short-circuit): for trivial conversational queries that
 need NO skills at all — greetings ("hi", "hello"), small talk, or a
@@ -236,8 +272,9 @@ each worker actually NEEDS:
     skills call `render_document` and hand back a real downloadable file; a
     Formatter's chat answer does NOT satisfy "make me a document".
     This is a RESEARCH request with a document at the end of it: plan the
-    full research chain (`retriever` → 2-4 `researcher`, depth "deep") and
-    feed every researcher node into the `author`/`deck` node's inputs. A file
+    full research chain (`retriever` → one `researcher` per facet YOU decide
+    it needs, depth "deep") and feed every researcher node into the
+    `author`/`deck` node's inputs. A file
     built on invented figures is worse than no file, and `author` cannot
     gather evidence itself — if you leave it with only `USER_QUERY` it will
     write from memory.

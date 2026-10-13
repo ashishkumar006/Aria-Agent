@@ -1,10 +1,19 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, RefreshCw, Send, Download, Eye, X, Loader2, FileText, Table2, Presentation,
+  Paperclip,
 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, useHealth, SkipLink } from '../components/ui';
+
+/* The same list the Documents drop-zone accepts, because this calls the same
+   api.uploadDocument. The server rejects anything else with a 400 naming the
+   problem, so a wider filter here would only produce failures. Note that
+   images are NOT in it: `parsers.detect_type` accepts no image type, so an
+   image cannot be uploaded anywhere in this app today. */
+const UPLOAD_ACCEPT =
+  '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm';
 import { renderMarkdown } from '../components/markdown';
-import { api, ago, CONF, headers, type ChatThread, type DocPreview } from '../api';
+import { api, ago, CONF, headers, type ChatThread, type DocPreview, type StreamFile } from '../api';
 
 /* The document viewer drags the whole setup panel in behind it and chat has no
    setup panel, so it is route-split the same way App.tsx splits the views: the
@@ -235,7 +244,25 @@ export default function Chat() {
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [filter, setFilter] = useState('');
-  const [cid, setCid] = useState('');
+  /* Which conversation is open. PERSISTED, because this is component state
+     and the view unmounts on navigation: `cid` was plain useState(''), so
+     clicking into another section reset it and the transcript came back empty
+     on return. The messages were never lost — they were in the thread store
+     the whole time; the view simply no longer knew which thread it was
+     looking at. An empty pane next to a full sidebar reads as data loss.
+     localStorage survives reload and navigation; the URL does not survive the
+     router's own state, and a deep link is not the point here. */
+  const LAST_CID_KEY = 'aria_chat_last_cid';
+  const [cid, setCid] = useState(() => {
+    try { return localStorage.getItem(LAST_CID_KEY) || ''; } catch { return ''; }
+  });
+  const rememberCid = (next: string) => {
+    setCid(next);
+    try {
+      if (next) localStorage.setItem(LAST_CID_KEY, next);
+      else localStorage.removeItem(LAST_CID_KEY);
+    } catch { /* private mode: the thread still lives server-side */ }
+  };
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState('');
   const nearLimit = input.length > CHAT_MAX_QUERY * 0.9;
@@ -389,6 +416,38 @@ export default function Chat() {
     refresh();
   }, [refresh]);
 
+  /* Re-open the thread that was on screen before navigating away. Without
+     this the view remounted with a remembered `cid` but an EMPTY transcript,
+     because only `select()` ever loaded messages — so the fix above would
+     have restored the id and nothing else. Runs once per mount, and is
+     skipped while a turn is streaming so it cannot stomp the live bubble. */
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || !cid) return;
+    restoredRef.current = true;
+    const t = threadsRef.current.find((x) => x.conversation_id === cid);
+    if (t) { void select(t); return; }
+    // The thread is not in the first page (or was deleted while away): fetch
+    // it directly rather than leaving an empty pane that looks like loss.
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await api.chatThread(cid);
+        if (cancelled || !mountedRef.current) return;
+        setCrumb((d.title || 'Chat').slice(0, 40));
+        setMsgs((d.messages || []).map((m) => m.role === 'user'
+          ? { id: nextId(), who: 'you' as const, text: m.content }
+          : { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content), arts: artRefs(m.content) }));
+      } catch {
+        // Gone for good: forget it, so the next visit starts clean instead of
+        // retrying a dead id on every mount.
+        try { localStorage.removeItem(LAST_CID_KEY); } catch { /* ignore */ }
+        rememberCid('');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [cid]);
+
   /* Follow the stream only while the user is already at the bottom. The
      unconditional `scrollTop = scrollHeight` on every delta physically
      prevented scrolling up to re-read earlier text mid-answer, because
@@ -456,7 +515,7 @@ export default function Chat() {
     // the abandoned turn kept streaming and holding a gateway call.
     abortRef.current?.abort();
     const req = ++reqRef.current;
-    setCid(t.conversation_id);
+    rememberCid(t.conversation_id);
     setCrumb((t.title || 'Chat').slice(0, 40));
     setHint(null);
     // Load this conversation's document preference so the toggle reflects
@@ -484,6 +543,37 @@ export default function Chat() {
     'Summarize my recent runs',
     'What is in my memory?',
   ];
+
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+
+  /* Upload, then name the files in the composer so the turn refers to them.
+     Uploading silently would leave the user unsure what was attached, and
+     the agent has nothing to ground on unless the file is named. */
+  const onPickFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+    setUploading(true);
+    const ok: string[] = [];
+    const bad: string[] = [];
+    for (const f of files) {
+      try {
+        await api.uploadDocument(f);
+        ok.push(f.name);
+      } catch (err) {
+        bad.push(`${f.name}: ${(err as Error).message || 'failed'}`);
+      }
+    }
+    setUploading(false);
+    setHint(bad.length
+      ? { tone: 'err', text: `${ok.length} attached, ${bad.length} failed — ${bad[0]}` }
+      : { tone: 'warn', text: `attached ${ok.join(', ')}` });
+    if (ok.length) {
+      setInput((prev) => (prev ? `${prev}\n` : '') +
+        ok.map((n) => `[attached: ${n}]`).join('\n'));
+    }
+  };
 
   const send = async (override?: string) => {
     const raw = override ?? input;
@@ -559,18 +649,24 @@ export default function Chat() {
     // Scanned only at settle, never mid-stream: the handle is the last thing
     // an answer contains, and a file row appearing inside the live region
     // while the text is still arriving reads as a glitch.
-    const settle = (meta: string) => {
+    const settle = (meta: string, files?: StreamFile[]) => {
       if (queued) { cancelAnimationFrame(queued); queued = 0; }
       setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
         id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), meta,
-        arts: artRefs(acc),
+        // The server's list first (verified against the artifact store), with
+        // the scraped handles kept as a fallback for a model that names one in
+        // prose without rendering anything. Before this, a document the model
+        // rendered was invisible here unless its handle appeared in the text.
+        arts: files?.length
+          ? files.map((f) => ({ id: f.artifact, label: f.filename }))
+          : artRefs(acc),
       }]);
     };
     try {
       for await (const ev of api.chatSimpleStream(q, cid, ac.signal)) {
         if (!mountedRef.current || reqRef.current !== req) return; // superseded
         if (ev.type === 'started' && (ev as { conversation_id?: string }).conversation_id) {
-          setCid((ev as { conversation_id?: string }).conversation_id as string);
+          rememberCid((ev as { conversation_id?: string }).conversation_id as string);
         } else if (ev.type === 'status') {
           setStatus((ev as { text?: string }).text || 'working…');
         } else if (ev.type === 'delta') {
@@ -579,14 +675,38 @@ export default function Chat() {
         } else if (ev.type === 'done') {
           acc = (ev as { answer?: string }).answer ?? acc;
           if ((ev as { conversation_id?: string }).conversation_id) {
-            setCid((ev as { conversation_id?: string }).conversation_id as string);
+            rememberCid((ev as { conversation_id?: string }).conversation_id as string);
           }
-          settle(`done in ${((Date.now() - t0) / 1000).toFixed(1)}s · lightweight`);
+          /* Prefer the server's measurement over the client's. The client
+             starts counting when the stream opens, so it silently drops the
+             time spent establishing the request — which is the part a slow
+             model makes the user wait through. Fall back to the local clock
+             for older backends that do not send it. */
+          const serverMs = (ev as { elapsed_ms?: number }).elapsed_ms;
+          const ms = typeof serverMs === 'number' && serverMs >= 0
+            ? serverMs
+            : Date.now() - t0;
+          const secs = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+          settle(`done in ${secs} · lightweight`,
+            (ev as { files?: StreamFile[] }).files);
           refresh();
         } else if (ev.type === 'error') {
-          setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
-            id: nextId(), who: 'err', text: humanError((ev as { text?: string }).text),
-          }]);
+          // The server can emit `error` AFTER the answer finished streaming
+          // ("answer delivered but could not be saved"). Replacing the bubble
+          // here threw away a complete answer the user had just watched
+          // arrive, including any file rows. Keep the answer; append the
+          // problem as a note on it.
+          if (acc.trim()) {
+            settle(`could not save · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+            setMsgs((m) => [...m, {
+              id: nextId(), who: 'aria',
+              text: humanError((ev as { text?: string }).text),
+            }]);
+          } else {
+            setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
+              id: nextId(), who: 'err', text: humanError((ev as { text?: string }).text),
+            }]);
+          }
         }
       }
     } catch (e) {
@@ -635,7 +755,7 @@ export default function Chat() {
   const fresh = () => {
     reqRef.current++; // invalidate any in-flight select/send
     abortRef.current?.abort(); // and stop any open stream
-    setCid('');
+    rememberCid('');
     setMsgs([]);
     setCrumb('Chat');
     setHint(null);
@@ -666,7 +786,7 @@ export default function Chat() {
       return;
     }
     if (id === cid) {
-      setCid('');
+      rememberCid('');
       setMsgs([]);
       setCrumb('Chat');
     }
@@ -876,6 +996,31 @@ export default function Chat() {
           )}
         </div>        <div className="border-t border-white/10 p-3">
           <div className="flex items-end gap-2">
+            {/* Attach. Chat had no upload affordance at all, so the only way
+                to get a file into a conversation was to leave for Documents
+                and come back - while the CONSUMPTION half already existed
+                here (the useDocs toggle reads the shared Documents store into
+                answers). This calls the same api.uploadDocument Documents
+                uses, so no backend change was needed. */}
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              className="hidden"
+              accept={UPLOAD_ACCEPT}
+              onChange={onPickFiles}
+              aria-label="Attach files"
+            />
+            <button
+              onClick={() => fileRef.current?.click()}
+              disabled={sending || uploading}
+              title="Attach files"
+              aria-label="Attach files"
+              className="flex flex-none items-center gap-1.5 self-end rounded-md border border-white/15 bg-white/5 px-3 py-2.5 text-xs font-bold text-zinc-300 hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
+            >
+              <Paperclip size={13} />
+              {uploading ? 'Uploading…' : 'Attach'}
+            </button>
             <textarea
               value={input}
               /* No maxLength, deliberately. It was the whole bug: the browser

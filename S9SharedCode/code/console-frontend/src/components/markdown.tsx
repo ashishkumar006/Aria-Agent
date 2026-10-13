@@ -20,7 +20,7 @@ export function esc(s: string): string {
 
 const SAFE_URL = /^https?:\/\/[^\s"'<>]+$/i;
 
-/** Inline spans: bold, inline code, links, strikethrough. Operates on
+/** Inline spans: bold, inline code, links, images, strikethrough. Operates on
     already-escaped text, so `<b>` etc. are the only tags it introduces. */
 function inline(s: string): string {
   return esc(s)
@@ -28,6 +28,14 @@ function inline(s: string): string {
     .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[\s(])_([^_]+)_(?=$|[\s.,;:)!?])/g, '$1<i>$2</i>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    // Images BEFORE links: `![a](u)` otherwise matches the link rule on its
+    // trailing `[a](u)`, leaving a stray leading `!` in the output. That was
+    // the whole of the missing-image behaviour — a literal bang, not a picture.
+    .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_m, alt: string, url: string) =>
+      SAFE_URL.test(url)
+        ? `<img src="${url}" alt="${alt || 'image'}" loading="lazy" ` +
+          `decoding="async" referrerpolicy="no-referrer" />`
+        : alt)
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, text: string, url: string) =>
       SAFE_URL.test(url)
         ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`
@@ -248,6 +256,53 @@ export function pillForStatus(status?: string): { label: string; tone: 'ok' | 'e
   if (/(pend|wait|queued|idle|paused)/.test(s)) return { label: 'queued', tone: 'muted' };
   if (/(done|complete|ok|success|pass)/.test(s)) return { label: 'done', tone: 'ok' };
   return { label: status || 'unknown', tone: 'muted' };
+}
+
+/** Did this node SUCCEED?
+ *
+ * Distinct from `isTerminal`, which answers "is it over?" — a skipped or
+ * interrupted node is over but did not succeed. Conflating the two is what
+ * made a stopped run render as a green success: `doneCount === nodes.length`
+ * was satisfied by three terminal nodes when only two had done any work.
+ */
+export function isSuccess(status?: string): boolean {
+  return /^(done|complete|completed|ok|success|succeeded|pass|passed)$/i
+    .test(String(status ?? '').trim());
+}
+
+/** The label/tone for a whole RUN, derived from its nodes.
+ *
+ * Research and Runs each used to decide this separately and disagree.
+ * Research tested `/fail|error/i`, which matches neither `skipped` nor
+ * `interrupted`, so a run the operator cancelled — planner and researcher
+ * complete, formatter skipped — satisfied "every node terminal" and showed a
+ * green `done` with an empty report. Six finished runs sat in the store that
+ * way.
+ *
+ * Order is deliberate. A real failure is the most actionable thing on the row,
+ * so it wins; then an `interrupted` node (the process died before it could
+ * mark itself terminal); then `stopped`, which is the user's own action and
+ * must not be dressed up as success; and only then `done`, which requires
+ * every node to have actually succeeded.
+ */
+export function runStatusFromNodes(
+  nodes: { status?: string }[],
+  running = false,
+): { label: string; tone: 'ok' | 'err' | 'warn' | 'info' | 'muted' } {
+  if (running) return { label: 'running', tone: 'info' };
+  const s = nodes.map((n) => String(n?.status ?? '').toLowerCase());
+  if (!s.length) return { label: 'idle', tone: 'muted' };
+  if (s.some((x) => /(fail|error|dead|denied)/.test(x))) {
+    return { label: 'failed', tone: 'err' };
+  }
+  if (s.some((x) => /interrupt|orphan|stale/.test(x))) {
+    return { label: 'interrupted', tone: 'warn' };
+  }
+  if (s.some((x) => /(cancel|skip|abandon)/.test(x))) {
+    return { label: 'stopped', tone: 'warn' };
+  }
+  if (s.every((x) => isSuccess(x))) return { label: 'done', tone: 'ok' };
+  return { label: 'idle', tone: 'muted' };
 }
 
 /** Single keyword classifier for node/run statuses (done/complete/ok → ok,

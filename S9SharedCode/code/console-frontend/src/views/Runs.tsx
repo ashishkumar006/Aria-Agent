@@ -16,8 +16,15 @@ function statusOf(r: RunRow): RunStatus {
     same blue and "queued" the same grey as everywhere else (this page
     previously used two different tones for the identical word "queued"). */
 function pillFor(r: RunRow): { label: string; tone: RunStatus } {
+  /* A run with no graph has no lifecycle to report. It was being labelled
+   * `queued`, which asserted that work was waiting to start on a run that had
+   * finished - or failed - hours ago. Nine of these carried `degraded: true`
+   * in run_status.json, i.e. they were real failed runs presented as fresh
+   * queued work, and they sorted to the top of the list. */
+  if (r.has_graph === false) return { label: 'no graph', tone: 'muted' };
   const c = r.status_counts || {};
   const total = Object.values(c).reduce<number>((a, b) => a + (Number(b) || 0), 0);
+  if (total === 0) return { label: 'no nodes', tone: 'muted' };
   const stopped = Object.entries(c)
     .filter(([k]) => /skip|cancel/i.test(k))
     .reduce((a, [, v]) => a + (Number(v) || 0), 0);
@@ -208,9 +215,20 @@ const nav = useNavigate();
                   <Pill tone={pill.tone}>{pill.label}</Pill>
                 </div>
                 <div className="mt-1 flex flex-wrap gap-x-2 text-[11px] tabular-nums text-zinc-muted">
-                  <span>{s.nodes || 0} nodes</span>
+                  <span>{s.has_graph === false ? 'no graph' : `${s.nodes || 0} nodes`}</span>
                   <span>${Number(s.usd || 0).toFixed(4)}</span>
-                  <span>{ago(s.updated ? Date.now() / 1000 - s.updated : 0)}</span>
+                  {/* The `s.updated ? ... : 0` here rendered "0s ago" for any
+                      run whose timestamp was 0, which read as "just now" for
+                      runs up to 119 hours old. Fall back to the server's own
+                      relative field, and print an explicit dash rather than a
+                      confident age when neither is known. */}
+                  <span>
+                    {typeof s.updated_ago === 'number'
+                      ? ago(s.updated_ago)
+                      : s.updated
+                        ? ago(Date.now() / 1000 - s.updated)
+                        : 'age unknown'}
+                  </span>
                 </div>
               </button>
             );
@@ -247,7 +265,15 @@ const nav = useNavigate();
         )}
         <div className="flex min-h-0 flex-1 gap-3 p-3.5">
           <div className="relative min-w-0 flex-1 overflow-hidden rounded-[10px] border border-white/10 bg-[#08080a]">
-            {!graph || !graph.nodes.length ? (
+            {/* Three distinct states, previously collapsed into one string.
+                "Select a run" was shown both when nothing was picked and when
+                the picked run has no graph — so a row highlighted as selected
+                could show instructions to click a node that does not exist,
+                with no way to learn the run had none. */}
+            {sid && !graph?.nodes?.length ? (
+              <Empty icon={<GitBranch size={30} />} title="This run has no graph"
+                sub="No execution graph was recorded for it, so there is nothing to inspect here. Its files, if any, are in the run's own record." />
+            ) : !graph || !graph.nodes.length ? (
               <Empty icon={<GitBranch size={30} />} title="Select a run" sub="Its execution graph renders here — click any node to inspect it." />
             ) : (
               /* DagCanvas is keyed by sid: it keeps per-instance

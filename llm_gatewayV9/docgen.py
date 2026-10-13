@@ -735,10 +735,14 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
     else:
         doc = SimpleDocTemplate(
             buf, pagesize=_page,
-            leftMargin=ML, rightMargin=MR,
-            topMargin=MT, bottomMargin=MB,
-            title=title or "document",
-            author=_as_text(spec.get("author"), 120) or "")
+        leftMargin=ML, rightMargin=MR,
+        topMargin=MT, bottomMargin=MB,
+        title=title or "document",
+        # Subject/keywords were left unset, so every rendered file reported
+        # `Subject: (unspecified)` in a PDF reader's properties panel.
+        subject=_as_text(spec.get("subject"), 200)
+        or _as_text(spec.get("subtitle"), 200) or "",
+        author=_as_text(spec.get("author"), 120) or "")
 
     ss = getSampleStyleSheet()
     st_title = ParagraphStyle("t", parent=ss["Title"], fontName="Helvetica-Bold",
@@ -756,10 +760,45 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         canv.saveState()
         pg = getattr(document, "page", 1)
         total = getattr(document, "_total_pages", 0)
-        if pg > 1 and title:
+
+        def _fit(text: str, font: str, size: float, avail: float) -> str:
+            """Shorten to the WIDTH available, not to a character count.
+
+            `title[:78]` produced a two-line header on every page of a
+            document whose title was the whole request: a long string sliced
+            at 78 characters still overflows the measure, and ReportLab's
+            drawString does not wrap - it runs off the page and the extract
+            shows it doubled on every page. Trim to the actual width, with an
+            ellipsis so it is visibly elided rather than looking truncated."""
+            s = str(text or "")
+            if not s:
+                return ""
+            if canv.stringWidth(s, font, size) <= avail:
+                return s
+            ell = "\u2026"
+            lo, hi = 0, len(s)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if canv.stringWidth(s[:mid] + ell, font, size) <= avail:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return (s[:lo] + ell) if lo else ell
+
+        # `running_header` was documented and accepted but NEVER READ - the
+        # header always drew `title`, so a caller asking for a short running
+        # head got the full title on every page instead. The title belongs on
+        # the cover and in the footer; this is the header's own text.
+        # The 400 here is a sanity bound only: clipping to a round number like
+        # 120 silently chopped a long header with no ellipsis, so `_fit` below
+        # never saw anything to elide and the header just stopped mid-word.
+        # `_fit` is the single authority on how much actually fits.
+        hdr = _as_text(spec.get("running_header"), 400) or title
+        if pg > 1 and hdr:
             canv.setFont("Helvetica", 7.6)
             canv.setFillColor(colors.HexColor("#8b8b96"))
-            canv.drawString(ML, _page[1] - 13 * mm, title[:78])
+            canv.drawString(ML, _page[1] - 13 * mm,
+                            _fit(hdr, "Helvetica", 7.6, _page[0] - MR - ML))
             canv.setStrokeColor(colors.HexColor("#ececf2"))
             canv.setLineWidth(0.4)
             canv.line(ML, _page[1] - 14.6 * mm, _page[0] - MR, _page[1] - 14.6 * mm)
@@ -769,8 +808,9 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         canv.line(ML, y + 4 * mm, _page[0] - MR, y + 4 * mm)
         canv.setFont(F_BODY, 8)
         canv.setFillColor(MUTED)
-        label = title[:70] if title else "document"
-        canv.drawString(ML, y - 2 * mm, label)
+        label = _fit(title or "document", F_BODY, 8, _page[0] - MR - ML - 70)
+        if label:
+            canv.drawString(ML, y - 2 * mm, label)
         page_label = f"page {pg}" if not total else f"page {pg} of {total}"
         canv.drawRightString(_page[0] - MR, y - 2 * mm, page_label)
         canv.restoreState()
@@ -864,13 +904,24 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
     # navigate and impossible to cross-reference from a chat answer.
     counters = [0, 0]
 
+    def _unnumbered(text: str) -> str:
+        """Drop a leading "3." / "3.1" the author already wrote.
+
+        The contents page read "1. 1. Introduction and Historical Context":
+        the model kept writing its own outline numbering into the heading
+        text (it was carrying forward a numbered outline from the first
+        render), and the renderer then numbered it again. Numbering an
+        already-numbered heading is the defect, not the model's prose."""
+        import re as _re2
+        return _re2.sub(r"^\s*\d+(?:\.\d+)*\.?\s+", "", str(text or ""), count=1)
+
     def _numbered(text: str, level: int) -> str:
         if level == 1:
             counters[0] += 1
             counters[1] = 0
-            return f"{counters[0]}. {_strip_md(text)}"
+            return f"{counters[0]}. {_strip_md(_unnumbered(text))}"
         counters[1] += 1
-        return f"{counters[0]}.{counters[1]} {_strip_md(text)}"
+        return f"{counters[0]}.{counters[1]} {_strip_md(_unnumbered(text))}"
 
     def _heading(txt, level):
         if number_sections:
@@ -928,6 +979,12 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ("LINEBELOW", (0, 0), (-1, -2), 0.4, RULE),
             ("BOX", (0, 0), (-1, -1), 0.6, RULE),
+            # Light column rules. Without them a comparison table reads as one
+            # undifferentiated run of text - both to a person scanning it and
+            # to text extraction, which flattened every cell into a single
+            # line ("Perspective Argument Regarding Sinter ...") with no way to
+            # see where one column ended and the next began.
+            ("LINEBEFORE", (1, 0), (-1, -1), 0.3, RULE),
         ]
         if head:
             cmds += [
@@ -1266,6 +1323,21 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
                 try:
                     toc_hook.notify("TOCEntry",
                                     (level, flowable.getPlainText(), self.page))
+                except Exception:
+                    pass
+                # PDF bookmarks, so the document is navigable in the reader's
+                # sidebar. An 18-page report with a printed contents page but
+                # no outline tree is half-navigable: the reader shows nothing
+                # to click. Wrapped because a bookmark failure must never
+                # cost the user their document.
+                try:
+                    _key = f"h{self.page}-{level}-{len(getattr(self, '_outline_n', []))}"
+                    self._outline_n = getattr(self, "_outline_n", [])
+                    self._outline_n.append((_key, flowable.getPlainText(), level))
+                    self.canv.bookmarkPage(_key)
+                    self.canv.addOutlineEntry(
+                        flowable.getPlainText(), _key, level=0,
+                        closed=(level == 1))
                 except Exception:
                     pass
 

@@ -160,11 +160,29 @@ def tool_usage(since=None):
 
 def by_agent(session=None, since=None):
     """V8: per-agent cost/token rollup. When `session` is set, scopes the
-    rollup to a single flow-run; otherwise rolls up the calendar day."""
-    where = ["ts >= ?"]
-    args = [since if since is not None else (time.time() - (time.time() % 86400))]
+    rollup to a single flow-run; otherwise rolls up the calendar day.
+
+    The calendar-day floor applies ONLY to the unscoped rollup. Passing
+    `session=` used to keep it, which meant any session whose calls were not
+    made in the current UTC day returned zero rows: measured against the live
+    store, 1,870 of 1,946 sessions with agent-tagged calls (96%) were
+    invisible. The agent's Ledger read this and, because the endpoint
+    reported a *successful* empty result rather than an error, rendered a
+    confident $0 for conversations that had genuinely been billed — the worst
+    combination, since a failure would at least have been visible.
+    """
+    where = []
+    args = []
     if session:
-        where.append("session=?"); args.append(session)
+        where.append("session=?")
+        args.append(session)
+    # The calendar-day floor is a DEFAULT for the unscoped rollup, not a filter
+    # that applies on top of an explicit scope. An explicit `since` is still
+    # honoured alongside a session, because the caller asked for that window.
+    if since is not None or not session:
+        where.append("ts >= ?")
+        args.append(since if since is not None
+                    else (time.time() - (time.time() % 86400)))
     q = (
         "SELECT agent, provider, COUNT(*) AS calls, "
         "SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, "

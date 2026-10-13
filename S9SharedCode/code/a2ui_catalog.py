@@ -334,6 +334,20 @@ def validate_components(components: Any) -> list[dict[str, Any]]:
                 raise CatalogError(
                     f"{cid} ({name}): unknown property {key!r}. Allowed: "
                     + ", ".join(sorted(spec["props"])))
+            # Enforce the declared enum. The type strings are machine-readable
+            # (`enum:a|b|c`), and they were only ever descriptions — a Link
+            # with `target: "https://elsewhere"` passed validation, which is
+            # harmless only because the client happens to render a <span>
+            # today. The next person to turn that into a real anchor would
+            # inherit a navigation sink that the catalog promises is closed.
+            declared = spec["props"][key]
+            if declared.startswith("enum:"):
+                allowed = set(declared.split(":", 1)[1].split("|"))
+                value = raw[key]
+                if isinstance(value, str) and value and value not in allowed:
+                    raise CatalogError(
+                        f"{cid} ({name}): {key}={value!r} is not one of "
+                        + ", ".join(sorted(allowed)))
 
         # Text budget, counted across the whole surface.
         for key, value in raw.items():

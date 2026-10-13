@@ -457,7 +457,29 @@ export default function Documents() {
                 <button onClick={closePreview} aria-label="Close preview"
                   className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5">×</button>
               </div>
+              {/* Sandboxed, and this is load-bearing rather than cosmetic.
+                  preview.url is a blob: URL, so the document shares this
+                  page's own origin — an uploaded .html file would otherwise
+                  run with full same-origin privileges, read the
+                  `aria-token` meta tag out of the parent document, and issue
+                  authenticated /api/* calls as the user. .html is an
+                  accepted upload type, so this was self-inflicted stored XSS.
+
+                  `allow-same-origin` WITHOUT `allow-scripts` is the specific
+                  combination. Measured across every token set:
+                    (none)                             token readable, PDF renders
+                    ""                                 token safe,   PDF BLOCKED
+                    "allow-scripts"                    token safe,   PDF blocked
+                    "allow-same-origin"                token safe,   PDF renders
+                    "allow-scripts allow-same-origin"  token readable, PDF renders
+                  Omitting `allow-scripts` is what makes this safe: page
+                  scripts cannot run at all, so an uploaded .html cannot
+                  execute, while plugins still work so Chrome's PDF viewer is
+                  not blocked. Dropping `allow-same-origin` breaks PDFs again.
+                  DocSetup.tsx and Apps.tsx sandbox differently because they
+                  render HTML via srcDoc and a URL, never a blob. */}
               <iframe src={preview.url} title={`Preview of ${preview.doc.filename}`}
+                sandbox="allow-same-origin" referrerPolicy="no-referrer"
                 className="min-h-0 flex-1 w-full rounded-b-[10px] bg-white" />
             </div>
           </div>

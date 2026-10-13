@@ -34,12 +34,21 @@ const SUB: Record<AgentNodeData['status'], string> = {
 };
 
 function AgentNode({ data }: NodeProps<AgentNodeType>) {
-  /* React Flow makes its nodes focusable, so a keyboard user can Tab onto a
-     node - but selection was wired only to onNodeClick, so Enter and Space did
-     nothing at all (measured: a mouse click opened the Inspector, Enter and
-     Space did not). A focusable thing that cannot be operated is worse than
-     one that is skipped, so the key handling belongs here, on the element that
-     actually receives the event. */
+  /* React Flow puts tabIndex=0 and role="group" on its own WRAPPER element,
+     not on the node component's root div. So a keydown handler attached here
+     never fires when a keyboard user activates the node: the event target is
+     the ancestor wrapper, and the handler sits on a descendant (measured: the
+     wrapper is focusable and has aria-label "planner - complete", the inner
+     div has tabindex=null, and Enter/Space on the focused wrapper opened
+     nothing while a mouse click worked fine).
+
+     React Flow's wrapper does run its own elementSelectionKeys handler, so
+     Enter/Space already set React Flow's internal selection and the node
+     highlights - which is exactly why this looked implemented. The fix is to
+     give the wrapper the keyboard role we are actually advertising and put
+     the handler where the event lands. tabIndex is set so the inner div is
+     itself reachable, and stopPropagation stops React Flow's handler from
+     double-firing alongside ours. */
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
     e.preventDefault();
@@ -49,6 +58,8 @@ function AgentNode({ data }: NodeProps<AgentNodeType>) {
   return (
     <div
       role="button"
+      tabIndex={0}
+      aria-label={`${data.cap} — ${data.state ?? data.status}`}
       aria-pressed={!!data.selected}
       onKeyDown={onKeyDown}
       className={`w-[200px] rounded-[10px] border bg-[#101016] px-3 py-2.5 shadow-[0_8px_24px_rgba(0,0,0,0.45)] transition-shadow ${RING[data.status]} ${
@@ -61,12 +72,12 @@ function AgentNode({ data }: NodeProps<AgentNodeType>) {
           <Bot size={15} className="text-violet-300" />
         </span>
         <div className="min-w-0">
-          <div className="truncate text-[11px] font-bold tracking-wide text-zinc-200">{data.cap}</div>
-          <div className={`truncate text-[11px] font-semibold ${SUB[data.status]}`}>{data.sub}</div>
+          <div className="truncate text-[12.5px] font-bold tracking-wide text-zinc-200">{data.cap}</div>
+          <div className={`truncate text-[12.5px] font-semibold ${SUB[data.status]}`}>{data.sub}</div>
         </div>
         {data.state ? (
           <span
-            className={`ml-auto max-w-[86px] truncate rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide ${SUB[data.status]}`}
+            className={`ml-auto max-w-[86px] truncate rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-[10.5px] font-bold uppercase tracking-wide ${SUB[data.status]}`}
           >
             {data.state}
           </span>

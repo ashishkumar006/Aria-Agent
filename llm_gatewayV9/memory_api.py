@@ -528,6 +528,67 @@ async def documents_list(request: Request):
     return {"documents": [d.to_dict() for d in _docs().list()]}
 
 
+class UnsupportedBytes(ValueError):
+    """The bytes cannot become a document (empty, too large, unknown type).
+
+    Named distinctly from the upload's own 400 path so callers that are not
+    HTTP - the Telegram poller, the agent's save-as-document tool - can catch
+    one failure and report it in their own terms.
+    """
+
+
+def safe_document_name(raw: str) -> str:
+    """A filename fit to persist verbatim and echo in a listing.
+
+    The client-supplied name is stored as-is today, which let a "../evil" name
+    through, and a 201-char "report.txt" was truncated mid-extension and then
+    rejected for having a ".tx" suffix - a name-length problem reported as a
+    file-type problem.
+    """
+    name = str(raw or "upload.bin").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(c for c in name
+                   if ord(c) >= 0x20 and ord(c) != 0x7f).strip()
+    name = name.lstrip(".") or "upload"
+    if len(name) > 200:
+        stem, dot, ext = name.rpartition(".")
+        if dot and 0 < len(ext) <= 12:
+            keep = 200 - len(dot) - len(ext)
+            name = (stem[:max(1, keep)] if len(stem) > keep else stem) + dot + ext
+        else:
+            name = name[:200]
+    return name
+
+
+def ingest_document(filename: str, data: bytes) -> dict:
+    """Register raw bytes in the Documents store and return the doc record.
+
+    The one place a document is created. The multipart upload route, the
+    Telegram inbound path and the agent's save-as-document tool all go through
+    here, so the filename sanitising and the 25 MB / supported-type rules
+    cannot drift between them.
+    """
+    if not data:
+        raise UnsupportedBytes("the file is empty")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise UnsupportedBytes(
+            f"file is {len(data)} bytes; limit is {MAX_UPLOAD_BYTES} "
+            f"({MAX_UPLOAD_BYTES // (1024 * 1024)} MB). Split the document or "
+            f"raise the limit server-side.")
+    name = safe_document_name(filename)
+    try:
+        kind = parsers.detect_type(name)
+    except parsers.UnsupportedDocument as e:
+        raise UnsupportedBytes(str(e)) from None
+    reg = _docs()
+    doc = reg.add(filename=name, doc_type=kind, size_bytes=len(data))
+    reg.write_source(doc.id, data)
+    return doc.to_dict()
+
+
+def _safe_upload_name(raw: str) -> str:  # pragma: no cover - alias kept for callers
+    return safe_document_name(raw)
+
+
 @_doc_router.post("/v1/documents")
 async def documents_upload(request: Request):
     """Accept an upload.
@@ -585,16 +646,13 @@ async def documents_upload(request: Request):
                      f"({MAX_UPLOAD_BYTES // (1024 * 1024)} MB). Split the "
                      f"document or raise the limit server-side."})
     try:
-        kind = parsers.detect_type(name)
-    except parsers.UnsupportedDocument as e:
+        doc = ingest_document(name, data)
+    except UnsupportedBytes as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-    reg = _docs()
-    doc = reg.add(filename=name, doc_type=kind, size_bytes=len(data))
-    reg.write_source(doc.id, data)
     # Off the event loop: _start_index joins any in-flight
     # indexer for this document (bounded, but up to 30s).
-    await asyncio.to_thread(_start_index, request, doc.id)
-    return {"document": reg.get(doc.id).to_dict()}
+    await asyncio.to_thread(_start_index, request, doc["id"])
+    return {"document": _docs().get(doc["id"]).to_dict()}
 
 
 @_doc_router.get("/v1/documents/{doc_id}")
@@ -977,7 +1035,8 @@ class SearchRequest(BaseModel):
 
 
 class RememberRequest(BaseModel):
-    kind: Literal["fact", "preference", "tool_outcome", "scratchpad"]
+    kind: Literal["fact", "preference", "tool_outcome", "scratchpad",
+                  "observation"]
     descriptor: str
     keywords: list[str] = Field(default_factory=list)
     value: dict = Field(default_factory=dict)
@@ -996,6 +1055,11 @@ class RememberRequest(BaseModel):
     expires_at: datetime | None = None
     supersedes: str | None = None
     doc: DocIn | None = None
+    # Declared on MemoryItem and defaulted to 1.0, but no write path ever set
+    # it, so every record in the store claimed certainty regardless of how it
+    # was produced. Callers that actually have a signal - an extractor that
+    # checked its output against the source text, say - can now say so.
+    confidence: float = 1.0
 
 
 class OutcomeRequest(BaseModel):
@@ -1062,7 +1126,8 @@ async def memory_remember(req: RememberRequest, request: Request):
             sources=[SourceRef(**s.model_dump()) for s in req.sources]
             if req.sources else None,
             expires_at=req.expires_at, supersedes=req.supersedes,
-            doc=DocSpan(**req.doc.model_dump()) if req.doc else None)
+            doc=DocSpan(**req.doc.model_dump()) if req.doc else None,
+            confidence=req.confidence)
     except PermissionError as e:
         # Fail-closed writer map (audited plane-side before raising).
         _log_mem("remember", t0, status="error", error=str(e),

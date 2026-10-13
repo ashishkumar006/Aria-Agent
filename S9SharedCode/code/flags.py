@@ -28,9 +28,23 @@ DEFINITIONS: dict[str, dict] = {
     "chat.tools": {
         "type": "bool",
         "default": True,
-        "description": "Chat page may call read-only tools (web_search, "
-                       "fetch_url, get_time, search_knowledge, "
-                       "currency_convert) instead of guessing.",
+        # Kept honest against `_CHAT_TOOLS` in agent_server.py. This text used
+        # to name `get_time` and `currency_convert`, which do not exist, and
+        # call the catalog "read-only" when it includes create_file, edit_file,
+        # schedule_task and render_document. A kill switch whose description
+        # misstates its blast radius is worse than no description: the user
+        # toggles it expecting to hide lookups and instead has no idea whether
+        # file writes are about to be switched off too.
+        "description": "Whether Chat may use its tools (web search and "
+                       "fetch, Gmail/GitHub/Notion/Slack/Calendar lookups, "
+                       "file create/edit/search, memory write, artifact read, "
+                       "document rendering and filing, task scheduling, and "
+                       "reading the behavioural profile). Off = plain "
+                       "text answers with no tools at all. The full list is "
+                       "GET /api/skills; the authoritative catalog is "
+                       "_CHAT_TOOLS in agent_server.py. Chat is read-only on "
+                       "GitHub and Notion: the write api_methods are stripped "
+                       "from the schema it is handed.",
     },
     "chat.agui": {
         "type": "bool",
@@ -67,6 +81,27 @@ DEFINITIONS: dict[str, dict] = {
         "default": True,
         "description": "PrefectHQ/prefab bundled render of tracker apps "
                        "(spike, side-by-side). Free, offline-capable.",
+    },
+    "memory.observations": {
+        "type": "bool",
+        # OFF by default. This is the only flag that changes how much of your
+        # conversations is retained: on, each chat turn is read for durable
+        # statements about how you like to work, and each one is stored with a
+        # verbatim quote from you as evidence. It records behaviour ("wants
+        # publication dates on every claim"), never personality labels,
+        # diagnosis or inferred intent. Turn it on deliberately.
+        "default": False,
+        "description": "Keep an evidence-backed behavioural profile of the "
+                       "user. Every entry stores a verbatim quote from the "
+                       "conversation as proof; an entry whose quote cannot be "
+                       "found in the source is discarded rather than saved. "
+                       "Observations are behavioural only - no personality "
+                       "type, no mental-health or motive inference, which the "
+                       "writer rejects outright. Off by default because it "
+                       "retains conversation text you never asked to be "
+                       "kept. Stored in the 'profile' drawer: listable, "
+                       "deletable and wipeable from the Memory view without "
+                       "touching your facts.",
     },
 }
 

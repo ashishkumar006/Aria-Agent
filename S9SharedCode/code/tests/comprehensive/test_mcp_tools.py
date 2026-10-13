@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 class ToolRegistration(unittest.TestCase):
     """mcp_server.mcp registers all tools."""
 
-    def test_40_tools_registered(self):
+    def test_49_tools_registered(self):
         """Was 40. get_time and currency_convert were removed as redundant
         with the model's own clock and arithmetic — each was an extra round
         trip for a trivial question. read_artifact was then added so a node
@@ -32,11 +32,30 @@ class ToolRegistration(unittest.TestCase):
         actually registered - it was a bare function, so it was absent from the
         advertised list and every model call returned "Unknown tool". Then
         _doc_stats was dropped again: it is a private helper render_document
-        calls, not a tool a model should be able to reach."""
+        calls, not a tool a model should be able to reach.
+
+        42: `list_channels` and `check_channel` were added so the agent can
+        find a delivery channel and tell "configured" from "the credential
+        still works" — the distinction that decides whether a reminder can
+        actually reach anyone.
+
+        43: `enable_scheduled`. "Turn that reminder back on" had no tool, so
+        the only way to satisfy it was schedule_task() a second time — which
+        left a duplicate and the original still disabled. The user saw two
+        identical disabled rows and no working reminder.
+
+        44: `save_as_document`. Files the agent produced were downloadable
+        artifacts or sandbox files; neither store is the one the console's
+        Documents list reads, so "save that to my docs" had nothing to call.
+
+        46: `record_observation` and `recall_observations`. The behavioural
+        profile had no tools: the agent could read standing preferences but
+        had no way to note a correction, so the only capture path was a
+        regex over chat text that matched "from now on" and nothing else."""
         import asyncio
         import mcp_server
         tools = asyncio.run(mcp_server.mcp.list_tools())
-        self.assertEqual(len(tools), 40)
+        self.assertEqual(len(tools), 49)
 
     def test_redundant_tools_are_gone(self):
         """They must not linger in the catalog or in the tool payload, or the

@@ -25,7 +25,8 @@ def new_id(prefix: str = "id") -> str:
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 
-MemoryKind = Literal["fact", "preference", "tool_outcome", "scratchpad"]
+MemoryKind = Literal["fact", "preference", "tool_outcome", "scratchpad",
+                    "observation"]
 
 
 class MemoryItem(BaseModel):

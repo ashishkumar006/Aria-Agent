@@ -1,6 +1,9 @@
-import { Suspense, lazy, useEffect } from 'react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
+import { STALE_TOKEN_EVENT } from './api';
 import ErrorBoundary from './components/ErrorBoundary';
+import TitleBar from './components/TitleBar';
 
 /* Route-split: each view (and the heavy @xyflow/react DAG code pulled in
    by Runs/Research) loads on demand instead of bloating first paint. */
@@ -101,6 +104,41 @@ function Fallback() {
   );
 }
 
+/* The agent's token is regenerated on EVERY launch and injected into this
+   document as a <meta> tag, read once at module load. A tab left open while the
+   agent restarts therefore holds a dead credential: every route 403s with
+   "missing or invalid X-Aria-Token" and the console is a dead end — no retry,
+   no login, nothing to click.
+
+   Reloading is the actual fix, because it re-fetches the document and the
+   agent re-injects the current token into it. The secret is deliberately not
+   persisted to storage, so this cannot be fixed by re-reading a cached copy;
+   only a fresh document gets a fresh token. */
+function StaleTokenNotice() {
+  const [stale, setStale] = useState(false);
+  useEffect(() => {
+    const on = () => setStale(true);
+    window.addEventListener(STALE_TOKEN_EVENT, on);
+    return () => window.removeEventListener(STALE_TOKEN_EVENT, on);
+  }, []);
+  if (!stale) return null;
+  return (
+    <div role="alert"
+      className="flex flex-wrap items-center gap-3 border-b border-amber-400/40 bg-amber-400/10 px-4 py-2 text-[12.5px] text-amber-100">
+      <AlertTriangle size={14} className="flex-none" />
+      <span className="min-w-0 flex-1">
+        The agent restarted, so its access token changed. This tab is holding
+        the old one — reload to continue. Nothing you were working on is lost.
+      </span>
+      <button type="button"
+        onClick={() => window.location.reload()}
+        className="flex-none rounded-md border border-amber-400/50 px-2.5 py-1 text-[11.5px] font-semibold hover:bg-amber-400/20">
+        Reload now
+      </button>
+    </div>
+  );
+}
+
 /* Aria console SPA — one React tree for every section. The server serves
    this same bundle at each route; the router picks the view client-side,
    so hopping sections never reloads the document. */
@@ -109,6 +147,13 @@ export default function App() {
     <BrowserRouter>
       <ErrorBoundary>
         <Preloader />
+        <StaleTokenNotice />
+        {/* The Electron shell hides the OS title bar (`titleBarStyle:
+            'hidden'`), which would otherwise leave the window with no way to
+            be moved or closed. This draws the replacement. It renders nothing
+            outside Electron — see TitleBar — so the browser build is
+            unaffected. */}
+        <TitleBar />
         <Suspense fallback={<Fallback />}>
           <Routes>
             <Route path="/" element={<Navigate to="/research" replace />} />

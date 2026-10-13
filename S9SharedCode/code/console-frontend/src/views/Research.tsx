@@ -1,9 +1,9 @@
-﻿import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { Search, FlaskConical } from 'lucide-react';
 import DagCanvas from '../components/DagCanvas';
 import Inspector from '../components/Inspector';
-import { isTerminal, renderMarkdown } from '../components/markdown';
+import { isTerminal, isSuccess, renderMarkdown, runStatusFromNodes } from '../components/markdown';
 import { Rail, TopBar, Pill, useHealth, SkipLink } from '../components/ui';
 import { DocumentViewer } from './DocSetup';
 import { api, headers, briefFor, displayTopic, ago, CONF, type GraphPayload, type GraphNode, type SessionSummary } from '../api';
@@ -261,6 +261,17 @@ const [viewFile, setViewFile] = useState<string | null>(null);
     void api.runProduced(s.session_id).then((snap) => {
       if (reqRef.current !== req) return;
       if (snap?.files?.length) setFiles(snap.files);
+      /* Reopening a finished run must tell the same story the live stream
+         told. The "this answer is incomplete" warning and the operator's stop
+         notice used to arrive once, in the SSE frame, and were gone after a
+         reload - so a degraded report looked complete the second time you
+         opened it. Both are persisted server-side now. */
+      if (snap?.degraded) {
+        const what = (snap.incomplete_detail || []).join('; ');
+        setNote(`This answer is incomplete — ${what || 'part of the question went unanswered'}. Treat the missing parts as unknown rather than settled.`);
+      } else if (snap?.stopped) {
+        setNote('Stopped before the run finished — the report below may be partial.');
+      }
     }).catch(() => { /* no files, or unreadable: the row simply stays empty */ });
     try {
       const g = await api.graph(s.session_id);
@@ -753,7 +764,7 @@ function fmtDur(s?: number | null): string {
 }
 
 /** One-line run summary + duration bars, docked above the canvas. Span is
-    min(started) â†’ max(completed, now if live), straight from the graph
+    min(started) → max(completed, now if live), straight from the graph
     rollup's own timestamps — no extra requests. The pill reflects the RUN
     (done/failed/live), not the page: showing "idle" for a finished run
     buried the outcome. */
@@ -765,34 +776,56 @@ function RunSummary({ graph, running, sid }: {
   const starts = graph.nodes.map((n) => n.started_at).filter((t): t is number => typeof t === 'number');
   const ends = graph.nodes.map((n) => n.completed_at).filter((t): t is number => typeof t === 'number');
   const span = starts.length ? fmtDur((ends.length && !running ? Math.max(...ends) : Date.now() / 1000) - Math.min(...starts)) : null;
-  const doneCount = graph.nodes.filter((n) => isTerminal(n.status)).length;
-  const failed = graph.nodes.some((n) => /fail|error/i.test(n.status || ''));
-  const pill = running
-    ? <Pill tone="info">running</Pill>
-    : failed
-      ? <Pill tone="err">failed</Pill>
-      : doneCount === graph.nodes.length && graph.nodes.length > 0
-        ? <Pill tone="ok">done</Pill>
-        : <Pill tone="muted">idle</Pill>;
+  /* `isTerminal` answers "is it over?" — a skipped or interrupted node is over
+     but did not succeed. Using it for a green `done` is what made a cancelled
+     run (planner+researcher complete, formatter skipped) satisfy
+     `doneCount === nodes.length` and render as a success with an empty report.
+     Six finished runs sat in the store that way. `runStatusFromNodes` is the
+     shared rule; Runs.tsx uses the same one. */
+  const okCount = graph.nodes.filter((n) => isSuccess(n.status)).length;
+  const status = runStatusFromNodes(graph.nodes, running);
+  const pill = <Pill tone={status.tone}>{status.label}</Pill>;
   return (
     <div className="border-b border-white/10 bg-[#0b0b0e]/80 px-4 py-2.5">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         {pill}
-        <span className="font-mono text-[11px] text-zinc-300">
-          {doneCount}/{graph.nodes.length} nodes
+        {/* Node count and wall-clock span are the two numbers a run is
+            actually judged by, and every other data view (Ledger, Documents,
+            Scheduler, Runs) leads with 20px numerals via the shared `Stat`
+            component. Research hand-rolled this strip at 11px monospace, which
+            is why the page reads as denser and smaller than its siblings
+            before a single node has been read. The labels stay small; the
+            values do not. */}
+        <span className="flex items-baseline gap-1.5">
+          <span className="text-xl font-bold tabular-nums leading-none text-zinc-100">
+            {okCount}/{graph.nodes.length}
+          </span>
+          <span className="text-[10px] font-bold uppercase tracking-[0.12em] text-zinc-muted">
+            nodes
+          </span>
+          {okCount < graph.nodes.length && (
+            <span className="text-[11px] text-zinc-muted" title="Nodes that finished without succeeding (skipped, interrupted, failed)">
+              (terminal but not successful)
+            </span>
+          )}
         </span>
         {span && (
-          <span className="font-mono text-[11px] tabular-nums text-zinc-300" title="Wall-clock span across node timestamps">
-            â± {span}{running ? ' so far' : ' total'}
+          <span className="flex items-baseline gap-1.5" title="Wall-clock span across node timestamps">
+            <span className="text-xl font-bold tabular-nums leading-none text-zinc-100">
+              {span}
+            </span>
+            <span className="text-[10px] font-bold uppercase tracking-[0.12em] text-zinc-muted">
+              {running ? 'so far' : 'total'}
+            </span>
           </span>
         )}
         {sid && (
-          <span className="truncate font-mono text-[10.5px] text-zinc-muted" title={sid}>
+          <span className="truncate font-mono text-[11px] text-zinc-muted" title={sid}>
             {sid.slice(0, 12)}…
           </span>
         )}
       </div>
-      <div className="mt-2 max-w-[560px]">
+      <div className="mt-2 max-w-[720px]">
         <Timeline nodes={graph.nodes} running={running} />
       </div>
     </div>
@@ -819,16 +852,16 @@ function Timeline({ nodes, running }: { nodes: GraphNode[]; running: boolean }) 
     <div className="space-y-1" role="list" aria-label="Node durations">
       {rows.map(({ n, dur, live }) => (
         <div key={n.id} role="listitem" className="flex items-center gap-2">
-          <span className="w-24 flex-none truncate font-mono text-[10.5px] text-zinc-400" title={n.id}>
-            {(n.skill || n.id).replace(/agent$/i, '').slice(0, 14) || n.id}
+          <span className="w-32 flex-none truncate font-mono text-[11.5px] text-zinc-300" title={n.id}>
+            {(n.skill || n.id).replace(/agent$/i, '').slice(0, 18) || n.id}
           </span>
-          <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-white/5">
+          <div className="h-2.5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/5">
             <div
               className={`h-full rounded-full ${live ? 'animate-pulse bg-violet-400' : n.status === 'failed' || n.status === 'error' ? 'bg-red-400/70' : isTerminal(n.status) ? 'bg-emerald-400/60' : 'bg-zinc-600'}`}
               style={{ width: `${Math.max(2, ((dur ?? 0) / max) * 100)}%` }}
             />
           </div>
-          <span className="w-14 flex-none text-right font-mono text-[10.5px] tabular-nums text-zinc-400">
+          <span className="w-16 flex-none text-right font-mono text-[11.5px] tabular-nums text-zinc-300">
             {dur == null ? '—' : fmtDur(dur)}
           </span>
         </div>

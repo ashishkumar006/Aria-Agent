@@ -143,7 +143,16 @@ def _next_fire_from_cron(cron: str, base: float) -> float:
 
 def schedule(query: str, when: str, *,
              conversation_id: str | None = None,
-             notify: bool = True) -> str:
+             notify: bool = True,
+             channel: str = "",
+             lead_s: float = 0,
+             lead_message: str = "",
+             message: str = "",
+             follow_up: str = "",
+             wait_for_ack: bool = False,
+             ack_timeout_s: float = 900,
+             snooze_s: float = 0,
+             max_follow_ups: int = 3) -> str:
     """Schedule `query` to run at `when`.
 
     `when` forms:
@@ -156,6 +165,21 @@ def schedule(query: str, when: str, *,
     Idempotent on (query, when): posting the identical enabled job twice
     (double-click, client retry, replayed request) returns the EXISTING id
     instead of scheduling a duplicate run that bills twice.
+
+    Notification shape
+    ------------------
+    `channel` names a gateway adaptor (telegram, slack, discord, gmail, ...).
+    `lead_s` fires a PRE-notification that many seconds before the task, with
+    its own agent-authored text; `message` is the text at fire time. Both are
+    optional and independent, so a reminder can warn first and report later
+    without the agent re-scheduling anything by hand.
+
+    `wait_for_ack` makes the pre-notification a conversation rather than an
+    announcement: the user is expected to reply, the reply is routed to the
+    agent LLM, and the agent may reply back, up to `max_follow_ups` times,
+    until the user acknowledges. `snooze_s` is the delay before the next
+    unacknowledged nudge. All of it is best-effort - a channel that cannot
+    deliver must never stop the task itself from firing.
     """
     sid = f"sch-{uuid.uuid4().hex[:8]}"
     now = time.time()
@@ -221,8 +245,36 @@ def schedule(query: str, when: str, *,
             f"unparseable schedule {when!r}: want 'in 30m' / 'in 1h' / "
             f"'daily@09:00' / 'every 30m' / 'every 2h' / 'tomorrow 9am' / "
             f"ISO datetime / epoch seconds")
+    # A one-shot in the past is refused, not fired. The worker disables every
+    # one-shot as it fires (so a crash cannot resurrect it), which means a past
+    # date produced a job that was born disabled and then consumed itself on
+    # the next tick. To the user that reads as "the scheduler is broken": they
+    # asked for tomorrow at 9am, were told it was scheduled, found it greyed
+    # out, and — with no enable tool — asked for a second copy. The real fault
+    # was an absolute date a model wrote a year in the past, accepted verbatim.
+    #
+    # Recurring jobs are exempt: "daily@09:00" legitimately rolls forward.
+    if recurring is None and fire <= now:
+        raise ValueError(
+            f"schedule {when!r} is in the past "
+            f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(fire))} "
+            f"local; now {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}). "
+            f"Use a relative form like 'in 2h' or 'tomorrow 9am', or check the "
+            f"year in an absolute date.")
     with _SCHED_LOCK:
         _load()
+        # Build and validate the policy BEFORE the idempotency short-circuit.
+        # Returning an existing id first meant a repeat of an invalid request
+        # (unknown channel, unparseable lead time) came back 200 with the old
+        # id, so the caller believed they had set a notification that was never
+        # configured.
+        policy = _build_notify_policy(
+            channel=channel, lead_s=lead_s, lead_message=lead_message,
+            message=message, follow_up=follow_up,
+            wait_for_ack=wait_for_ack, ack_timeout_s=ack_timeout_s,
+            snooze_s=snooze_s, max_follow_ups=max_follow_ups,
+            fire_at=fire,
+        )
         for _esid, _job in _SCHEDULES.items():
             if not isinstance(_job, dict):
                 # A hand-edited or torn schedules.json can hold
@@ -244,19 +296,142 @@ def schedule(query: str, when: str, *,
             "enabled": True,
             "created": now,
         }
+        # Notification policy lives beside the job rather than in a second
+        # schedule row. Two rows would be independently cancellable, so
+        # cancelling a task could leave its pre-notification armed to fire
+        # into a reminder the user had already dismissed.
+        if policy:
+            _SCHEDULES[sid]["notify_policy"] = policy
         heapq.heappush(_HEAP, (fire, sid))
         _save()
     _ensure_worker()
+    # Arm the pre-notification as a SEPARATE, derived job keyed to the parent.
+    # It carries no agent query, so firing it costs no LLM spend - it only
+    # sends the agent-authored lead message.
+    if policy and policy.get("lead_fire") and policy["lead_fire"] > now:
+        lead_sid = f"{sid}-lead"
+        with _SCHED_LOCK:
+            _load()
+            _SCHEDULES[lead_sid] = {
+                "query": "",
+                "when": when,
+                "next_fire": policy["lead_fire"],
+                "recurring": None,
+                "conversation_id": conversation_id,
+                "notify": False,
+                "enabled": True,
+                "created": now,
+                "parent": sid,
+                "notify_policy": policy,
+                "phase": "lead",
+            }
+            heapq.heappush(_HEAP, (policy["lead_fire"], lead_sid))
+            _save()
+        _log(f"[{sid}] pre-notification armed for "
+             f"{round(policy['lead_fire'] - now)}s from now")
     return sid
 
 
+# ── notification policy ─────────────────────────────────────────────────────
+
+def _coerce_seconds(v, field: str, *, minimum: float = 0.0,
+                    maximum: float = 7 * 86400) -> float:
+    """Accept a number or a duration string ('15m', '2h', '90s').
+
+    The agent passes LLM-authored text straight through, so `lead_s: "fifteen
+    minutes"` has to fail loudly here rather than silently becoming 0 (which
+    would mean "no pre-notification", the opposite of what was asked for)."""
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, bool):
+        raise ValueError(f"{field} must be a number of seconds or a duration")
+    if isinstance(v, (int, float)):
+        s = float(v)
+    else:
+        import re as _re
+        m = _re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd])?\s*",
+                          str(v), _re.I)
+        if not m:
+            raise ValueError(
+                f"{field}={v!r}: use seconds (900) or a duration like "
+                f"'15m', '2h', '1d'")
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        s = float(m.group(1)) * mult.get((m.group(2) or "s").lower(), 1)
+    if s < minimum:
+        raise ValueError(f"{field} must be >= {minimum:g}")
+    return min(s, maximum)
+
+
+def _build_notify_policy(*, channel: str, lead_s, lead_message: str,
+                         message: str, follow_up: str, wait_for_ack: bool,
+                         ack_timeout_s, snooze_s, max_follow_ups,
+                         fire_at: float) -> dict:
+    """Validate and assemble the notification policy for one schedule.
+
+    Returns {} when nothing was requested, so the common case persists exactly
+    what it always did."""
+    channel = (channel or "").strip()
+    if channel:
+        # Validate against the registry the gateway uses, at schedule time.
+        # An unknown channel used to be accepted silently and then failed at
+        # delivery, an hour later, with the task already billed.
+        try:
+            import notify as _notify
+            known = {str(c.get("name") or "") for c in
+                     _notify.available_channels()}
+        except Exception:
+            known = set()
+        if known and channel.lower() not in known:
+            raise ValueError(
+                f"unknown channel {channel!r}; use one of "
+                f"{', '.join(sorted(known))}")
+    lead_s = _coerce_seconds(lead_s, "lead_s")
+    ack_timeout_s = _coerce_seconds(ack_timeout_s or 900, "ack_timeout_s",
+                                    minimum=30)
+    snooze_s = _coerce_seconds(snooze_s, "snooze_s")
+    if not any([channel, lead_s, message, follow_up, wait_for_ack, snooze_s]):
+        return {}
+    try:
+        n = int(max_follow_ups)
+    except (TypeError, ValueError):
+        raise ValueError("max_follow_ups must be an integer 0-10")
+    if not 0 <= n <= 10:
+        raise ValueError("max_follow_ups must be between 0 and 10")
+    lead_fire = 0.0
+    if lead_s:
+        lead_fire = fire_at - lead_s
+        if lead_fire <= time.time():
+            raise ValueError(
+                f"lead_s={lead_s:g}s is longer than the time until the task "
+                f"({max(0, fire_at - time.time()):.0f}s), so the "
+                f"pre-notification would fire in the past")
+    return {
+        "channel": channel,
+        "lead_fire": lead_fire,
+        "lead_message": str(lead_message or ""),
+        "message": str(message or ""),
+        "follow_up": str(follow_up or ""),
+        "wait_for_ack": bool(wait_for_ack),
+        "ack_timeout_s": ack_timeout_s,
+        "snooze_s": snooze_s,
+        "max_follow_ups": n,
+    }
+
+
 def list_schedules() -> list[dict]:
+    """Read every schedule. This is a READ and must not mutate stored state.
+
+    It used to purge as a side effect, because fired one-shots are marked
+    disabled by the worker rather than by cancel(), so ghost rows accumulated.
+    But the console polls this endpoint every 15s, which means simply OPENING
+    the Scheduler page deleted the operator's execution history: a month-old
+    executed one-shot was gone after one page load, with nothing in the
+    response saying so. A read that deletes is not a read; the purge already
+    has its own endpoint (`purge_disabled`) which reports how many it removed,
+    so the caller opts in explicitly.
+    """
     with _SCHED_LOCK:
         _load()
-        # Sweep stale disabled one-shots here too: fired one-shots are
-        # marked disabled by the worker (not by cancel()), so without this
-        # every completed reminder left a permanent ghost row behind.
-        _purge_locked(_PURGE_AFTER_S)
         # Return ALL schedules (enabled and disabled). Cancelled schedules
         # remain visible so callers can inspect the `enabled` flag; the UI
         # layer decides whether to grey them out. Non-dict entries (see
@@ -280,9 +455,108 @@ def cancel(sid: str) -> bool:
             # ran — one stray agent turn after a successful cancel.
             spec["_cancelled"] = True
             _save()
-            _purge_locked(_PURGE_AFTER_S)
+            # No purge here either. Cancelling is a write the user asked for,
+            # and it should not silently discard *other* jobs' history as a
+            # side effect; `purge_disabled()` remains the explicit, reported
+            # way to clear out aged disabled rows.
             return True
     return False
+
+
+def _reparse_when(when: str, base: float | None = None) -> float:
+    """Resolve a stored `when` string to an absolute fire time.
+
+    Handles every form `schedule()` accepts — relative delays, `tomorrow
+    HH:MM`, recurring specs, ISO and epoch — in one place.
+
+    It exists because `schedule()`'s dispatch and `_next_fire_from_cron` are
+    not the same parser: the cron helper cannot read "in 2h", so anything that
+    re-derives a fire time from stored text (re-enabling a disabled schedule)
+    broke on the most common reminder there is. Two parsers for one field is
+    how that happened.
+    """
+    import re as _re
+    now = base if base is not None else time.time()
+    low = when.strip().lower()
+    if low.startswith("in "):
+        m = _re.fullmatch(
+            r"(\d+)\s*(m|min|mins|minutes|minute|h|hr|hrs|"
+            r"hour|hours|s|sec|secs|second|seconds)?", low[3:].strip())
+        if not m:
+            raise ValueError(f"unparseable delay: {when!r}")
+        n, unit = int(m.group(1)), (m.group(2) or "m")
+        per = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+               "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+               "h": 3600, "hr": 3600, "hrs": 3600,
+               "hour": 3600, "hours": 3600}[unit]
+        return now + n * per
+    return _next_fire_from_cron(when, now)
+
+
+def set_enabled(sid: str, enabled: bool) -> dict:
+    """Enable or disable a schedule without deleting it.
+
+    There was no way back from a disabled job. `cancel_scheduled` removes one,
+    and `schedule_task` creates a new one, so "the reminder is greyed out, turn
+    it on" had no answer — and the model's only available move was to schedule
+    a second copy, which left the user with two identical rows, both still
+    disabled, and no better off. The enabled flag is state, not existence, so
+    re-enabling has to be possible.
+
+    A one-shot whose fire time has passed is re-armed only if `when` still
+    makes sense: the stored `when` is re-parsed, and a job whose time has
+    genuinely passed stays disabled with the reason attached rather than
+    firing instantly. That is the failure this function exists to undo, so it
+    must not reproduce it.
+    """
+    with _SCHED_LOCK:
+        _load()
+        spec = _SCHEDULES.get(sid)
+        if not isinstance(spec, dict):
+            return {"ok": False, "error": f"unknown schedule {sid!r}"}
+        if not enabled:
+            spec["enabled"] = False
+            _save()
+            return {"ok": True, "schedule_id": sid, "enabled": False}
+        raw_when = str(spec.get("when") or "").strip()
+        if not spec.get("recurring") and raw_when:
+            # Re-parse through `schedule()`'s own dispatch, not
+            # `_next_fire_from_cron`: that helper only understands cron, ISO
+            # and epoch, so a RELATIVE reminder ("in 2h") could not be
+            # re-armed at all — it raised "could not convert string to float".
+            # A user disabling and re-enabling the most common kind of
+            # reminder hit an error.
+            try:
+                fire = _reparse_when(raw_when)
+            except ValueError as e:
+                spec["enabled"] = False
+                spec["last_error"] = f"cannot re-arm {sid}: {e}"[:400]
+                _save()
+                return {"ok": False, "schedule_id": sid,
+                        "error": spec["last_error"],
+                        "hint": "cancel it and schedule a new one"}
+            if fire <= time.time():
+                # Leave it OFF. Returning ok:False while the row stayed
+                # `enabled` would report a refusal while leaving the job armed,
+                # so the next worker tick would fire a reminder the user was
+                # just told was not running.
+                spec["enabled"] = False
+                spec["last_error"] = (
+                    f"not re-enabled: {raw_when!r} is in the past")[:400]
+                _save()
+                return {"ok": False, "schedule_id": sid,
+                        "error": spec["last_error"],
+                        "hint": "cancel it and schedule a new one with a "
+                                "future time, e.g. 'tomorrow 9am'"}
+            spec["next_fire"] = fire
+        spec["enabled"] = True
+        spec.pop("last_error", None)
+        heapq.heappush(_HEAP, (float(spec.get("next_fire") or time.time()), sid))
+        _save()
+    _ensure_worker()
+    return {"ok": True, "schedule_id": sid, "enabled": True,
+            "next_fire": spec.get("next_fire"),
+            "when": spec.get("when")}
 
 
 def remove(sid: str) -> bool:
@@ -342,8 +616,22 @@ def purge_disabled(max_age_days: float = 7) -> int:
         return _purge_locked(float(max_age_days) * 86400)
 
 
+# Tasks that are really just a nudge. The research DAG is the wrong tool for
+# these: it runs planner -> researcher -> formatter -> action, bills four or
+# five model calls, takes 20-30s, and returns a REPORT about e.g. "take a
+# break and refocus". The user asked to be reminded, not researched.
+#
+# The signal is the agent's own `message`: if it wrote the words to send, the
+# text IS the deliverable and running a pipeline to produce more text is both
+# slow and wrong. A job with no authored message still runs the DAG, because
+# then the task genuinely is "go and do/find something".
+def _is_nudge_only(spec: dict) -> bool:
+    pol = spec.get("notify_policy") or {}
+    return bool(str(pol.get("message") or "").strip())
+
+
 def _fire(sid: str, spec: dict | None = None) -> None:
-    """Run one scheduled query through the orchestrator (blocking).
+    """Run one scheduled task.
 
     `spec` is the snapshot taken by the worker under _SCHED_LOCK — _fire
     never reads the shared _SCHEDULES dict itself, so a concurrent
@@ -374,22 +662,31 @@ def _fire(sid: str, spec: dict | None = None) -> None:
     except Exception as e:
         _log(f"[{sid}] cost snapshot failed (non-fatal): {e}")
     try:
-        from flow import Executor
         import asyncio
-        # RELIABILITY FIX (resume on missing session): the scheduler used to
-        # pass resume=True for a brand-new session id, but Executor.run
-        # raises when there is no persisted graph for that id. Detect a
-        # missing session and start fresh instead. Probe the graph file
-        # directly — constructing SessionStore would mkdir empty session
-        # dirs that pollute list_sessions().
-        from persistence import SESSIONS_ROOT
-        resume = (SESSIONS_ROOT / derived_sid / "graph.json").exists()
-        answer = asyncio.run(
-            Executor().run(spec["query"],
-                           session_id=derived_sid, resume=resume)
-        )
-        _log(f"[{sid}] ok in {round(_t.time() - _start, 1)}s -> "
-             f"{str(answer or '')[:160]!r}")
+        if _is_nudge_only(spec):
+            # The agent already wrote the message. Do not run a pipeline to
+            # generate text nobody asked for: send what it wrote and spend
+            # nothing. The body delivered is the reminder's own text, so this
+            # path costs zero model calls and finishes in milliseconds.
+            answer = ""
+            _log(f"[{sid}] nudge-only: delivering the agent's message "
+                 f"without running a task ({_t.time() - _start:.2f}s)")
+        else:
+            from flow import Executor
+            # RELIABILITY FIX (resume on missing session): the scheduler used
+            # to pass resume=True for a brand-new session id, but Executor.run
+            # raises when there is no persisted graph for that id. Detect a
+            # missing session and start fresh instead. Probe the graph file
+            # directly — constructing SessionStore would mkdir empty session
+            # dirs that pollute list_sessions().
+            from persistence import SESSIONS_ROOT
+            resume = (SESSIONS_ROOT / derived_sid / "graph.json").exists()
+            answer = asyncio.run(
+                Executor().run(spec["query"],
+                               session_id=derived_sid, resume=resume)
+            )
+            _log(f"[{sid}] ok in {round(_t.time() - _start, 1)}s -> "
+                 f"{str(answer or '')[:160]!r}")
     except Exception as e:
         answer = f"[scheduler] run failed: {e}"
         error = str(e)[:400]
@@ -409,25 +706,75 @@ def _fire(sid: str, spec: dict | None = None) -> None:
     except Exception as e:
         _log(f"[{sid}] cost record failed (non-fatal): {e}")
     if spec.get("notify", True):
-        # ALWAYS record the result in the in-app feed first. Telegram may be
-        # unconfigured or unreachable, and a reminder whose outcome exists
-        # only in a Telegram message that never arrived is a reminder that
-        # did not happen.
+        # ALWAYS record the result in the in-app feed first. A channel may be
+        # unconfigured, unpaired or unreachable, and a reminder whose outcome
+        # exists only in a message that never arrived is a reminder that did
+        # not happen.
         try:
             from agent_server import _notif_add
+            # A nudge-only job produces no answer by design, so recording
+            # "(no answer)" there would read as a failure.
+            summary = (answer or "").strip()[:400] or "delivered"
             _notif_add("scheduled",
-                       f"{spec['query'][:160]} -> "
-                       f"{(answer or '').strip()[:400] or '(no answer)'}",
+                       f"{spec['query'][:160]} -> {summary}",
                        derived_sid)
         except Exception as e:
             _log(f"[{sid}] in-app record failed: {e}")
-        try:
-            from agent_server import notify_task_done
-            notify_task_done(spec["query"], answer or "",
-                             round(_t.time() - _start, 1), derived_sid,
-                             scheduled=True)
-        except Exception as e:
-            _log(f"[{sid}] notify failed: {e}")
+        pol = spec.get("notify_policy") or {}
+        channel = str(pol.get("channel") or "")
+        # The agent writes the message it wants sent when it schedules the
+        # task. Both branches below send it verbatim; neither reformats it.
+        custom = str(pol.get("message") or "").strip()
+        if channel:
+            # An agent-authored fire-time message, delivered on the channel the
+            # agent chose.
+            text = custom or (
+                f"{spec['query'][:160]}\n\n"
+                f"{(answer or '').strip()[:900] or '(no answer)'}")
+            _deliver(sid, channel, text, derived_sid,
+                     str(pol.get("follow_up") or ""))
+        else:
+            try:
+                from agent_server import notify_task_done
+                notify_task_done(spec["query"], answer or "",
+                                 round(_t.time() - _start, 1), derived_sid,
+                                 scheduled=True, message=custom)
+            except Exception as e:
+                _log(f"[{sid}] notify failed: {e}")
+
+
+def _deliver(sid: str, channel: str, text: str, session_id: str,
+             follow_up: str = "") -> None:
+    """Send a notification and record the outcome, whatever it is.
+
+    Never raises: a channel failure must not turn a completed task into a
+    failed one. The delivery attempt is logged either way, because the whole
+    reason this exists is that a silent non-delivery is indistinguishable from
+    a reminder that was never set."""
+    try:
+        import notify as _notify
+        res = _notify.send_channel_message(
+            channel, text, agent="scheduler", session_id=session_id)
+    except Exception as e:
+        _log(f"[{sid}] deliver raised on {channel}: {e!r}")
+        return
+    if res.get("delivered"):
+        _log(f"[{sid}] -> {channel}: delivered")
+        return
+    why = str(res.get("error") or "unknown")[:200]
+    _log(f"[{sid}] -> {channel}: NOT delivered ({why})")
+    hint = ""
+    if res.get("reauth_needed"):
+        hint = (f" The {channel} credential looks invalid"
+                f"{' (' + str(res.get('reauth_hint')) + ')' if res.get('reauth_hint') else ''}"
+                f" - refresh it, then re-arm.")
+    try:
+        from agent_server import _notif_add
+        _notif_add("scheduled",
+                   f"could not deliver the notification for {sid[:160]} on "
+                   f"{channel}: {why}.{hint}", session_id)
+    except Exception:
+        pass
 
 
 def _worker() -> None:
@@ -498,11 +845,60 @@ def _worker_tick() -> None:
     if live is not None and isinstance(live, dict) and live.get("_cancelled"):
         return
     # Fire outside the lock, with the still-enabled snapshot.
+    if snap.get("phase") == "lead":
+        # A pre-notification carries no query, so it must not run the agent.
+        # Routing it through _fire would bill a full LLM turn to say "this is
+        # a reminder", and would record a run in Runs for a message that was
+        # never a task.
+        _fire_lead(sid, snap)
+        return
     try:
         _fire(sid, snap)
     except Exception as e:
         _log(f"[{sid}] fire raised: {traceback.format_exc()}")
         _record(sid, repr(e))
+
+
+def _fire_lead(sid: str, spec: dict) -> None:
+    """Send the pre-notification. Never runs the agent, never blocks the
+    task, and always records locally even when the channel is unreachable."""
+    pol = spec.get("notify_policy") or {}
+    channel = str(pol.get("channel") or "")
+    text = str(pol.get("lead_message") or "").strip()
+    parent = spec.get("parent") or ""
+    _record(sid, "pre-notification sent")
+    if not channel or not text:
+        return
+    try:
+        from notify import send_channel_message
+        res = send_channel_message(channel, text,
+                                    agent="scheduler", session_id=parent or sid)
+    except Exception as e:
+        _log(f"[{sid}] lead notify failed: {e!r}")
+        try:
+            from agent_server import _notif_add
+            _notif_add("scheduled",
+                       f"pre-notification for {parent} could not be sent "
+                       f"via {channel}: {e}"[:400], parent or sid)
+        except Exception:
+            pass
+        return
+    _log(f"[{sid}] lead -> {channel}: {res}")
+    if pol.get("wait_for_ack"):
+        try:
+            import ack as _ack
+            import ack_bridge as _bridge
+            _ack.open_thread(parent or sid, channel,
+                             str(res.get("target") or ""),
+                             query=str(spec.get("query") or ""),
+                             ack_timeout_s=float(pol.get("ack_timeout_s") or 900),
+                             snooze_s=float(pol.get("snooze_s") or 0),
+                             max_follow_ups=int(pol.get("max_follow_ups") or 0),
+                             prompt=str(pol.get("lead_message") or text))
+            _bridge.start_nudger()
+            _log(f"[{sid}] ack thread opened for {parent}")
+        except Exception as e:
+            _log(f"[{sid}] ack thread failed: {e!r}")
 
 
 def _ensure_worker() -> None:

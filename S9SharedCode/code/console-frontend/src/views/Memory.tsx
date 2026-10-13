@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Database, SearchX } from 'lucide-react';
+import { Database, SearchX, Trash2 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, SkipLink } from '../components/ui';
 import { api, type MemItem } from '../api';
 
@@ -16,6 +16,7 @@ import { api, type MemItem } from '../api';
 const KINDS = [
   { id: 'fact', label: 'facts', sub: 'things learned about the world' },
   { id: 'preference', label: 'preferences', sub: 'how you like things done' },
+  { id: 'observation', label: 'observations', sub: "what we've noticed, with your words as proof" },
   { id: 'tool_outcome', label: 'tool outcomes', sub: 'what worked and what did not' },
   { id: 'scratchpad', label: 'scratchpad', sub: 'working notes for this run' },
 ];
@@ -77,6 +78,12 @@ export default function Memory() {
   const [q, setQ] = useState('');
   const [submitted, setSubmitted] = useState('');
   const [hide, setHide] = useState(true);
+  const [profileEnabled, setProfileEnabled] = useState(false);
+  const [profileNote, setProfileNote] = useState('');
+  const [observations, setObservations] = useState<{
+    id: string; observation: string; evidence: string; confidence?: number;
+    seen_count?: number;
+  }[]>([]);
   const [kind, setKind] = useState('fact');
   const [desc, setDesc] = useState('');
   const [kw, setKw] = useState('');
@@ -133,6 +140,66 @@ export default function Memory() {
     return () => { abortRef.current?.abort(); };
   }, [load]);
 
+  /* The profile is fetched separately and deliberately not folded into
+     `load`: it lives behind its own flag, and a failure there must not blank
+     the memory list the user came to read. */
+  const loadProfile = useCallback(async () => {
+    try {
+      const d = await api.profile();
+      setProfileEnabled(d.enabled);
+      setObservations(d.observations || []);
+      setProfileNote(d.note || '');
+    } catch {
+      setProfileEnabled(false);
+      setObservations([]);
+      setProfileNote('Could not load the profile.');
+    }
+  }, []);
+
+  useEffect(() => { loadProfile(); }, [loadProfile]);
+
+  /* Delete from the profile panel, where the row is an observation rather
+     than a generic memory and so has no `it` to read a drawer from. The
+     confirm shows the quoted evidence: the user is deciding whether the
+     thing the agent noticed still holds, and the quote is what that decision
+     is about. */
+  const forgetObservation = async (o: { id: string; observation: string; evidence: string }) => {
+    if (busy || !o.id) return;
+    if (!confirm(
+      `Delete this observation?\n\n${o.observation}\n\n`
+      + `it was based on: "${o.evidence || '(no quote)'}"\n\n`
+      + 'Deleted immediately. No undo, no audit entry.',
+    )) return;
+    setBusy(true);
+    setOut('deleting…');
+    try {
+      await api.deleteMemory(o.id);
+      setObservations((prev) => prev.filter((x) => x.id !== o.id));
+      setOut(`deleted ${o.id}`);
+    } catch (e) {
+      setOut(String((e as Error)?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportProfile = async () => {
+    if (busy) return;
+    setBusy(true);
+    setOut('saving profile…');
+    try {
+      const d = await api.saveProfileDocument();
+      setOut(d.ok
+        ? `saved ${d.filename} to Documents`
+        : `could not save the profile: ${d.error || 'failed'}`);
+      loadProfile();
+    } catch (e) {
+      setOut(String((e as Error).message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submit = () => setSubmitted(q.trim());
   const clearSearch = () => { setQ(''); setSubmitted(''); };
 
@@ -181,6 +248,10 @@ export default function Memory() {
     setOut('deleting…');
     try {
       await api.deleteMemory(id);
+      /* A deleted observation is still in the profile panel until it
+         refetches — the row would vanish from the list below and linger
+         above, which reads as the delete having half-worked. */
+      if (it.kind === 'observation') loadProfile();
       setOut(`deleted ${id}`);
       /* Drop the row optimistically: the refetch below can fail
          (gateway hiccup), and a successful delete must never
@@ -347,6 +418,89 @@ export default function Memory() {
           </>)}
         </div>
         <p className="sr-only" role="status" aria-live="polite">{statusText}</p>
+        {/* The behavioural profile, above the generic memory list.
+            It earns its own panel because its rows are not facts: each is a
+            pattern drawn from past conversations, and the quoted line under it
+            is the only thing supporting it. Showing the evidence is what lets
+            the user judge an entry — and spot the ones that are wrong. */}
+        <div className="mx-3.5 mt-2.5 rounded-[10px] border border-white/10 bg-[#0e0e12]">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 border-b border-white/10 px-3 py-2">
+            <span className="text-[11px] font-bold tracking-[0.12em] text-zinc-muted">WHAT WE'VE NOTICED</span>
+            {profileEnabled ? (
+              <>
+                <span className="text-[11.5px] text-zinc-300">
+                  <span className="font-bold">{observations.length}</span>{' '}
+                  {observations.length === 1 ? 'observation' : 'observations'}
+                  <span className="text-zinc-muted"> · each with your words as evidence</span>
+                </span>
+                <button
+                  onClick={exportProfile}
+                  disabled={busy}
+                  title="Save this profile and your standing preferences as a document"
+                  className="ml-auto rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 hover:border-violet-400 disabled:opacity-40"
+                >
+                  {busy ? 'Saving…' : 'Save as document'}
+                </button>
+              </>
+            ) : (
+              <span className="text-[11.5px] text-zinc-muted">{profileNote}</span>
+            )}
+          </div>
+          {profileEnabled && observations.length > 0 && (
+            /* Bounded and independently scrollable. This panel sits ABOVE the
+               memory list in a non-scrolling flex column, so without a height
+               cap a long profile pushes everything below it off-screen with
+               no way to reach it - the page looked stuck. The header stays
+               put; only the rows scroll. */
+            <ul className="max-h-[34vh] divide-y divide-white/5 overflow-y-auto">
+              {observations.map((o) => {
+                const seen = o.seen_count ?? 1;
+                return (
+                <li key={o.id} className="px-3 py-2.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-[12.5px] leading-snug text-zinc-100">{o.observation}</p>
+                      {o.evidence && (
+                        <p className="mt-1 break-words border-l-2 border-violet-400/40 pl-2 text-[11.5px] italic text-zinc-muted">
+                          “{o.evidence}”
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-none items-center gap-1.5">
+                      {/* How many times this has actually been seen, stated
+                          plainly. A single incident is an anecdote, and
+                          presenting it beside a confidence score made one
+                          message read as an established preference. */}
+                      <Pill tone={seen > 1 ? 'ok' : 'warn'}>
+                        {seen > 1 ? `seen ${seen}×` : 'seen once'}
+                      </Pill>
+                      {seen > 1 && typeof o.confidence === 'number' && (
+                        <span className="font-mono text-[10.5px] text-zinc-muted">
+                          {o.confidence.toFixed(2)}
+                        </span>
+                      )}
+                      <button
+                        onClick={() => forgetObservation(o)}
+                        title="Delete this observation"
+                        aria-label={`Delete observation: ${o.observation}`}
+                        className="rounded-md border border-white/15 px-2 py-1 text-zinc-muted hover:border-red-400 hover:text-red-300"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  </div>
+                </li>
+                );
+              })}
+            </ul>
+          )}
+          {profileEnabled && observations.length === 0 && (
+            <p className="px-3 py-2.5 text-[11.5px] text-zinc-muted">
+              Nothing recorded yet. This grows only when you correct the agent or
+              say how you want something done.
+            </p>
+          )}
+        </div>
         {/* Load failures get their own region, above the list, so they are
             never mistaken for the result of a Remember/Forget/Wipe and are
             cleared by the next successful load. */}
@@ -428,6 +582,14 @@ export default function Memory() {
             <section key={it.id || `${it.kind}-${it.descriptor}`} className="rounded-[10px] border border-white/10 bg-[#0e0e12]">
               <div className="flex items-center gap-2 border-b border-white/10 px-3.5 py-2.5">
                 {it.superseded_by ? <Pill tone="err">superseded</Pill> : <Pill tone="ok">{it.kind || '?'}</Pill>}
+                {/* Only for kinds that write a real score. Everything else
+                    defaults to 1.0, so showing it everywhere would put a
+                    confident "1.00" on records that were never assessed. */}
+                {typeof it.confidence === 'number' && it.kind === 'observation' && (
+                  <Pill tone={it.confidence >= 0.7 ? 'ok' : 'warn'}>
+                    {it.confidence.toFixed(2)}
+                  </Pill>
+                )}
                 <span className="flex-1" />
                 {it.id && (
                   <button

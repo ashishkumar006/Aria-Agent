@@ -46,18 +46,22 @@ def test_ea05_malformed_planner_json_graceful(deterministic):
 
 
 def test_ea06_node_cap_no_infinite_loop(deterministic):
-    # A planner that emits 70 nodes must be capped at MAX_NODES (60).
+    # A planner that emits more workers than MAX_NODES must be capped at
+    # MAX_NODES, not at whatever the number used to be. The cap is a runaway
+    # LOOP guard (MAX_NODES 60 -> 400 so a book-length plan's research fleet
+    # fits); it is not a cap on plan quality, which is now uncapped.
+    import flow
     nodes = [
         {"skill": "researcher", "inputs": ["USER_QUERY"],
          "metadata": {"label": f"w{i}"}}
-        for i in range(70)
+        for i in range(flow.MAX_NODES + 20)
     ]
     deterministic["planner"] = {"nodes": nodes}
     deterministic["researcher"] = {"text": "x"}
     ans = run_executor("spawn many workers", "L0-ea06")
     assert isinstance(ans, str)
-    # Planner + capped workers; never more than 60 executed nodes.
-    assert len(skills_called()) <= 60, len(skills_called())
+    # Planner + capped workers; never more than MAX_NODES executed nodes.
+    assert len(skills_called()) <= flow.MAX_NODES, len(skills_called())
     assert skills_called()[0] == "planner"
 
 
@@ -125,12 +129,27 @@ def test_ee01_mcp_tool_catalogue():
     import mcp_server as mcp_mod
     tools = asyncio.run(mcp_mod.mcp.list_tools())
     names = {t.name for t in tools}
-    # 40-tool catalogue (matches tests/comprehensive/test_mcp_tools.py).
+    # 46-tool catalogue (matches tests/comprehensive/test_mcp_tools.py).
     # Was 40: render_document was counted as present while never having been
-    # registered, so the model could not call it.
-    assert len(tools) == 40, f"expected 40 tools, got {len(tools)}"
-    for expected in ("list_scheduled", "web_search", "read_file", "list_dir",
-                     "search_knowledge", "github_query", "read_artifact"):
+    # registered, so the model could not call it. +2 for list_channels and
+    # check_channel, which tell the agent where a reminder can be delivered
+    # and whether that channel's credential still works. +1 for
+    # enable_scheduled: "re-enable that reminder" was answered by scheduling a
+    # SECOND copy and leaving the original greyed out.
+    # +3 for the coding-agent loop: run_checks (the project's own
+    # lint/typecheck/tests - without it a file with a syntax error reports
+    # success), git_inspect (review your own diff) and find_symbol
+    # (definitions vs usages, which regex cannot separate).
+    #
+    # The count is deliberately an equality, not a floor: every addition has to
+    # be a decision. `tests/test_mcp_tool_reachability.py` separately proves
+    # all of them are also ADVERTISED, which registration alone does not.
+    assert len(tools) == 49, f"expected 49 tools, got {len(tools)}"
+    for expected in ("run_checks", "git_inspect", "find_symbol",
+                     "list_scheduled", "web_search", "read_file", "list_dir",
+                     "search_knowledge", "github_query", "read_artifact",
+                     "schedule_task", "list_channels", "check_channel",
+                     "enable_scheduled", "save_as_document", "record_observation", "recall_observations"):
         assert expected in names, f"missing MCP tool: {expected}"
 
 

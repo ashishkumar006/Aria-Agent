@@ -31,6 +31,8 @@ export default function Ledger() {
      the other. */
   const [nodeHealth, setNodeHealth] = useState<{
     sessions: number;
+    /** Graphs that could not be parsed. >0 means the table is partial. */
+    unreadable?: number;
     rows: import('../api').NodeHealthRow[];
     totals: { nodes: number; failed: number; fail_pct: number };
   } | null>(null);
@@ -50,6 +52,9 @@ export default function Ledger() {
   }, []);
 
   useEffect(() => { void loadNodes(); }, [loadNodes]);
+
+  const nodeUnreadable = nodeHealth?.unreadable ?? 0;
+  const nodeSessions = nodeHealth?.sessions ?? 0;
 
   const refreshRecent = useCallback(() => {
     // Both conversation kinds are billable: research runs (s8-)
@@ -118,6 +123,13 @@ export default function Ledger() {
      "no pricing data", not "no spend" — one is a gap, the other a wrong
      number. */
   const hasSpend = rows.length > 0 && rows.some((r) => Number(r.dollars || 0) !== 0);
+  /* Every figure below must obey the same rule as the tile. The tile already
+     refused to print "$0.0000" when pricing is missing, but both tables went
+     on printing it unconditionally - so the page said "cost data unavailable"
+     in the header and then asserted $0.0000 on every row beneath it. A page
+     that admits it cannot price something must not then print a price. */
+  const usdCell = (v: unknown) =>
+    hasSpend ? `$${Number(v || 0).toFixed(4)}` : '—';
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current;
@@ -342,7 +354,9 @@ export default function Ledger() {
               <div className="px-3 py-4 text-[12px] text-zinc-600">
                 {nodeErr
                   ? <>couldn't load node reliability ({nodeErr}). <button onClick={loadNodes} className="underline">retry</button></>
-                  : 'No completed nodes in the recent runs.'}
+                  : nodeUnreadable
+                    ? <>couldn't read {nodeUnreadable} of the {nodeSessions} run graph{nodeUnreadable === 1 ? '' : 's'} in this window, so these numbers are incomplete.</>
+                    : 'No completed nodes in the recent runs.'}
               </div>
             )}
           </section>
@@ -367,7 +381,7 @@ export default function Ledger() {
                       <td className="px-2.5 py-2 text-right">{r.calls}</td>
                       <td className="px-2.5 py-2 text-right">{r.in_tokens}</td>
                       <td className="px-2.5 py-2 text-right">{r.out_tokens}</td>
-                      <td className="px-2.5 py-2 text-right">${Number(r.dollars || 0).toFixed(4)}</td>
+                      <td className="px-2.5 py-2 text-right">{usdCell(r.dollars)}</td>
                     </tr>
                   ))}
                   {!rows.length && <tr><td colSpan={5}>{loadError ? <div className="px-3 py-4 text-xs text-red-200">couldn't load spend ({loadError}). <button onClick={load} className="underline">retry</button></div> : scopeError ? <div className="px-3 py-4 text-xs text-amber-200">{scopeError}</div> : <Empty icon={<Receipt size={30} />} title="No spend yet" sub="Chat or research something and costs land here." />}</td></tr>}
@@ -392,7 +406,7 @@ export default function Ledger() {
                     <td className="whitespace-nowrap px-2.5 py-2">{x.ts ? new Date(x.ts * 1000).toLocaleString() : '—'}</td>
                     <td className="px-2.5 py-2">{x.query || '(no query)'}</td>
                     <td className="px-2.5 py-2 text-right">{x.calls}</td>
-                    <td className="px-2.5 py-2 text-right">${Number(x.usd || 0).toFixed(4)}</td>
+                    <td className="px-2.5 py-2 text-right">{usdCell(x.usd)}</td>
                   </tr>
                 ))}
                 {!turns.length && loaded && <tr><td colSpan={4}><div className="px-3 py-4 text-xs text-zinc-muted">no turns recorded</div></td></tr>}

@@ -20,10 +20,11 @@ import {
   useCallback, useEffect, useMemo, useRef, useState, type ReactNode,
 } from 'react';
 import {
-  Braces, ChevronDown, ChevronRight, Circle, Code2, Columns2,
-  FileCode2, FileText, Folder, FolderOpen, Maximize2, PanelLeftClose,
+  Braces, ChevronDown, ChevronRight, Circle, CircleCheck, Code2, Columns2,
+  FileCode2, FileText, Folder, FolderOpen, Loader2, Maximize2,
+  PanelLeftClose,
   PanelLeftOpen, Play, Search, Square, Terminal, TriangleAlert, WrapText, X,
-  Keyboard, ListTree, CircleDot,
+  Keyboard, ListTree, CircleDot, Sparkles,
 } from 'lucide-react';
 import { Rail, TopBar, Empty, Pill, SkipLink } from '../components/ui';
 import { useFocusTrap } from '../lib/a11y';
@@ -44,6 +45,7 @@ import { foldRanges, symbols as symbolsOf, type Symbol } from '../lib/lang';
 import { useHistory, type Snapshot } from '../lib/useHistory';
 import {
   api, type CodeEntry, type CodeFile, type CodeProblem, type CodeMatch,
+  type CodeChecks,
 } from '../api';
 
 const STORE_KEY = 'aria.code.drafts.v1';
@@ -648,6 +650,26 @@ export default function Code() {
   );
   const [checkNote, setCheckNote] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  /* The project's own checks, run for real. `problems` above is the BUFFER
+     parsed with ast.parse — fast, and honest about being only syntax. These are
+     pytest/tsc/npm test/ruff/cargo/go vet, which is the only signal that
+     catches a change which parses cleanly but is wrong. */
+  const [checks, setChecks] = useState<CodeChecks | null>(null);
+  const [checksBusy, setChecksBusy] = useState(false);
+  /* What is on DISK, as opposed to the drafts in this browser. This is the
+     review step: a change to a file has to be looked at before it is trusted,
+     and the browser buffer is not what anyone else will get. */
+  const [gitView, setGitView] = useState<'status' | 'diff' | 'log'>('status');
+  const [gitOut, setGitOut] = useState<{ text: string; ok: boolean
+    | undefined; error?: string } | null>(null);
+  const [gitBusy, setGitBusy] = useState(false);
+  /* The AI half of the editor. One question at a time: a second answer would
+     race the first and the panel would show whichever arrived last. */
+  const [ask, setAsk] = useState({
+    question: '', answer: '', busy: false,
+    error: null as string | null, provider: '', context: [] as string[],
+  });
+  const askAbort = useRef<AbortController | null>(null);
   const [shortcuts, setShortcuts] = useState(false);
   const [search, setSearch] = useState<{ open: boolean; q: string; hits: CodeMatch[]; busy: boolean }>(
     { open: false, q: '', hits: [], busy: false });
@@ -917,7 +939,97 @@ export default function Code() {
     [pane, lang],
   );
 
-  /* Debounced real syntax check. Sends the draft text; the server parses it
+  const loadGit = useCallback(async (which: 'status' | 'diff' | 'log') => {
+  setGitView(which);
+  setGitBusy(true);
+  try {
+    const r = await api.codeGit(which);
+    if (r) {
+      setGitOut({ text: r.output || '', ok: r.ok,
+        error: r.error || (r.ok ? undefined : 'git reported a problem') });
+    }
+  } catch (e) {
+    setGitOut({ text: '', ok: false,
+      error: `could not read git: ${e instanceof Error ? e.message : 'error'}` });
+  } finally {
+    setGitBusy(false);
+  }
+}, []);
+
+/* Ask the agent about the open file.
+     *  The draft goes up (unsaved edits included) so the answer is about what
+     *  is on screen, not what is on disk. Read-only: the endpoint cannot
+     *  write, so there is no path from this panel to a changed file. */
+const submitAsk = useCallback(async (e: React.FormEvent) => {
+  e.preventDefault();
+  const q = ask.question.trim();
+  if (!q || !pane || ask.busy) return;
+  askAbort.current?.abort();
+  const ac = new AbortController();
+  askAbort.current = ac;
+  setAsk((a) => ({ ...a, busy: true, answer: '', error: null, question: q }));
+  try {
+    for await (const f of api.codeAskStream(q, pane.path, pane.body, ac.signal)) {
+      if (ac.signal.aborted) return;
+      if (f.type === 'delta' && f.text) {
+        setAsk((a) => ({ ...a, answer: a.answer + f.text }));
+      } else if (f.type === 'error') {
+        setAsk((a) => ({
+          ...a, error: f.text || 'the agent could not answer',
+        }));
+      } else if (f.type === 'done') {
+        setAsk((a) => ({
+          ...a, answer: f.answer || a.answer,
+          provider: f.provider || '', busy: false,
+          context: f.context_files || [],
+        }));
+      }
+    }
+  } catch (err) {
+    if (ac.signal.aborted) return;
+    setAsk((a) => ({
+      ...a, busy: false,
+      error: `ask failed: ${err instanceof Error ? err.message : 'error'}`,
+    }));
+  } finally {
+    if (!ac.signal.aborted) setAsk((a) => ({ ...a, busy: false }));
+  }
+}, [ask.question, ask.busy, pane]);
+
+/* Put the answer into the buffer at the caret, as an editable insertion.
+   Not a silent rewrite: the user sees exactly what changed and can undo it,
+   because it goes through the same buffer setter as typing does. */
+const insertAnswerAtCursor = useCallback(() => {
+  if (!ask.answer || !pane) return;
+  const at = offsetOf(pane.body, cursor);
+  const head = pane.body.slice(0, at);
+  edit((head && !head.endsWith('\n') ? head + '\n' : head)
+    + ask.answer + '\n'
+    + pane.body.slice(at));
+}, [ask.answer, pane, cursor, edit]);
+
+/* Run the project's real lint/typecheck/tests.
+     * Deliberately NOT auto-run on edit: a test suite takes what it takes, and
+     * firing one per keystroke would hammer the machine. It is a deliberate
+     * action, and the result is kept until the next run so a red state is
+     * never silently replaced by an empty list. */
+const runProjectChecks = useCallback(async () => {
+  if (checksBusy) return;
+  setChecksBusy(true);
+  try {
+    const r = await api.codeChecks();
+    if (r) setChecks(r);
+  } catch (e) {
+    setChecks({
+      ok: false, checks_run: 0, results: [],
+      error: `could not run checks: ${e instanceof Error ? e.message : 'error'}`,
+    });
+  } finally {
+    setChecksBusy(false);
+  }
+}, [checksBusy]);
+
+/* Debounced real syntax check. Sends the draft text; the server parses it
      with `ast.parse` for Python and never writes or executes anything. */
   useEffect(() => {
     if (!pane) { setProblems([]); setCheckNote(null); return; }
@@ -1614,8 +1726,8 @@ export default function Code() {
             )}
 
             {/* Problems — real diagnostics, not an apology. */}
-            <div className="max-h-[26vh] flex-none overflow-y-auto border-t border-glass-border bg-surface-0">
-              <div className="sticky top-0 flex items-center gap-2 border-b border-glass-border bg-surface-0 px-3 py-1.5">
+            <div className="max-h-[40vh] flex-none overflow-y-auto border-t border-glass-border bg-surface-0">
+              <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-glass-border bg-surface-0 px-3 py-1.5">
                 <Terminal size={12} className="text-zinc-muted" />
                 <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-zinc-muted">
                   Problems
@@ -1626,7 +1738,60 @@ export default function Code() {
                       {problems.length} problem{problems.length === 1 ? '' : 's'}
                     </Pill>}
                 {checkNote && <Pill tone="muted">{checkNote}</Pill>}
+                <span className="flex-1" />
+                {/* The project's REAL checks, not the buffer parser. `/api/code/check`
+                    judges this draft with ast.parse; this runs pytest/tsc/npm test/
+                    ruff/cargo/go vet. Slow by nature — that is the point, and it is
+                    the only signal that catches a change which parses but is wrong. */}
+                <button type="button"
+                  onClick={runProjectChecks}
+                  disabled={checksBusy}
+                  aria-label="Run the project's lint, typecheck and tests"
+                  className="flex flex-none items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400 disabled:opacity-60">
+                  {checksBusy ? <Loader2 size={11} className="animate-spin" />
+                    : <Play size={11} />}
+                  {checksBusy ? 'running…' : 'Run checks'}
+                </button>
               </div>
+
+              {checks && (
+                <div className="border-b border-glass-border">
+                  <div className="flex items-center gap-2 px-3 py-1.5">
+                    <Pill tone={checks.ok ? 'ok' : 'err'}>
+                      {checks.ok ? 'all checks passed'
+                        : 'checks failed'}
+                    </Pill>
+                    <span className="text-[11px] text-zinc-muted">
+                      {checks.checks_run} checker{checks.checks_run === 1 ? '' : 's'}
+                      {checks.cwd ? ` · ${checks.cwd}` : ''}
+                    </span>
+                  </div>
+                  {checks.error && (
+                    <p className="px-3 pb-2 text-[11.5px] text-amber-300">
+                      {checks.error}
+                    </p>
+                  )}
+                  {checks.results.map((r) => (
+                    <details key={r.tool} className="border-t border-glass-border/60">
+                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[11.5px] hover:bg-glass-hover">
+                        {r.ok ? <CircleCheck size={11} className="flex-none text-emerald-400" />
+                          : <CircleDot size={11} className="flex-none text-rose-400" />}
+                        <span className="font-semibold">{r.tool}</span>
+                        <Pill tone={r.ok ? 'ok' : 'err'}>
+                          {r.exit_code == null ? 'error' : `exit ${r.exit_code}`}
+                        </Pill>
+                        <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-muted">
+                          {(r.stdout || r.error || r.stderr || '').trim().split('\n').slice(-1)[0]}
+                        </span>
+                      </summary>
+                      <pre className="max-h-56 overflow-auto whitespace-pre-wrap px-3 pb-2 text-[11px] leading-relaxed text-zinc-300">
+                        {[r.stdout, r.stderr, r.error].filter(Boolean).join('\n')}
+                      </pre>
+                    </details>
+                  ))}
+                </div>
+              )}
+
               {problems.length > 0 ? (
                 <ul className="divide-y divide-glass-border">
                   {problems.map((p, i) => (
@@ -1665,10 +1830,118 @@ export default function Code() {
                   </li>
                   <li className="flex items-start gap-2">
                     <Play size={12} className="mt-0.5 flex-none text-zinc-muted" />
-                    <span>Run and agent actions stay disabled until execution is
-                      sandboxed and approval-gated.</span>
+                    <span>“Run checks” above runs the project’s own lint,
+                      typecheck and tests. Syntax-only until you do.</span>
                   </li>
                 </ul>
+              )}
+            </div>
+          </div>
+
+          {/* Ask — the AI half of the editor.
+              *  Read-only on purpose: the agent sees the draft and the project
+              *  and answers, but a question must never rewrite files behind the
+              *  user's back. Applying an answer is a separate, visible act. */}
+          <div className="flex min-h-0 flex-1 flex-col border-t border-glass-border bg-surface-1">
+            <div className="flex flex-none items-center gap-2 border-b border-glass-border px-3 py-2">
+              <Sparkles size={12} className="flex-none text-violet-300" />
+              <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-zinc-muted">
+                Ask
+              </span>
+              {ask.busy
+                ? <Pill tone="muted">thinking…</Pill>
+                : ask.answer && <Pill tone="ok">answered</Pill>}
+              <span className="flex-1" />
+              {ask.answer && (
+                <button type="button"
+                  onClick={() => setAsk({ question: '', answer: '', busy: false, error: null, provider: '', context: [] })}
+                  aria-label="Clear the answer"
+                  className="flex-none text-zinc-muted hover:text-zinc-200">
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+
+            <form
+              onSubmit={submitAsk}
+              className="flex flex-none gap-2 border-b border-glass-border p-2">
+              <input
+                value={ask.question}
+                onChange={(e) => setAsk((a) => ({ ...a, question: e.target.value }))}
+                placeholder={pane
+                  ? `About ${pane.path.split('/').pop()}…`
+                  : 'Open a file to ask about it…'}
+                disabled={!pane || ask.busy}
+                aria-label="Ask the agent about this code"
+                className="min-w-0 flex-1 rounded-md border border-white/10 bg-surface-0 px-2 py-1.5 text-[12px] outline-none focus:border-violet-400 disabled:opacity-50" />
+              <button type="submit"
+                disabled={!pane || ask.busy || !ask.question.trim()}
+                aria-label="Send question"
+                className="flex flex-none items-center rounded-md border border-white/10 px-2.5 text-[11px] font-semibold hover:border-violet-400 disabled:opacity-50">
+                {ask.busy
+                  ? <Loader2 size={12} className="animate-spin" />
+                  : <Sparkles size={12} />}
+              </button>
+            </form>
+
+            <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2.5">
+              {/* Review what is on disk, above the answer. An edit nobody
+                  looked at is an edit nobody approved. */}
+              <div className="mb-3">
+                <div className="flex items-center gap-1">
+                  {(['status', 'diff', 'log'] as const).map((t) => (
+                    <button key={t} type="button"
+                      onClick={() => loadGit(t)}
+                      disabled={gitBusy}
+                      className={`rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide ${
+                        gitView === t
+                          ? 'bg-violet-500/25 text-violet-200'
+                          : 'text-zinc-muted hover:text-zinc-200'}`}>
+                      {t}
+                    </button>
+                  ))}
+                  <span className="flex-1" />
+                  {gitBusy && <Loader2 size={11} className="animate-spin text-zinc-muted" />}
+                </div>
+                {gitOut && (
+                  gitOut.error
+                    ? <p className="mt-1 text-[11px] text-amber-300">{gitOut.error}</p>
+                    : (gitOut.text.trim()
+                      ? <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap text-[10.5px] leading-relaxed text-zinc-300">
+                        {gitOut.text.slice(0, 40_000)}
+                      </pre>
+                      : <p className="mt-1 text-[11px] text-zinc-muted">
+                        nothing to show — no uncommitted changes
+                      </p>)
+                )}
+              </div>
+
+              <hr className="mb-3 border-glass-border" />
+
+              {ask.error ? (
+                <p className="text-[11.5px] text-rose-300">{ask.error}</p>
+              ) : ask.answer ? (
+                <>
+                  <pre className="whitespace-pre-wrap break-words text-[11.5px] leading-relaxed text-zinc-200">
+                    {ask.answer}
+                  </pre>
+                  {ask.context.length > 0 && (
+                    <p className="mt-2 text-[10.5px] text-zinc-muted">
+                      Grounded in: {ask.context.join(', ')}
+                    </p>
+                  )}
+                  <button type="button"
+                    onClick={insertAnswerAtCursor}
+                    className="mt-2 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400">
+                    Insert at cursor
+                  </button>
+                </>
+              ) : (
+                <p className="text-[11.5px] text-zinc-muted">
+                  {pane
+                    ? 'Ask about the open file. The agent reads your draft — unsaved edits included — and the surrounding project, and answers with file names and line numbers.'
+                    : 'Open a file first. The answer is grounded in what you are actually looking at, not in what the model remembers.'}
+                </p>
               )}
             </div>
           </div>

@@ -164,12 +164,18 @@ class CriticAutoInsert(unittest.TestCase):
 
 
 class NodeCap(unittest.TestCase):
-    """MAX_NODES stops runaway graphs."""
+    """MAX_NODES stops runaway graphs.
+
+    It is a LOOP guard, not a cap on plan quality. It was 60 and was raised to
+    400 so a book-length plan's research fleet (dozens of facets) fits; the
+    planner's facet list itself is now uncapped. The upper bound here is a
+    sanity check on the backstop, so it tracks that intent.
+    """
 
     def test_node_cap_stops_graph(self):
         from flow import Executor, MAX_NODES
         self.assertGreater(MAX_NODES, 0)
-        self.assertLessEqual(MAX_NODES, 100)
+        self.assertLessEqual(MAX_NODES, 500)
 
 
 class SessionPersistence(unittest.TestCase):

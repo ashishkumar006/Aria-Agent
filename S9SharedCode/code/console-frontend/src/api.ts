@@ -96,7 +96,13 @@ export interface SessionSummary {
      has_files?: boolean;
   nodes?: number;
   skills?: string[];
+  /** Seconds since the run last changed, computed server-side. Preferred over
+      deriving it from `updated`, because `updated: 0` is falsy and used to
+      collapse into a confident "0s ago" for runs over 100 hours old. */
   updated_ago?: number;
+  /** False = there is no graph for this run. Distinct from a run that is
+      queued: "nothing to show" is not "waiting to start". */
+  has_graph?: boolean;
   conversation_id?: string | null;
   status_counts?: Record<string, number>;
   usd?: number;
@@ -189,6 +195,10 @@ export interface MemItem {
   keywords?: string[];
   source?: string;
   superseded_by?: string;
+  /** How well-supported the record is. Only observations write a real
+      value; everything else was written before the field had a writer and
+      defaults to 1.0. */
+  confidence?: number;
 }
 
 export interface DocItem {
@@ -279,6 +289,37 @@ export interface CodeMatch {
   text: string;
 }
 
+/** One checker the project actually has, and what it said. */
+export interface CodeCheckResult {
+  tool: string;
+  ok: boolean;
+  exit_code: number | null;
+  stdout?: string;
+  stderr?: string;
+  error?: string;
+  available?: boolean;
+}
+
+/** `/api/code/checks` — the project's own lint/typecheck/tests, run for real. */
+export interface CodeChecks {
+  ok: boolean;
+  checks_run: number;
+  results: CodeCheckResult[];
+  cwd?: string;
+  error?: string;
+  note?: string;
+}
+
+/** A frame from `/api/code/ask`. Unknown types are ignored, not fatal. */
+export interface CodeAskFrame {
+  type: string;
+  text?: string;
+  answer?: string;
+  path?: string;
+  provider?: string;
+  context_files?: string[];
+}
+
 export interface SkillRow {
   skill: string;
   calls?: number;
@@ -293,7 +334,12 @@ export interface SkillRow {
  *  "4 nodes failed overall" is not. */
 export interface NodeHealthRow {
   skill: string;
+  /** Every node seen for this skill, including ones never dispatched. */
   nodes: number;
+  /** Nodes actually attempted (complete + failed). The fail_pct denominator. */
+  attempted?: number;
+  /** pending + interrupted: recorded, but never ran, so never failed. */
+  never_run?: number;
   failed: number;
   skipped: number;
   fail_pct: number;
@@ -322,11 +368,29 @@ export type ChatEvent =
   | { type: 'error'; text?: string }
   | { type: string; [k: string]: unknown };
 
+/** A file a run produced, as reported on a stream's `done` frame. The server
+    resolves every handle against the artifact store before reporting it, so a
+    listed file always downloads. */
+export interface StreamFile {
+  artifact: string;
+  filename: string;
+  format: string;
+  skill?: string;
+  bytes?: number;
+}
+
 export type SimpleStreamEvent =
   | { type: 'started'; conversation_id?: string }
   | { type: 'status'; text?: string }
   | { type: 'delta'; text?: string }
-  | { type: 'done'; answer?: string; conversation_id?: string }
+  /** `files` is what makes a rendered document (and any chart inside it)
+      visible in Chat without the model having to paste its artifact handle
+      into the prose. Verified against the artifact store server-side, so an
+      entry here always downloads. */
+  /* `elapsed_ms` is measured server-side from the moment the turn starts, not
+     from when the client rendered: time spent opening the SSE connection is
+     the user's wait too, and hiding it would flatter the answer. */
+  | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number }
   | { type: 'error'; text?: string }
   | { type: string; [k: string]: unknown };
 
@@ -407,7 +471,29 @@ async function reason(r: Response): Promise<string> {
   const pick = [b?.error, b?.detail, b?.message]
     .map((v) => (typeof v === 'string' ? v : Array.isArray(v) ? JSON.stringify(v) : ''))
     .find((v) => v.trim().length > 0);
-  return pick ? `${r.status} ${pick}` : `HTTP ${r.status} ${r.url}`;
+  const msg = pick ? `${r.status} ${pick}` : `HTTP ${r.status} ${r.url}`;
+  /* The agent regenerates its token on every launch and the console reads it
+     once from a <meta> tag, so a tab left open across a restart holds a dead
+     credential: every route 403s and there is nothing the user can do about
+     it. Flag it so the shell can say "reload" instead of showing an error
+     that reads like a bug. */
+  if (r.status === 403 && /X-Aria-Token/i.test(msg)) {
+    notifyStaleToken();
+  }
+  return msg;
+}
+
+/** Fired once when the console's per-launch token is rejected. A reload
+ *  re-fetches the document, and the agent re-injects the current token into
+ *  it — which is the only way to recover without persisting the secret. */
+export const STALE_TOKEN_EVENT = 'aria:stale-token';
+let staleNotified = false;
+function notifyStaleToken(): void {
+  if (staleNotified) return;
+  staleNotified = true;
+  try {
+    window.dispatchEvent(new CustomEvent(STALE_TOKEN_EVENT));
+  } catch { /* no DOM: nothing to show it on */ }
 }
 
 async function j<T>(url: string, init?: RequestInit): Promise<T> {
@@ -595,6 +681,8 @@ export const api = {
   nodeHealth: (conversationId?: string) =>
     j<{
       sessions: number;
+      /** Graph files that failed to parse; >0 means the table is partial. */
+      unreadable?: number;
       rows: NodeHealthRow[];
       totals: { nodes: number; failed: number; fail_pct: number };
     }>(
@@ -607,6 +695,12 @@ export const api = {
     j<{ status: string }>(`/api/schedule/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   scheduleDelete: (id: string) =>
     j<{ status: string }>(`/api/schedule/${encodeURIComponent(id)}?hard=true`, { method: 'DELETE' }),
+  /* Re-arm a cancelled or already-fired reminder instead of creating a
+     second copy of it. Returns `{ok:false, hint}` when the time has passed,
+     which the view shows rather than silently doing nothing. */
+  scheduleToggle: (id: string, enabled: boolean) =>
+    pj<{ ok: boolean; schedule_id?: string; enabled?: boolean; error?: string; hint?: string }>(
+      `/api/schedule/${encodeURIComponent(id)}/enabled`, { enabled }),
   tools: () => j<{ tools: ToolSpec[] }>('/api/tools'),
   toolsGuard: () =>
     j<{ disabled: string[] | null; error?: string }>('/api/config/tools'),
@@ -699,6 +793,29 @@ export const api = {
     j<{ items?: MemItem[]; error?: string }>(`/api/memory?${params}`, { signal }),
   remember: (body: Record<string, unknown>) =>
     pj<{ status: string; id?: string }>('/api/memory/remember', body),
+  /* The behavioural profile. Separate from `memory` because the evidence is
+     the point: each row carries the user's own words, so a wrong observation
+     is visibly a guess and can be deleted knowing what it rested on. */
+  profile: (signal?: AbortSignal) =>
+    j<{
+      enabled: boolean;
+      note?: string;
+      observations?: {
+        id: string;
+        observation: string;
+        evidence: string;
+        confidence?: number;
+        /** How many separate conversations this has turned up in. One is an
+            anecdote, not a tendency. */
+        seen_count?: number;
+        created_at?: string;
+      }[];
+    }>('/api/profile', { signal }),
+  /* Write the whole profile - observations AND standing preferences - into the
+     Documents section as markdown. */
+  saveProfileDocument: () =>
+    pj<{ ok: boolean; document_id?: string; filename?: string; error?: string }>(
+      '/api/profile/document', {}),
   /* `confirm=wipe` is required server-side: an unscoped DELETE /api/memory
      deletes every drawer, so the intent has to be explicit. */
   wipeMemory: (sessionId: string) =>
@@ -792,6 +909,47 @@ export const api = {
   codeFile: (path: string, signal?: AbortSignal) =>
     j<CodeFile>(`/api/code/file?path=${encodeURIComponent(path)}`,
       signal ? { signal } : undefined),
+  /** Run the project's own lint / typecheck / tests.
+   *
+   *  Distinct from codeCheck, which judges the BUFFER with a parser: this one
+   *  runs pytest / tsc / npm test / ruff / cargo / go vet for whichever the
+   *  project actually has. Slow by nature - that is the point. It is what makes
+   *  the panel a feedback loop rather than a spell-checker. */
+  codeChecks: (path?: string, signal?: AbortSignal) =>
+    pj<CodeChecks>(`/api/code/checks`, { path: path || '' },
+      signal ? { signal } : undefined),
+  /** Ask the agent about the code in the editor.
+   *
+   *  Read-only by design: it answers, it does not edit. A question typed into a
+   *  panel must not be able to rewrite files behind the user's back. Streams,
+   *  because a grounded answer over a real file takes longer than a spinner
+   *  should. fetch + ReadableStream, not EventSource: EventSource cannot send
+   *  X-Aria-Token, so every frame would 401. */
+  async *codeAskStream(question: string, path: string, text: string,
+                        signal?: AbortSignal): AsyncGenerator<CodeAskFrame> {
+    const r = await fetch('/api/code/ask', {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ question, path, text }),
+      signal,
+    });
+    if (!r.ok) throw new Error(await reason(r));
+    if (!r.body) throw new Error('empty response body');
+    for await (const f of sseFrames(r, signal)) {
+      yield f as unknown as CodeAskFrame;
+    }
+  },
+  /** Review what is on disk: status, diff, or recent log.
+   *
+   *  Read-only by construction — the server offers no write verb, so this
+   *  cannot stage, commit or revert. It is the review step for anything that
+   *  edited a file: browser drafts are invisible here, disk changes are not. */
+  codeGit: (target: 'status' | 'diff' | 'log' = 'status',
+            signal?: AbortSignal) =>
+    j<{ ok?: boolean; target?: string; exit_code?: number | null;
+         output?: string; truncated?: boolean; error?: string }>(
+      `/api/code/git?target=${target}`,
+      signal ? { signal } : undefined),
   adopt: (sessionId: string) =>
     pj<{ conversation_id?: string; error?: string }>('/api/conversations/adopt', {
       session_id: sessionId,
@@ -841,6 +999,14 @@ export const api = {
       files: { artifact: string; filename: string; format: string; skill: string }[];
       answer: string;
       live: boolean;
+      /** The run lost a branch: the answer is not complete. Persisted, so it
+          survives reopening - previously this lived only in the live SSE
+          frame and a reloaded run looked finished and whole. */
+      degraded?: boolean;
+      /** Which parts went unanswered, for the user rather than the log. */
+      incomplete_detail?: string[];
+      /** Stopped by the operator before finishing. */
+      stopped?: boolean;
       nodes: { id: string; skill: string; status: string }[];
     }>(`/api/sessions/${encodeURIComponent(sid)}/produced`),
   safe,

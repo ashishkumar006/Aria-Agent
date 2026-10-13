@@ -25,13 +25,15 @@ def new_id(prefix: str = "mem") -> str:
     return f"{prefix}:{uuid4().hex[:8]}"
 
 
-MemoryKind = Literal["fact", "preference", "tool_outcome", "scratchpad"]
+MemoryKind = Literal["fact", "preference", "tool_outcome", "scratchpad",
+                    "observation"]
 
 # Phase 1 drawers: the cabinet. Permissions and lifetimes differ per
 # drawer (see plane.DRAWER_WRITERS); retrieval never brute-forces across
 # all of them.
 DrawerName = Literal[
     "working", "episode", "fact", "playbook", "policy", "audit", "document",
+    "profile",
 ]
 
 # Who is asking for the write. The call path sets it (remember→agent,
@@ -81,6 +83,12 @@ KIND_DRAWER: dict[str, DrawerName] = {
     "preference": "fact",
     "tool_outcome": "episode",
     "scratchpad": "working",
+    # Observations get their own drawer rather than joining `fact`. They are
+    # the most sensitive thing the store holds — material about how a person
+    # works — so they must be listable, wipeable and deletable on their own,
+    # without touching the user's facts. Filing them under `fact` made them
+    # invisible in exactly the sense that mattered: they were still there.
+    "observation": "profile",
 }
 
 # Fail-closed writer map. Call paths set the role (remember→agent,
@@ -94,6 +102,10 @@ DRAWER_WRITERS: dict[DrawerName, frozenset] = {
     "policy": frozenset({"operator", "system"}),
     "audit": frozenset({"gateway"}),
     "document": frozenset({"indexer", "operator", "system", "gateway"}),
+    # The agent proposes; the operator promotes. `runtime` is excluded on
+    # purpose: tool-outcome capture runs on every skill node and must never be
+    # able to write a claim about the user as a side effect of a tool call.
+    "profile": frozenset({"agent", "operator", "system"}),
 }
 
 

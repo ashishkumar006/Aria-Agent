@@ -193,15 +193,15 @@ def test_malformed_planner_json_does_not_crash():
 # ── 5. node cap (MAX_NODES=60) ────────────────────────────────────────────────
 
 def test_fanout_is_bounded_and_still_terminates():
-    """A planner that emits more nodes than MAX_FANOUT must not open them all
-    at once, and the run must still finish.
+    """A planner that emits more nodes than MAX_CONCURRENCY must not open them
+    all at once, and the run must still finish.
 
     Deferring a node is only safe while it stays PENDING. Marking the whole
     ready set as running and dispatching a capped batch left the deferred
     nodes stuck in `running` with nothing executing them, so has_running()
     never cleared and the run looped forever.
     """
-    n_nodes = flow.MAX_FANOUT * 2 + 3
+    n_nodes = flow.MAX_CONCURRENCY * 2 + 3
 
     def _wide_planner(count):
         return _planner_reply([
@@ -231,10 +231,19 @@ def test_fanout_is_bounded_and_still_terminates():
     assert not stuck, f"nodes left non-terminal: {stuck}"
 
 
-def test_max_fanout_constant_is_sane():
-    assert 1 <= flow.MAX_FANOUT <= 8, \
-        "a very wide fan-out re-creates the rate-limit problem it bounds"
-    assert flow.MAX_FANOUT < flow.MAX_NODES
+def test_the_remaining_limits_are_mechanical():
+    """What is left bounds MECHANICS, not plan quality.
+
+    Concurrency is a rate-limit guard - gemini is tpm 250000 in router.py.
+    MAX_NODES bounds a runaway planner/recovery loop. Neither discards a node
+    from the plan: deferred nodes stay pending and run on the next wave. See
+    tests/test_planner_decides_fanout.py for the absence of a facet cap.
+    """
+    assert 1 <= flow.MAX_CONCURRENCY <= 12, \
+        "a very wide batch re-creates the rate-limit problem it bounds"
+    assert flow.MAX_CONCURRENCY < flow.MAX_NODES
+    assert flow.MAX_NODES >= 100, \
+        "too low to run a book-length plan's research fleet"
 
 
 def test_node_cap_stops_planner_loop():

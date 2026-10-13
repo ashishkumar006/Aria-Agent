@@ -57,11 +57,39 @@ def _write_sidecar(session_id, payload):
     return d
 
 
-def test_produced_files_round_trip(tmp_path, monkeypatch):
-    root = tmp_path / "state" / "sessions"
+@pytest.fixture()
+def artifact_store(tmp_path, monkeypatch):
+    """Repoint the artifact store at a temp dir for one test.
+
+    `artifacts.STORE` is resolved at import, so without this the tests write
+    into the repo's real store and then read back handles that only exist
+    because the test put them there.
+    """
+    import artifacts
+    store = tmp_path / "store"
+    store.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(artifacts, "STORE", store)
+    return store
+
+
+def _store_blob(store, hexid, data=b"%PDF-1.4 test"):
+    """Put real bytes in the artifact store so a handle resolves."""
+    (store / f"{hexid}.bin").write_bytes(data)
+    return "art:" + hexid
+
+
+def test_produced_files_round_trip(tmp_path, monkeypatch, artifact_store):
+    """A handle the store can actually resolve comes back with its metadata.
+
+    The sidecar is written from the renderer's return value, so the ids in it
+    are real. These tests therefore put the bytes in the store too: the reader
+    now verifies each handle, and a test that invented an id without one would
+    be asserting the failure path.
+    """
     monkeypatch.setattr(flow, "_SROOT", tmp_path)
     _write_sidecar("s8-abc", json.dumps([
-        {"artifact": "art:" + "a" * 16, "filename": "Report.pdf",
+        {"artifact": _store_blob(artifact_store, "a" * 16),
+         "filename": "Report.pdf",
          "format": "pdf", "skill": "author"},
     ]))
     got = flow.take_produced_files("s8-abc")
@@ -84,18 +112,47 @@ def test_produced_files_rejects_traversal_ids(tmp_path, monkeypatch):
         assert flow.take_produced_files(bad) == [], bad
 
 
-def test_produced_files_drops_malformed_entries(tmp_path, monkeypatch):
+def test_produced_files_drops_malformed_entries(tmp_path, monkeypatch,
+                                                artifact_store):
     monkeypatch.setattr(flow, "_SROOT", tmp_path)
+    good = _store_blob(artifact_store, "b" * 16)
     _write_sidecar("s8-bad", json.dumps([
         "not a dict",
         {"artifact": "no-prefix"},
         {"filename": "orphan.pdf"},
-        {"artifact": "art:" + "b" * 16},
+        {"artifact": good},
     ]))
     got = flow.take_produced_files("s8-bad")
-    assert [g["artifact"] for g in got] == ["art:" + "b" * 16]
+    assert [g["artifact"] for g in got] == [good]
     # A nameless file still gets a usable name.
     assert got[0]["filename"] == "document"
+
+
+def test_produced_files_drops_handles_the_store_cannot_resolve(tmp_path,
+                                                               monkeypatch,
+                                                               artifact_store):
+    """The read-path twin of the writer's guard.
+
+    `flow.py` refuses to WRITE an id the store cannot resolve, but sidecars
+    written before that guard existed still name handles like `art:dummy` and
+    `art:mock-placeholder`. Reading those back produced a file list where
+    every button failed with "400 malformed artifact id", indistinguishable
+    from the genuine files beside them - one run rendered 3 real documents
+    and offered 12 rows, 9 of them dead.
+    """
+    monkeypatch.setattr(flow, "_SROOT", tmp_path)
+    real = _store_blob(artifact_store, "c" * 16)
+    _write_sidecar("s8-legacy", json.dumps([
+        {"artifact": "art:dummy", "filename": "invented1.pdf"},
+        {"artifact": "art:generated_document", "filename": "invented2.pdf"},
+        {"artifact": "art:mock-id", "filename": "invented3.pdf"},
+        {"artifact": "art:mock-placeholder", "filename": "invented4.pdf"},
+        {"artifact": "art:zzzzzzzzzzzzzzzz", "filename": "never-rendered.pdf"},
+        {"artifact": real, "filename": "Real.pdf"},
+    ]))
+    got = flow.take_produced_files("s8-legacy")
+    assert [g["filename"] for g in got] == ["Real.pdf"], (
+        "a dead download button is being offered to the user")
 
 
 def test_produced_files_survives_corrupt_json(tmp_path, monkeypatch):

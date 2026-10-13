@@ -205,10 +205,22 @@ def test_there_is_no_write_or_delete_route():
         for m in getattr(r, "methods", set())
     }
     code_routes = {p for p, _m in routes if p.startswith("/api/code")}
+    # `/api/code/ask` (ask the agent about the open file), `/api/code/checks`
+    # (run the project's real lint/typecheck/tests) and `/api/code/git` (review
+    # what changed on disk) were added for the AI editor. None of them WRITES —
+    # see the verb assertions below, which are the property this test is for.
     assert code_routes == {
         "/api/code/roots", "/api/code/tree", "/api/code/files",
         "/api/code/file", "/api/code/check", "/api/code/search",
+        "/api/code/ask", "/api/code/checks", "/api/code/git",
     }, code_routes
+    # The AI surface must be read-only over HTTP: a question typed into a
+    # panel must not be able to rewrite files behind the user's back, and the
+    # review route must not be able to stage, commit or revert.
+    for p in ("/api/code/ask", "/api/code/checks", "/api/code/git"):
+        verbs = {m for path, m in routes if path == p}
+        assert not (verbs & {"PUT", "PATCH", "DELETE"}), (
+            f"{p} must not expose a write verb: {verbs}")
     for p in code_routes:
         verbs = {m for path, m in routes if path == p}
         # `/api/code/check` takes a buffer, never a path, and never writes.

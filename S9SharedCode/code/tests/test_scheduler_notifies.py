@@ -47,11 +47,17 @@ def test_a_reminder_is_not_gated_behind_an_env_flag(monkeypatch):
 
     The opt-in flag exists so ordinary CHAT replies stay quiet. A fired
     reminder is the opposite case: the user asked to be told.
+
+    Asserts the send itself rather than that a thread was created: the send
+    used to be handed to a daemon thread whose HTTP 401 was swallowed, so this
+    test passed for a whole release while every channel-less reminder went
+    missing. See tests/test_reminder_delivery.py.
     """
     monkeypatch.delenv("AGENT_TELEGRAM_NOTIFY", raising=False)
     sent = []
     monkeypatch.setattr(agent_server, "resolve_notify_chat", lambda *a: "12345")
-    monkeypatch.setattr(agent_server, "threading", _FakeThread(sent))
+    monkeypatch.setattr(agent_server, "_notify_telegram",
+                        lambda text, chat=None: sent.append((text, chat)) or True)
     agent_server.notify_task_done("remind me", "done", 1.2, "s8-x",
                                   scheduled=True)
     assert sent, "a fired reminder produced no notification"
@@ -63,7 +69,8 @@ def test_a_chat_reply_is_still_opt_in(monkeypatch):
     monkeypatch.delenv("AGENT_TELEGRAM_NOTIFY", raising=False)
     sent = []
     monkeypatch.setattr(agent_server, "resolve_notify_chat", lambda *a: "12345")
-    monkeypatch.setattr(agent_server, "threading", _FakeThread(sent))
+    monkeypatch.setattr(agent_server, "_notify_telegram",
+                        lambda text, chat=None: sent.append((text, chat)) or True)
     agent_server.notify_task_done("hello", "hi", 0.1, "s8-x")
     assert not sent, "every chat reply was pushed to Telegram"
 

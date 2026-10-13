@@ -35,12 +35,26 @@ from recovery import handle_critic_verdict, plan_recovery
 from schemas import AgentResult, NodeState
 from skills import SkillRegistry, run_skill
 
-MAX_NODES = 60  # hard cap so a Planner loop cannot grow forever
-# Concurrent nodes per batch. A planner that emits 20 facets used to open 20
-# simultaneous LLM calls, which trips provider rate limits and makes every
-# sibling fail together. Deferred nodes stay `pending` and run on the next
-# scheduling round, so nothing is lost.
-MAX_FANOUT = 4
+# There is no cap on how many researcher nodes a plan may contain, and no cap
+# on how many facets the planner may list. The planner is told it decides, that
+# nothing it emits will be dropped, and what each node type is for; the
+# executor honours it. Two earlier constants were both local guesses about
+# "enough" that silently truncated plans the model had already reasoned about:
+# MAX_FANOUT=4 threw away a 6-facet plan, and the 12 that replaced it threw
+# away a 30-facet one. Measured cost of the 4: 4 facets produced 17,782 chars
+# of findings and a 2,367-word document, 3 produced 13,421 and a 310-word stub.
+# The evidence base is the document's ceiling, so it is the planner's call.
+#
+# What remains are limits on MECHANICS, not on plan quality, and neither
+# discards work:
+#   MAX_NODES      - a runaway planner/recovery LOOP cannot run forever. It
+#                    stops scheduling, not the plan's quality.
+#   MAX_CONCURRENCY - how many calls run in the same wave. gemini is tpm
+#                    250000 (router.py); unbounded waves 429 together and every
+#                    sibling fails. Deferred nodes stay `pending` and run on the
+#                    next wave, so a 60-facet plan still runs all 60.
+MAX_NODES = 400
+MAX_CONCURRENCY = 8
 
 # ── soft time budget ───────────────────────────────────────────────────────
 # Every node already stamps started_at/completed_at into the graph rollup, and
@@ -352,7 +366,10 @@ def ensure_authoring_research(graph: Graph, query: str) -> list[str]:
                     facets = [str(f) for f in (_rp.get("facets") or []) if f]
         except Exception:
             facets = []
-        facets = facets[:MAX_FANOUT] or _fallback_facets(query)
+# No facet cap: the planner decided, and every facet it emitted becomes
+        # a researcher. MAX_NODES bounds a runaway loop and MAX_CONCURRENCY
+        # bounds the wave size; neither drops a node from the plan.
+        facets = facets or _fallback_facets(query)
 
         workers: list[str] = []
         for i, facet in enumerate(facets):
@@ -422,19 +439,221 @@ def take_produced_files(session_id: str) -> list[dict]:
         if not isinstance(data, list):
             return []
         out = []
+        # Resolve every handle against the store, not just its shape. The
+        # writer refuses to persist an unresolvable id (see _finish_write,
+        # which checks artifacts.get_bytes), but sidecars written before that
+        # guard existed still name handles like "art:dummy" and
+        # "art:mock-placeholder". Reading those back produced a row of
+        # download buttons that all failed with "400 malformed artifact id",
+        # indistinguishable from the genuine files beside them. Verifying at
+        # READ time closes the boundary properly: the guard belongs on both
+        # sides of persistence, not only the writer.
+        try:
+            import artifacts as _arts
+        except Exception:
+            _arts = None
         for e in data:
             if not isinstance(e, dict):
                 continue
             art = e.get("artifact")
-            if not (isinstance(art, str) and art.startswith("art:")):
+            if not (isinstance(art, str)
+                    and re.fullmatch(r"art:[0-9a-fA-F]{16}", art)):
                 continue
+            if _arts is not None:
+                try:
+                    _arts.get_bytes(art)
+                except Exception:
+                    print(f"  -> produced_files names {art}, which the store "
+                          f"cannot resolve; omitting it from the file list")
+                    continue
+            # Cost is attached per file but is the RUN's total, labelled `scope:
+            # "run"`. Splitting it across files would be a fiction - the
+            # researchers, planner and author share one budget and cannot be
+            # attributed per document after the fact. The console shows it as
+            # the cost of producing this run.
+            cost = session_cost_totals(session_id)
+            # bytes and stats are carried through. They are already in the
+            # sidecar and in the author node's `produced`, but this reader
+            # dropped them, so the `done` frame told the console a file had
+            # no size and no word count - the exact signal the model uses to
+            # notice it shipped a stub, and the one a person uses to decide
+            # whether to open it.
             out.append({"artifact": art,
                         "filename": str(e.get("filename") or "document"),
                         "format": str(e.get("format") or "").lower(),
-                        "skill": str(e.get("skill") or "")})
+                        "skill": str(e.get("skill") or ""),
+                        "bytes": e.get("bytes"),
+                        "blocks": e.get("blocks"),
+                        "stats": e.get("stats") or {},
+                        "cost": cost})
         return out
     except Exception:
         return []
+
+
+def _cost_from_gateway(session_id: str, zero: dict) -> dict:
+    """Last resort: the gateway's own per-session total.
+
+    `turn_costs.json` is only written when `_session_cost_delta` could reach the
+    gateway's cost API. When that call fails the ledger is deliberately NOT
+    written - a fabricated `$0` row would be worse than none - which left the
+    Authoring UI reporting `0 tokens` for documents that had in fact spent
+    hundreds of thousands. Falling back to the live session total shows the
+    run's LIFETIME spend rather than one turn's, so it is labelled `scope:
+    "session"` and the UI must not present it as per-document.
+
+    Any failure here returns `zero` unchanged: a missing number is honest, a
+    wrong one is not."""
+    try:
+        import agent_server as _as
+        bd = _as._session_cost_breakdown(session_id)
+        if not isinstance(bd, dict) or not bd:
+            return zero
+        # `_session_cost_breakdown` returns PER-AGENT buckets
+        # ({agent: {usd, in_tok, out_tok, calls}}), not flat totals. Reading
+        # `input_tokens` off it returned None and the UI showed 0 for a
+        # session the gateway was holding 1.4M tokens for.
+        it = ot = calls = 0
+        usd = 0.0
+        by_agent: dict[str, dict] = {}
+        for agent, v in bd.items():
+            if not isinstance(v, dict):
+                continue
+            a_in = int(v.get("in_tok") or 0)
+            a_out = int(v.get("out_tok") or 0)
+            a_usd = float(v.get("usd") or 0.0)
+            a_calls = int(v.get("calls") or 0)
+            it += a_in
+            ot += a_out
+            usd += a_usd
+            calls += a_calls
+            by_agent[agent] = {"input_tokens": a_in,
+                               "output_tokens": a_out,
+                               "cost": a_usd, "calls": a_calls}
+        if not (it or ot):
+            return zero
+        return {"input_tokens": it, "output_tokens": ot,
+                "total_tokens": it + ot, "turns": 0, "calls": calls,
+                "cost": round(usd, 6), "currency": "USD",
+                "by_agent": by_agent, "scope": "session"}
+    except Exception:
+        return zero
+
+
+def session_cost_totals(session_id: str) -> dict:
+    """Total tokens and spend for one session, for the done frame.
+
+    Read from the per-turn cost sidecar, which is written as calls complete.
+    Never raises: a missing or unreadable sidecar is zero, because the
+    download list must still appear when cost accounting is unavailable.
+    """
+    zero = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "turns": 0, "calls": 0, "cost": 0.0, "currency": "USD",
+            "by_agent": {},
+            # The figure is the whole run's spend, attached to each produced
+            # file for display. Splitting it per document would be a fiction:
+            # the planner, researchers and author share one budget.
+            "scope": "run"}
+    try:
+        if (not session_id or session_id.startswith(".")
+                or "/" in session_id or "\\" in session_id):
+            return zero
+        p = _SROOT / "state" / "sessions" / session_id / "turn_costs.json"
+        if not p.exists():
+            return _cost_from_gateway(session_id, zero)
+        rows = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(rows, dict):
+            rows = rows.get("turns") or []
+        if not isinstance(rows, list):
+            return zero
+        # The sidecar schema is {"ts", "query", "per_agent": {skill: {usd,
+        # in_tok, out_tok, calls}}, "totals": {...}} - there are no top-level
+        # `input_tokens`/`output_tokens`/`cost` keys, so reading those (as an
+        # earlier version did) reported 0 tokens for every run.
+        it = ot = 0
+        cost = 0.0
+        calls = 0
+        by_agent: dict[str, dict] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            per = r.get("per_agent")
+            if isinstance(per, dict):
+                for agent, v in per.items():
+                    if not isinstance(v, dict):
+                        continue
+                    acc = by_agent.setdefault(
+                        agent, {"input_tokens": 0, "output_tokens": 0,
+                                "cost": 0.0, "calls": 0})
+                    acc["input_tokens"] += int(v.get("in_tok") or 0)
+                    acc["output_tokens"] += int(v.get("out_tok") or 0)
+                    acc["cost"] += float(v.get("usd") or 0.0)
+                    acc["calls"] += int(v.get("calls") or 0)
+            t = r.get("totals")
+            if isinstance(t, dict):
+                it += int(t.get("in_tok") or 0)
+                ot += int(t.get("out_tok") or 0)
+                cost += float(t.get("usd") or 0.0)
+                calls += int(t.get("calls") or 0)
+        for acc in by_agent.values():
+            if not it and not ot:
+                it += acc["input_tokens"]
+                ot += acc["output_tokens"]
+                cost += acc["cost"]
+                calls += acc["calls"]
+        return {"input_tokens": it, "output_tokens": ot,
+                "total_tokens": it + ot, "turns": len(rows),
+                "calls": calls, "cost": round(cost, 6),
+                "currency": "USD", "scope": "run",
+                "by_agent": by_agent}
+    except Exception:
+        return zero
+
+
+def _write_run_status(sid: str, *, degraded: bool = False,
+                      detail: list | None = None) -> None:
+    """Persist how this run ENDED, next to its artifacts.
+
+    The graph records what each node did; it does not record the verdict. So
+    the two facts the console most needs on reload - "this answer is
+    incomplete, here is what is missing" and "this run was stopped by the
+    operator" - existed only inside the SSE frame that carried them. Reopening
+    the run showed a report with no warning at all.
+
+    Best-effort: a run that cannot write its own status file must still
+    deliver its answer.
+    """
+    try:
+        import json as _json
+        d = _SROOT / "state" / "sessions" / sid
+        if not sid or sid.startswith(".") or "/" in sid or "\\" in sid:
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        _p = d / "run_status.json"
+        _tmp = _p.with_suffix(".json.tmp")
+        _tmp.write_text(_json.dumps({
+            "degraded": bool(degraded),
+            "detail": [str(x)[:300] for x in (detail or [])][:20],
+            "updated": time.time(),
+        }, indent=2), encoding="utf-8")
+        _tmp.replace(_p)
+    except Exception as e:
+        print(f"  -> could not persist run status for {sid}: {e!r}")
+
+
+def read_run_status(session_id: str) -> dict:
+    """How a past run ended. Never raises; {} when nothing was recorded."""
+    try:
+        if (not session_id or session_id.startswith(".")
+                or "/" in session_id or "\\" in session_id):
+            return {}
+        p = _SROOT / "state" / "sessions" / session_id / "run_status.json"
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 # F10 FIX (cross-session memory contamination): best-effort append of the
@@ -611,7 +830,8 @@ class Executor:
                 break
             # Bound BOTH the batch and the projected total. The cap check must
             # use the batch actually dispatched, not the full ready set: a
-            # planner that emits 5 nodes with MAX_FANOUT=4 would otherwise see
+            # planner that emits 9 nodes with MAX_CONCURRENCY=8 would
+            # otherwise see
             # `executed + 5 > MAX_NODES` on the first round, skip every node,
             # and spin without ever advancing.
             if executed_count + len(ready) > MAX_NODES:
@@ -632,10 +852,10 @@ class Executor:
             # calls and blow through the provider's rate limit. Deferring a
             # node requires leaving it PENDING, so this must be computed
             # before the running marks below.
-            batch = ready[:MAX_FANOUT]
-            if len(ready) > MAX_FANOUT:
-                print(f"[flow] fan-out capped at {MAX_FANOUT}; "
-                      f"{len(ready) - MAX_FANOUT} node(s) deferred")
+            batch = ready[:MAX_CONCURRENCY]
+            if len(ready) > MAX_CONCURRENCY:
+                print(f"[flow] batch limited to {MAX_CONCURRENCY}; "
+                      f"{len(ready) - MAX_CONCURRENCY} node(s) deferred")
 
             # Mark ONLY the dispatched batch as running. Marking the whole
             # ready set left deferred nodes stuck in `running` with nothing
@@ -994,7 +1214,96 @@ class Executor:
                 produced.append({"artifact": art,
                                  "filename": out.get("filename") or "",
                                  "format": (out.get("format") or "").lower(),
+                                 # The NODE id is what makes "one node rendered
+                                 # three documents" (the user asked for three)
+                                 # distinguishable from "two author nodes each
+                                 # rendered one" (a retry). Without it the
+                                 # grouping below keys on the skill name, which
+                                 # is identical for every author node.
+                                 "node": str(nid),
                                  "skill": graph.g.nodes[nid].get("skill", "")})
+        # One REQUEST, one document. Two author nodes in one session are not
+        # two documents the user asked for - they are the recovery planner
+        # re-planning after an author node failed, and both attempts then
+        # succeed and both files reach the console. Observed on one 60-page
+        # request: n_022 failed, n_030 rendered 6,509 words, n_033 failed,
+        # n_036 rendered 1,432 words, and the sidebar offered both.
+        #
+        # Collapsing PER NODE is not enough (that already happens in
+        # skills.run_skill); this is across nodes. Keep the best document: the
+        # one with the most delivered words, which is the finished one rather
+        # than the thin recovery attempt. Files inside ONE node are preserved -
+        # that is the legitimate "render three of these" case.
+        if produced:
+            # 1. Collapse the same artifact reported twice.
+            by_artifact: dict[str, dict] = {}
+            for p in produced:
+                by_artifact.setdefault(p["artifact"], p)
+
+            # 2. Group by NODE. One node rendering several files is the user
+            #    asking for several, so those all survive.
+            #
+            #    Keying on the skill instead made this impossible: every author
+            #    node reports skill="author", so N single-file nodes were
+            #    indistinguishable from one multi-file node, the
+            #    `len(items) > 1` branch fired, and every recovery duplicate
+            #    shipped. That is how a 5,145-word duplicate with NO headings -
+            #    and the raw request text as its title - was delivered alongside
+            #    the real 3,444-word document.
+            by_node: dict[str, list[dict]] = {}
+            for p in by_artifact.values():
+                key = f"{p.get('node') or '?'}:{p.get('skill') or '?'}"
+                by_node.setdefault(key, []).append(p)
+
+            multi = {k: v for k, v in by_node.items() if len(v) > 1}
+
+            # 3. Across NODES running the same skill, keep the best document.
+            #
+            #    Length alone picked the wrong winner: the duplicate that won
+            #    had MORE words but no headings, so it had no contents page,
+            #    no bookmarks and no real title. Structure first, then length -
+            #    a complete document beats a longer fragment.
+            def _rank(p):
+                st = p.get("stats") or {}
+                heads = int(st.get("headings") or st.get("sections") or 0)
+                words = int(st.get("words") or 0)
+                return (1 if heads else 0,
+                        1 if st.get("bookmarks") or st.get("outline") else 0,
+                        words)
+
+            by_skill: dict[str, list[list[dict]]] = {}
+            for key, items in by_node.items():
+                skill = items[0].get("skill") or "?"
+                by_skill.setdefault(skill, []).append(items)
+
+            kept: list[dict] = []
+            for skill, node_groups in by_skill.items():
+                # Every group for this skill is multi-file: the user asked for
+                # several from each, so nothing competes.
+                if all(len(g) > 1 for g in node_groups):
+                    for g in node_groups:
+                        kept.extend(g)
+                    continue
+                singles = [g for g in node_groups if len(g) == 1]
+                for g in node_groups:
+                    if len(g) > 1:
+                        kept.extend(g)
+                if len(singles) <= 1:
+                    kept.extend(g[0] for g in singles)
+                    continue
+                cands = [g[0] for g in singles]
+                best = max(cands, key=_rank)
+                dropped = [c for c in cands if c is not best]
+                if dropped:
+                    print(f"  -> {skill}: {len(cands)} documents from separate "
+                          f"nodes for ONE request; keeping "
+                          f"{best['artifact']} "
+                          f"({(best.get('stats') or {}).get('words')} words) "
+                          f"and not listing {len(dropped)} recovery "
+                          f"duplicate(s)")
+                kept.append(best)
+            produced = kept
+            _ = multi
         if produced:
             try:
                 import json as _json
@@ -1043,6 +1352,13 @@ class Executor:
                                 if (formatter_answer or "").strip()
                                 else ("I could not finish this request."
                                       + _note))
+            # Persist the warning, not just return it. The note lived only in
+            # the SSE `done` frame, so re-opening the run from /research or
+            # /runs showed a report that looked complete and was not: the
+            # warning had been shown once, live, and then was gone forever.
+            # The answer text is recovered from the formatter node on reload,
+            # which never carries this suffix, so it has to live on disk.
+            _write_run_status(sid, degraded=True, detail=list(failed))
 
         # A run that WAS asked for a file and produced none must never look
         # like a success. The planner can short-circuit on `{"answer": ...}`

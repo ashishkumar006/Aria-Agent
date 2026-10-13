@@ -584,7 +584,8 @@ def test_channel_send_approve_creates_pending(monkeypatch, tmp_path):
     assert len(_A.list_pending()) == 1
 
 
-def test_pairings_are_masked_for_display_but_resolvable_for_delivery():
+def test_pairings_are_masked_for_display_but_resolvable_for_delivery(
+        tmp_path, monkeypatch):
     """Display must stay masked; delivery must not be.
 
     `list_paired` masks ids because it feeds a panel, and for a long time that
@@ -594,6 +595,13 @@ def test_pairings_are_masked_for_display_but_resolvable_for_delivery():
     GET /v1/control/notify-target.
     """
     from adaptors import trust
+
+    # Isolated store: the live one has a real owner the moment anyone has
+    # messaged the bot, and list_paired must show the real (masked) entry
+    # rather than an assumption about an empty machine.
+    store = tmp_path / "pairing.json"
+    store.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(trust, "STORE_PATH", store)
 
     trust.pair("telegram", "99887766", "owner")
     try:
@@ -611,7 +619,8 @@ def test_an_unpaired_channel_resolves_to_nothing_rather_than_guessing():
     assert not trust.resolve_notify_target("discord"), \
         "invented a destination for a channel nobody paired with"
 
-def test_first_contact_claims_ownership_but_a_stranger_cannot_take_over():
+def test_first_contact_claims_ownership_but_a_stranger_cannot_take_over(
+        tmp_path, monkeypatch):
     """Trust-on-first-contact, and only on an empty store.
 
     The pairing store used to be writable only from a loopback control call,
@@ -619,15 +628,22 @@ def test_first_contact_claims_ownership_but_a_stranger_cannot_take_over():
     contact becomes `owner` so the channel works; a LATER sender is only
     `paired`, and `resolve_notify_target` prefers `owner` - so someone who
     finds the bot cannot redirect your reminders to themselves.
+
+    Runs against an isolated store: the live one is written by the real
+    long-poll listener the moment anyone talks to the bot, so asserting on it
+    made these tests fail on a machine that was actually working.
     """
     from adaptors import trust
     from channels_api import _auto_pair_inbound
+    store = tmp_path / "pairing.json"
+    store.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(trust, "STORE_PATH", store)
 
     class _Msg:
         sender_id = "55112233"
         chat_id = "55112233"
 
-    assert not trust.has_pairings("telegram"), "pre-existing pairing"
+    assert not trust.has_pairings("telegram"), "store not isolated"
     try:
         assert _auto_pair_inbound("telegram", _Msg()) == "owner"
         assert trust.resolve_notify_target("telegram") == "55112233"

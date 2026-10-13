@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { A2uiComponent, A2uiProps, A2uiSurface } from '../api';
 
 export type { A2uiComponent, A2uiProps, A2uiSurface };
@@ -103,6 +103,14 @@ function Table({ columns, rows, rowKey, searchable, paginated, emptyText }: {
   const pages = paginated ? Math.max(1, Math.ceil(filtered.length / per)) : 1;
   const shown = paginated ? filtered.slice(page * per, page * per + per) : filtered;
 
+  // A stale page index after the data changes makes the table lie: paged to
+  // page 3 of a 3-page feed, then a refresh shrinks it to one page — `shown`
+  // becomes empty and the panel prints "No items" while rows exist.
+  useEffect(() => setPage(0), [rows, columns]);
+  useEffect(() => {
+    if (page >= pages) setPage(pages - 1);
+  }, [page, pages]);
+
   return (
     <div className="min-w-0">
       {searchable ? (
@@ -125,17 +133,16 @@ function Table({ columns, rows, rowKey, searchable, paginated, emptyText }: {
                 {columns.map((c) => (
                   <th key={c.key} scope="col"
                     className="border-b border-glass-border px-2 py-1 font-medium text-zinc-muted">
-                    {searchable || true ? (
-                      <button
-                        type="button"
-                        onClick={() => setSort((s) => (s?.key === c.key ? (s.dir === 1 ? { key: c.key, dir: -1 } : null) : { key: c.key, dir: 1 }))}
-                        className="inline-flex items-center gap-1 hover:text-zinc-100"
-                        aria-label={`Sort by ${c.label}`}
-                      >
-                        {c.label}
-                        {sort?.key === c.key ? <span aria-hidden>{sort.dir === 1 ? '▲' : '▼'}</span> : null}
-                      </button>
-                    ) : c.label}
+                    <button
+                      type="button"
+                      onClick={() => setSort((s) => (s?.key === c.key ? (s.dir === 1 ? { key: c.key, dir: -1 } : null) : { key: c.key, dir: 1 }))}
+                      className="inline-flex items-center gap-1 hover:text-zinc-100"
+                      aria-label={`Sort by ${c.label}`}
+                      aria-sort={sort?.key === c.key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}
+                    >
+                      {c.label}
+                      {sort?.key === c.key ? <span aria-hidden>{sort.dir === 1 ? '▲' : '▼'}</span> : null}
+                    </button>
                   </th>
                 ))}
               </tr>
@@ -249,6 +256,38 @@ function Leaf({ c }: { c: A2uiComponent }) {
               {str(o.label)}
             </span>
           ))}
+        </div>
+      );
+    }
+    case 'StatusRow': {
+      const items = (p.items as A2uiComponent[]) || [];
+      return (
+        <div className="flex flex-wrap items-center gap-1">
+          {items.map((it, i) => (
+            <span key={i} className="inline-flex items-center rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10.5px] text-accent">{str(it.props.text)}</span>
+          ))}
+        </div>
+      );
+    }
+    case 'Empty':
+      return (
+        <div className="rounded border border-dashed border-glass-border px-3 py-4 text-center">
+          <p className="m-0 text-[12px] text-zinc-200">{str(p.title)}</p>
+          {p.sub ? <p className="m-0 mt-0.5 text-[11.5px] text-zinc-muted">{str(p.sub)}</p> : null}
+        </div>
+      );
+    case 'Progress': {
+      const v = num(p.value);
+      const pct = v === null ? 0 : Math.max(0, Math.min(1, v));
+      return (
+        <div>
+          {p.label ? <div className="mb-0.5 text-[11.5px] text-zinc-muted">{str(p.label)}</div> : null}
+          <div className="h-1.5 w-full overflow-hidden rounded bg-glass-border"
+            role="progressbar" aria-valuemin={0} aria-valuemax={1}
+            aria-valuenow={pct}
+            aria-label={p.label ? str(p.label) : 'Progress'}>
+            <div className="h-full rounded bg-accent/70" style={{ width: `${pct * 100}%` }} />
+          </div>
         </div>
       );
     }

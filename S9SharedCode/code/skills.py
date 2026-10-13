@@ -18,6 +18,7 @@ What lives here:
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import re
 import time
@@ -362,7 +363,18 @@ def _format_memory_hits(hits: list) -> str:
         line = f"  - [{kind}] {desc}"
         if source:
             line += f"\n      source: {source}"
-        if isinstance(chunk, str) and chunk.strip():
+        if kind == "observation":
+            # An observation is a pattern DRAWN from past conversations, not
+            # something the user asserted. Without its quote it renders
+            # identically to a fact, and the Planner has no way to tell a
+            # well-supported pattern from a guess — so the evidence travels
+            # with it, exactly as it does in the chat path.
+            ev = (val.get("evidence") or "").strip()
+            if ev:
+                line += f"\n      they said: \"{ev[:240]}\""
+            line += ("\n      (a pattern inferred from past chats, not a "
+                     "stated rule — weigh it, don't obey it)")
+        elif isinstance(chunk, str) and chunk.strip():
             preview = chunk[:2000].replace("\n", " ")
             more = " …" if len(chunk) > 2000 else ""
             line += f"\n      chunk: {preview}{more}"
@@ -400,6 +412,23 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
                   policy_notes: list | None = None,
                   budget_note: str = "") -> str:
     parts = [skill.prompt_template().rstrip()]
+    # The current date, for every skill. A prompt template is a constant read
+    # off disk, so it cannot state what day it is, and a model has no clock -
+    # "this week", "recent", "as_of" and "currently" are all resolved against
+    # its training data otherwise. That is a correctness bug, not a cosmetic
+    # one: researcher.md asks for an `as_of` date and planner.md routes
+    # recency queries, and both would be filled in from a guess.
+    #
+    # Local time with an explicit UTC offset, so "today" agrees with the clock
+    # that later resolves a relative `when` against.
+    _now = _dt.datetime.now().astimezone()
+    parts += [
+        "",
+        f"CURRENT DATE AND TIME: {_now.strftime('%A %d %B %Y, %H:%M')} "
+        f"{_now.strftime('%Z')} (UTC{_now.strftime('%z')}). "
+        "'today', 'this week', 'recent', 'current' and any `as_of` field all "
+        "mean relative to this, not to your training data. Get the year right.",
+    ]
     # Untrusted-content contract. Applied here rather than only in the
     # individual prompt files so that adding a retrieval-capable skill later
     # cannot ship without it: web_search / fetch_url / fetch_pdf /
@@ -511,7 +540,15 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
     # Formatter's job is to expand, and it has max_tokens headroom to do
     # it. 120k chars (~30k tokens) is well inside every current model's
     # context window.
-    parts += ["", "INPUTS:", _inputs_block(resolved, 120_000,
+    #
+    # Raised to 400k. A researcher can now emit up to 65536 tokens (~260k
+    # chars) and a 4-way fan-out means four such outputs can reach one node.
+    # At 120k the remedy was to DROP WHOLE ENTRIES from the end of the list —
+    # silently discarding entire research facets — which is a worse outcome
+    # than the compression this budget was meant to prevent. Fields over the
+    # spill threshold become artifact handles instead, so the block stays
+    # bounded while the detail remains one `read_artifact` call away.
+    parts += ["", "INPUTS:", _inputs_block(resolved, 400_000,
                                            skill_name=skill.name)]
     return "\n".join(parts)
 
@@ -521,34 +558,54 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
 # legitimately runs to many thousands of characters.
 _FIELD_BUDGET = 60_000
 
-# Above this size a text field is moved into the content-addressed
-# artifact store and replaced by a handle + preview, so it is paid for
-# once instead of on every node that reads it.
+# Above this size a text field is moved into the content-addressed artifact
+# store and replaced by a handle + preview, so it is paid for once instead of
+# on every node that reads it.
 #
-# 4KB (the first proposal) is far too low: one researcher's `findings`
-# is ~8KB, so nearly every node output would spill and the Formatter
-# would receive handles instead of the material it has to write from.
-# 24KB keeps normal results inline and only spills genuine outliers
-# (a 40-page PDF extract, a 1370-chunk document, a long page dump).
-_ARTIFACT_SPILL_BYTES = 24_000
+# This was 24KB with a comment arguing 4KB was "far too low" because one
+# researcher's `findings` is ~8KB and would therefore always spill. That
+# reasoning has it backwards: the author is BUILT to read the material, and
+# `read_artifact` is already in its tool surface precisely for this. At 4KB the
+# text is preserved intact on disk and a pointer carries a readable opening, so
+# nothing is lost - what changes is that a node no longer carries eight
+# researchers' worth of findings inline when deciding what to read. The
+# trade is deliberate: fewer tokens per turn, one tool call when the node
+# decides the rest is worth opening.
+_ARTIFACT_SPILL_BYTES = 4_096
 # Text kept inline alongside the handle so a node can decide whether it
-# needs the rest without spending a tool call.
-_ARTIFACT_PREVIEW_CHARS = 1_500
+# needs the rest without spending a tool call. Kept proportional to the
+# threshold: a 4KB threshold needs a short preview or the preview itself
+# becomes the payload.
+_ARTIFACT_PREVIEW_CHARS = 800
 
 
 def _spill_field_to_artifact(value: str, *, source: str,
                              title: str) -> dict:
     """Store a large text field and return a handle + preview in its place."""
     try:
+        blob = value.encode("utf-8")
         art_id = artifacts_svc.put(
-            value.encode("utf-8"), content_type="text/plain",
+            blob, content_type="text/plain",
             source=source, descriptor=title[:200])
-    except Exception:
-        return {"text": value, "spill_failed": True}
+    except Exception as e:
+        # Return the field intact rather than truncated. An earlier version
+        # did exactly that, which is right for a single field — losing a
+        # research finding to a store hiccup is worse than a big prompt — but
+        # it was silent, so the model had a full 24k+ blob with no marker
+        # explaining why. Say so.
+        print(f"[skills.spill] store failed for {title!r}: {e!r}")
+        return {"text": value, "spill_failed": True,
+                "note": "could not be moved to the artifact store; the full "
+                        "text is included here"}
     return {
         "artifact": art_id,
         "title": title[:200],
-        "bytes": len(value),
+        # The real byte count, not `len(value)`. This field said "bytes" and
+        # reported characters, so a 2040-char / 2520-byte field claimed 2040
+        # and disagreed with the size read_artifact returns for the same
+        # handle.
+        "bytes": len(blob),
+        "chars": len(value),
         "preview": value[:_ARTIFACT_PREVIEW_CHARS]
         + (f"\n…[{len(value) - _ARTIFACT_PREVIEW_CHARS} more chars — call "
            f"read_artifact with the handle for the full text]"
@@ -557,11 +614,21 @@ def _spill_field_to_artifact(value: str, *, source: str,
 
 
 def _section_title(entry: dict, idx: int, total: int) -> str:
-    """A heading for one section of a sectioned answer."""
-    for key in ("question", "topic", "label", "title", "facet", "name"):
-        val = entry.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()[:120]
+    """A heading for one section of a sectioned answer.
+
+    Reads through the `output` wrapper too: `resolve_inputs` nests an upstream
+    node's payload under `output`, so a top-level-only lookup finds nothing and
+    every section ends up titled "Part N of M".
+    """
+    scopes = [entry]
+    inner = entry.get("output") if isinstance(entry, dict) else None
+    if isinstance(inner, dict):
+        scopes.append(inner)
+    for scope in scopes:
+        for key in ("question", "topic", "label", "title", "facet", "name"):
+            val = scope.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:120]
     return f"Part {idx + 1} of {total}"
 
 
@@ -644,6 +711,403 @@ def _lenient_json(raw: str):
         return json.loads("".join(out))
     except Exception:
         return None
+
+
+async def _sectioned_document_blocks(skill: "Skill", rendered: str,
+                                     outline: list[str],
+                                     resolved: list, query: str,
+                                     session_id: str) -> list[dict]:
+    """One focused call PER SECTION, each returning BLOCKS, flattened here.
+
+    The single-call shape cannot produce a long document: the model is asked
+    for the entire `blocks` array in one tool call, and a 60-page document is
+    a ~36,000-token JSON object. Measured - asked for 27,000 words, it
+    returned 2,464, then 1,261. Raising max_tokens did not help; the output
+    SHAPE is the constraint, not the budget.
+
+    This is the same split that works for the Formatter's prose (see
+    `_sectioned_final_answer`, where 3 per-section calls produced 779 words
+    against 248 for one combined call), applied to the author: N calls each
+    return one section's blocks, the harness concatenates them, and the
+    document is rendered ONCE so the user still gets a single file.
+    """
+    import asyncio as _aio
+
+    entries = [e for e in (resolved or []) if isinstance(e, dict)]
+    titles = [str(t).strip() for t in outline if str(t).strip()]
+    if not titles:
+        return []
+    # Pair each section with the upstream material most likely to support it,
+    # so a section call is working from evidence rather than from memory.
+    n_ent = len(entries)
+
+    async def _one(title: str, idx: int) -> list[dict]:
+        # Give this section the research, not the whole fleet: handing one
+        # call 400k chars of INPUTS is what compressed the output last time.
+        chunk = ""
+        if n_ent:
+            lo = (idx * n_ent) // len(titles)
+            hi = max(lo + 1, ((idx + 1) * n_ent) // len(titles))
+            picked = entries[lo:hi]
+            if not picked:
+                picked = [entries[idx % n_ent]]
+            chunk = json.dumps(picked, indent=2, default=str)[:90_000]
+        prompt = (
+            f"{rendered}\n\n"
+            f"=== WRITE ONE SECTION OF THE DOCUMENT ===\n"
+            f"You are writing ONE section of a longer document. Your section "
+            f"is: {title}\n\n"
+            f"Return ONLY a JSON object: "
+            f'{{"blocks": [...]}}. The blocks are this section\'s content '
+            f"only. Use the block types from your instructions "
+            f'(paragraph, bullets, numbers, table, quote, heading). Start '
+            f"with a level-1 heading naming the section.\n\n"
+            f"Write the section IN FULL - this is the substance of the "
+            f"document, so develop every point the material supports with "
+            f"its figures, dates, names, units and attributions. Do not "
+            f"write an introduction or a conclusion; other sections do "
+            f"that. Do not pad with restatement of your own heading.\n\n"
+            + (f"RESEARCH MATERIAL FOR THIS SECTION (JSON):\n{chunk}\n\n"
+               if chunk else "")
+        )
+        res = await _aio.to_thread(
+            LLM().chat, prompt=prompt, agent=skill.name,
+            session=session_id, provider=skill.provider_pin,
+            max_tokens=skill.max_tokens, temperature=skill.temperature)
+        spec = parse_skill_json(str((res or {}).get("text") or ""))
+        blocks = spec.get("blocks")
+        if isinstance(blocks, list):
+            return [b for b in blocks if isinstance(b, dict)]
+        # The model wrote prose instead of JSON. Keep the words rather than
+        # discarding the call we already paid for.
+        raw = _strip_answer_envelope(str((res or {}).get("text") or "")).strip()
+        if raw and raw.startswith("{"):
+            return []
+        if raw:
+            return [{"type": "heading", "level": 1, "text": title},
+                    {"type": "paragraph", "text": raw}]
+        return []
+
+    out: list[dict] = []
+    for i, title in enumerate(titles):
+        try:
+            got = await _one(title, i)
+        except Exception as e:
+            print(f"[skills] {skill.name}: section {i + 1} "
+                  f"({title[:40]!r}) failed: {type(e).__name__}")
+            got = []
+        if got:
+            out.extend(got)
+        print(f"[skills] {skill.name}: section {i + 1}/{len(titles)} "
+              f"{title[:44]!r} -> {len(got)} blocks")
+    return out
+
+
+def _entry_has_research(entry) -> bool:
+    """Does a resolved input carry actual research?
+
+    `resolve_inputs` wraps an upstream node as
+    `{"id": "n:3", "kind": "upstream", "output": {...}}` - the findings live
+    under `output`, not at the top level. A guard reading `e.get("findings")`
+    therefore reports "no research" for an author that was handed 46,969
+    characters of findings, and silently skips the expansion.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("findings") or entry.get("sources"):
+        return True
+    out = entry.get("output")
+    if isinstance(out, dict):
+        return bool(out.get("findings") or out.get("sources"))
+    return False
+
+
+def _document_title(parsed: dict, query: str) -> str:
+    """A real document title, never the prompt.
+
+    The fallback was `parsed.get("title") or query`, and the Authoring page
+    prefixes every request with the literal string "Create a document.". So a
+    model that did not supply a title produced a cover page, a running header
+    on all 12 pages and a filename reading:
+
+        Create a document. Write a comprehensive treatise of about 60 pages on
+        the engineering of Roman aqueduct systems: construction materials,
+        gradients and hydraulics, surveying and measurement, maintena
+
+    - truncated mid-word, in the header of every page. Preference order:
+    the model's own title, then its first heading, then the query with the UI
+    boilerplate and any leading length instruction stripped."""
+    t = str((parsed or {}).get("title") or "").strip()
+    if t and len(t) <= 200:
+        return t
+
+    for b in ((parsed or {}).get("blocks") or []):
+        if not isinstance(b, dict):
+            continue
+        if str(b.get("type") or "").lower() == "cover":
+            ct = str(b.get("title") or "").strip()
+            if ct:
+                return ct[:200]
+
+    # The query's subject, stripped of the UI prefix and the length
+    # instruction. Tried BEFORE the first heading: "the engineering of Roman
+    # aqueduct systems" names the whole document, whereas the first heading is
+    # one section of it.
+    q = " ".join(str(query or "").split())
+    # "Create a document." is the Authoring page's own prefix.
+    q = re.sub(r"^\s*create a document\s*[.:]?\s*", "", q, flags=re.I)
+    # "Write a comprehensive treatise of about 60 pages on ..." - keep the
+    # subject, drop the instruction and the length.
+    q = re.sub(r"^\s*(?:please\s+)?(?:write|produce|create|generate|make|"
+               r"draft|compose)\s+(?:me\s+)?(?:an?\s+|the\s+)?"
+               r"(?:comprehensive\s+|detailed\s+|extensive\s+|brief\s+|"
+               r"short\s+|in-depth\s+|full-length\s+|long-form\s+)*"
+               r"(?:treatise|whitepaper|report|essay|paper|document|study|"
+               r"memo|article|summary|piece|draft|analysis)?\s*"
+               r"(?:of|on|about|covering|regarding)\s+(?:about\s+|approximately\s+|"
+               r"roughly\s+|around\s+)?"
+               r"(?:\d+\s*(?:pages?|words?)\s*(?:in|of|long)?\s*)?(?:on|of|about)?\s*",
+               "", q, flags=re.I)
+    q = re.sub(r"\s*[:;]\s*.*$", "", q).strip(" .")
+    if q:
+        return q[:200]
+
+    # Last resort: the first heading, which at least names something.
+    for b in ((parsed or {}).get("blocks") or []):
+        if isinstance(b, dict) and str(b.get("type") or "").lower() == "heading":
+            h = _unnumber_heading(str(b.get("text") or "")).strip()
+            if h and 3 <= len(h.split()) <= 20:
+                return h[:200]
+    return "Document"
+
+
+async def _expand_document_sections(skill, rendered, blocks, resolved,
+                                    graph_nodes, query, session_id, parsed,
+                                    fmt, forced, _f, current, *,
+                                    pre_rendered: bool) -> list[dict]:
+    """Write the document one section per call, then render it ONCE.
+
+    A single call renders whatever the model felt like writing: measured
+    900-1,660 words against 40,000 characters of findings sitting in the same
+    prompt. N calls, one section each, is what actually scales - it is how the
+    Formatter's prose already works (`_sectioned_final_answer`: 3 calls, 779
+    words, against 248 for one combined call).
+
+    Returns the produced-file record, replaced in place when the sectioned
+    version is longer. The first render is kept if the expansion produced
+    nothing usable, so a failure here can never lose a document."""
+    cur_words = int((current.get("stats") or {}).get("words") or 0)
+    outline = _derive_document_outline(blocks, resolved, graph_nodes, query)
+    if len(outline) < 2:
+        print(f"[skills] {skill.name}: only {len(outline)} section(s) "
+              f"derivable; keeping the single-call document "
+              f"({cur_words} words)")
+        return [current] if pre_rendered else current
+
+    # Nothing upstream to expand FROM. A document with no research behind it
+    # has no evidence for four extra sections, and fanning out anyway costs N
+    # live model calls to write nothing. (It also made the test suite take
+    # five minutes because these tests exercise the real path.)
+    if not [e for e in (resolved or [])
+            if isinstance(e, dict) and _entry_has_research(e)]:
+        print(f"[skills] {skill.name}: no research behind this render; "
+              f"keeping the single-call document ({cur_words} words)")
+        return [current] if pre_rendered else current
+
+    # The user's format choice wins, exactly as on the first render. Reading it
+    # back off `current` ignored the forced setup and silently reverted a docx
+    # request to pdf.
+    fmt = str(parsed.get("format") or "").strip().lower() or fmt
+    if forced.get("format") and forced["format"] != "auto":
+        fmt = str(forced["format"]).strip().lower()
+    if fmt not in ("pdf", "pptx", "docx", "xlsx"):
+        fmt = "pptx" if skill.name == "deck" else "pdf"
+
+    print(f"[skills] {skill.name}: writing {len(outline)} sections "
+          f"(single call gave {cur_words} words)")
+    extra = await _sectioned_document_blocks(
+        skill, rendered, outline[:40], resolved, query, session_id)
+    if not extra:
+        print(f"[skills] {skill.name}: sectioned writer returned nothing; "
+              f"keeping the single-call document")
+        return [current] if pre_rendered else current
+
+    # Keep the section headings. These used to be filtered out on block type to
+    # avoid double-numbering, which left a 4,832-word document with NINE
+    # sections and ZERO visible headings: no sections counted, no table of
+    # contents, no bookmarks, and pages that ran on as an unbroken wall of
+    # prose. Double-numbering is handled at the SOURCE - docgen strips a
+    # leading "3." / "3.1" before numbering - so deleting every heading here
+    # solved a problem that no longer existed, at the cost of the document's
+    # entire structure.
+    #
+    # Dropping ALL headings did, however, paper over a real one: when the
+    # original call already produced a heading for a section the sectioned
+    # writer also wrote, the heading appeared twice. So headings are now
+    # deduplicated BY TEXT instead of by type - the structure survives, and a
+    # repeated heading still cannot slip through.
+    def _hkey(b):
+        return " ".join(_unnumber_heading(str(b.get("text") or ""))
+                         .lower().split())
+
+    merged, seen_h = [], set()
+    for b in ([x for x in (blocks or []) if isinstance(x, dict)]
+              + [x for x in extra if isinstance(x, dict)]):
+        if str(b.get("type") or "").lower() == "heading":
+            k = _hkey(b)
+            if not k or k in seen_h:
+                continue
+            seen_h.add(k)
+        merged.append(b)
+    try:
+        import mcp_server as _m
+        got = _m.render_document(
+            format=fmt,
+            title=_document_title(parsed, query),
+            subtitle=str(parsed.get("subtitle") or "")[:300],
+            author_name=str(parsed.get("author") or "")[:120],
+            toc=bool(forced.get("toc")) or bool(parsed.get("toc")),
+            running_header=(str(parsed.get("title") or "Document")[:120]
+                            if forced.get("running_header") else ""),
+            page_size=_f("page_size"), orientation=_f("orientation"),
+            margins=_f("margins"),
+            columns=int(forced.get("columns") or parsed.get("columns") or 0),
+            style=_f("style"), citation_style=_f("citation_style"),
+            references=parsed.get("references") if isinstance(
+                parsed.get("references"), list) else None,
+            slide_size=_f("slide_size"), blocks=merged[:400])
+    except Exception as e:
+        print(f"[skills] {skill.name}: sectioned render raised "
+              f"{type(e).__name__}: {e}"[:200])
+        return [current] if pre_rendered else current
+
+    if not (isinstance(got, dict) and got.get("ok")
+            and re.fullmatch(r"art:[0-9a-fA-F]{16}",
+                             str(got.get("artifact") or ""))):
+        print(f"[skills] {skill.name}: sectioned render refused: "
+              f"{str((got or {}).get('error') or got)[:200]}")
+        return [current] if pre_rendered else current
+
+    new_words = int((got.get("stats") or {}).get("words") or 0)
+    if new_words <= cur_words:
+        # The sectioned attempt was worse; keep the document we already have.
+        print(f"[skills] {skill.name}: sectioned gave {new_words} words vs "
+              f"{cur_words}; keeping the longer one")
+        return [current] if pre_rendered else current
+
+    print(f"[skills] {skill.name}: {cur_words} -> {new_words} words "
+          f"({len(merged)} blocks)")
+    rec = [{"artifact": got["artifact"], "filename": got.get("filename") or "",
+            "format": fmt, "bytes": got.get("bytes"),
+            "blocks": got.get("blocks"), "stats": got.get("stats") or {}}]
+    return rec if pre_rendered else rec[0]
+
+
+def _derive_document_outline(blocks, resolved, graph_nodes, query) -> list[str]:
+    """The sections to write, from the most reliable source available.
+
+    Every previous version took the outline from the MODEL'S OWN OUTPUT - the
+    level-1 headings it happened to emit. Measured failure: a run rendered 72
+    blocks and `sections: 0`, with no level-1 heading anywhere, so there was
+    nothing to expand along and the document stopped at 267 words against a
+    27,000-word floor. The expansion could not fire because the thing it keyed
+    on was missing, and it was missing because the model said so - which is the
+    same variable the expansion is trying to repair.
+
+    So the order below walks AWAY from the model: headings if they exist, then
+    the planner's structured facet list, then the researchers' questions, then
+    the topics named in the request itself, and only then a generic frame.
+
+    The request is the best source and the least used: a user asking for a
+    treatise on aqueducts names their sections in the sentence -
+    "construction materials, gradients and hydraulics, surveying and
+    measurement, maintenance and failure modes, water quality..., the towns and
+    economies that grew around them, and their decline and reuse". That list is
+    a better outline than anything the author would invent, and it does not
+    depend on the author succeeding first."""
+    # 1. The model's own headings, if it emitted a real tree.
+    heads = [str(b.get("text") or "").strip()
+             for b in (blocks or [])
+             if isinstance(b, dict) and b.get("type") == "heading"
+             and int(b.get("level") or 1) == 1]
+    heads = [_unnumber_heading(h) for h in heads if h]
+    if len(heads) >= 2:
+        return heads
+
+    # 2. The planner's facet list. Structured, produced before the author ran,
+    #    and each facet is already scoped for one researcher.
+    try:
+        for n in (graph_nodes or []):
+            if not isinstance(n, dict) or n.get("skill") != "planner":
+                continue
+            res = n.get("result") or {}
+            out = res.get("output") if isinstance(res, dict) else None
+            if not isinstance(out, dict):
+                continue
+            rp = out.get("research_plan")
+            facets = (rp.get("facets") if isinstance(rp, dict) else None) or []
+            facets = [_unnumber_heading(str(f)) for f in facets if str(f).strip()]
+            if len(facets) >= 2:
+                return facets
+    except Exception:
+        pass
+
+    # 3. What the researchers were actually asked.
+    qs = [_unnumber_heading(str((e.get("output") or e).get("question") or ""))
+          for e in (resolved or [])
+          if isinstance(e, dict)
+          and str((e.get("output") or e).get("question") or "").strip()]
+    if len(qs) >= 2:
+        return qs
+
+    # 4. The topics named in the request itself.
+    from_q = _topics_from_query(query)
+    if len(from_q) >= 2:
+        return from_q
+
+    # 5. Last resort: a frame that at least produces a document with a spine.
+    return ["Introduction", "Background and Context", "Analysis",
+            "Findings", "Discussion", "Conclusion"][:max(2, 4)]
+
+
+def _unnumber_heading(text: str) -> str:
+    import re as _re
+    return _re.sub(r"^\s*\d+(?:\.\d+)*\.?\s+", "", str(text or "")).strip()
+
+
+def _topics_from_query(query: str) -> list[str]:
+    """Section-sized topics named in the request sentence.
+
+    "...on the engineering of Roman aqueduct systems: construction materials,
+    gradients and hydraulics, surveying and measurement, maintenance and
+    failure modes, water quality and lead poisoning, and their decline and
+    reuse" -> those eight clauses."""
+    import re as _re
+    q = str(query or "").replace("\n", " ")
+    # Only the part after an explicit enumeration marker, so a preamble like
+    # "Write a report about the history of X" does not become a section.
+    m = _re.search(r"(?::|\b(?:covering|including|on the topics of|"
+                   r"with sections (?:on|for))\b)", q, _re.I)
+    if not m:
+        return []
+    tail = q[m.end():]
+    tail = _re.split(r"(?<=[.!?])\s{2,}|\t", tail)[0]
+    parts = _re.split(r",", tail)
+    out: list[str] = []
+    for raw in parts:
+        # Split on COMMAS only. An "and" inside a clause is part of the topic:
+        # "gradients and hydraulics", "water quality and lead poisoning" and
+        # "the towns and economies that grew around them" are each one
+        # subject, not two. A list-joining "and X" is already preceded by a
+        # comma, so the split handles it; only a LEADING "and " needs
+        # stripping. An earlier version split on "and" too and produced
+        # "Gradients hydraulics" - losing the word, not the topic.
+        t = _re.sub(r"^\s*and\s+", "", raw).strip(" .;:-")
+        t = _unnumber_heading(t)
+        if 2 <= len(t.split()) <= 12 and not t.lower().startswith("produce"):
+            if t and t[0].isalpha():
+                out.append(t[0].upper() + t[1:])
+    return out[:24]
 
 
 async def _sectioned_final_answer(skill: "Skill", rendered: str,
@@ -766,19 +1230,46 @@ def _inputs_block(resolved: list, budget: int, *,
             trimmed.append(entry)
             continue
         item = dict(entry)
-        for key, val in list(item.items()):
-            if not isinstance(val, str) or len(val) <= _FIELD_BUDGET:
+        # An upstream node's payload lives one level DOWN, under the
+        # dict-valued `output` key that resolve_inputs puts there
+        # (`{"id","kind","skill","output": {...}}`). This loop used to walk
+        # top-level keys only, so `isinstance(val, str)` was False for
+        # `output` and the content — findings, sources, evidence, the actual
+        # text of the run — was never examined. The spill subsystem had
+        # therefore never fired once in production, and neither had the
+        # per-field truncation. `tests/test_artifact_spill.py` passed because
+        # it hand-built a FLAT dict that resolve_inputs cannot produce.
+        target = item.get("output") if isinstance(item.get("output"), dict) \
+            else None
+        fields = target if target is not None else item
+        for key, val in list(fields.items()):
+            if not isinstance(val, str) or not val:
                 continue
-            if spill and len(val) > _ARTIFACT_SPILL_BYTES:
-                title = (str(entry.get("question") or entry.get("topic")
-                          or entry.get("label") or key) or key)
-                item[key] = _spill_field_to_artifact(
+            title = (str(entry.get("question") or entry.get("topic")
+                        or entry.get("label") or entry.get("skill") or key)
+                     or key)
+            # The spill test comes FIRST, and at 4KB rather than 24KB. At
+            # 24k almost nothing spilled, because a researcher's whole
+            # findings field landed under it - which is precisely the text
+            # the author downstream needs. 4KB is the point where a field
+            # stops being scannable in context and starts being a document
+            # the reader should open deliberately: under it, everything is
+            # inline and readable; over it, the text is preserved intact as
+            # an artifact with a readable pointer in its place.
+            if spill and len(val.encode("utf-8")) > _ARTIFACT_SPILL_BYTES:
+                fields[key] = _spill_field_to_artifact(
                     val, source=f"skill:{skill_name or 'unknown'}",
                     title=f"{title} — {key}")
                 continue
-            item[key] = (val[:_FIELD_BUDGET]
-                         + f"\n…[{len(val) - _FIELD_BUDGET} chars of this "
-                           f"field omitted — INPUTS size limit]")
+            if len(val) <= _FIELD_BUDGET:
+                continue
+                fields[key] = _spill_field_to_artifact(
+                    val, source=f"skill:{skill_name or 'unknown'}",
+                    title=f"{title} — {key}")
+                continue
+            fields[key] = (val[:_FIELD_BUDGET]
+                           + f"\n…[{len(val) - _FIELD_BUDGET} chars of this "
+                             f"field omitted — INPUTS size limit]")
         trimmed.append(item)
 
     text = json.dumps(trimmed, indent=2, default=str)
@@ -812,10 +1303,35 @@ _LENGTH_TIERS: tuple[tuple[int, str, re.Pattern[str]], ...] = (
     # two paragraphs. They used to be targets with a hard 700-word default,
     # which is why every document came out at 5-6 pages: the model was hitting
     # the number it was given rather than writing what the evidence supported.
+    # The top tier is a FLOOR for a book-length request. It used to be 6,000,
+    # which is 13 pages - so a request for a 300-page whitepaper was told
+    # "6,000 words minimum" and delivered a 30-page document that read as
+    # complete. The tiers are ordered, and a longer ask now maps to a longer
+    # floor: 50-100 pages is 22,000-45,000 words.
+    (45000, "a book-length work - at least this substantial",
+     # "study" alone is NOT here: "a thorough comprehensive study" is an
+     # existing expectation at 6,000, and a study is as often a 20-page
+     # paper as a treatise. The unmistakable book nouns are.
+     re.compile(
+         r"\b(comprehensive treatise|monograph|whitepaper|white paper|"
+         r"book(?:-length)?|thesis|dissertation|"
+         r"extremely long|in[- ]depth study)\b", re.I)),
+    # Restored at its original 6,000. "a comprehensive study" is a real
+    # 13-page piece far more often than a treatise, and it is a pinned
+    # expectation; it moved down a tier only as a side effect of the 45,000
+    # tier being introduced above.
     (6000, "an in-depth piece - at least this substantial",
      re.compile(
-         r"\b(whitepaper|book|thesis|comprehensive (study|treatise)|"
-         r"300\+? pages|extremely long|in[- ]depth study)\b", re.I)),
+         r"\b(comprehensive study|\d{3}\+? pages)\b", re.I)),
+    # 15,000 words (~33 pages) for an explicit multi-page or book-shaped ask.
+    # Deliberately NARROW: "extensive", "detailed analysis" and friends stay
+    # in the 3,000 tier below, because they describe the subject's depth, not
+    # the document's length, and mapping them here turned an ordinary detailed
+    # report into a 33-page demand.
+    (15000, "a long-form work - at least this substantial",
+     re.compile(
+         r"\b(\d{2,3}\+? pages|multi[- ]chapter|book[- ]length|"
+         r"full[- ]length)\b", re.I)),
     (3000, "a long-form report - at least this substantial",
      re.compile(
          r"\b(extensive|exhaustive|thorough(ly)?|comprehensive|full[- ]length|"
@@ -824,6 +1340,33 @@ _LENGTH_TIERS: tuple[tuple[int, str, re.Pattern[str]], ...] = (
      re.compile(
          r"\b(detailed|comprehensive|in[- ]depth|substantial|multi[- ]section|"
          r"proper (report|write[- ]up))\b", re.I)),
+    # A named genre is a request for a document, not a paragraph. Before this
+    # tier, "write a report on X" and "a market analysis of Y" matched nothing
+    # and fell through to floor=0, so the author was told "no length has been
+    # imposed... and no more" and produced a 310-word stub where the same
+    # request worded as "a detailed analysis" produced 2,367 words. The genre
+    # words here are the ones that genuinely imply body prose; "note", "brief"
+    # and the one-liners stay in the tiers below.
+    (1200, "a report - at least this substantial",
+     # "article" is deliberately absent: it collides with publication-date
+     # phrasing and reads as a noun here far more often than a genre.
+     re.compile(
+         r"\b(report|analysis|study|paper|essay|white ?paper|case study|"
+         r"write[- ]?up|survey)\b", re.I)),
+    # A request to PRODUCE A DOCUMENT is a request for body prose, even with no
+    # genre word. The Authoring page prefixes every query with "Create a
+    # document.", so "produce a pdf on the history of the Silk Road" reached
+    # the author with floor=0 and shipped as a stub - the same shape as the
+    # "find out about rag and create a neat pdf explaining it" run. Note this
+    # is a lower tier than the genre words above, so a document that is also
+    # called a report still gets the report floor.
+    (1000, "a document with real substance",
+     re.compile(
+         r"(create|produce|make|generate|write|render|build|give)\s+(me\s+)?"
+         r"(a|an|the)?\s*(new\s+)?"
+         r"(detailed\s+|full\s+|complete\s+|comprehensive\s+)?"
+         r"(pdf|docx?|pptx|xlsx?|powerpoint|deck|word document|"
+         r"spreadsheet|report|document|whitepaper)\b", re.I)),
     (0, "a brief", re.compile(
         r"\b(brief|briefing|summar|overview|memo|one[- ]pager|snippet|"
         r"explain|describe)\b", re.I)),
@@ -833,11 +1376,17 @@ _LENGTH_TIERS: tuple[tuple[int, str, re.Pattern[str]], ...] = (
         r"bullet points only|tl;?dr|in (?:a )?few (?:lines|words)\b)", re.I)),
 )
 
-# No artificial ceiling. This is a rendering limit, not a content one: it
-# exists so that a request for 600 pages produces an honest error naming the
-# achievable maximum instead of a silent stub beside an impossible number.
-# Within it the agent decides how much to write.
-_MAX_WORDS_PER_RENDER = 60_000
+# The document ceiling, raised from 60,000. The 60k figure was inherited from
+# the old output-cap era (author max_tokens 16,000 => ~60k words of prose), so
+# it described a limit that no longer existed rather than a real one.
+#
+# Now 500,000 so a long-form treatise (50-100 pages is 22,000-45,000 words;
+# a 300-page reference work is ~135,000) is a matter of evidence rather than
+# of a local constant. The binding limits are real and elsewhere: the renderer's
+# own MAX_BYTES in docgen.py, checked at render time with a readable error, and
+# the provider's actual output ceiling. This number exists only to turn an
+# absurd request into an honest message instead of a silent stub.
+_MAX_WORDS_PER_RENDER = 500_000
 
 
 def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
@@ -883,9 +1432,19 @@ def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
             return min(max(150, v * 450), _MAX_WORDS_PER_RENDER), \
                 f"the requested {v} page(s)"
 
+    # An explicit LIMIT in the request outranks a genre word. "a TL;DR of this
+    # report" contains "report", but it is a 120-word ceiling the user set; a
+    # 1,200-word floor there would make the contract demand two numbers at
+    # once and the model could satisfy neither.
+    limit = ceiling_for(q, skill_name)
     for floor, label, pat in _LENGTH_TIERS:
-        if pat.search(q):
-            return floor, label
+        if not pat.search(q):
+            continue
+        if floor > 0 and limit and limit <= floor:
+            # The user's cap wins; report no floor so `length_contract` emits
+            # the ceiling block alone rather than contradicting it.
+            return 0, label
+        return floor, label
     # Nothing was asked for. Imposing a number here is what produced 700-word
     # documents from every brief, including the ones that said "comprehensive".
     return 0, "whatever the material genuinely supports"
@@ -968,11 +1527,18 @@ def length_contract(query: str, skill_name: str = "") -> str:
             + shared
         )
     if floor <= 0:
+        # The trailing "and no more" was the defect. With no number to aim
+        # at, that clause is read as an instruction to stop early: the
+        # measured result was documents of a few hundred words against
+        # research inputs running to tens of thousands of characters. Length
+        # still follows the material - but "as much as it supports" is a floor
+        # direction, not a cap.
         return (
             "\n\n## LENGTH\n\n"
             f"The request reads as {label}. No length has been imposed on "
-            f"you: write as much as the material genuinely supports, and no "
-            f"more.\n\n"
+            f"you, so write as much as the material genuinely supports: "
+            f"develop every point you have evidence for rather than "
+            f"summarising it and stopping.\n\n"
             + shared
         )
     target_floor = max(80, int(floor * 0.75))
@@ -1043,32 +1609,151 @@ def _format_requested_in(text: str) -> str:
     return best_fmt
 
 
+def _balanced_object(t: str) -> str | None:
+    """The first complete top-level JSON object in `t`, string-aware.
+
+    The old fallback was `t[t.find("{"):t.rfind("}")+1]` - a blind slice from
+    the first brace to the last. A researcher whose findings quote a formula or
+    a citation containing a brace makes that span start or end in the wrong
+    place, and the parse fails on a reply that was perfectly good.
+
+    Measured cost of that: `n_004` returned output beginning
+    `{"question": "gradients and hydraulics in Roman water con...`, was
+    rejected, retried ZERO times, and took a whole research node - plus the
+    recovery re-run and the duplicate document it triggered - with it."""
+    start = -1
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(t):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    return t[start:i + 1]
+    return None
+
+
+def _repair_json(t: str) -> str:
+    """Fix the JSON defects models actually emit, without touching valid JSON.
+
+    * raw control characters inside string literals (a literal newline in a
+      "findings" string is the single most common one), and
+    * trailing commas before `}` / `]`.
+    """
+    out = []
+    in_str = False
+    esc = False
+    for ch in t:
+        if in_str:
+            if esc:
+                esc = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                esc = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+            if ord(ch) < 0x20:
+                # Escape it: \n, \t, \r and the rest.
+                out.append({0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+                            0x0D: "\\r", 0x0C: "\\f"}.get(ord(ch),
+                                                           f"\\u{ord(ch):04x}"))
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+    s = "".join(out)
+    # Trailing commas: `,}` / `,]` but never inside a string.
+    fixed = []
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            fixed.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+            fixed.append(ch)
+            continue
+        if ch in "}]":
+            j = len(fixed) - 1
+            while j >= 0 and fixed[j] in " \t\r\n":
+                j -= 1
+            if j >= 0 and fixed[j] == ",":
+                fixed[j] = " "
+        fixed.append(ch)
+    return "".join(fixed)
+
+
 def parse_skill_json(text: str) -> dict:
     """Skills return a single top-level JSON object. Strip markdown fences
-    if the model added them despite being told not to."""
+    if the model added them despite being told not to.
+
+    Escalating, not brittle: direct parse, then a string-aware balanced-object
+    extraction, then a repair pass for the defects models actually produce.
+    Losing a research node's entire output to a stray brace is a far worse
+    outcome than spending a few microseconds on a second attempt."""
     t = (text or "").strip()
-    # BUG-FIX (K): the old code did `t.strip("`")` which removed *every*
-    # leading/trailing backtick — not just the fence — and could corrupt a
-    # JSON value that legitimately starts/ends with a backtick. Parse the
-    # fence explicitly instead.
     if t.startswith("```"):
-        # Drop the opening fence line (``` or ```json).
         nl = t.find("\n")
         if nl != -1:
             t = t[nl + 1:]
-        # Drop a trailing fence if present.
         if t.endswith("```"):
             t = t[:-3]
         t = t.strip()
+
+    # 1. As-is.
     try:
-        return json.loads(t)
+        val = json.loads(t)
+        if isinstance(val, dict):
+            return val
     except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
-                pass
+        pass
+
+    # 2. The first complete top-level object, ignoring braces inside strings.
+    obj = _balanced_object(t)
+    if obj:
+        try:
+            val = json.loads(obj)
+            if isinstance(val, dict):
+                return val
+        except json.JSONDecodeError:
+            pass
+        # 3. Repaired: escaped control characters, trailing commas.
+        fixed = _repair_json(obj)
+        try:
+            val = json.loads(fixed)
+            if isinstance(val, dict):
+                return val
+        except json.JSONDecodeError:
+            pass
     return {}
 
 
@@ -1102,9 +1787,16 @@ _TOOL_CATALOG = {
         "name": "render_document",
         "description": (
             "Render a PDF, PowerPoint, Word or Excel file and get a "
-            "downloadable artifact back. Write the content as blocks "
-            "(heading/paragraph/bullets/numbers/quote/table/pagebreak), not "
+            "downloadable artifact back. Write the content as blocks, not "
             "as a blob of text: the layout follows the block structure. "
+            "Block types: heading, paragraph, bullets, numbers, quote, "
+            "table, pagebreak, plus three the short list used to omit - "
+            "`chart` (kind bar/line/pie with `categories` and `series`, "
+            "drawn as a real vector chart in the document: use it whenever "
+            "the answer compares numbers over time or across categories, "
+            "rather than describing the numbers in prose), `image` (a "
+            "figure from a document the user uploaded, by document id and "
+            "page - there is no URL fetching), and `cover` (a title page). "
             "Returns an artifact handle and filename - report the filename to "
             "the user, and copy the handle EXACTLY as returned."),
         "input_schema": {
@@ -1632,15 +2324,106 @@ _TOOL_CATALOG = {
     # three tools expose it through the MCP tool channel.
     "schedule_task": {
         "name": "schedule_task",
-        "description": "Schedule a task/reminder to run at a future time. `when` accepts natural language ('in 1h', 'tomorrow 9am') or ISO datetime.",
+        "description": (
+            "Schedule a task/reminder to run at a future time, and optionally "
+            "notify the user over a chat channel — including BEFORE it runs.\n\n"
+            "`when` accepts natural language ('in 1h', 'tomorrow 9am', "
+            "'daily@09:00') or an ISO datetime.\n\n"
+            "Notification arguments, all optional; without them the task runs "
+            "and records locally with no message:\n"
+            "- `channel`: 'telegram' (default when any notification is asked "
+            "for), or 'slack', 'discord', 'gmail', 'webhook', ... Use "
+            "list_channels() to see what is reachable. Anything else is "
+            "refused with the list of valid names.\n"
+            "- `lead_s`: how long BEFORE the task to warn, e.g. '15m', '2h', "
+            "or a number of seconds. Set it when the user would want to "
+            "prepare, not just be told. `lead_message` is the text sent at "
+            "that moment; `message` is the text sent when the task actually "
+            "fires. They are independent, so write a useful warning for one "
+            "and a useful summary for the other.\n"
+            "- `wait_for_ack`: make the warning a conversation instead of an "
+            "announcement. The user is expected to reply; their reply is sent "
+            "to the agent, which decides whether it needs a response and may "
+            "reply back up to `max_follow_ups` times. Use it for reminders "
+            "the user must not miss. Without it the warning is sent once and "
+            "forgotten.\n"
+            "- `snooze_s`: how long to wait before nudging again if the user "
+            "has not replied. Requires wait_for_ack.\n"
+            "- `ack_timeout_s`: give up on the conversation after this long. "
+            "Defaults to 15 minutes.\n"
+            "- `max_follow_ups`: how many times the agent may re-message "
+            "(0-10, default 3). This is a hard cap, not a suggestion.\n\n"
+            "Example: schedule_task('Board briefing', 'tomorrow 9am', "
+            "channel='telegram', lead_s='15m', "
+            "lead_message='Board briefing in 15 minutes - anything to add?', "
+            "message='Board briefing starting now.', wait_for_ack=True, "
+            "max_follow_ups=2, snooze_s='5m')"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "The task for the agent to run at the scheduled time."},
-                "when": {"type": "string", "description": "When to run it (natural language or ISO)."},
+                "query": {"type": "string",
+                          "description": "The task for the agent to run at the scheduled time."},
+                "when": {"type": "string",
+                         "description": "When to run it (natural language or ISO)."},
                 "conversation_id": {"type": "string"},
+                "channel": {"type": "string",
+                            "description": "Delivery channel: telegram, slack, discord, gmail, webhook, ... See list_channels()."},
+                "lead_s": {"type": "string",
+                           "description": "How long before the task to warn, e.g. '15m', '2h', or seconds."},
+"lead_message": {"type": "string",
+                                  "description": "The text sent at pre-warning time, exactly as written."},
+                "message": {"type": "string",
+                            "description": "The text the user receives when the task fires, sent "
+                                           "EXACTLY as written - no template, no emoji, no timing "
+                                           "line added. Write the words you want them to read, "
+                                           "in your own voice, for this specific reminder. "
+                                           "Leave it empty only if you truly have nothing to say "
+                                           "beyond the task's own output."},
+                "wait_for_ack": {"type": "boolean",
+                                 "description": "Make the warning a conversation the user is expected to answer."},
+                "snooze_s": {"type": "string",
+                             "description": "Delay before nudging again if unanswered."},
+                "ack_timeout_s": {"type": "string",
+                                  "description": "Give up on the conversation after this long. Default 15m."},
+                "max_follow_ups": {"type": "integer",
+                                   "description": "Hard cap on re-messages, 0-10."},
             },
             "required": ["query", "when"],
+        },
+    },
+    "list_channels": {
+        "name": "list_channels",
+        "description": (
+            "Chat channels a notification can be delivered on, and what each "
+            "needs. Read from the gateway, so it cannot drift from what "
+            "actually works. Each entry reports whether the gateway holds a "
+            "credential ('configured'), what kind of destination it needs, and "
+            "— for the ones that can be paired by simply messaging the bot — "
+            "whether anyone is paired yet. A channel that is configured with "
+            "no destination is the one that looks fine and delivers nothing, "
+            "so call this before promising the user a notification."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    "check_channel": {
+        "name": "check_channel",
+        "description": (
+            "Verify whether a chat channel's credential still works. Separate "
+            "from list_channels on purpose: that reports what is configured, "
+            "this reports whether the credential is still accepted. Use it "
+            "when a scheduled notification has stopped arriving — a revoked "
+            "bot token leaves the channel looking configured while every send "
+            "fails. Never returns the token itself; if re-authentication "
+            "needs a human it says so and names the environment variable."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string",
+                            "description": "Channel name, e.g. 'telegram'."},
+            },
+            "required": ["channel"],
         },
     },
     "list_scheduled": {
@@ -1657,6 +2440,95 @@ _TOOL_CATALOG = {
                 "schedule_id": {"type": "string"},
             },
             "required": ["schedule_id"],
+        },
+    },
+    "enable_scheduled": {
+        "name": "enable_scheduled",
+        "description": (
+            "Turn a scheduled task back on, or off, without deleting it. Use "
+            "this when the user says a reminder is 'disabled' or 'greyed out', "
+            "or asks you to enable it - scheduling the same thing again "
+            "creates a DUPLICATE row and leaves the original off, which is not "
+            "what they asked. A one-shot whose time has passed cannot be "
+            "re-armed and will say so; cancel it and schedule a new one."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "schedule_id": {"type": "string",
+                                "description": "The id from list_scheduled."},
+                "enabled": {"type": "boolean",
+                            "description": "True to switch it back on, false "
+                                           "to switch it off. Default true."},
+            },
+            "required": ["schedule_id"],
+        },
+    },
+    "save_as_document": {
+        "name": "save_as_document",
+        "description": (
+            "Save a file you already produced into the user's Documents "
+            "section, where it is listed and indexed for search. Use it when "
+            "the user says 'save that to my docs', 'keep this for later', or "
+            "'put it in my documents'. `path` is a sandbox path or an "
+            "`art:<id>` handle from render_document. This is the only way a "
+            "file reaches Documents - render_document makes a downloadable "
+            "artifact and create_file writes to the sandbox, but neither "
+            "appears in that list."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description": "Sandbox path, or art:<id> handle."},
+                "filename": {"type": "string",
+                             "description": "Name to show. Defaults to the "
+                                            "file's own name; keep the "
+                                            "extension so it is indexed."},
+            },
+            "required": ["path"],
+        },
+    },
+    "record_observation": {
+        "name": "record_observation",
+        "description": (
+            "Note something durable about how the user works, quoting their own "
+            "words as evidence. Use when they correct you or say how they want "
+            "things done ('always give me the date', 'stop with the preamble', "
+            "'shorter'). `evidence` must be copied verbatim; the store "
+            "discards any observation whose quote it cannot find in the "
+            "conversation, so a paraphrase fails and only a real quote "
+            "survives. Behaviour only: no personality labels, no mental-health "
+            "observations, no guesses about motive."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "observation": {"type": "string",
+                                "description": "One third-person sentence "
+                                               "about observable behaviour."},
+                "evidence": {"type": "string",
+                             "description": "Their words, verbatim."},
+                "keywords": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number",
+                               "description": "How well supported this is, "
+                                              "0-1. Default 0.8."},
+            },
+            "required": ["observation", "evidence"],
+        },
+    },
+    "recall_observations": {
+        "name": "recall_observations",
+        "description": (
+            "What you have noticed about how the user works, each with the "
+            "user's own words as evidence. Behavioural only - requests, "
+            "corrections, answer shape. Treat entries as hypotheses, not "
+            "facts; the user contradicting one wins."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "k": {"type": "integer", "description": "Default 10."},
+                "min_confidence": {"type": "number",
+                                   "description": "Drop weaker entries. "
+                                                  "Default 0."},
+            },
         },
     },
     # Sandbox FS + indexing tools. They exist in mcp_server.py but no skill
@@ -1689,6 +2561,45 @@ _TOOL_CATALOG = {
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
+        },
+    },
+    "run_checks": {
+        "name": "run_checks",
+        "description": "Run this project's own lint/typecheck/test suite and report the real exit code and output. Detect the checker from what the project contains (pyproject/pytest.ini -> pytest, tsconfig.json -> tsc, package.json -> npm test, ruff.toml -> ruff, Cargo.toml -> cargo check, go.mod -> go vet). Call this after every edit and read the output.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "default": "."},
+                "timeout": {"type": "integer", "default": 180},
+            },
+            "required": [],
+        },
+    },
+    "git_inspect": {
+        "name": "git_inspect",
+        "description": "See what changed: target='status' for changed files, 'diff' for the patch, 'log' for recent commits. Use 'diff' to review your own edits before declaring the work done.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "default": "."},
+                "target": {"type": "string", "enum": ["status", "diff", "log"],
+                           "default": "status"},
+                "max_chars": {"type": "integer", "default": 20000},
+            },
+            "required": [],
+        },
+    },
+    "find_symbol": {
+        "name": "find_symbol",
+        "description": "Find where a function/class is DEFINED and every place it is USED, with line numbers and definitions reported separately from call sites. Better than regex search, which cannot tell a definition from a use.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "path": {"type": "string", "default": "."},
+                "max_hits": {"type": "integer", "default": 40},
+            },
+            "required": ["name"],
         },
     },
     "search_files": {
@@ -2369,6 +3280,13 @@ policy_notes: list | None = None,
                   f"recovering the spec")
             parsed = dict(_inner)
 
+    # NOTE on duplicate renders: a second render_document call is normally the
+    # model re-rendering after reading `stats.words`, or correcting itself.
+    # Both files used to reach produced_files.json, so the console listed two
+    # near-identically-named PDFs and the user had to guess which was which.
+    # The latest render is the finished one, so it is the one that is kept -
+    # see the collapse of `produced` below.
+
     # The tool loop came back with nothing at all - no text, no tool call.
     # Observed live, repeatedly, on the author node: the prompt asks it to
     # call render_document, the tool loop yields an empty completion, and the
@@ -2507,7 +3425,7 @@ policy_notes: list | None = None,
                             }] + _blocks
             got = _mcp.render_document(
                 format=fmt,
-                title=str(parsed.get("title") or query or "Document")[:200],
+                title=_document_title(parsed, query),
                 subtitle=str(parsed.get("subtitle") or "")[:300],
                 author_name=str(parsed.get("author") or "")[:120],
                 toc=bool(_forced.get("toc")) or bool(parsed.get("toc")),
@@ -2540,6 +3458,15 @@ policy_notes: list | None = None,
                 print(f"[skills] {skill.name}: rendered the model's spec from "
                       f"code ({len(parsed['blocks'])} blocks, "
                       f"{(got.get('stats') or {}).get('words')} words)")
+
+                # The single call came back far under the length the request
+                # implies, and the reason is SHAPE: one tool call cannot carry
+                # a 27,000-word blocks array. Rewrite it section by section and
+                # render ONCE, so the user still gets a single document.
+                _authoritative = await _expand_document_sections(
+                    skill, rendered, _blocks, resolved, graph_nodes, query,
+                    session_id, parsed, fmt, _forced, _f, got,
+                    pre_rendered=False)
             else:
                 _why = (f"spec fallback render failed: "
                         f"{str((got or {}).get('error') or got)[:250]}")
@@ -2553,6 +3480,71 @@ policy_notes: list | None = None,
             _why = f"spec fallback render raised {type(e).__name__}: {e}"[:250]
             render_errors.append(_why)
             print(f"[skills] {skill.name}: {_why}")
+
+    # The sectioned rewrite ALSO has to run when the model called
+    # render_document itself. It was wired only into the spec-fallback branch
+    # above, so a WELL-BEHAVED author - one that actually called the tool -
+    # never got it. Measured: the 18-page run happened to come from a node
+    # whose tool call failed and fell back to returning a spec; a clean run
+    # rendered 904 words against a 27,000-word floor and stopped. The worse
+    # the model's behaviour, the bigger the document - exactly backwards.
+    #
+    # Skipped when the fallback above already handled it (it sets
+    # `_authoritative`), so the expansion can only happen once.
+    # One document, written SECTION BY SECTION, unconditionally.
+    #
+    # There is no trigger and no threshold any more. Every previous version
+    # gated this on `_delivered < _floor * 0.6` AND on being able to derive an
+    # outline, and the gate never fired once in four consecutive runs - so every
+    # well-behaved author shipped its single ~900-word call and the mechanism
+    # that produced 6,509 words (N section calls) never ran. The 6,509-word
+    # result was not a threshold firing; it was nine separate calls happening.
+    #
+    # So this always runs for author/deck, on whichever render path produced
+    # the document. One author node, N section calls, ONE rendered file.
+    if skill.name in ("author", "deck"):
+        # `_f` was defined inside the spec-fallback branch, so the
+        # unconditional block below could not see it (UnboundLocalError) and
+        # `_authoritative[0]` did not exist on the tool path (KeyError: 0).
+        # Both are page-setup readers; define them here, once.
+        def _f(k, d=""):
+            return str(_forced.get(k) or d)
+
+        if isinstance(_authoritative, dict) and _authoritative:
+            # `_authoritative` is a DICT on the path that assigns it
+            # `parsed` directly, so `_authoritative[0]` was a KeyError.
+            _authoritative = await _expand_document_sections(
+                skill, rendered, parsed.get("blocks") or [], resolved,
+                graph_nodes, query, session_id, parsed,
+                str(_authoritative.get("format") or "pdf"), _forced, _f,
+                _authoritative, pre_rendered=True)
+        elif isinstance(_authoritative, list) and _authoritative:
+            _cur = _authoritative[-1]
+            _authoritative = await _expand_document_sections(
+                skill, rendered, parsed.get("blocks") or [], resolved,
+                graph_nodes, query, session_id, parsed,
+                str(_cur.get("format") or "pdf"), _forced, _f, _cur,
+                pre_rendered=True)
+        elif produced:
+            _cur = produced[-1]
+            produced[:] = [await _expand_document_sections(
+                skill, rendered, parsed.get("blocks") or [], resolved,
+                graph_nodes, query, session_id, parsed,
+                str(_cur.get("format") or "pdf"), _forced, _f, _cur,
+                pre_rendered=True)[0]]
+
+    # Collapse duplicate renders to the LAST one. The author often renders,
+    # reads `stats.words`, and re-renders fuller; both files then reached
+    # produced_files.json and the console, so one request produced two PDFs
+    # with near-identical names. The final render is the finished document,
+    # so it is the one the user should see.
+    if (skill.name in ("author", "deck") and len(produced) > 1):
+        _superseded = produced[:-1]
+        produced[:] = [produced[-1]]
+        print(f"[skills] {skill.name}: {len(_superseded) + 1} renders in one "
+              f"node; keeping the final one "
+              f"({(produced[-1].get('stats') or {}).get('words')} words) and "
+              f"dropping {len(_superseded)} superseded draft(s)")
 
     # A writing skill that claims a document and never produced one produced
     # nothing. Failing here is the whole point: the run must not reach the

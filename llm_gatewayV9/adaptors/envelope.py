@@ -27,6 +27,13 @@ class Attachment(BaseModel):
     data_b64: str | None = None  # small inline payloads
     mime: str | None = None
     name: str | None = None
+    size: int = 0
+    # A provider-held handle, meaningful only to the adaptor that issued it.
+    # Telegram gives a `file_id` instead of bytes, so without this field the
+    # identifier was dropped at construction and every downstream lookup of
+    # it came back empty - the file was registered as existing but could
+    # never be fetched.
+    file_id: str | None = None
 
 
 class ChannelMessage(BaseModel):

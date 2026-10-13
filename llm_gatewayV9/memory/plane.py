@@ -38,10 +38,11 @@ from .service import MemoryService, check_writer, route_drawer
 # Recall priority for merged reads. Audit is review-only: searchable when
 # named explicitly, never injected into prompts by default.
 RECALL_ORDER: list[DrawerName] = [
-    "policy", "fact", "playbook", "document", "episode", "working",
+    "policy", "profile", "fact", "playbook", "document", "episode", "working",
 ]
 ALL_DRAWERS: list[DrawerName] = [
     "working", "episode", "fact", "playbook", "policy", "audit", "document",
+    "profile",
 ]
 
 # Phase 2: the session-start drawer set. Working notes are run-scoped by
@@ -49,7 +50,7 @@ ALL_DRAWERS: list[DrawerName] = [
 # else. The agent passes this list explicitly — the contract is pinned
 # here, not inferred per query.
 SESSION_DRAWERS: list[str] = [
-    "policy", "fact", "playbook", "document", "episode", "legacy",
+    "policy", "profile", "fact", "playbook", "document", "episode", "legacy",
 ]
 
 # Working notes disappear: default TTL applied server-side when the write
@@ -160,7 +161,8 @@ class MemoryPlane:
                        sources: list[SourceRef] | None = None,
                        expires_at: datetime | None = None,
                        supersedes: str | None = None,
-                       doc: DocSpan | None = None) -> MemoryRecord:
+                       doc: DocSpan | None = None,
+                       confidence: float = 1.0) -> MemoryRecord:
         routed = drawer or route_drawer(kind, value)
         if value and value.get("chunk") is not None:
             routed = "document"  # indexer spans must stay spans
@@ -185,7 +187,8 @@ class MemoryPlane:
             session_id=session_id, drawer=routed,
             principal_role=principal_role,  # type: ignore[arg-type]
             principal_id=principal_id, scope=scope, sources=sources,
-            expires_at=expires_at, supersedes=supersedes, doc=doc)
+            expires_at=expires_at, supersedes=supersedes, doc=doc,
+            confidence=confidence)
         if supersedes:
             await self._mark_superseded(supersedes, item.id, routed)
         if routed == "document" and doc and doc.doc_id:

@@ -266,7 +266,21 @@ async def lifespan(app: FastAPI):
     app.state.router_pool = RouterPool(app.state.router_providers,
                                        expand_order(ROUTER_ORDER, app.state.router_providers))
     app.state.embedders, app.state.embed_order = E.build_embedders()
+    # Inbound Telegram. Long-polls in-process because a webhook needs a public
+    # HTTPS URL (Telegram cannot reach 127.0.0.1) and no `setWebhook` call
+    # exists anywhere in this repo — which left the inbound path, and therefore
+    # pairing, unreachable on a local install. See telegram_poller.py.
+    try:
+        import telegram_poller as _TGP
+        app.state.telegram_poller = _TGP.start()
+    except Exception as _e:
+        print(f"[telegram] poller not started: {type(_e).__name__}")
     yield
+    try:
+        import telegram_poller as _TGP
+        _TGP.stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="LLM Gateway V9", lifespan=lifespan,

@@ -580,3 +580,42 @@ html, body, #root {
 .docview-thumb img { width: 100%; height: auto; display: block; }
 .docview-thumb-svg { display: block; width: 100%; }
 .docview-thumb-svg svg { width: 100%; height: auto; display: block; }
+
+/* Images inside rendered markdown (chat answers, research summaries).
+   The renderer emits `max-width: 100%` so an oversized figure cannot force
+   the transcript to scroll sideways, and `vertical-align` keeps an inline
+   image from opening a gap under its baseline. A chart the model drew as an
+   image lands here. */
+.md img, .prose img {
+  max-width: 100%; height: auto; display: block; margin: 10px 0;
+  border-radius: 4px; background: #fff;
+}
+.md img[data-src], .prose img[data-src] { min-height: 40px; }
+
+/* ── Desktop window chrome ────────────────────────────────────────────────
+   The Electron shell sets `titleBarStyle: 'hidden'`, which removes the OS
+   title bar and reclaims its height on every screen. `app-region: drag` is what
+   makes the replacement strip behave like one: the OS drags the window with
+   it. Without this rule the window cannot be moved at all.
+
+   The buttons inside it set `no-drag`, because an element marked `drag` does
+   not deliver clicks — the press is swallowed as the start of a window move.
+   The inverse mistake is worse: marking the whole app draggable makes text
+   unselectable and every control awkward to click, so the region is scoped to
+   the strip alone.
+
+   Harmless in a browser: `-webkit-app-region` is simply an unknown property
+   there, and the strip is never rendered outside Electron anyway. */
+.aria-dragbar {
+  -webkit-app-region: drag;
+  app-region: drag;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.aria-dragbar button,
+.aria-dragbar a,
+.aria-dragbar input,
+.aria-dragbar select {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}

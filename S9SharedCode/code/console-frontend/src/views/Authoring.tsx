@@ -31,6 +31,28 @@ interface MadeFile {
   format: string;
   artifact: string;
   bytes?: number;
+  /** What render_document reported about the delivered document. */
+  blocks?: number;
+  stats?: { words?: number; sections?: number; format?: string };
+  /** Tokens + spend. `scope` is "run": this is the whole authoring run's
+   *  cost, not this file's alone, because the planner, researchers and author
+   *  all draw on one budget and cannot be attributed per document. */
+  cost?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    turns: number;
+    calls?: number;
+    cost: number;
+    currency: string;
+    scope: string;
+    by_agent?: Record<string, {
+      input_tokens: number;
+      output_tokens: number;
+      cost: number;
+      calls: number;
+    }>;
+  };
 }
 
 /** An authoring run, as the sidebar shows it.
@@ -53,7 +75,7 @@ interface Run extends SessionSummary {
 
 /** What /produced says about one run. */
 type Produced = {
-  files?: { artifact: string; filename: string; format: string }[];
+  files?: MadeFile[];
   answer?: string;
   live?: boolean;
   nodes?: { id: string; skill: string; status: string }[];
@@ -63,13 +85,55 @@ type Produced = {
 const logLines = (nodes?: Produced['nodes']) =>
   (nodes || []).map((n) => `[${n.id}] ${n.skill} ${n.status}`);
 
+const kb = (n?: number) =>
+  n == null ? '' : n >= 1024 * 1024
+    ? `${(n / 1024 / 1024).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(n / 1024))} KB`;
+
+/** One line under a filename: what was delivered, and what the run cost.
+ *
+ *  Nothing is invented - each part is omitted when the server did not report
+ *  it, so a missing figure reads as absent rather than as zero. */
+const fileMeta = (f: MadeFile): string[] => {
+  const out: string[] = [];
+  const w = f.stats?.words;
+  const s = f.stats?.sections;
+  if (w != null) {
+    out.push(s != null
+      ? `${w.toLocaleString()} words · ${s} section${s === 1 ? '' : 's'}`
+      : `${w.toLocaleString()} words`);
+  }
+  if (f.bytes != null) out.push(kb(f.bytes));
+  const c = f.cost;
+  if (c && c.total_tokens) {
+    // `scope` is honest about what the number is: "run" is this authoring run's
+    // spend; "session" is the whole conversation's, used only as a fallback
+    // when the per-turn ledger could not be written. Presenting the second as
+    // the first would over- or under-state a document's cost silently.
+    const label = c.scope === 'session' ? 'tokens (whole session)'
+      : c.scope === 'run' ? 'tokens' : 'tokens';
+    out.push(`${c.total_tokens.toLocaleString()} ${label}`);
+    if (c.cost > 0) {
+      out.push(`$${c.cost.toFixed(3)}${c.scope === 'session' ? ' (session)' : ''}`);
+    }
+  }
+  return out;
+};
+
 /** Fold a /produced snapshot into its row. One place, so the sidebar count, the
  *  receipt and the file list can never disagree about what a run did. */
 const withProduced = (r: Run, snap: Produced): Run => {
-  const fs = (snap.files || []).map((f) => ({
+  const fs: MadeFile[] = (snap.files || []).map((f) => ({
     artifact: f.artifact,
     filename: f.filename,
     format: f.format,
+    // Carried through so the file list can show what was actually delivered
+    // and what the run cost. Dropping them here is why every file rendered
+    // as a bare name with no size.
+    bytes: f.bytes,
+    blocks: f.blocks,
+    stats: f.stats,
+    cost: f.cost,
   }));
   return {
     ...r,
@@ -1195,6 +1259,17 @@ export default function Authoring() {
                             {p.subtitle}
                           </span>
                         )}
+                        {/* What was actually delivered, and what the run cost.
+                            *  A 9-word "document" and a 1,900-word one look
+                            *  identical in a file list otherwise. */}
+                        <span className="mt-0.5 block text-[10.5px] text-zinc-500">
+                          {fileMeta(f).map((bit, i) => (
+                            <span key={bit}>
+                              {i > 0 && <span className="text-zinc-700"> · </span>}
+                              {bit}
+                            </span>
+                          ))}
+                        </span>
                       </span>
                       {f.format && <Pill tone="info">{f.format}</Pill>}
                       <button
