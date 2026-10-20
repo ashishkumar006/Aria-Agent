@@ -57,6 +57,37 @@ def test_an_explicit_short_request_still_binds(query, ceiling):
     assert skills.ceiling_for(query, "author") == ceiling
     block = skills.length_contract(query, "author")
     assert f"{ceiling:,}" in block, block
+    # The same number must not also be stated as a FLOOR: "one page" is a
+    # ceiling, and the old explicit-count branch read it as "at least 450".
+    assert "FLOOR" not in block, block
+
+
+@pytest.mark.parametrize("query,ceiling", [
+    ("two paragraphs on the outage", 240),
+    ("three sentences on the outage", 90),
+    ("5 bullets on the outage", 100),
+])
+def test_multi_unit_asks_scale_the_cap(query, ceiling):
+    """H6: only `one paragraph` was recognised; "two paragraphs on X" had no
+    cap, so the shape instruction was silently ignored."""
+    assert skills.ceiling_for(query, "author") == ceiling
+    assert f"{ceiling:,}" in skills.length_contract(query, "author")
+
+
+def test_the_authoring_prefix_does_not_add_a_length_floor():
+    """`Create a document.` is the console's routing prefix, not the user's
+    request. It used to match the "produce a document" tier and put a
+    1,000-word floor under a board note or a short brief."""
+    assert skills.length_target(
+        "Create a document.\n\nA board note on why onboarding takes 9 days",
+        "author")[0] == 0
+    # A genre or verb the USER wrote still earns its floor.
+    assert skills.length_target(
+        "Create a document.\n\nWrite a report on Roman aqueducts",
+        "author")[0] >= 1200
+    assert skills.length_target(
+        "Create a document.\n\nproduce a pdf explaining RAG",
+        "author")[0] >= 1000
 
 
 def test_impossible_word_counts_are_capped_and_said_so():

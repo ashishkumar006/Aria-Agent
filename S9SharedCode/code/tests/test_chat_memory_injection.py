@@ -99,9 +99,17 @@ def test_document_registry_failure_still_yields_hits(monkeypatch):
     assert "user is in IST" in agent_server._chat_memory_block("tz?", "s1")
 
 
-async def test_with_chat_memory_inserts_before_final_user_turn():
+async def test_with_chat_memory_inserts_before_final_user_turn(monkeypatch):
     """Ordering matters: the block must sit adjacent to the question, the
-    same contract as document context."""
+    same contract as document context.
+
+    The block is stubbed. This test is about WHERE the block is inserted, and
+    left reading the real memory store it silently depended on the store
+    happening to be non-empty - so it passed or failed with whatever the user
+    had remembered, and went red the moment memory was cleared.
+    """
+    monkeypatch.setattr(agent_server, "_chat_memory_block",
+                        lambda q, s: "REMEMBERED: user is in IST")
     msgs = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "old"},
@@ -112,6 +120,9 @@ async def test_with_chat_memory_inserts_before_final_user_turn():
 
     assert out[-1]["content"] == "the question"
     assert out[-2]["role"] == "system"
+    assert "REMEMBERED" in out[-2]["content"]
+    # The original transcript must be intact around the insertion.
+    assert [m["content"] for m in out[:3]] == ["sys", "old", "reply"]
 
 
 async def test_with_chat_memory_is_a_noop_without_hits(monkeypatch):

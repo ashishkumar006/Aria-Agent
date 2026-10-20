@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import { Rail, TopBar, Skel, Pill, SkipLink } from '../components/ui';
+import { useMainId, useActivePoll } from '../components/KeepAlive';
 import { api, CONF, gatewayUrl, getToken, setToken } from '../api';
+import { yamlHighlighter, yamlLine } from '../lib/yaml';
 
 export default function Settings() {
+  const mainId = useMainId();
   const [rows, setRows] = useState<[string, boolean, string][]>([]);
   const [loaded, setLoaded] = useState(false);
   const [cfg, setCfg] = useState('');
@@ -21,6 +24,15 @@ export default function Settings() {
   const cfgLines = cfg.split('\n');
   const cfgQ = cfgFilter.trim().toLowerCase();
   const cfgHits = cfgQ ? cfgLines.filter((l) => l.toLowerCase().includes(cfgQ)).length : 0;
+  /* Highlighting is stateful: it has to know whether a line is inside a `|`
+     block scalar, and that depends on the lines before it. So the spans are
+     computed in ONE ordered pass over the document, memoised on `cfg` - not
+     per line during render, which would walk the wrong state and mis-colour
+     every prompt body. */
+  const cfgSpans = useMemo(() => {
+    const h = yamlHighlighter();
+    return cfgLines.map((l) => h.line(l));
+  }, [cfg]);
 
   const load = useCallback(async () => {
     const [h, tools, sess, sch, tpl, c] = await Promise.all([
@@ -55,11 +67,7 @@ export default function Settings() {
     setApiDown(!h);
   }, []);
 
-  useEffect(() => {
-    load();
-    const t = setInterval(load, CONF.pollSlowMs);
-    return () => clearInterval(t);
-  }, [load]);
+  useActivePoll(load, CONF.pollSlowMs);
 
   useEffect(() => { setTokenField(getToken()); }, []);
 
@@ -89,7 +97,7 @@ export default function Settings() {
           ))}
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Settings" />
         <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
           {loaded && apiDown && (
@@ -142,10 +150,20 @@ export default function Settings() {
             />
             {cfgQ && <span className="font-sans font-semibold normal-case tracking-normal text-violet-300">{cfgHits} hit{cfgHits === 1 ? '' : 's'}</span>}
           </div>
-          <div className="overflow-auto whitespace-pre-wrap rounded-[10px] border border-white/10 bg-[#0a0a0d] p-3.5 font-mono text-[11.5px] leading-relaxed">
-            {!cfg && 'loading…'}
+          {/* FIXED height, not intrinsic. This block went from the single word
+              "loading…" to several hundred lines of YAML the moment the config
+              arrived, and everything below it was pushed down with it -
+              cumulative layout shift 0.70 on tablet and 0.64 on mobile, the
+              worst on the site by a factor of two. A bounded, scrollable region
+              is also the right shape for a config dump: an unbounded `<pre>`
+              lets one long file make the whole page taller than the viewport. */}
+          <div className="h-[52vh] min-h-[300px] overflow-auto whitespace-pre-wrap rounded-[10px] border border-white/10 bg-[#0a0a0d] p-3.5 font-mono text-[11.5px] leading-relaxed">
+            {!cfg && <span className="text-zinc-500">loading…</span>}
             {cfgLines.map((l, i) => (
-              <div key={i} className={cfgQ && !l.toLowerCase().includes(cfgQ) ? 'opacity-25' : undefined}>{l || ' '}</div>
+              /* Highlighting returns nodes, not an HTML string: this file
+                 contains prompts and prose, and rendering it through
+                 dangerouslySetInnerHTML would parse its own text as markup. */
+              <div key={i}>{yamlLine(cfgSpans[i], !!cfgQ && !l.toLowerCase().includes(cfgQ))}</div>
             ))}
           </div>
           <div className="mt-3 text-[11px] text-zinc-muted">

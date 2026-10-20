@@ -6,7 +6,17 @@ GEMINI_API_KEY_2, GITHUB_TOKEN, OPENROUTER_API_KEY) while missing real ones.
 Run: uv run python check_keys.py
 """
 import os
+import sys
+
 from dotenv import load_dotenv
+
+# The section banners use box-drawing characters. On Windows, piped stdout is
+# still encoded with the locale codepage (cp1252), which crashed the report
+# halfway through. Force UTF-8 so the tool always finishes.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 load_dotenv('.env')
 

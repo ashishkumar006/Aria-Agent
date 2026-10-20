@@ -19,18 +19,22 @@ def test_key_list_parsing(monkeypatch):
 
 
 def test_sibling_build(monkeypatch):
+    # Kilo is the vehicle now. These tests exercise the FAN-OUT MECHANISM
+    # (singular + plural keys -> -2, -3 siblings), and groq - which they used
+    # to use - is no longer constructed at all, so keeping it here would assert
+    # a behaviour the gateway no longer has.
     for v in ["GEMINI_API_KEY", "GEMINI_API_KEYS", "NVIDIA_API_KEY",
-              "NVIDIA_API_KEYS", "CEREBRAS_API_KEY", "OPEN_ROUTER_API_KEY",
-              "GITHUB_ACCESS_TOKEN", "KILO_API_KEY", "OLLAMA_MODEL"]:
+              "NVIDIA_API_KEYS", "CEREBRAS_API_KEY", "GROQ_API_KEY",
+              "GROQ_API_KEYS", "OPEN_ROUTER_API_KEY",
+              "GITHUB_ACCESS_TOKEN", "OLLAMA_MODEL"]:
         monkeypatch.delenv(v, raising=False)
-    monkeypatch.setenv("GROQ_API_KEY", "a")
-    monkeypatch.setenv("GROQ_API_KEYS", "b,c")
+    monkeypatch.setenv("KILO_API_KEY", "a")
+    monkeypatch.setenv("KILO_API_KEYS", "b,c")
     from cache import GeminiCache
     ws = P.build_providers(GeminiCache())
-    assert sorted(ws.keys()) == ["groq", "groq-2", "groq-3"]
-    assert ws["groq-2"].model == ws["groq"].model
-    # capabilities resolve through the canonical provider
-    assert ws["groq-2"].capabilities.get("tools") is True
+    assert sorted(ws.keys()) == ["kilo", "kilo-2", "kilo-3"]
+    assert ws["kilo-2"].model == ws["kilo"].model
+    assert ws["kilo-3"].model == ws["kilo"].model
 
 
 def test_gemini_pair_fanout(monkeypatch):
@@ -46,13 +50,79 @@ def test_gemini_pair_fanout(monkeypatch):
 
 
 def test_router_sibling_build(monkeypatch):
+    # Must clear every other key and pin ROUTER_ORDER, because ROUTER_ORDER is
+    # an ALLOWLIST that decides which router providers get BUILT.
+    for v in ["CEREBRAS_API_KEY", "CEREBRAS_API_KEYS", "GROQ_API_KEY",
+              "GROQ_API_KEYS", "NVIDIA_API_KEY", "NVIDIA_API_KEYS",
+              "GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"]:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.delenv("KILO_API_KEYS", raising=False)
+    monkeypatch.setenv("KILO_API_KEY", "a")
+    monkeypatch.setenv("KILO_API_KEYS", "b")
+    monkeypatch.setenv("ROUTER_ORDER", "kilo")
+    rp = P.build_router_providers()
+    assert sorted(rp.keys()) == ["kilo", "kilo-2"]
+
+
+def test_disabled_providers_are_never_constructed(monkeypatch):
+    """The removal has to hold against a hostile environment.
+
+    Keys present, and every disabled provider named in BOTH allowlists: if any
+    of them can still be built, it is still reachable via an explicit
+    `provider=` request - which is exactly the "I don't want these at all"
+    requirement failing quietly.
+    """
+    for v in ("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS", "GROQ_API_KEY",
+              "GROQ_API_KEYS", "NVIDIA_API_KEY", "NVIDIA_API_KEYS",
+              "OPEN_ROUTER_API_KEY", "OPEN_ROUTER_API_KEYS",
+              "GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS", "KILO_API_KEY"):
+        monkeypatch.setenv(v, "k")
+    monkeypatch.setenv("ROUTER_ORDER",
+                       "cerebras,groq,nvidia,github,openrouter,kilo")
+    from cache import GeminiCache
+    workers = P.build_providers(GeminiCache())
+    routers = P.build_router_providers()
+    for dead in P.DISABLED_PROVIDERS:
+        assert dead not in workers, f"{dead} is still a worker"
+        assert dead not in routers, f"{dead} is still a router"
+        # and no sibling fan-out of it either
+        assert not [k for k in workers if k == dead or k.startswith(dead + "-")]
+    assert "kilo" in workers and "kilo" in routers
+
+
+def test_router_order_is_an_allowlist(monkeypatch):
+    """A provider left out of ROUTER_ORDER must not even be constructed."""
+    for v in ["CEREBRAS_API_KEY", "CEREBRAS_API_KEYS", "GROQ_API_KEY",
+              "GROQ_API_KEYS", "NVIDIA_API_KEY", "NVIDIA_API_KEYS",
+              "GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"]:
+        monkeypatch.delenv(v, raising=False)
+    for v in ("CEREBRAS_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY",
+              "GITHUB_ACCESS_TOKEN", "KILO_API_KEY"):
+        monkeypatch.setenv(v, "k")
+    monkeypatch.setenv("ROUTER_ORDER", "kilo")
+    rp = P.build_router_providers()
+    assert sorted(rp.keys()) == ["kilo"]
+    # Blank ROUTER_ORDER must fall back to the shipped default rather than
+    # silently building an empty pool - and the shipped default is now Kilo
+    # alone, since the per-model-metered routers were all removed.
+    monkeypatch.setenv("ROUTER_ORDER", "")
+    rp = P.build_router_providers()
+    assert sorted(rp.keys()) == ["kilo"]
+
+
+def test_kilo_is_a_router_pool_member(monkeypatch):
+    """The user has to be able to SEE Kilo in the worker pool to use it."""
     for v in ["CEREBRAS_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY",
               "GITHUB_ACCESS_TOKEN"]:
         monkeypatch.delenv(v, raising=False)
-    monkeypatch.setenv("GROQ_API_KEY", "a")
-    monkeypatch.setenv("GROQ_API_KEYS", "b")
+    monkeypatch.delenv("KILO_API_KEYS", raising=False)
+    monkeypatch.setenv("KILO_API_KEY", "a")
+    monkeypatch.setenv("KILO_API_KEYS", "b")
     rp = P.build_router_providers()
-    assert sorted(rp.keys()) == ["groq", "groq-2"]
+    assert sorted(rp.keys()) == ["kilo", "kilo-2"]
+    # Never a retired id, and never a bare name.
+    assert rp["kilo"].model and "/" in rp["kilo"].model
+    assert rp["kilo"].model != "tencent/hy3:free"
 
 
 def test_keep_gemini_only():

@@ -130,7 +130,7 @@ errors surface faithfully as 429/400/502).
 | cerebras | CerebrasProvider | gpt-oss-120b (zai-glm-4.7 archived 2026-09; account currently 402s on all Cerebras models → 5-min backoff + failover covers) | OpenAI-compat |
 | openrouter | OpenRouterProvider | nvidia/nemotron-3-super-120b-a12b:free | OpenAI-compat |
 | github | GitHubProvider | openai/gpt-4.1-mini | OpenAI-compat |
-| kilo | KiloProvider | tencent/hy3:free | reasoning forced OFF unless asked |
+| kilo | KiloProvider | auto (best free model from the live roster) | reasoning forced OFF unless asked; model ids route for agent=`code` only |
 | ollama | OllamaProvider | `$OLLAMA_MODEL`, gated by `ENABLE_OLLAMA_LLM` | local, no tools-parallel/cache |
 
 Each class normalizes its dialect to one result shape (`text`,

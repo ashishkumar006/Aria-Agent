@@ -119,7 +119,11 @@ def test_every_retrieval_capable_skill_gets_the_untrusted_contract():
 
 def test_the_researcher_prompt_states_the_contract_in_its_own_words():
     body = (skills.ROOT / "prompts" / "researcher.md").read_text(encoding="utf-8")
-    assert "UNTRUSTED CONTENT" in body
+    low = body.lower()
+    assert "untrusted_web_content" in low, (
+        "the UNTRUSTED_WEB_CONTENT envelope marker is gone; the code "
+        "wraps every fetched page in it (mcp_server.py:134) and the "
+        "prompt has to name it")
     assert "UNTRUSTED_WEB_CONTENT" in body
 
 

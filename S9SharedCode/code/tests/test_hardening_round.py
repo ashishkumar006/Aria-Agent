@@ -73,12 +73,28 @@ def test_the_dag_endpoint_also_deduplicates():
     run. This asserts the DAG path claims and honours a key."""
     src = (agent_server.ROOT / "agent_server.py").read_text(encoding="utf-8")
     handler = src.split('@app.post("/api/chat")')[1].split("@app.post(")[0]
-    assert "_inflight_run_lookup" in handler, "/api/chat does not dedupe"
     assert "_inflight_run_claim" in handler, "/api/chat does not claim a key"
     assert "_dedup_stream" in handler, "/api/chat does not return a dedup frame"
     # And the run it delegates to must be able to release the key.
     assert "idem_key: str = \"\"" in src
     assert "_inflight_run_release(idem_key)" in src
+
+
+def test_claiming_the_same_key_is_atomic_and_keeps_the_first_owner():
+    """Lookup-then-claim let two simultaneous submits both start a paid run.
+
+    The claim must be one operation: the second caller is told who owns the
+    key, and must never overwrite it.
+    """
+    key = "research:atomic:race"
+    with agent_server._inflight_lock:
+        agent_server._inflight_runs.clear()
+    try:
+        assert agent_server._inflight_run_claim(key, "ct-first") == ""
+        assert agent_server._inflight_run_claim(key, "ct-second") == "ct-first"
+        assert agent_server._inflight_run_lookup(key) == "ct-first"
+    finally:
+        agent_server._inflight_run_release(key)
 
 
 # ── soft node budgets ───────────────────────────────────────────────────────
@@ -290,11 +306,29 @@ def test_verify_citations_survives_a_network_error(monkeypatch):
 # ── the researcher's evidence contract ──────────────────────────────────────
 def test_researcher_prompt_requires_evidence_and_conflicts():
     body = (skills.ROOT / "prompts" / "researcher.md").read_text(encoding="utf-8")
-    assert '"evidence"' in body
+    assert '"sources"' in body
     assert '"conflicts"' in body
     assert '"caveats"' in body
-    # The instruction that makes quotes trustworthy.
-    assert "not a quote" in body.lower()
+    # Per-claim citation was REMOVED. It cost a measured 77% of the findings:
+    # the same model on the same topic produced 1,118 words of prose against
+    # 255 words through the claim/quote/source schema. The URLs now live in
+    # `sources` and the document carries one Sources section at the end.
+    assert '"evidence"' not in body, (
+        "the per-claim evidence table is back; it is what starved findings")
+    # The prompt names verify_citations only to forbid it, so assert on the
+    # wiring instead of the string: the tool must not be callable here.
+    cfg = (skills.ROOT / "agent_config.yaml").read_text(encoding="utf-8")
+    block = cfg.split("researcher:", 1)[1].split("\ndistiller:", 1)[0]
+    tools = [ln for ln in block.splitlines()
+             if ln.strip().startswith("tools_allowed") or
+             (ln.strip() and not ln.strip().startswith("#")
+              and "[" in ln and ln.rstrip().endswith("]"))]
+    tools = "\n".join(tools)
+    assert "verify_citations" not in tools, (
+        "verify_citations is callable by the researcher again; it spent 18 of "
+        "125 tool calls in one run verifying quotes a Sources section covers")
+    # Prose must be stated explicitly, or the model drifts back to a list.
+    assert "continuous prose" in body.lower()
 
 
 def test_verify_citations_is_not_fooled_by_inline_markup(monkeypatch):
@@ -351,7 +385,7 @@ def test_planner_prompt_documents_the_structured_plan():
     for field in ("topic", "facets", "source_hints", "depth"):
         assert field in body, field
     # The topic is the run title, so the prompt has to be explicit about it.
-    assert "never an instruction to yourself" in body
+    assert "never an instruction to yourself" in body.lower()
 
 
 def test_plan_round_trips_through_the_session_store(tmp_path, monkeypatch):

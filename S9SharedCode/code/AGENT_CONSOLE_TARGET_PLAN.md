@@ -115,6 +115,13 @@ Mic capture → `POST /api/stt` → chat → `POST /api/tts` auto-play, waveform
 - **Phase D (open):** remaining 4.3 tool-test + 4.5 routing-config endpoints
 - **Phase E (open):** P1 hardening (attachments via 4.6 files endpoint, TTS playback, tabs) + P8 Voice if needed
 - **Someday:** compare-mode analytics, run diffing, scheduled-run calendar view
+- **Idea (deferred, agreed not now):** turn the left rail into an edge-peek
+  overlay drawer — hover the left edge (with a ~150–250ms intent delay and a
+  small always-visible handle/tab), a pin toggle persisted in `localStorage`,
+  opens on focus too so it is not mouse-only, and it overlays content rather
+  than reflowing it. Lower-risk fallback if the hover behaviour misbehaves:
+  collapse the rail to an icon-only ~52px strip with a toggle. Ctrl+K already
+  switches sections, so hiding the rail is low-cost.
 
 ## 6. Non-goals (explicitly not building)
 

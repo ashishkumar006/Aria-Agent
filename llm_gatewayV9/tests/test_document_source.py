@@ -83,6 +83,45 @@ def test_source_honours_range_requests(monkeypatch, tmp_path):
         assert r5.content == PDF
 
 
+def test_preview_renders_a_stored_pdf_without_a_browser_plugin(
+        monkeypatch, tmp_path):
+    """The Documents modal must not depend on Electron's PDF plugin."""
+    import docgen
+
+    pdf, _n = docgen.build_pdf({
+        "title": "Stored report",
+        "blocks": [{"type": "paragraph",
+                    "text": "A page rendered from the uploaded bytes."}],
+    })
+    reg = Registry(tmp_path / "documents")
+    doc = reg.add(filename="stored.pdf", doc_type="pdf",
+                  size_bytes=len(pdf))
+    reg.write_source(doc.id, pdf)
+    monkeypatch.setattr(MA, "_docs", lambda: reg)
+
+    with TestClient(M.app) as c:
+        r = c.get(f"/v1/documents/{doc.id}/preview")
+    assert r.status_code == 200, r.text[:300]
+    out = r.json()
+    assert out["mode"] == "pages"
+    assert out["format"] == "pdf"
+    assert out["pages"], "no pages rendered"
+    assert out["pages"][0]["data"].startswith("data:image/png;base64,")
+
+
+def test_preview_refuses_a_format_it_cannot_render(monkeypatch, tmp_path):
+    reg = Registry(tmp_path / "documents")
+    doc = reg.add(filename="notes.txt", doc_type="txt",
+                  size_bytes=5)
+    reg.write_source(doc.id, b"hello")
+    monkeypatch.setattr(MA, "_docs", lambda: reg)
+
+    with TestClient(M.app) as c:
+        r = c.get(f"/v1/documents/{doc.id}/preview")
+    assert r.status_code == 415
+    assert "preview" in r.json()["error"]
+
+
 def test_source_404s_for_missing_document_and_file(monkeypatch, tmp_path):
     c, doc = _wire(monkeypatch, tmp_path)
     with c:

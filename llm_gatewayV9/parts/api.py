@@ -107,6 +107,15 @@ async def _analyse(
         # branching on them should not have to parse a message. `error_report`
         # exists for callers that would rather have one uniform 200 body.
         _raise(exc)
+    except NotImplementedError as exc:
+        # `load` raises this for an extension no reader claims. It is a CLIENT
+        # error with a known status (415), not a bug, and it was escaping as a
+        # 500: the `_STATUS` map below has no entry that could catch it because
+        # the exception type never reaches the mapper.
+        raise HTTPException(415, detail={
+            "code": "unsupported_format",
+            "message": str(exc),
+        }) from exc
     except Exception as exc:  # a bug in here is a 500, never a traceback
         raise HTTPException(
             500,

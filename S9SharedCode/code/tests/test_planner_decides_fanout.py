@@ -8,6 +8,7 @@ document's ceiling, so this is now the planner's call.
 Supersedes test_research_facet_budget.py, which pinned the two-cap split that
 this removed.
 """
+import re
 import ast
 import pathlib
 
@@ -83,8 +84,26 @@ def test_the_planner_prompt_no_longer_prescribes_a_range():
 
 
 def test_the_prompt_ties_facet_count_to_page_count():
-    low = PROMPT.read_text(encoding="utf-8").lower()
-    assert "50-100 page" in low, "the page-count target is not stated"
-    assert "ceiling" in low, "the evidence-ceiling point is not made"
-    assert "25-60" in low or "25" in low, (
-        "no guidance on facet count for a book-length document")
+    """Facet count is banded, not open-ended.
+
+    This used to assert a 25-60 range for book-length documents. That was
+    reversed on measurement: 20 narrow facets produced 13,031 words for 1.1M
+    tokens while 12 produced 8,129 words for 1M, because each extra node
+    re-reads the same background pages. 6-10 BROAD facets is the current
+    target, and the non-overlap rule is what stops coverage being bought
+    twice."""
+    prompt = PROMPT.read_text(encoding="utf-8")
+    low = prompt.lower()
+    assert re.search(r"pages?\s*x\s*450|evidence needed|words of evidence",
+                  prompt, re.I), (
+        "facet count must be DERIVED from the document target, not a "
+        "fixed band: 6 facets x the 1,500-word floor cannot produce a "
+        "60-page document")
+    assert "not overlap" in low or "must not overlap" in low, (
+        "the non-overlap rule is gone; two facets fetching the same pages "
+        "pays for them twice and keeps one half")
+    assert "broad" in low, (
+        "facets must be broad subject areas, not single details, or each "
+        "researcher has too little to write about")
+    for must in ("retriever", "researcher", "author", "formatter", "deck"):
+        assert must in prompt, must

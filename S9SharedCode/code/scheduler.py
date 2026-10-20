@@ -1,4 +1,4 @@
-"""Lightweight task scheduler for proactive / deferred agent runs.
+﻿"""Lightweight task scheduler for proactive / deferred agent runs.
 
 Lets the operator schedule an agent query to run later ("remind me in 10
 min") or on a recurring cadence ("run daily at 09:00"). Schedules are
@@ -16,6 +16,8 @@ from __future__ import annotations
 import heapq
 import json
 import os
+import re as _re
+import sys
 import threading
 import time
 import traceback
@@ -141,6 +143,95 @@ def _next_fire_from_cron(cron: str, base: float) -> float:
     return float(cron)
 
 
+class _BadWhen(ValueError):
+    """A `when` value whose own message must reach the caller unchanged.
+
+    schedule() rewrites generic parse failures into one list of accepted
+    forms; the messages here are already specific ('9:00 AM has already
+    passed today, ...') and that rewrite destroyed exactly the detail the
+    model needs. Raised when a NAMED clock time is in the past: the model
+    used to be handed the generic error, whose first suggestion was a
+    relative delay, and it answered a '9am' request by silently scheduling
+    'in 1h'.
+    """
+
+
+_CLOCK_AMPM = _re.compile(
+    r"^(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)$")
+_CLOCK_24H = _re.compile(r"^(?:at\s+)?(\d{1,2}):(\d{2})$")
+_CLOCK_TODAY = _re.compile(
+    r"^today\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$")
+
+
+def _looks_like_clock(when: str) -> bool:
+    """Whether `when` names a clock time rather than a delay/epoch.
+
+    Bare digits stay epochs ('1789...'): only an am/pm marker or a colon
+    makes a bare string a time, so '9am', '9:30' and '21:45' are clocks
+    while '930' keeps its old epoch meaning. Both word orders work
+    ('today 9am', '9am today').
+    """
+    low = _strip_trailing_today(when.strip().lower())
+    return bool(low.startswith("today ")
+                or _CLOCK_AMPM.match(low) or _CLOCK_24H.match(low))
+
+
+def _strip_trailing_today(low: str) -> str:
+    return low[:-len(" today")].rstrip() if low.endswith(" today") else low
+
+
+def _clock_today_epoch(cron: str, base: float) -> tuple[float, str]:
+    """Parse a clock time meant for TODAY ('today 9am', '9am', '9:30',
+    '21:45', '2:30pm') into an epoch, plus a display string.
+
+    A time that has already passed today is a REFUSAL, not a delay: the
+    caller gets _BadWhen naming the time and the two honest ways forward.
+    Silently shifting it (the old behaviour, via the generic error that
+    suggested 'in 2h') moved a 9am reminder to 10:09.
+    """
+    import datetime as _dt
+    low = _strip_trailing_today(cron.strip().lower())
+    m = _CLOCK_TODAY.match(low) or _CLOCK_AMPM.match(low) or _CLOCK_24H.match(low)
+    if not m:
+        raise _BadWhen(
+            f"unparseable time {cron!r}: want 'today 9am' / '9am' / "
+            f"'9:30' / '14:45' / '2:30pm'")
+    if m.re is _CLOCK_TODAY:
+        hh_s, mm_s, ap = m.group(1), m.group(2), m.group(3)
+    elif m.re is _CLOCK_AMPM:
+        hh_s, mm_s, ap = m.group(1), m.group(2), m.group(3)
+    else:
+        hh_s, mm_s, ap = m.group(1), m.group(2), None
+    hh = int(hh_s)
+    mm = int(mm_s or 0)
+    if ap == "pm" and hh < 12:
+        hh += 12
+    elif ap == "am" and hh == 12:
+        hh = 0
+    if hh > 23 or mm > 59:
+        raise _BadWhen(
+            f"no such clock time in {cron!r}: hours go to "
+            f"{23 if not ap else 12}, minutes to 59")
+    now = _dt.datetime.fromtimestamp(base)
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    # %-I is a glibc extension; C strftime on Windows renders it literally.
+    fmt = "%I:%M %p" if _WIN32 else "%-I:%M %p"
+    shown = target.strftime(fmt)
+    if target.timestamp() <= base:
+        raise _BadWhen(
+            f"{shown} has already passed today ({target:%Y-%m-%d %H:%M} "
+            f"local; now {now:%H:%M}). A named time must not be turned into "
+            f"a relative delay - if the user meant tomorrow, schedule "
+            f"'tomorrow {cron.strip().removeprefix('today ').strip()}'; "
+            f"otherwise tell the user the time has passed and ask which "
+            f"day they meant.")
+    return target.timestamp(), shown
+
+
+# strftime is C on Windows: '%-I' is not a valid directive there.
+_WIN32 = sys.platform.startswith("win")
+
+
 def schedule(query: str, when: str, *,
              conversation_id: str | None = None,
              notify: bool = True,
@@ -156,10 +247,13 @@ def schedule(query: str, when: str, *,
     """Schedule `query` to run at `when`.
 
     `when` forms:
-      - "in 10m" / "in 1h"  → relative delay
-      - "daily@09:00"      → recurring daily at 09:00 local
-      - "every 30m"        → recurring every 30 minutes
-      - "<epoch seconds>"  → absolute one-shot
+      - "in 10m" / "in 1h"  â†’ relative delay
+      - "daily@09:00"      â†’ recurring daily at 09:00 local
+      - "every 30m"        â†’ recurring every 30 minutes
+      - "tomorrow 9am" / "tomorrow 14:30" â†’ one-shot tomorrow
+      - "9am" / "today 9am" / "9:30" / "2:30pm" â†’ one-shot TODAY, refused
+        (with its own message) if that time has already passed
+      - ISO datetime / "<epoch seconds>"  â†’ absolute one-shot
     Returns the schedule id.
 
     Idempotent on (query, when): posting the identical enabled job twice
@@ -186,14 +280,14 @@ def schedule(query: str, when: str, *,
     import re as _re
     # Dispatch case-insensitively. _next_fire_from_cron lowercases
     # before parsing, so "DAILY@09:00" / "EVERY 30m" parsed fine in
-    # the branch below — but the case-sensitive startswith() here
+    # the branch below â€” but the case-sensitive startswith() here
     # sent them to the one-shot else: a recurring job the operator
     # asked for fired ONCE and never re-armed. Reachable via the MCP
     # schedule_task tool, which passes LLM-generated text verbatim.
     low_when = when.strip().lower()
     try:
         if low_when.startswith("in "):
-            # Relative delay: "in 30m", "in 1h", "in 45s" —
+            # Relative delay: "in 30m", "in 1h", "in 45s" â€”
             # plus the spelled-out units people actually type
             # ("in 1 hour", "in 30 minutes"). The old parser
             # only matched single letters, so every plural form
@@ -207,7 +301,7 @@ def schedule(query: str, when: str, *,
             n, unit = int(m.group(1)), (m.group(2) or "m")
             if n < 1:
                 # "in 0 seconds" used to schedule a job whose
-                # fire time is NOW — it executed immediately (and
+                # fire time is NOW â€” it executed immediately (and
                 # billed) while looking like a deferred task. The
                 # "every" branch has had this floor all along.
                 raise ValueError("delay must be at least 1 unit")
@@ -220,7 +314,7 @@ def schedule(query: str, when: str, *,
             fire = now + n * per
             recurring = None
         elif low_when.startswith("tomorrow"):
-            # One-shot at that time tomorrow — NOT recurring
+            # One-shot at that time tomorrow â€” NOT recurring
             # (the word means the next day only; "daily@" is
             # the recurring form).
             fire = _next_fire_from_cron(when, now)
@@ -228,8 +322,15 @@ def schedule(query: str, when: str, *,
         elif low_when.startswith("daily@") or low_when.startswith("every "):
             fire = _next_fire_from_cron(when, now)
             recurring = when
+        elif _looks_like_clock(low_when):
+            # A named clock time for today: '9am', 'today 14:30', '2:30pm'.
+            # One-shot. A time that has already passed refuses with its own
+            # message rather than the generic form list - that list is what
+            # nudged the model into answering a 9am reminder with 'in 1h'.
+            fire, _ = _clock_today_epoch(when, now)
+            recurring = None
         else:
-            # ISO datetime or epoch seconds — _next_fire_from_cron
+            # ISO datetime or epoch seconds â€” _next_fire_from_cron
             # parses both (fromisoformat, then bare float). The
             # old code ran float(when) directly, so the ISO and
             # "tomorrow" forms its own error message advertised
@@ -238,19 +339,20 @@ def schedule(query: str, when: str, *,
             recurring = None
     except ValueError as e:
         # _next_fire_from_cron already names valid forms for recurring
-        # intervals — keep its message; otherwise name them all.
-        if "want '" in str(e):
+        # intervals â€” keep its message; otherwise name them all.
+        # _BadWhen messages are specific on purpose and pass through too.
+        if isinstance(e, _BadWhen) or "want '" in str(e):
             raise
         raise ValueError(
             f"unparseable schedule {when!r}: want 'in 30m' / 'in 1h' / "
             f"'daily@09:00' / 'every 30m' / 'every 2h' / 'tomorrow 9am' / "
-            f"ISO datetime / epoch seconds")
+            f"'today 9am' / '9am' / '14:30' / ISO datetime / epoch seconds")
     # A one-shot in the past is refused, not fired. The worker disables every
     # one-shot as it fires (so a crash cannot resurrect it), which means a past
     # date produced a job that was born disabled and then consumed itself on
     # the next tick. To the user that reads as "the scheduler is broken": they
     # asked for tomorrow at 9am, were told it was scheduled, found it greyed
-    # out, and — with no enable tool — asked for a second copy. The real fault
+    # out, and â€” with no enable tool â€” asked for a second copy. The real fault
     # was an absolute date a model wrote a year in the past, accepted verbatim.
     #
     # Recurring jobs are exempt: "daily@09:00" legitimately rolls forward.
@@ -259,8 +361,10 @@ def schedule(query: str, when: str, *,
             f"schedule {when!r} is in the past "
             f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(fire))} "
             f"local; now {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}). "
-            f"Use a relative form like 'in 2h' or 'tomorrow 9am', or check the "
-            f"year in an absolute date.")
+            f"If the user named a time, use 'tomorrow 9am' rather than "
+            f"shifting it â€” a relative form like 'in 2h' answers a delay the "
+            f"user asked for, never a named clock time. For an absolute "
+            f"date, check the year.")
     with _SCHED_LOCK:
         _load()
         # Build and validate the policy BEFORE the idempotency short-circuit.
@@ -280,7 +384,7 @@ def schedule(query: str, when: str, *,
                 # A hand-edited or torn schedules.json can hold
                 # non-dict entries. The heap build ignores them,
                 # but this scan called .get() on every entry and
-                # raised AttributeError — 500ing every POST
+                # raised AttributeError â€” 500ing every POST
                 # /api/schedule until the file was hand-fixed.
                 continue
             if _job.get("enabled") and _job.get("query") == query \
@@ -332,7 +436,7 @@ def schedule(query: str, when: str, *,
     return sid
 
 
-# ── notification policy ─────────────────────────────────────────────────────
+# â”€â”€ notification policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _coerce_seconds(v, field: str, *, minimum: float = 0.0,
                     maximum: float = 7 * 86400) -> float:
@@ -435,7 +539,7 @@ def list_schedules() -> list[dict]:
         # Return ALL schedules (enabled and disabled). Cancelled schedules
         # remain visible so callers can inspect the `enabled` flag; the UI
         # layer decides whether to grey them out. Non-dict entries (see
-        # schedule()) are dropped here too — `{**"garbage"}` raised
+        # schedule()) are dropped here too â€” `{**"garbage"}` raised
         # TypeError on every GET /api/schedule.
         return [{"id": k, **v} for k, v in _SCHEDULES.items()
                 if isinstance(v, dict)]
@@ -452,7 +556,7 @@ def cancel(sid: str) -> bool:
             # Marker the worker checks between its snapshot and the
             # fire: a cancel landing in that window used to return
             # True while the captured still-enabled snapshot still
-            # ran — one stray agent turn after a successful cancel.
+            # ran â€” one stray agent turn after a successful cancel.
             spec["_cancelled"] = True
             _save()
             # No purge here either. Cancelling is a write the user asked for,
@@ -466,8 +570,8 @@ def cancel(sid: str) -> bool:
 def _reparse_when(when: str, base: float | None = None) -> float:
     """Resolve a stored `when` string to an absolute fire time.
 
-    Handles every form `schedule()` accepts — relative delays, `tomorrow
-    HH:MM`, recurring specs, ISO and epoch — in one place.
+    Handles every form `schedule()` accepts â€” relative delays, `tomorrow
+    HH:MM`, recurring specs, ISO and epoch â€” in one place.
 
     It exists because `schedule()`'s dispatch and `_next_fire_from_cron` are
     not the same parser: the cron helper cannot read "in 2h", so anything that
@@ -498,7 +602,7 @@ def set_enabled(sid: str, enabled: bool) -> dict:
 
     There was no way back from a disabled job. `cancel_scheduled` removes one,
     and `schedule_task` creates a new one, so "the reminder is greyed out, turn
-    it on" had no answer — and the model's only available move was to schedule
+    it on" had no answer â€” and the model's only available move was to schedule
     a second copy, which left the user with two identical rows, both still
     disabled, and no better off. The enabled flag is state, not existence, so
     re-enabling has to be possible.
@@ -516,6 +620,10 @@ def set_enabled(sid: str, enabled: bool) -> dict:
             return {"ok": False, "error": f"unknown schedule {sid!r}"}
         if not enabled:
             spec["enabled"] = False
+            # A disable can land between the worker's snapshot and its fire.
+            # `enabled` alone is not consulted after that snapshot, so mark it
+            # cancelled for the same reason `cancel()` does.
+            spec["_cancelled"] = True
             _save()
             return {"ok": True, "schedule_id": sid, "enabled": False}
         raw_when = str(spec.get("when") or "").strip()
@@ -523,7 +631,7 @@ def set_enabled(sid: str, enabled: bool) -> dict:
             # Re-parse through `schedule()`'s own dispatch, not
             # `_next_fire_from_cron`: that helper only understands cron, ISO
             # and epoch, so a RELATIVE reminder ("in 2h") could not be
-            # re-armed at all — it raised "could not convert string to float".
+            # re-armed at all â€” it raised "could not convert string to float".
             # A user disabling and re-enabling the most common kind of
             # reminder hit an error.
             try:
@@ -550,6 +658,9 @@ def set_enabled(sid: str, enabled: bool) -> dict:
                                 "future time, e.g. 'tomorrow 9am'"}
             spec["next_fire"] = fire
         spec["enabled"] = True
+        # Re-enabling is the inverse of cancel/disable: clear the marker or
+        # the worker will keep skipping this row forever.
+        spec.pop("_cancelled", None)
         spec.pop("last_error", None)
         heapq.heappush(_HEAP, (float(spec.get("next_fire") or time.time()), sid))
         _save()
@@ -579,8 +690,8 @@ _PURGE_AFTER_S = 7 * 86400
 def _epoch_or(v, fallback: float) -> float:
     """float() that treats a corrupt stored value as the fallback.
 
-    A hand-edited string `next_fire` can exist — _load() only
-    type-checks for the heap — and `float("soon")` raised ValueError
+    A hand-edited string `next_fire` can exist â€” _load() only
+    type-checks for the heap â€” and `float("soon")` raised ValueError
     inside the purge sweep, 500ing every GET /api/schedule."""
     try:
         return float(v)
@@ -608,7 +719,7 @@ def purge_disabled(max_age_days: float = 7) -> int:
     """Public entry: hard-delete disabled one-shots older than the cutoff."""
     if max_age_days < 0:
         # max(0, ...) used to clamp a negative to 0, making the age
-        # test true for EVERY past fire — a purge with max_age_days=-1
+        # test true for EVERY past fire â€” a purge with max_age_days=-1
         # deleted all disabled one-shots regardless of age.
         raise ValueError("max_age_days must be >= 0")
     with _SCHED_LOCK:
@@ -633,7 +744,7 @@ def _is_nudge_only(spec: dict) -> bool:
 def _fire(sid: str, spec: dict | None = None) -> None:
     """Run one scheduled task.
 
-    `spec` is the snapshot taken by the worker under _SCHED_LOCK — _fire
+    `spec` is the snapshot taken by the worker under _SCHED_LOCK â€” _fire
     never reads the shared _SCHEDULES dict itself, so a concurrent
     schedule()/cancel() can't clobber the firing run's parameters."""
     if spec is None:
@@ -645,7 +756,7 @@ def _fire(sid: str, spec: dict | None = None) -> None:
     # Derive a stable session id without assuming the "sch-" prefix format.
     short = sid[4:] if sid.startswith("sch-") and len(sid) > 4 else sid
     # A task scheduled FROM a conversation runs IN it. The
-    # conversation_id was accepted, persisted and then ignored —
+    # conversation_id was accepted, persisted and then ignored â€”
     # _fire always derived a blank session, so a reminder set
     # mid-conversation answered with none of that context.
     derived_sid = spec.get("conversation_id") or f"s8-{short}"
@@ -677,7 +788,7 @@ def _fire(sid: str, spec: dict | None = None) -> None:
             # to pass resume=True for a brand-new session id, but Executor.run
             # raises when there is no persisted graph for that id. Detect a
             # missing session and start fresh instead. Probe the graph file
-            # directly — constructing SessionStore would mkdir empty session
+            # directly â€” constructing SessionStore would mkdir empty session
             # dirs that pollute list_sessions().
             from persistence import SESSIONS_ROOT
             resume = (SESSIONS_ROOT / derived_sid / "graph.json").exists()
@@ -691,7 +802,7 @@ def _fire(sid: str, spec: dict | None = None) -> None:
         answer = f"[scheduler] run failed: {e}"
         error = str(e)[:400]
         _log(f"[{sid}] run failed: {traceback.format_exc()}")
-    # Record the outcome even when notify=False — previously the result
+    # Record the outcome even when notify=False â€” previously the result
     # was dropped entirely, leaving no trace that the job had run.
     _record(sid, error)
     # Record spend into the per-session ledger (same helper the chat
@@ -784,7 +895,7 @@ def _worker() -> None:
         except Exception:
             # One poison entry (an unparseable `recurring`, an
             # unwritable state dir) used to raise out of the loop and
-            # kill the thread — and because _ensure_worker only
+            # kill the thread â€” and because _ensure_worker only
             # restarts it on the NEXT schedule() call, which re-heaps
             # the same entry from disk, every restarted worker died
             # again immediately: one bad value silently stopped ALL
@@ -805,7 +916,7 @@ def _worker_tick() -> None:
             return
         # CRITICAL: snapshot BEFORE mutating. The worker used to set
         # enabled=False and then pass that same dict to _fire, whose
-        # own enabled guard aborted the run — so every ONE-SHOT
+        # own enabled guard aborted the run â€” so every ONE-SHOT
         # schedule silently fired nothing. Capture the still-enabled
         # spec first, then persist the disable (crash safety), then
         # hand the untouched snapshot to _fire.
@@ -816,15 +927,15 @@ def _worker_tick() -> None:
                 spec["next_fire"] = _next_fire_from_cron(
                     spec["recurring"], time.time())
             except (ValueError, OSError) as e:
-                # A corrupt `recurring` value used to raise HERE —
-                # inside the loop with no guard — killing the worker
+                # A corrupt `recurring` value used to raise HERE â€”
+                # inside the loop with no guard â€” killing the worker
                 # (see _worker). Disable the job itself so the
                 # scheduler keeps serving every OTHER job, and say
                 # why on the job's row.
                 spec["enabled"] = False
                 spec["last_error"] = f"unparseable recurring: {e}"[:400]
                 _save()
-                _log(f"[{sid}] disabled — unparseable recurring "
+                _log(f"[{sid}] disabled â€” unparseable recurring "
                      f"{spec.get('recurring')!r}: {e}")
                 return
             heapq.heappush(_HEAP, (spec["next_fire"], sid))
@@ -838,11 +949,12 @@ def _worker_tick() -> None:
             spec["enabled"] = False
             _save()
     # A cancel() that landed between the snapshot and here must not
-    # still fire — the snapshot predates the cancel and is still
+    # still fire â€” the snapshot predates the cancel and is still
     # enabled (see cancel()).
     with _SCHED_LOCK:
         live = _SCHEDULES.get(sid)
     if live is not None and isinstance(live, dict) and live.get("_cancelled"):
+        _log(f"[{sid}] skipped - cancelled before it fired")
         return
     # Fire outside the lock, with the still-enabled snapshot.
     if snap.get("phase") == "lead":
@@ -913,3 +1025,4 @@ def start() -> None:
     with _SCHED_LOCK:
         _load()
     _ensure_worker()
+

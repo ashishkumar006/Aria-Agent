@@ -124,7 +124,11 @@ def test_an_obj_upload_is_read(client):
     v, f = prim.cube()
     body = client.post("/v1/parts/analyse", files=upload("part.obj", prim.obj(v, f))).json()
     assert body["source"]["format"] == "obj"
-    assert body["source"]["io_backend"] == "native-obj"
+    # Which READER wins is an implementation detail, not a contract: it was
+    # "native-obj" until `trimesh` was installed, and `trimesh` claims OBJ
+    # first now. `capabilities` reports which backends are present, so a client
+    # that needs to know asks there. Assert the part was actually read.
+    assert body["source"]["io_backend"] in ("native-obj", "trimesh")
     assert body["verdict"]["status"] == "ok"
 
 
@@ -154,11 +158,23 @@ def test_an_oversized_upload_is_a_413(client):
     assert detail["detail"]["kind"] == "bytes"
 
 
-def test_a_format_needing_trimesh_is_a_415(client):
+def test_a_bodyless_ply_is_reported_as_broken_not_unsupported(client):
+    """PLY used to be refused with a 415 because no backend claimed it.
+
+    `trimesh` is installed now, so PLY is readable and this file is read as
+    what it actually is: a supported format containing no geometry. That is a
+    422 `mesh_integrity`, NOT a 415 `unsupported_format` - telling a client
+    their format is unsupported when it is supported sends them looking for a
+    different format instead of re-exporting the part.
+
+    Whether a format is readable is a deployment question, and
+    `/v1/parts/capabilities` is where that is answered. This test pins the
+    classification of a bodyless file, which must not change with the backend.
+    """
     response = client.post("/v1/parts/validate",
                            files=upload("part.ply", b"ply\nformat ascii 1.0\nend_header\n"))
-    assert response.status_code == 415
-    assert response.json()["detail"]["code"] == "unsupported_format"
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "mesh_integrity"
 
 
 def test_a_truncated_mesh_is_a_422(client):

@@ -4,6 +4,8 @@ import {
   Terminal, Download, History, FileText, Table2, Presentation,
 } from 'lucide-react';
 import { SkipLink, Rail, TopBar, Pill } from '../components/ui';
+import { useMainId, useSectionActive } from '../components/KeepAlive';
+import { toast } from 'sonner';
 import { renderMarkdown } from '../components/markdown';
 import { api, headers, ago, displayTopic, type DocPreview, type SessionSummary } from '../api';
 import { DocumentViewer } from './DocSetup';
@@ -146,6 +148,20 @@ const withProduced = (r: Run, snap: Produced): Run => {
   };
 };
 
+/** Stable, short key for one authoring brief. The server dedupes only while a
+ *  run is in flight, so this collapses a double-click and a retry of the SAME
+ *  brief - but a deliberate re-run after the first finishes still starts a new
+ *  one, because the claim is released on `done`. A per-call random key (the
+ *  old behaviour) made every retry a fresh paid run. */
+function briefKey(text: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `auth:${(h >>> 0).toString(36)}:${text.length}`;
+}
+
 const LS_KEY = 'aria.authoring.runs.v1';
 const MAX_KEPT = 40;
 /* /api/sessions clamps to 500 and every row parses a whole graph.json, so ask
@@ -178,6 +194,8 @@ const KIND_ICON: Record<string, typeof FileText> = {
 };
 
 export default function Authoring() {
+  const mainId = useMainId();
+  const active = useSectionActive();
   const [brief, setBrief] = useState('');
   const [running, setRunning] = useState(false);
   const [note, setNote] = useState('');
@@ -191,16 +209,16 @@ export default function Authoring() {
   const [activeId, setActiveId] = useState('');
   /** the session window came back full, so older runs are still off-list. */
   const [windowFull, setWindowFull] = useState(false);
+  /** the history read from the store failed; distinct from "no documents". */
+  const [historyErr, setHistoryErr] = useState('');
   const [preview, setPreview] = useState<Record<string, DocPreview>>({});
   const [previewErr, setPreviewErr] = useState('');
-  /* PDFs get the browser's own renderer, not extracted text. pypdf hands
-   * back a flat run of words - the table columns come back as one paragraph
-   * ("Metric HNSW IVF Recall / Accuracy Very High...") - which reads far
-   * worse than the real page. The Documents view already previews PDFs this
-   * way; blob URL + iframe, revoked when it goes away. */
-  const [pdfUrls, setPdfUrls] = useState<Record<string, string>>({});
 
   const ctlRef = useRef<AbortController | null>(null);
+  /* False once the view is torn down, so the reattach poll and the SSE loop
+     stop touching state after unmount. Reset to true on mount: React's
+     StrictMode dev double-invoke runs the teardown once before the real mount. */
+  const mountedRef = useRef(true);
   const reqRef = useRef(0);
   const sidRef = useRef('');
   const startRef = useRef<HTMLButtonElement>(null);
@@ -291,11 +309,12 @@ export default function Authoring() {
    * settled run is never polled again: nothing here costs a request while no
    * run is going. */
   useEffect(() => {
+    if (!active) return;
     const iv = window.setInterval(() => {
       for (const sid of Array.from(runningRef.current)) void loadProduced(sid);
     }, 4000);
     return () => window.clearInterval(iv);
-  }, [loadProduced]);
+  }, [active, loadProduced]);
 
   /* Load the previews of whatever files are on screen. Reading the artifact
    * is the only honest source - see the DocPreview doc comment. One effect
@@ -309,33 +328,28 @@ export default function Authoring() {
     let alive = true;
     setPreviewErr('');
     (async () => {
-      const got: Record<string, DocPreview> = {};
-      const urls: Record<string, string> = {};
-      for (const f of files) {
-        if (!alive) return;
+      /* Read the files in parallel. A run that produced a PDF, a deck and a
+       * sheet used to pay three sequential round-trips before the first
+       * preview could appear. The full PDF bytes are deliberately NOT fetched
+       * here: DocumentViewer rasterises them server-side, and the old eager
+       * blob download doubled the transfer just to power an "open in a new
+       * tab" button that is now lazy. */
+      const results = await Promise.all(files.map(async (f) => {
         try {
-          got[f.artifact] = await api.artifactPreview(f.artifact);
+          return [f.artifact, await api.artifactPreview(f.artifact), ''] as const;
         } catch (e) {
-          if (alive) {
-            setPreviewErr(`could not read ${f.filename}: ${(e as Error)?.message || e}`);
-          }
-          continue;
+          return [f.artifact, null, `could not read ${f.filename}: ${(e as Error)?.message || e}`] as const;
         }
-        if ((got[f.artifact]?.kind || f.format) === 'pdf') {
-          try {
-            const r = await fetch(`/api/artifact/${f.artifact}?download=0`, {
-              headers: headers(),
-            });
-            if (r.ok && alive) urls[f.artifact] = URL.createObjectURL(await r.blob());
-          } catch { /* fall back to the extracted text */ }
-        }
-      }
+      }));
       if (!alive) return;
+      const got: Record<string, DocPreview> = {};
+      let firstError = '';
+      for (const [id, preview, error] of results) {
+        if (preview) got[id] = preview;
+        if (error && !firstError) firstError = error;
+      }
       setPreview(got);
-      setPdfUrls((old) => {
-        Object.values(old).forEach((u) => URL.revokeObjectURL(u));
-        return urls;
-      });
+      if (firstError) setPreviewErr(firstError);
     })();
     return () => { alive = false; };
   }, [files]);
@@ -345,9 +359,16 @@ export default function Authoring() {
     setFiles(fs);
   }, []);
 
-  useEffect(() => () => {
-    Object.values(pdfUrls).forEach((u) => URL.revokeObjectURL(u));
-  }, [pdfUrls]);
+  /* Teardown for the whole view: mark it unmounted (so the reattach poll below
+     stops calling setState) and abort any open authoring stream - without this
+     an SSE response outlived the view after a section switch. */
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      ctlRef.current?.abort();
+    };
+  }, []);
 
   /** Put a run's row on screen: its answer, its files and its log lines. The
    *  row is the single source, so a snapshot that lands AFTER the click (the
@@ -419,6 +440,10 @@ export default function Authoring() {
     for (let i = 0; i < 900; i++) {
       // eslint-disable-next-line no-await-in-loop
       const snap = await api.runProduced(sid).catch(() => null);
+      /* Bail if the view went away: this loop runs up to 900× at 2s (30 min),
+         and without the guard it kept polling and calling setState long after
+         unmount. */
+      if (!mountedRef.current) return;
       if (!snap) break;
       if (snap.nodes?.length) setLogs(logLines(snap.nodes));
       if (!snap.live) {
@@ -463,43 +488,47 @@ export default function Authoring() {
    * badge claimed completeness over 91 documents it could not reach. And it must
    * not cap the rows: a paid document you cannot open is money you cannot get
    * back. */
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const d = await api.sessions(SESSION_WINDOW);
-        if (!alive) return;
-        const rows = (d.sessions || []).filter((s) => s.run_kind === 'authoring');
-        /* metadata only. /produced is one graph parse per call, and reading all
-         * 131 up front made the sidebar unusable for seconds - so the files are
-         * read lazily, for the rows that are shown. */
-        const loaded: Run[] = rows.map((s) => ({
-          session_id: s.session_id,
-          topic: s.topic || s.query || '',
-          // null, not []: nothing has been read for this run yet, and [] reads
-          // as "0 files" - the exact look of a run still going.
-          files: null,
-          at: (s.updated || 0) * 1000,
-          live: false,
-          kind: 'auto',
-        }));
-        if (!alive) return;
-        /* a full window means the store holds more runs than one request
-         * returns, so the list says so rather than claiming to be all of it. */
-        setWindowFull((d.sessions || []).length >= SESSION_WINDOW);
-        setHistory((prev) => {
-          /* Keep anything local the server has not caught up with yet - a run
-           * still in flight has no produced_files.json. Nothing is sliced off:
-           * every run the server knows about stays reachable. */
-          const seen = new Set(loaded.map((r) => r.session_id));
-          return [...prev.filter((r) => !seen.has(r.session_id)), ...loaded]
-            .sort((a, b) => (b.at || 0) - (a.at || 0));
-        });
-        prefetchProduced(loaded.slice(0, READ_AHEAD).map((r) => r.session_id));
-      } catch { /* the sidebar simply stays as it was */ }
-    })();
-    return () => { alive = false; };
-  }, []);
+  const loadHistory = useCallback(async () => {
+    try {
+      const d = await api.sessions(SESSION_WINDOW);
+      if (!mountedRef.current) return;
+      const rows = (d.sessions || []).filter((s) => s.run_kind === 'authoring');
+      /* metadata only. /produced is one graph parse per call, and reading all
+       * 131 up front made the sidebar unusable for seconds - so the files are
+       * read lazily, for the rows that are shown. */
+      const loaded: Run[] = rows.map((s) => ({
+        session_id: s.session_id,
+        topic: s.topic || s.query || '',
+        // null, not []: nothing has been read for this run yet, and [] reads
+        // as "0 files" - the exact look of a run still going.
+        files: null,
+        at: (s.updated || 0) * 1000,
+        live: false,
+        kind: 'auto',
+      }));
+      /* a full window means the store holds more runs than one request
+       * returns, so the list says so rather than claiming to be all of it. */
+      setWindowFull((d.sessions || []).length >= SESSION_WINDOW);
+      setHistory((prev) => {
+        /* Keep anything local the server has not caught up with yet - a run
+         * still in flight has no produced_files.json. Nothing is sliced off:
+         * every run the server knows about stays reachable. */
+        const seen = new Set(loaded.map((r) => r.session_id));
+        return [...prev.filter((r) => !seen.has(r.session_id)), ...loaded]
+          .sort((a, b) => (b.at || 0) - (a.at || 0));
+      });
+      prefetchProduced(loaded.slice(0, READ_AHEAD).map((r) => r.session_id));
+      setHistoryErr('');
+    } catch (e) {
+      /* Not swallowed. A failed read used to leave `history` empty and the
+         sidebar then said "Nothing yet", so a paid document looked lost. */
+      if (mountedRef.current) {
+        setHistoryErr(String((e as Error)?.message || e));
+      }
+    }
+  }, [prefetchProduced]);
+
+  useEffect(() => { void loadHistory(); }, [loadHistory]);
 
   /* On mount: is there a run still going? */
   useEffect(() => {
@@ -546,12 +575,16 @@ export default function Authoring() {
     try {
       // An idempotency key, or three synchronous clicks are three PAID runs.
       // The `running` guard cannot help here: within one tick React has not
-      // re-rendered, so `running` is still false. Research already dedupes
-      // server-side on this key; authoring has to opt in too.
-      const idempotencyKey =
-        `auth-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      // re-rendered, so `running` is still false. Stable per brief, not per
+      // call: a retry after a dropped response must join the run it already
+      // paid for instead of starting a second one.
+      const idempotencyKey = briefKey(t);
       for await (const ev of api.chat(query, undefined, ctl.signal, {
         idempotencyKey,
+        /* Declared, not inferred: this run is an authoring run, so it must be
+           listed on the Authoring page from its first second and never in the
+           Research sidebar. */
+        runKind: 'authoring',
       })) {
         if (reqRef.current !== req) return;
         if (ev.type === 'started') {
@@ -658,11 +691,31 @@ export default function Authoring() {
     const sid = sidRef.current;
     ctlRef.current?.abort();
     setRunning(false);
-    setNote('stopped.');
-    if (sid) {
-      api.cancelRun({ session_id: sid }).catch(() => { /* best effort */ });
-      setErr('Stopped. The server may still finish this run — check the Runs page.');
+    setErr('');
+    if (!sid) {
+      setNote('stopped.');
+      requestAnimationFrame(() => startRef.current?.focus());
+      return;
     }
+    /* Cancelling is a server-side flag honoured at the next node boundary:
+     * the stream can close before that, so keep the run marked live and keep
+     * /produced polling. Without this the row stayed `live:true` forever and
+     * reopening Authoring reattached to a run that had already stopped. */
+    runningRef.current.add(sid);
+    setNote('stopping after the current step...');
+    void api.cancelRun({ session_id: sid })
+      .then((res) => {
+        if (!mountedRef.current) return;
+        setNote(res.found
+          ? 'stop requested - waiting for the current step to end'
+          : 'stopped.');
+        void loadProduced(sid);
+      })
+      .catch(() => {
+        if (!mountedRef.current) return;
+        setNote('stopped locally; the server did not acknowledge the cancel.');
+        void loadProduced(sid);
+      });
     requestAnimationFrame(() => startRef.current?.focus());
   };
 
@@ -691,9 +744,15 @@ export default function Authoring() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
-      setNote(`downloaded ${f.filename} (${Math.max(1, Math.round(blob.size / 1024))} KB)`);
+      const size = Math.max(1, Math.round(blob.size / 1024));
+      setNote(`downloaded ${f.filename} (${size} KB)`);
+      // The inline note is transient and the pane may have scrolled; a toast
+      // is what confirms the download to a person who just clicked.
+      toast.success('Downloaded', { description: `${f.filename} · ${size} KB` });
     } catch (e) {
-      setErr(`download failed: ${String((e as Error)?.message || e)}`);
+      const msg = String((e as Error)?.message || e);
+      setErr(`download failed: ${msg}`);
+      toast.error('Download failed', { description: msg });
     } finally {
       setBusyFile('');
     }
@@ -734,7 +793,14 @@ export default function Authoring() {
   /* ── preview bodies ─────────────────────────────────────────────────── */
 
   const PreviewPane = ({ f }: { f: MadeFile }) => {
-    const p = preview[f.artifact];
+    /* A PDF does not need `artifactPreview` to be drawable: DocumentViewer
+     * rasterises the artifact itself and reports its own page count. Waiting
+     * for pypdf first put an avoidable round-trip in front of the first page,
+     * so the viewer opens immediately and the metadata (warnings, subtitle)
+     * fills in when it arrives. Other formats still need their extracted
+     * slides/sheets/paragraphs before they can render. */
+    const p = preview[f.artifact]
+      ?? (f.format === 'pdf' ? { kind: 'pdf' } as DocPreview : null);
     if (!p) {
       return (
         <div className="flex h-full items-center justify-center p-6 text-[12.5px] text-zinc-muted">
@@ -882,20 +948,6 @@ export default function Authoring() {
                 format: f.format || 'pdf', label: f.filename,
               }} />
             </div>
-            <div className="flex items-center gap-2">
-              {pdfUrls[f.artifact] && (
-                <button
-                  type="button"
-                  onClick={() => window.open(pdfUrls[f.artifact], '_blank', 'noopener')}
-                  className="flex items-center gap-1.5 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400"
-                >
-                  Open in a new tab
-                </button>
-              )}
-              <span className="text-[11px] text-zinc-600">
-                {p.pages?.length || 0} page(s)
-              </span>
-            </div>
             {/* The extracted text of every page used to be dumped here, one
                 block per page. It was noise, not information: the rasterised
                 page above IS the document, the words are already on screen,
@@ -956,7 +1008,7 @@ export default function Authoring() {
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Authoring">
           <span className="text-[11.5px] text-zinc-muted">
             {running ? 'building…' : note || 'Ctrl+Enter to build'}
@@ -1097,7 +1149,18 @@ export default function Authoring() {
                     prefetchProduced(unread());
                   }
                 }}>
-                {history.length === 0 ? (
+                {historyErr && (
+                  <p className="p-2 text-[11.5px] text-amber-300/90">
+                    couldn&apos;t load documents from the store ({historyErr}).{' '}
+                    <button
+                      onClick={() => void loadHistory()}
+                      className="underline"
+                    >
+                      retry
+                    </button>
+                  </p>
+                )}
+                {history.length === 0 && !historyErr ? (
                   <p className="p-2 text-[11.5px] text-zinc-600">
                     Nothing yet. Documents you build are listed here and stay
                     downloadable after a reload.

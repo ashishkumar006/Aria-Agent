@@ -107,6 +107,27 @@ def test_markdown_code_fence_is_not_reinterpreted():
     assert headings == ["Real"]
 
 
+def test_markdown_code_fence_preserves_indentation_and_inner_spaces():
+    """Cleaning prose must not turn code into a single line of tokens."""
+    src = (
+        "# Real\n\n```python\n"
+        "def f(x):\n"
+        "    if x:\n"
+        "        return 'a  b'\n"
+        "```\n"
+    )
+    res = P.parse("d.md", src.encode())
+    code = next(b for b in res.blocks if b.kind == "code")
+    assert code.text == "def f(x):\n    if x:\n        return 'a  b'"
+
+
+def test_html_pre_preserves_indentation():
+    src = b"<html><body><pre>def f():\n    return 1\n</pre></body></html>"
+    res = P.parse("a.html", src)
+    code = next(b for b in res.blocks if b.kind == "code")
+    assert code.text == "def f():\n    return 1"
+
+
 def test_markdown_setext_headings():
     res = P.parse("d.md", b"Chapter One\n==========\n\nBody text here.\n")
     h = [b for b in res.blocks if b.kind == "heading"]

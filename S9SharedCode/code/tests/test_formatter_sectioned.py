@@ -82,6 +82,54 @@ def test_sectioned_formatter_assembles_one_section_per_input():
     assert not out.strip().startswith("{")
 
 
+def test_fenced_envelope_after_prose_is_unwrapped():
+    """Live degradation run: a section call answered with a two-sentence
+    summary, then a fenced `{"final_answer": ...}` block. The answer shipped
+    with both, so the user read raw JSON in the middle of the report."""
+    text = ('SQLite and DuckDB are both embedded engines.\n\n'
+            '```json\n{"final_answer": "## Real\\n\\nBody text."}\n```')
+    assert skills._strip_answer_envelope(text) == "## Real\n\nBody text."
+    # A fenced block that is not an envelope is left alone.
+    kept = 'Prose.\n\n```json\n{"other": 1}\n```'
+    assert skills._strip_answer_envelope(kept) == kept
+
+
+def test_sectioned_formatter_ignores_non_data_entries():
+    """A recovered run appends `upstream-missing` rows to INPUTS. They are
+    not material and must not become an (empty) section - that bogus section
+    was what produced the summary + JSON envelope."""
+    import asyncio
+
+    class _SecLLM:
+        def __init__(self):
+            self.prompts = []
+
+        def chat(self, prompt=None, **kw):
+            self.prompts.append(prompt or "")
+            if "WRITE THE OPENING ONLY" in (prompt or ""):
+                return {"text": "Orientation."}
+            return {"text": "## Section\n\nBody."}
+
+    reg = skills.SkillRegistry()
+    fm = reg.get("formatter")
+    fake = _SecLLM()
+    orig = skills.LLM
+    skills.LLM = lambda *a, **k: fake
+    try:
+        out = asyncio.run(skills._sectioned_final_answer(
+            fm, "prompt",
+            [{"id": "n:5", "kind": "upstream-missing", "output": None},
+             {"id": "n:2", "kind": "upstream", "output": {"findings": "a"}},
+             {"id": "n:3", "kind": "upstream", "output": {"findings": "b"}}],
+            "q", "sess"))
+    finally:
+        skills.LLM = orig
+    assert out
+    section_calls = [p for p in fake.prompts if "WRITE ONE SECTION" in p]
+    assert len(section_calls) == 2, section_calls
+    assert not any("upstream-missing" in p for p in fake.prompts)
+
+
 def test_sectioned_formatter_falls_back_to_single_call():
     """With fewer than two upstream results there is nothing to expand,
     so the helper must decline and let the normal single-call path run."""

@@ -1,9 +1,10 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, RefreshCw, Send, Download, Eye, X, Loader2, FileText, Table2, Presentation,
-  Paperclip,
+  Paperclip, Clock,
 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, useHealth, SkipLink } from '../components/ui';
+import { useMainId, useSectionActive } from '../components/KeepAlive';
 
 /* The same list the Documents drop-zone accepts, because this calls the same
    api.uploadDocument. The server rejects anything else with a 400 naming the
@@ -14,6 +15,8 @@ const UPLOAD_ACCEPT =
   '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm';
 import { renderMarkdown } from '../components/markdown';
 import { api, ago, CONF, headers, type ChatThread, type DocPreview, type StreamFile } from '../api';
+import { ModelPicker } from '../components/ModelPicker';
+import { useFocusTrap } from '../lib/a11y';
 
 /* The document viewer drags the whole setup panel in behind it and chat has no
    setup panel, so it is route-split the same way App.tsx splits the views: the
@@ -25,6 +28,10 @@ const DocumentViewer = lazy(() =>
  *  with a 400, so the composer has to refuse one - visibly, with the text
  *  still in the box - rather than quietly clamping it and losing the tail. */
 const CHAT_MAX_QUERY = 4000;
+
+/** Which engine answers a chat turn. "light" is one direct gateway call
+ *  (classic chat); "dag" runs the full planner/executor graph. */
+type ChatMode = 'light' | 'dag';
 
 interface ArtRef {
   id: string;
@@ -47,16 +54,42 @@ interface Msg {
   meta?: string;
   /** Artifact handles this answer names. See artRefs. */
   arts?: ArtRef[];
+  /** "report" when this message is a research report displayed in full. The
+   *  raw markdown rides on `text` (not `html`) so the reader dialog can
+   *  render it; the bubble shows a preview card instead of the whole thing. */
+  kind?: string;
+  /** The report's name (the research topic). */
+  title?: string;
+}
+
+/** Stored thread messages → transcript bubbles. One mapper for both load
+ *  paths (thread switch, deep-link restore), because they drifted before and
+ *  a fix to one silently missed the other. A stored `kind: "report"` message
+ *  comes back as the preview card it rendered as live - not as a wall of
+ *  markdown - and keeps its title. */
+function toMsgs(
+  list: Array<{ role: string; content: string; kind?: string; title?: string }>,
+  nextId: () => number,
+): Msg[] {
+  return (list || []).map((m) => {
+    if (m.role === 'user') return { id: nextId(), who: 'you' as const, text: m.content };
+    if (m.kind === 'report') {
+      return { id: nextId(), who: 'aria' as const, text: m.content,
+        kind: 'report', title: m.title || '', arts: artRefs(m.content) };
+    }
+    return { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content), arts: artRefs(m.content) };
+  });
 }
 
 /** The artifact handles an answer names.
  *
- *  `/api/chat/simple/stream`'s `done` frame carries the answer text and
- *  nothing else - unlike the authoring endpoint it has no `files` array - so
- *  the handle the model printed in its own sentence is the only thing that
- *  crosses the wire. It is also what the thread store persists, which is why
- *  a handle found in a conversation reopened today is exactly as live as one
- *  from the turn streaming right now. The id grammar is the server's own. */
+ *  The `done` frame now carries a verified `files` array (a delegated
+ *  authoring run reports the documents it rendered), and that array is
+ *  preferred. This scrape stays as the fallback for a model that names a
+ *  handle in its own sentence without rendering anything, which is also what
+ *  the thread store persists - so a handle found in a conversation reopened
+ *  today is exactly as live as one from the turn streaming right now. The id
+ *  grammar is the server's own. */
 function artRefs(s: string): ArtRef[] {
   const text = String(s || '');
   const out = new Map<string, ArtRef>();
@@ -236,10 +269,100 @@ function ArtRow({ art, label, state }: { art: string; label?: string; state: Art
     </div>
   );
 }
+/* One research report, as a preview card that opens full size.
+ *
+ *  A report hand-delegated from chat is the research agent's own text, shown
+ *  VERBATIM - not the model's summary of it. At several thousand words it
+ *  cannot be inlined (it would bury the conversation) and must not be hidden
+ *  behind a link (that would bury the thing the user asked for), so the bubble
+ *  carries a card: the title, the opening lines and a word count, with the
+ *  whole report opening in a dialog over the blurred backdrop the Ctrl+K
+ *  palette uses. The transcript keeps its shape; the report keeps all its
+ *  words. */
+function ReportCard({ title, body }: { title: string; body: string }) {
+  const [open, setOpen] = useState(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(dialogRef, { active: open, onEscape: () => setOpen(false) });
+  const html = useMemo(() => renderMarkdown(body || ''), [body]);
+  const words = useMemo(
+    () => (body.trim() ? body.trim().split(/\s+/).length : 0), [body]);
+  const preview = useMemo(() => {
+    const t = body.replace(/^#+\s*/gm, '').replace(/[*_`>]/g, '').trim();
+    if (t.length <= 360) return t;
+    // Cut on a word boundary: "battery innovation and cha…" read as a typo.
+    return t.slice(0, 360).replace(/\s+\S*$/, '').trimEnd() + '…';
+  }, [body]);
+  const name = title || 'Research report';
+
+  return (
+    <div className="rounded-lg border border-violet-400/25 bg-violet-400/[0.04]">
+      <div className="flex flex-wrap items-center gap-2 border-b border-white/10 px-3 py-2">
+        <FileText size={14} className="flex-none text-violet-300" />
+        <span className="min-w-0 flex-1 basis-40 truncate text-[12.5px] font-semibold">{name}</span>
+        <Pill tone="info">report</Pill>
+        <span className="text-[10.5px] text-zinc-muted">{words.toLocaleString()} words</span>
+      </div>
+      <p className="whitespace-pre-wrap px-3 py-2 text-[12.5px] leading-relaxed text-zinc-300">
+        {preview}
+      </p>
+      <div className="px-3 pb-3">
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          aria-haspopup="dialog"
+          aria-label={`Read the full report: ${name}`}
+          className="flex items-center gap-1.5 rounded-md border border-white/10 px-2.5 py-1 text-[11.5px] font-semibold hover:border-violet-400"
+        >
+          <Eye size={12} /> Read the full report
+        </button>
+      </div>
+      {open && (
+        /* The same surface as the command palette (Ctrl+K): dim, blurred
+           backdrop, panel near the top. Escape and a backdrop click close it;
+           focus is trapped inside the dialog while it is up. */
+        <div
+          className="fixed inset-0 z-[300] flex items-start justify-center bg-black/55 p-4 pt-[6vh] backdrop-blur-[3px]"
+          onMouseDown={(e) => { if (e.target === e.currentTarget) setOpen(false); }}
+        >
+          <div
+            ref={dialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label={name}
+            className="flex max-h-[86vh] w-full max-w-[860px] flex-col overflow-hidden rounded-xl border border-white/15 bg-[#0e0e12] shadow-2xl"
+          >
+            <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
+              <FileText size={15} className="flex-none text-violet-300" />
+              <span className="min-w-0 flex-1 truncate text-[14px] font-bold">{name}</span>
+              <span className="hidden text-[11px] text-zinc-muted sm:inline">
+                {words.toLocaleString()} words
+              </span>
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                aria-label="Close report"
+                className="flex-none rounded-md border border-white/15 px-2 py-1 hover:border-violet-400"
+              >
+                <X size={13} />
+              </button>
+            </div>
+            <div
+              className="prose-chat min-h-0 flex-1 overflow-y-auto px-5 py-4 text-[13px] leading-relaxed text-zinc-200"
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* Lightweight chat: one direct LLM call per turn via /api/chat/simple.
    No DAG, no sessions, no cost ledger — threads live in their own store
    and never appear in Runs. Research keeps the full pipeline. */
 export default function Chat() {
+  const mainId = useMainId();
+  const active = useSectionActive();
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -274,6 +397,37 @@ export default function Chat() {
   /* Per-conversation document access. On by default; turning it off means no
      uploaded document may contribute to this conversation's answers. */
   const [useDocs, setUseDocs] = useState(true);
+  /* Execution engine for the NEXT message. The choice is pinned onto a thread
+     when its first message is sent, so an existing conversation never
+     silently changes engines under the user. */
+  const [mode, setMode] = useState<ChatMode>(() => {
+    try { return localStorage.getItem('aria.chat.mode') === 'dag' ? 'dag' : 'light'; }
+    catch { return 'light'; }
+  });
+  /* The model this chat asks the gateway for. Empty = the gateway routes. */
+  const [aiModel, setAiModel] = useState(() => {
+    try { return localStorage.getItem('aria.chat.model') || ''; } catch { return ''; }
+  });
+  /* Per-thread pin of {mode, model}, so reopening a thread restores the engine
+     and model it actually ran on rather than the current global default. */
+  const prefsRef = useRef<Record<string, { mode: ChatMode; model: string }>>({});
+  useEffect(() => {
+    try { prefsRef.current = JSON.parse(localStorage.getItem('aria.chat.prefs') || '{}') || {}; }
+    catch { prefsRef.current = {}; }
+  }, []);
+  const savePrefs = () => {
+    try { localStorage.setItem('aria.chat.prefs', JSON.stringify(prefsRef.current)); }
+    catch { /* private mode */ }
+  };
+  useEffect(() => {
+    try { localStorage.setItem('aria.chat.mode', mode); } catch { /* private mode */ }
+  }, [mode]);
+  useEffect(() => {
+    try {
+      if (aiModel) localStorage.setItem('aria.chat.model', aiModel);
+      else localStorage.removeItem('aria.chat.model');
+    } catch { /* private mode */ }
+  }, [aiModel]);
   const [status, setStatus] = useState('');
   /* The gateway pill reads the shared health hook like every other page.
      A hand-rolled one-shot fetch here stayed stale after a gateway flap
@@ -291,11 +445,19 @@ export default function Chat() {
   // re-creating its callback on every poll.
   const threadsRef = useRef<ChatThread[]>([]);
   useEffect(() => { threadsRef.current = threads; }, [threads]);
+  // Mirror of `mode` for the fetch callbacks, whose identity must stay stable
+  // across a toggle. The sidebar lists only the current engine's threads.
+  const modeRef = useRef<ChatMode>(mode);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
   const mountedRef = useRef(true);
   const [nowS, setNowS] = useState(Date.now() / 1000);
   /* A composer-level message: why a send did not happen. Whitespace-only Enter
      used to clear the box and say nothing, which reads as a dead key. */
   const [hint, setHint] = useState<{ text: string; tone: 'warn' | 'err' } | null>(null);
+  /* Follow-ups typed while a run is streaming. A DAG run is long, and the old
+     `if (sendingRef.current) return` guard discarded whatever was typed next
+     without a word. They run in order, one at a time, as each turn ends. */
+  const [queued, setQueued] = useState<string[]>([]);
   /* What chat can actually reach. null means "not read yet or unreadable" —
      never a fallback number, because a wrong number here is a lie. */
   const [toolCount, setToolCount] = useState<number | null>(null);
@@ -318,7 +480,7 @@ export default function Chat() {
 
   const refresh = useCallback(async () => {
     try {
-      const d = await api.chatThreads(PAGE, 0);
+      const d = await api.chatThreads(PAGE, 0, modeRef.current);
       if (!mountedRef.current) return;
       loadedOnceRef.current = true;
       const first = d.threads || [];
@@ -348,7 +510,7 @@ export default function Chat() {
     setMoreLoading(true);
     try {
       const from = threadsRef.current.length;
-      const d = await api.chatThreads(PAGE, from);
+      const d = await api.chatThreads(PAGE, from, modeRef.current);
       if (!mountedRef.current) return;
       const extra = d.threads || [];
       setThreads((prev) => {
@@ -362,6 +524,22 @@ export default function Chat() {
       if (mountedRef.current) setMoreLoading(false);
     }
   }, [moreLoading]);
+  /* Switching engine switches the whole context: a thread belongs to exactly
+     one engine, so the open thread, the transcript and the list are all reset
+     to the target engine's threads. Before this the toggle changed only the
+     NEXT message's engine, so the sidebar showed the same conversations under
+     both — a lightweight thread and a DAG run were listed side by side. */
+  const switchMode = (next: ChatMode) => {
+    if (next === mode) return;
+    setMode(next);
+    modeRef.current = next;
+    rememberCid('');
+    setQueued([]);
+    setMsgs([]);
+    setThreads([]);
+    setTotal(0);
+    void refresh();
+  };
   /* What the tool pill says, read from the server rather than asserted here.
      It was the literal "21 tools", so it would go on claiming 21 the day the
      next tool landed. Two reads, both already-authed client calls:
@@ -407,14 +585,15 @@ export default function Chat() {
      capability document is static per deploy, so polling it forever would be
      one request every 15s to re-read a constant. */
   useEffect(() => {
+    if (!active) return;
     if (toolCount !== null && toolsOn !== null) return;
     const t = setTimeout(() => { loadCaps(); }, CONF.pollSlowMs);
     return () => clearTimeout(t);
-  }, [toolCount, toolsOn, loadCaps]);
+  }, [active, toolCount, toolsOn, loadCaps]);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    if (active) refresh();
+  }, [active, refresh]);
 
   /* Re-open the thread that was on screen before navigating away. Without
      this the view remounted with a remembered `cid` but an EMPTY transcript,
@@ -423,7 +602,11 @@ export default function Chat() {
      skipped while a turn is streaming so it cannot stomp the live bubble. */
   const restoredRef = useRef(false);
   useEffect(() => {
-    if (restoredRef.current || !cid) return;
+    // `send()` mints the conversation id and calls rememberCid while the first
+    // answer is still streaming. Restoring at that moment fetched an EMPTY
+    // thread and replaced the live transcript with it. A turn in flight owns
+    // the pane; only a mount with no turn running may restore.
+    if (restoredRef.current || !cid || sendingRef.current) return;
     restoredRef.current = true;
     const t = threadsRef.current.find((x) => x.conversation_id === cid);
     if (t) { void select(t); return; }
@@ -435,9 +618,7 @@ export default function Chat() {
         const d = await api.chatThread(cid);
         if (cancelled || !mountedRef.current) return;
         setCrumb((d.title || 'Chat').slice(0, 40));
-        setMsgs((d.messages || []).map((m) => m.role === 'user'
-          ? { id: nextId(), who: 'you' as const, text: m.content }
-          : { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content), arts: artRefs(m.content) }));
+        setMsgs(toMsgs(d.messages || [], nextId));
       } catch {
         // Gone for good: forget it, so the next visit starts clean instead of
         // retrying a dead id on every mount.
@@ -501,13 +682,14 @@ export default function Chat() {
   /* "5m ago" was frozen between renders because nothing re-rendered on a
      timer, and a thread created in another tab never appeared. */
   useEffect(() => {
+    if (!active) return;
     const t = setInterval(() => {
       if (!mountedRef.current) return;
       setNowS(Date.now() / 1000);
       refresh();
     }, CONF.pollSlowMs);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [active, refresh]);
 
   const select = async (t: ChatThread) => {
     // Switching threads abandons any in-flight stream. Bumping reqRef makes
@@ -516,6 +698,10 @@ export default function Chat() {
     abortRef.current?.abort();
     const req = ++reqRef.current;
     rememberCid(t.conversation_id);
+    setQueued([]);
+    // Show the engine + model this thread actually ran on, not the default.
+    const pref = prefsRef.current[t.conversation_id];
+    if (pref) { setMode(pref.mode); setAiModel(pref.model); }
     setCrumb((t.title || 'Chat').slice(0, 40));
     setHint(null);
     // Load this conversation's document preference so the toggle reflects
@@ -529,10 +715,9 @@ export default function Chat() {
       const d = await api.chatThread(t.conversation_id);
       if (!mountedRef.current || reqRef.current !== req) return; // stale
       // Hands are scanned on reload too, so a document produced in an earlier
-      // conversation comes back reachable rather than as prose.
-      setMsgs((d.messages || []).map((m) => m.role === 'user'
-        ? { id: nextId(), who: 'you' as const, text: m.content }
-        : { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content), arts: artRefs(m.content) }));
+      // conversation comes back reachable rather than as prose. A report
+      // comes back as its preview card, not as a wall of markdown.
+      setMsgs(toMsgs(d.messages || [], nextId));
     } catch {
       if (!mountedRef.current || reqRef.current !== req) return;
       setMsgs([{ id: nextId(), who: 'err', text: 'could not load this thread.' }]);
@@ -547,6 +732,45 @@ export default function Chat() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
 
+  /* A fresh upload lands DISABLED: the Documents view deliberately asks the
+     user to review a file before it informs answers. Chat is different - the
+     user attached it to this conversation, so leaving it off made a perfectly
+     good upload look broken ("can you read this?" -> "I can't see any file").
+     The gateway refuses `enabled` until indexing finishes, so poll the
+     document and switch it on when it reaches ready. */
+  const enableDocWhenReady = async (id: string, name: string) => {
+    for (let i = 0; i < 90; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (!mountedRef.current) return;
+      try {
+        const d = (await api.documentDetail(id)).document;
+        if (!d) return;
+        if (d.status === 'ready') {
+          await api.setDocumentEnabled(id, true);
+          if (!mountedRef.current) return;
+          if (!useDocs) {
+            setUseDocs(true);
+            if (cid) await api.setChatThreadPrefs(cid, true).catch(() => { });
+          }
+          setHint({ tone: 'warn', text: `${name} is ready and switched on for this chat` });
+          return;
+        }
+        if (d.status === 'failed' || d.status === 'blocked') {
+          setHint({
+            tone: 'err',
+            text: `${name} could not be read${d.error ? `: ${d.error}` : ''}`,
+          });
+          return;
+        }
+      } catch { return; }
+    }
+    if (!mountedRef.current) return;
+    setHint({
+      tone: 'warn',
+      text: `${name} is still indexing; switch it on in Documents once it is ready`,
+    });
+  };
+
   /* Upload, then name the files in the composer so the turn refers to them.
      Uploading silently would leave the user unsure what was attached, and
      the agent has nothing to ground on unless the file is named. */
@@ -559,8 +783,9 @@ export default function Chat() {
     const bad: string[] = [];
     for (const f of files) {
       try {
-        await api.uploadDocument(f);
+        const r = await api.uploadDocument(f);
         ok.push(f.name);
+        if (r.document?.id) void enableDocWhenReady(r.document.id, f.name);
       } catch (err) {
         bad.push(`${f.name}: ${(err as Error).message || 'failed'}`);
       }
@@ -612,15 +837,38 @@ export default function Chat() {
     // reqRef bump made the first stream bail before creating its bubble
     // — two user bubbles, one answer. A ref is synchronous, so the claim
     // is atomic; the state flag still drives the disabled UI.
-    if (sendingRef.current) return;
+    if (sendingRef.current) {
+      // A long run kept the composer live but the Send button disabled and
+      // this guard silently dropping the next message. Queue it instead; it
+      // runs, in order, when this turn finishes.
+      setQueued((list) => [...list, q]);
+      setInput('');
+      return;
+    }
     sendingRef.current = true;
     const req = ++reqRef.current;
+    // Read the picker ONCE, at send time: a later change must not re-route a
+    // message that is already in flight.
+    const useMode = mode;
+    const useModel = aiModel;
+    const pinThis = (id: string) => {
+      if (!id || prefsRef.current[id]) return;
+      prefsRef.current[id] = { mode: useMode, model: useModel };
+      savePrefs();
+    };
     setSending(true);
     setHint(null);
-    setInput('');
+    // An override comes from a starter chip or the queue drain; clearing the
+    // composer then would wipe whatever the user is typing for the next turn.
+    if (override === undefined) setInput('');
     setStatus('thinking…');
     setMsgs((m) => [...m, { id: nextId(), who: 'you', text: q }]);
-    setCrumb(q.length > 40 ? q.slice(0, 40) + '…' : q);
+    /* The crumb names the CONVERSATION, so only the first message of a thread may
+       set it. This used to overwrite it on every turn, so after a follow-up the
+       breadcrumb showed the latest question while the sidebar kept the thread's
+       own title — two different names for one conversation, depending on where
+       you looked. */
+    if (!cid) setCrumb(q.length > 40 ? q.slice(0, 40) + '…' : q);
     const t0 = Date.now();
     // Aria's bubble appears immediately and fills in as deltas arrive.
     const bubbleId = nextId();
@@ -649,25 +897,39 @@ export default function Chat() {
     // Scanned only at settle, never mid-stream: the handle is the last thing
     // an answer contains, and a file row appearing inside the live region
     // while the text is still arriving reads as a glitch.
-    const settle = (meta: string, files?: StreamFile[]) => {
+    // A report settles as a CARD, not as rendered markdown: the server sends
+    // the research agent's own text as the answer, and inlining several
+    // thousand words would bury the conversation it belongs to.
+    const settle = (meta: string, files?: StreamFile[], kind?: string, title?: string) => {
       if (queued) { cancelAnimationFrame(queued); queued = 0; }
-      setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
-        id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), meta,
-        // The server's list first (verified against the artifact store), with
-        // the scraped handles kept as a fallback for a model that names one in
-        // prose without rendering anything. Before this, a document the model
-        // rendered was invisible here unless its handle appeared in the text.
-        arts: files?.length
-          ? files.map((f) => ({ id: f.artifact, label: f.filename }))
-          : artRefs(acc),
-      }]);
+      setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), kind === 'report'
+        ? { id: bubbleId, who: 'aria' as const, meta, text: acc,
+            kind: 'report', title: title || '', arts: artRefs(acc) }
+        : {
+          id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), meta,
+          // The server's list first (verified against the artifact store), with
+          // the scraped handles kept as a fallback for a model that names one in
+          // prose without rendering anything. Before this, a document the model
+          // rendered was invisible here unless its handle appeared in the text.
+          arts: files?.length
+            ? files.map((f) => ({ id: f.artifact, label: f.filename }))
+            : artRefs(acc),
+        }]);
     };
     try {
-      for await (const ev of api.chatSimpleStream(q, cid, ac.signal)) {
+      // DAG frames are log/done; the lightweight stream is status/delta/done.
+      // The loop below reads both by type, so the transcript rendering is
+      // identical either way.
+      const frames = useMode === 'dag'
+        ? api.chat(q, cid, ac.signal, { runKind: 'chat' })
+        : api.chatSimpleStream(q, cid, ac.signal, useModel || undefined);
+      for await (const ev of frames) {
         if (!mountedRef.current || reqRef.current !== req) return; // superseded
         if (ev.type === 'started' && (ev as { conversation_id?: string }).conversation_id) {
-          rememberCid((ev as { conversation_id?: string }).conversation_id as string);
-        } else if (ev.type === 'status') {
+          const nid = (ev as { conversation_id?: string }).conversation_id as string;
+          rememberCid(nid);
+          pinThis(nid);
+        } else if (ev.type === 'status' || ev.type === 'log') {
           setStatus((ev as { text?: string }).text || 'working…');
         } else if (ev.type === 'delta') {
           acc += (ev as { text?: string }).text ?? '';
@@ -675,7 +937,9 @@ export default function Chat() {
         } else if (ev.type === 'done') {
           acc = (ev as { answer?: string }).answer ?? acc;
           if ((ev as { conversation_id?: string }).conversation_id) {
-            rememberCid((ev as { conversation_id?: string }).conversation_id as string);
+            const nid = (ev as { conversation_id?: string }).conversation_id as string;
+            rememberCid(nid);
+            pinThis(nid);
           }
           /* Prefer the server's measurement over the client's. The client
              starts counting when the stream opens, so it silently drops the
@@ -687,8 +951,19 @@ export default function Chat() {
             ? serverMs
             : Date.now() - t0;
           const secs = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
-          settle(`done in ${secs} · lightweight`,
-            (ev as { files?: StreamFile[] }).files);
+          settle(`done in ${secs} · ${useMode === 'dag' ? 'DAG' : 'lightweight'}`,
+            (ev as { files?: StreamFile[] }).files,
+            (ev as { kind?: string }).kind,
+            (ev as { title?: string }).title);
+          /* A DAG turn lives in the run's session, which the sidebar store
+             never sees; record it under `dag` so the conversation is listed
+             and can be reopened. Lightweight turns are saved server-side. */
+          if (useMode === 'dag') {
+            const stored = (ev as { conversation_id?: string }).conversation_id || cid;
+            if (stored) {
+              void api.chatThreadTurn(stored, q, acc, 'dag').catch(() => {});
+            }
+          }
           refresh();
         } else if (ev.type === 'error') {
           // The server can emit `error` AFTER the answer finished streaming
@@ -728,7 +1003,7 @@ export default function Chat() {
            rejection the text would be stranded in a bubble having reached
            nobody. Put it back: this failure is the one case where the turn
            provably never got to the model. */
-        if (isTooLong(msg)) setInput(q);
+        if (isTooLong(msg) && override === undefined) setInput(q);
         setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
           id: nextId(), who: 'err', text: humanError(msg, q.length),
         }]);
@@ -748,15 +1023,51 @@ export default function Chat() {
     }
   };
   const stop = () => {
+    const dropped = queued.length;
+    if (dropped) {
+      setMsgs((m) => [...m, {
+        id: nextId(), who: 'aria' as const,
+        text: `Stopped ${dropped} queued message${dropped === 1 ? '' : 's'} before they ran — they were not sent.`,
+      }]);
+    }
+    setQueued([]);
     abortRef.current?.abort();
     setStatus('stopping…');
   };
 
+  /* `send` is recreated every render, so the drain reads it through a ref and
+     depends only on the state it must react to (a turn ending, the queue
+     changing). Including `send` would re-fire the effect on every render. */
+  const sendRef = useRef<(q?: string) => void>(() => {});
+  useEffect(() => { sendRef.current = send; });
+
+  /* Run the next queued follow-up once the current turn has ended. Dequeuing
+     here, not inside `send`, keeps exactly one turn in flight and reads the
+     CURRENT queue rather than the one captured when the turn started. */
+  useEffect(() => {
+    if (sending || queued.length === 0) return;
+    const [next, ...rest] = queued;
+    setQueued(rest);
+    void sendRef.current(next);
+  }, [sending, queued]);
+
   const fresh = () => {
     reqRef.current++; // invalidate any in-flight select/send
     abortRef.current?.abort(); // and stop any open stream
+    // Starting a new chat mid-answer used to blank the transcript as if
+    // nothing had happened, while the question was still sitting in the
+    // thread server-side. Say what happened so the user knows the turn was
+    // kept (they can reopen it from the list) rather than silently dropped.
+    const hadTurn = sendingRef.current;
+    const wasQueued = queued.length;
     rememberCid('');
-    setMsgs([]);
+    setQueued([]);
+    setMsgs(hadTurn || wasQueued ? [{
+      id: nextId(), who: 'aria' as const,
+      text: wasQueued
+        ? `Stopped ${wasQueued} queued message${wasQueued === 1 ? '' : 's'} before they ran — they were not sent.`
+        : 'Stopped before the answer finished. Your question was kept in the conversation, so you can reopen it and continue.',
+    }] : []);
     setCrumb('Chat');
     setHint(null);
     sendingRef.current = false;
@@ -772,6 +1083,7 @@ export default function Chat() {
     setDropping(id);
     abortRef.current?.abort();
     reqRef.current++;
+    setQueued([]);
     try {
       await api.chatThreadDelete(id);
     } catch (e) {
@@ -824,6 +1136,27 @@ export default function Chat() {
         </div>
         <div className="px-2.5 pb-2">
           <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter…" aria-label="Filter threads" className="w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
+        </div>
+        {/* Engine + model for the next chat. In the rail because these are
+            properties of a conversation, not of a single message. */}
+        <div className="space-y-1.5 px-2.5 pb-2">
+          <div role="group" aria-label="Chat engine for new chats"
+               className="flex rounded-md border border-white/10 bg-black/40 p-0.5 text-[10.5px] font-semibold">
+            <button type="button" onClick={() => switchMode('light')}
+                    aria-pressed={mode === 'light'}
+                    title="One direct gateway call — fast, single-shot"
+                    className={`flex-1 rounded px-1.5 py-1 ${mode === 'light' ? 'bg-violet-400/20 text-violet-100' : 'text-zinc-400 hover:text-zinc-200'}`}>
+              Lightweight
+            </button>
+            <button type="button" onClick={() => switchMode('dag')}
+                    aria-pressed={mode === 'dag'}
+                    title="Full planner/executor graph — multi-step, slower"
+                    className={`flex-1 rounded px-1.5 py-1 ${mode === 'dag' ? 'bg-violet-400/20 text-violet-100' : 'text-zinc-400 hover:text-zinc-200'}`}>
+              DAG
+            </button>
+          </div>
+          <ModelPicker model={aiModel} onChange={setAiModel} busy={sending}
+                       label="Model for chat" applyDefault={false} />
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-2.5 pb-3">
           {!loaded && <Skel />}
@@ -878,7 +1211,7 @@ export default function Chat() {
           ))}
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb={crumb}>
           {/* What chat can reach, counted from the server's own chat toolset
               rather than asserted here. It used to read a hardcoded
@@ -954,9 +1287,11 @@ export default function Chat() {
               className={`max-w-[720px] rounded-[10px] border p-4 ${m.who === 'you' ? 'ml-auto border-violet-400/30 bg-violet-400/[0.07]' : m.who === 'err' ? 'border-red-400/40 bg-red-400/5' : 'border-white/10 bg-[#0e0e12]'}`}
             >
               <div className="mb-1 text-xs font-bold text-violet-300">{m.who === 'you' ? 'You' : m.who === 'err' ? 'Error' : 'Aria'}</div>
-              {m.html
-                ? <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200" dangerouslySetInnerHTML={{ __html: m.html }} />
-                : <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">{m.text}</p>}
+              {m.kind === 'report'
+                ? <ReportCard title={m.title || ''} body={m.text || ''} />
+                : m.html
+                  ? <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200" dangerouslySetInnerHTML={{ __html: m.html }} />
+                  : <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">{m.text}</p>}
               {/* A document this run rendered. It used to exist only as prose:
                   the model says "you can download it here", the markdown
                   sanitiser keeps http(s) links only, so the handle in that
@@ -1014,7 +1349,7 @@ export default function Chat() {
             <button
               onClick={() => fileRef.current?.click()}
               disabled={sending || uploading}
-              title="Attach files"
+              title="Attach a document: PDF, DOCX, MD, TXT, HTML, CSV or XLSX (images cannot be read yet)"
               aria-label="Attach files"
               className="flex flex-none items-center gap-1.5 self-end rounded-md border border-white/15 bg-white/5 px-3 py-2.5 text-xs font-bold text-zinc-300 hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
             >
@@ -1050,8 +1385,13 @@ export default function Chat() {
                 key that explains nothing. send() refuses it and states the
                 reason, so clicking and pressing Enter both say the same
                 thing. */}
-            <button onClick={() => send()} disabled={sending} aria-label="Send message" className="flex items-center gap-1.5 self-end rounded-md bg-violet-400 px-4 py-2.5 text-xs font-bold text-[#0b0b0e] shadow-[0_0_16px_rgba(139,124,246,0.35)] hover:brightness-110 disabled:opacity-50">
-              <Send size={13} /> Send
+            {/* While a run streams this queues the message rather than being
+                disabled: a dead Send is exactly what lost the text before. */}
+            <button onClick={() => send()} disabled={sending && !input.trim()}
+              aria-label={sending ? 'Queue message' : 'Send message'}
+              title={sending ? 'Queue — runs when this turn finishes' : undefined}
+              className="flex items-center gap-1.5 self-end rounded-md bg-violet-400 px-4 py-2.5 text-xs font-bold text-[#0b0b0e] shadow-[0_0_16px_rgba(139,124,246,0.35)] hover:brightness-110 disabled:opacity-50">
+              {sending ? <Clock size={13} /> : <Send size={13} />} {sending ? 'Queue' : 'Send'}
             </button>
           </div>
           <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
@@ -1068,6 +1408,14 @@ export default function Chat() {
                 className={`min-w-0 text-[11.5px] ${hint.tone === 'err' ? 'text-red-300' : 'text-amber-300'}`}
               >
                 {hint.text}
+              </span>
+            )}
+            {queued.length > 0 && (
+              <span className="flex items-center gap-1 rounded-full border border-violet-400/40 bg-violet-400/10 px-2 py-0.5 text-[11px] text-violet-200"
+                title={`${queued.length} follow-up${queued.length === 1 ? '' : 's'} waiting`}>
+                <Clock size={10} /> {queued.length} queued
+                <button type="button" onClick={() => setQueued([])} aria-label="Clear queued messages"
+                  className="ml-0.5 text-violet-200/70 hover:text-violet-100"><X size={10} /></button>
               </span>
             )}
             <span

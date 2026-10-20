@@ -67,7 +67,7 @@ Notes:
       "sources": [{"url": "<url>", "title": "<title>"}, ...]
     Do NOT drop or rename it — downstream Formatter nodes read your output
     (not the upstream node directly), so if you omit `sources` the final
-    answer loses its citations. Only copy `sources` that were actually
+    answer loses its Sources section. Only copy `sources` that were actually
     present upstream; never invent URLs.
 
 A Critic node may run after you. Its evaluation will fail if you

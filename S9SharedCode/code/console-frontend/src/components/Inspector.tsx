@@ -181,15 +181,23 @@ export default function Inspector({
           <pre className="whitespace-pre-wrap rounded-lg border border-white/10 bg-[#0a0a0d] p-2.5 font-mono text-[11.5px] leading-relaxed">{outText(d).slice(0, 6000)}</pre>
         )}
         {d && tab === 'preview' && <ReportPreview text={asText(r.output)} />}
-        {d && tab === 'stats' && (
+{d && tab === 'stats' && (
           <dl className="space-y-1.5">
-            {/* `AgentResult` carries provider/cost/elapsed_s only — no model
-                name and no token counts. Those rows read permanent "—", so
-                the tab now shows only fields the server actually sends. */}
+            {/* Per-node token accounting. `AgentResult` now carries
+                input_tokens/output_tokens directly, and for a tool-using node
+                they are the loop's ACCUMULATED total across every turn, not
+                just the last one - so a researcher that searched and fetched
+                for six turns reports what the node actually spent.
+                Previously these rows were omitted because the server sent no
+                token counts and they read as permanent dashes. */}
             {[
               ['agent', r.agent_name || d?.skill || '—'],
               ['provider', r.provider || '—'],
               ['duration', fmtDur(d)],
+              ['input tokens', typeof r.input_tokens === 'number'
+                ? r.input_tokens.toLocaleString() : '—'],
+              ['output tokens', typeof r.output_tokens === 'number'
+                ? r.output_tokens.toLocaleString() : '—'],
               ['cost', cost],
               ['retries', String(d.retries ?? 0)],
               ['status', d.status || '—'],

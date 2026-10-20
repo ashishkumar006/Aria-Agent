@@ -60,14 +60,20 @@ researcher:
   # remember_preference: a research run is where "always give me the
   # publication date" and "no paywalled sources" get said out loud. Without a
   # write path here, preferences said during research were lost.
-  # verify_citations: it existed in the catalog and in the Skills page but
-  # was wired to nothing, so nothing ever checked a URL before the report
-  # cited it. read_artifact: a sibling's findings spill to a handle when
+  # verify_citations: REMOVED from this skill. The tool still exists in the
+  # catalog (other skills may use it), but requiring it here meant the
+  # researcher emitted a per-claim quote/source table before it could write
+  # anything, and that table cost a measured 77% of the findings: the same
+  # model on the same topic produced 1,118 words of prose against 255 words
+  # through the claim/quote/source schema. It also spent 18 of 125 tool calls
+  # in one run verifying quotes that a Sources section at the end of the
+  # document serves just as well.
+  # read_artifact: a sibling's findings spill to a handle when
   # they are long, and a spilled result is unreadable without this.
   tools_allowed: [web_search, fetch_url, arxiv_search, wikipedia_search,
                   openalex_search, news_search, fetch_pdf, extract_tables,
                   wayback_fetch, remember_preference, recall_preferences,
-                  verify_citations, read_artifact]
+                  read_artifact]
   temperature: 0.7         # exploratory; let the model choose phrasings
   # `findings` is what every downstream node reads, and this was the single
   # tightest constraint in the whole DAG: 6000 tokens had to cover the
@@ -218,6 +224,8 @@ coder:
   # file" into a coding agent: without them `create_file` returned ok:true for
   # code that does not compile and the node reported success.
   tools_allowed: [read_file, list_dir, search_files, find_symbol,
+                  document_symbols, find_references, blast_radius,
+                  preview_edit, apply_symbol_edit,
                   create_file, update_file, edit_file, delete_file,
                   run_checks, git_inspect, index_document]
   internal_successors: [sandbox_executor]

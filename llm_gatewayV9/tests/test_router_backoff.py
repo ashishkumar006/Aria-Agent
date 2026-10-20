@@ -45,10 +45,10 @@ def test_402_backoff_skips_provider_in_pick():
         model = "x"
         capabilities = {}
 
-    r = Router({"groq": _Dead()}, ["groq"])
+    r = Router({"kilo": _Dead()}, ["kilo"])
     secs, reason = M._backoff_for(P.ProviderError("pay up", status=402))
-    r.state["groq"].mark_unavailable(secs, reason)
-    name, attempts = r.pick(100, ["groq"])
+    r.state["kilo"].mark_unavailable(secs, reason)
+    name, attempts = r.pick(100, ["kilo"])
     assert name is None
     assert any("backoff" in a["reason"] for a in attempts)
 
@@ -63,16 +63,16 @@ def test_pick_spreads_load_across_providers():
         model = "x"
         capabilities = {}
 
-    r = Router({"groq": _P(), "cerebras": _P()}, ["groq", "cerebras"])
-    first, _ = r.pick(100, ["groq", "cerebras"])
-    assert first == "groq"  # tie → candidate order
+    r = Router({"kilo": _P(), "gemini35lite": _P()}, ["kilo", "gemini35lite"])
+    first, _ = r.pick(100, ["kilo", "gemini35lite"])
+    assert first == "kilo"  # tie → candidate order
     r.state[first].record(0)
     r.state[first].last_call -= 10  # out of cooldown, but still 1 recent call
-    second, _ = r.pick(100, ["groq", "cerebras"])
-    assert second == "cerebras"  # load moved off the just-used provider
+    second, _ = r.pick(100, ["kilo", "gemini35lite"])
+    assert second == "gemini35lite"  # load moved off the just-used provider
     r.state[second].record(0)
     r.state[second].last_call -= 10
-    third, _ = r.pick(100, ["groq", "cerebras"])
+    third, _ = r.pick(100, ["kilo", "gemini35lite"])
     assert third == first  # both used once → earliest last_call wins
 
 
@@ -88,15 +88,15 @@ def test_router_exception_backs_off_pool_member(tmp_db):
 
     class _Pool:
         def __init__(self):
-            self.providers = {"groq": _Raiser()}
+            self.providers = {"kilo": _Raiser()}
             self.state = defaultdict(RateState)
 
         def candidates(self):
-            return ["groq"]
+            return ["kilo"]
 
     pool = _Pool()
     req = ChatRequest(prompt="hello there", agent="t", session="s")
     decision = asyncio.run(M._classify_tier(req, "memory", pool, "hello"))
     assert decision.fallback_used is True  # pool exhausted → count rule
-    snap = pool.state["groq"].snapshot(LIMITS["groq"])
+    snap = pool.state["kilo"].snapshot(LIMITS["kilo"])
     assert snap["backoff_remaining"] > 0  # dead router backed off

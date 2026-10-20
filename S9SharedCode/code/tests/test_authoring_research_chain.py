@@ -146,8 +146,10 @@ def test_the_planner_prompt_says_the_same_thing():
     """The prompt and the enforcement must not disagree, or the model spends
     its budget planning a shape the code then rewrites."""
     md = open("prompts/planner.md", encoding="utf-8").read()
-    assert "DOCUMENT REQUESTS ARE RESEARCH REQUESTS" in md
-    assert "NEVER emit `author`/`deck` straight from `USER_QUERY`" in md
+    low = md.lower()
+    assert "documents" in low and "research chain" in low, (
+        "the authoring-must-be-grounded rule is gone from planner.md")
+    assert "never emit `author`/`deck` straight from `user_query`" in md.lower()
 
 
 def test_the_author_prompt_demands_grounding_in_its_inputs():

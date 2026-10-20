@@ -59,13 +59,15 @@ def _polling_enabled() -> bool:
         "off", "0", "false", "no")
 
 
-def _absorb_files(inst, msg_obj) -> None:
+def _absorb_files(inst, msg_obj, app=None) -> None:
     """Download each attachment and put it in the console's Documents store.
 
     This runs on its own thread, after the message has already been forwarded
     to the agent, so a slow or oversized download can never block the poll
-    loop or delay the user's reply. By the time the agent tries to use the
-    file it is usually already indexed and searchable via search_knowledge.
+    loop or delay the user's reply. Indexing is started explicitly once the
+    bytes are stored: `ingest_document` only writes the record, and outside an
+    upload request nothing else starts the indexer - the file used to sit in
+    `pending` forever, so the agent could never read it.
 
     Telegram gives no filename for photos, so one is synthesised from the
     message id - stable, and it keeps re-sends from colliding.
@@ -73,6 +75,15 @@ def _absorb_files(inst, msg_obj) -> None:
     from memory_api import ingest_document, UnsupportedBytes
 
     for att in list(getattr(msg_obj, "attachments", None) or []):
+        # Attachments are pydantic `Attachment` models. The `.get` calls here
+        # were the same AttributeError as in `_forward_to_agent`: the thread
+        # died before downloading anything, so every Telegram file was
+        # silently never stored and the agent's Documents search came back
+        # empty no matter how many times the user resent it.
+        if hasattr(att, "model_dump"):
+            att = att.model_dump()
+        if not isinstance(att, dict):
+            continue
         file_id = str((att or {}).get("file_id") or "")
         if not file_id:
             continue
@@ -99,6 +110,13 @@ def _absorb_files(inst, msg_obj) -> None:
                   f"{type(e).__name__}: {e}")
             continue
         print(f"[telegram] stored {name} as {doc.get('id')}")
+        if app is not None:
+            try:
+                from memory_api import index_document
+                index_document(doc["id"], app)
+            except Exception as e:
+                print(f"[telegram] could not start indexing {name}: "
+                      f"{type(e).__name__}: {e}")
 
 
 def _offset() -> int:
@@ -131,7 +149,7 @@ def _webhook_registered(inst) -> bool:
         return False
 
 
-def poll_once(inst, *, state: dict | None = None) -> dict:
+def poll_once(inst, *, state: dict | None = None, app=None) -> dict:
     """One polling cycle. Returns a report dict; never raises.
 
     `state` lets a caller (or a test) carry the offset in memory instead of
@@ -186,7 +204,7 @@ def poll_once(inst, *, state: dict | None = None) -> dict:
             # other message. Hand it to a thread and carry on.
             if msg_obj.attachments:
                 threading.Thread(target=_absorb_files,
-                                 args=(inst, msg_obj), daemon=True,
+                                 args=(inst, msg_obj, app), daemon=True,
                                  name="tg-file").start()
             _record_inbound("telegram", msg_obj)
             report["delivered"] += 1
@@ -206,7 +224,7 @@ def poll_once(inst, *, state: dict | None = None) -> dict:
     return report
 
 
-def _worker(interval: float = 5.0) -> None:
+def _worker(interval: float = 5.0, app=None) -> None:
     global _STOOD_DOWN
     from adaptors import registry
 
@@ -224,7 +242,7 @@ def _worker(interval: float = 5.0) -> None:
                                "listener stood down")
                 print(f"[telegram] {_STOOD_DOWN}")
                 return
-            report = poll_once(inst, state=state)
+            report = poll_once(inst, state=state, app=app)
             if report.get("stopped"):
                 _STOOD_DOWN = str(report.get("error") or "stopped")
                 print(f"[telegram] {_STOOD_DOWN}")
@@ -243,8 +261,13 @@ def _worker(interval: float = 5.0) -> None:
                             if fail_streak else interval))
 
 
-def start() -> threading.Thread | None:
-    """Start the long-poll listener once per process. Idempotent."""
+def start(app=None) -> threading.Thread | None:
+    """Start the long-poll listener once per process. Idempotent.
+
+    `app` is the FastAPI instance, handed to the download thread so stored
+    attachments can start indexing (which needs the app's embedder registry).
+    Optional so tests and older callers keep working.
+    """
     global _THREAD, _STARTED_AT, _STOOD_DOWN
     if _THREAD is not None and _THREAD.is_alive():
         return _THREAD
@@ -254,8 +277,8 @@ def start() -> threading.Thread | None:
     _STOP.clear()
     _STOOD_DOWN = ""
     _STARTED_AT = time.time()
-    _THREAD = threading.Thread(target=_worker, daemon=True,
-                               name="telegram-poll")
+    _THREAD = threading.Thread(target=_worker, kwargs={"app": app},
+                               daemon=True, name="telegram-poll")
     _THREAD.start()
     return _THREAD
 

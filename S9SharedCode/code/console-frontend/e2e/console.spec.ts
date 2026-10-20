@@ -25,7 +25,7 @@ const PAGES: { route: string; markers: string[] }[] = [
   { route: '/ledger', markers: ['SPEND BY SKILL', 'TURN HISTORY'] },
   { route: '/mission', markers: ['EVENT FEED', 'Sources'] },
   { route: '/settings', markers: ['READ-ONLY CONFIG', 'Environment'] },
-  { route: '/code', markers: ['Explorer', 'read-only source', 'Problems'] },
+  { route: '/code', markers: ['Explorer', 'Pick a file to start editing', 'Problems'] },
 ];
 
 for (const p of PAGES) {

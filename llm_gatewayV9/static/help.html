@@ -228,7 +228,7 @@ for chunk in llm.stream("count to 5"):
   <tr><td>Gemini 3.5 Lite</td><td>gemini-3.5-flash-lite</td><td>15</td><td>1,000</td><td>250K TPM · 1M ctx</td></tr>
   <tr><td>OpenRouter</td><td>nvidia/nemotron-3-super-120b-a12b:free</td><td>20</td><td>50</td><td>per model · pooled</td></tr>
   <tr><td>GitHub Models</td><td>openai/gpt-4.1-mini</td><td>10</td><td>50</td><td>8K ctx</td></tr>
-  <tr><td>Kilo</td><td>tencent/hy3:free</td><td>60</td><td>9999</td><td>262K ctx</td></tr>
+  <tr><td>Kilo</td><td>auto (live free model)</td><td>60</td><td>9999</td><td>262K+ ctx</td></tr>
 </table>
 
 <h2>Configuration (.env)</h2>
@@ -253,7 +253,7 @@ GITHUB_ACCESS_TOKEN=...
 GITHUB_MODEL=openai/gpt-4.1-mini
 
 KILO_API_KEY=...
-KILO_MODEL=tencent/hy3:free
+KILO_MODEL=  # leave blank: the best free model is read from the roster
 KILO_BASE_URL=https://api.kilo.ai/api/gateway
 
 OLLAMA_URL=http://localhost:11434

@@ -1,10 +1,12 @@
-/* Code — a browser editor over the agent's two source trees.
+/* Code — a browser editor over whatever folder you point it at.
 
    Scope, stated plainly because it matters:
 
-   * The agent serves these files READ ONLY (`/api/code/*`, path-confined to
-     `S9SharedCode/code` and `llm_gatewayV9`). There is no write, move, delete
-     or execute route, so nothing typed here can reach the disk or run.
+   * The editor starts on an empty scratch workspace; Open Folder or New
+     Playground re-roots it at a local directory (`/api/code/*`). Reads are
+     path-confined to the workspace. The coding agent CAN write, and its edits
+     apply straight to disk — each one is marked in the editor for a Keep or
+     Revert review afterwards; the editor's own Save pays a confirm of its own.
    * Edits live in this browser tab (and localStorage, so a reload does not
      lose them). A dirty tab can be reverted to what the agent actually serves.
    * There is no language server: no diagnostics, completion or go-to-definition.
@@ -20,15 +22,27 @@ import {
   useCallback, useEffect, useMemo, useRef, useState, type ReactNode,
 } from 'react';
 import {
-  Braces, ChevronDown, ChevronRight, Circle, CircleCheck, Code2, Columns2,
-  FileCode2, FileText, Folder, FolderOpen, Loader2, Maximize2,
-  PanelLeftClose,
-  PanelLeftOpen, Play, Search, Square, Terminal, TriangleAlert, WrapText, X,
-  Keyboard, ListTree, CircleDot, Sparkles,
+  ChevronDown, ChevronRight, Circle, CircleCheck, Code2,
+  Eye, FileCode2, FileText, Folder, FolderPlus, FolderOpen, Globe, Loader2,
+  Maximize2,
+  PanelLeftClose, PanelLeftOpen, Play, Save, Search, Square, Terminal,
+  Braces, TriangleAlert, WrapText, X, Keyboard, ListTree, CircleDot, Sparkles,
+  ShieldQuestion, FilePlus,
 } from 'lucide-react';
 import { Rail, TopBar, Empty, Pill, SkipLink } from '../components/ui';
 import { useFocusTrap } from '../lib/a11y';
-import Editor from '../components/CodeEditor';
+import { useMainId, useSectionActive } from '../components/KeepAlive';
+import { parseUnifiedMarks, type DiffMarks } from '../lib/diffMarks';
+import { renderMarkdown } from '../components/markdown';
+import MonacoEditor, {
+  type CaretInfo, type EditorHandle, type EditorOp,
+} from '../components/MonacoEditor';
+import AgentPanel from '../components/AgentPanel';
+import { EditPermissionDialog, type PendingEdit } from '../components/EditPermissionDialog';
+import TerminalDock, { type TerminalStatus } from '../components/TerminalDock';
+import {
+  DiffView, IntelModal, lineDiff, useWordAtCursor,
+} from '../components/CodeIntel';
 
 /* A draft only ever exists in this browser - the server never receives it - so
    before anything destructive touches it, the user gets a copy they can keep.
@@ -38,10 +52,11 @@ function downloadText(name: string, text: string) {
   const url = `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
   const a = document.createElement('a');
   a.href = url;
-  a.download = name.replace(/[\\/]/g, '_');
+  a.download = name.replace(/\\/g, '_');
   a.click();
 }
-import { foldRanges, symbols as symbolsOf, type Symbol } from '../lib/lang';
+
+import { symbols as symbolsOf, type Symbol } from '../lib/lang';
 import { useHistory, type Snapshot } from '../lib/useHistory';
 import {
   api, type CodeEntry, type CodeFile, type CodeProblem, type CodeMatch,
@@ -49,11 +64,11 @@ import {
 } from '../api';
 
 const STORE_KEY = 'aria.code.drafts.v1';
-const COMMENT: Record<string, string> = {
-  python: '# ', sh: '# ', shell: '# ', yaml: '# ', yml: '# ', toml: '# ',
-  ini: '; ', sql: '-- ', css: '/* ', html: '<!-- ', javascript: '// ',
-  typescript: '// ', typescriptreact: '// ', json: '// ', markdown: '<!-- ',
-};
+/* The agent's disk-writing tools (agent_server.py's own list). A successful
+   result from any of these means the explorer's cached listings are stale. */
+const WRITE_TOOLS = new Set([
+  'create_file', 'update_file', 'edit_file', 'delete_file', 'apply_symbol_edit',
+]);
 const LANG_LABEL: Record<string, string> = {
   python: 'Python', typescript: 'TypeScript', typescriptreact: 'TypeScript React',
   javascript: 'JavaScript', json: 'JSON', yaml: 'YAML', toml: 'TOML',
@@ -61,7 +76,50 @@ const LANG_LABEL: Record<string, string> = {
   text: 'Plain Text', ini: 'Config',
 };
 
-/* ── small helpers ─────────────────────────────────────────────────────── */
+/* Is the focus inside the editor? Answered by containment, not identity:
+   Monaco renders its own textarea inside the host div, so there is no node of
+   ours to compare against. `e.target === ta.current` was the old way. */
+const ED_HOST = 'div[data-editor-host]';
+function edInFocus(t: EventTarget | null): boolean {
+  if (!(t instanceof Node)) return false;
+  const host = document.querySelector(ED_HOST);
+  return !!host && host.contains(t);
+}
+
+/*  small helpers  */
+
+/* The agent trace, boiled down to one line a human will read. The tool's full
+   arguments and full result are NOT this: a JSON dump in the activity list is
+   noise, and the identifying argument plus the outcome is what actually
+   explains what happened. */
+function briefArgs(args: unknown): string {
+  if (!args || typeof args !== 'object') return '';
+  const a = args as Record<string, unknown>;
+  for (const k of ['path', 'pattern', 'file', 'name', 'query', 'symbol']) {
+    if (typeof a[k] === 'string') return a[k] as string;
+  }
+  const first = Object.values(a).find((v) => typeof v === 'string');
+  return typeof first === 'string' ? first.slice(0, 60) : '';
+}
+
+function outcomeBrief(r: { result?: string; detail?: string; error?: string }): string {
+  const raw = String(r.error || r.detail || r.result || '');
+  try {
+    const o = JSON.parse(raw) as Record<string, unknown>;
+    const bits: string[] = [];
+    if (o.truncated === true) {
+      bits.push(`truncated, lines ${o.start_line}-${o.end_line} of ${o.line_count}`);
+    }
+    if (Array.isArray(o.hits)) bits.push(`${o.hits.length} hit(s)`);
+    if (typeof o.line === 'number') bits.push(`line ${o.line}`);
+    if (typeof o.definition === 'string') bits.push(o.definition);
+    if (typeof o.next_offset === 'number') bits.push(`continue at ${o.next_offset}`);
+    if (typeof o.count === 'number') bits.push(`${o.count} match(es)`);
+    return bits.join(' · ');
+  } catch {
+    return raw.replace(/\s+/g, ' ').trim().slice(0, 70);
+  }
+}
 
 function loadDrafts(): Record<string, string> {
   try {
@@ -103,7 +161,7 @@ function fuzzy(needle: string, hay: string): number | null {
   return score - Math.min(hay.length, 60) * 0.12;
 }
 
-/* ── editor state ───────────────────────────────────────────────────────── */
+/*  editor state  */
 
 type Pane = { path: string; file: CodeFile; body: string; base: string };
 
@@ -132,37 +190,82 @@ function offsetOf(text: string, c: Cursor): number {
   return Math.max(0, Math.min(text.length, starts[i] + c.col - 1));
 }
 
-function lineSlice(text: string, line: number): string {
-  const starts = offsets(text);
-  const i = line - 1;
-  if (i < 0 || i >= starts.length) return '';
-  const end = i + 1 < starts.length ? starts[i + 1] - 1 : text.length;
-  return text.slice(starts[i], end);
-}
-
-/* ── explorer ───────────────────────────────────────────────────────────── */
+/*  explorer  */
 
 function Explorer({
-  onOpen, activePath,
-}: { onOpen: (p: string) => void; activePath: string | null }) {
+  onOpen, activePath, onWorkspaceChange, reloadAt, changed,
+}: {
+  onOpen: (p: string) => void; activePath: string | null;
+  onWorkspaceChange?: () => void;
+  /** Bumped when the workspace changed on disk outside this component - a
+   *  re-root, or the agent writing files. Re-reads the tree from disk. */
+  reloadAt?: number;
+  /** Client paths with an unreviewed agent change: a dot marks the row, so
+   *  the user can see at a glance where the agent has been. */
+  changed?: Set<string>;
+}) {
   const [tree, setTree] = useState<Record<string, CodeEntry[]>>({});
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [roots, setRoots] = useState<string[]>([]);
+  const [wsName, setWsName] = useState('');
+  const [wsDefault, setWsDefault] = useState(true);
+  const [wsBusy, setWsBusy] = useState(false);
+  const [ask, setAsk] = useState(false);
+  const [askPath, setAskPath] = useState('');
+  const [newFile, setNewFile] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newBusy, setNewBusy] = useState(false);
+
+  /* Read the live workspace: its roots (the tree's top level) and its
+     name. Both come from the server, never a literal, so an Open Folder
+     shows up here without a reload. */
+  const refreshRoots = useCallback(async () => {
+    const r = await api.codeRoots();
+    if (r?.roots) setRoots(r.roots.map((x) => x.name));
+    try {
+      const w = await api.codeWorkspace();
+      setWsName(w?.name || '');
+      setWsDefault(w?.is_default !== false);
+    } catch { /* the name is decoration; the roots are load-bearing */ }
+  }, []);
 
   useEffect(() => {
     let live = true;
-    api.codeRoots()
-      .then((r) => { if (live && r?.roots) setRoots(r.roots.map((x) => x.name)); })
-      .catch((e) => {
-        /* Swallowed before, so a failed root fetch left the
-           explorer on "reading workspace…" forever with no way
-           to tell broken from slow. */
-        if (live) setErr(e instanceof Error ? e.message : 'could not read the workspace');
-      });
+    refreshRoots().catch((e) => {
+      /* Not swallowed: a failed root fetch used to leave the explorer on
+         "reading workspace" forever, so broken and slow looked alike. */
+      if (live) setErr(e instanceof Error ? e.message : 'could not read the workspace');
+    });
     return () => { live = false; };
-  }, []);
+  }, [refreshRoots]);
+
+  /* Point the workspace at a folder, or a fresh playground, then re-read.
+     The tree and open-set are cleared first: keeping the old keys would
+     make the reload effect walk directories that no longer exist. */
+  const switchWs = useCallback(async (run: () => Promise<unknown>) => {
+    setWsBusy(true);
+    try {
+      await run();
+      setTree({});
+      setOpen(new Set());
+      await refreshRoots();
+      setErr(null);
+      /* The parent owns the quick-open index; it re-fetches on this. */
+      onWorkspaceChange?.();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'could not open that folder');
+    } finally { setWsBusy(false); }
+  }, [refreshRoots, onWorkspaceChange]);
+
+  /* Re-read the workspace after a failed root fetch. Without this the amber
+     error just sat there with no way back short of a full reload. */
+  const retryExplorer = useCallback(() => {
+    setErr(null);
+    refreshRoots().catch((e) =>
+      setErr(e instanceof Error ? e.message : 'could not read the workspace'));
+  }, [refreshRoots]);
 
   const load = useCallback(async (dir: string) => {
     setBusy(true);
@@ -182,6 +285,61 @@ function Explorer({
     }
   }, [roots, load]);
 
+  /* Which directories are expanded, readable from effects that must not
+     re-run (and re-load) every time the user toggles one. */
+  const openRef = useRef(open);
+  useEffect(() => { openRef.current = open; }, [open]);
+
+  /* The agent writes straight to disk, outside this component's own create /
+     save paths, so nothing re-read the tree: a file the agent had just
+     created stayed invisible in the explorer (a folder already showing
+     "empty" kept saying "empty") until the user collapsed and re-expanded
+     it. The parent bumps `reloadAt` when a turn touched files; re-read the
+     roots and every expanded directory. */
+  useEffect(() => {
+    if (!reloadAt) return;
+    let live = true;
+    (async () => {
+      await refreshRoots().catch(() => { /* the reload below still helps */ });
+      if (!live) return;
+      for (const d of openRef.current) await load(d);
+    })();
+    return () => { live = false; };
+  }, [reloadAt, refreshRoots, load]);
+
+  /* Create one empty file and open it, so "New file" leaves the user somewhere
+     to type. The console could not create anything before: a fresh playground
+     is empty, "Open folder" needs a folder that already exists, and
+     `/api/code/write` only saves a buffer that was already open. */
+  const createFile = useCallback(async () => {
+    const name = newName.trim();
+    if (!name || newBusy) return;
+    setNewBusy(true);
+    try {
+      /* Paths here are "root/sub/file" - `_code_abs` resolves against the
+         workspace base, not against a root - so the file goes inside the first
+         root the explorer is showing. A bare name resolved to the base, which
+         is the parent of the roots and rejected as "outside the workspace". */
+      const root = roots[0] || '';
+      const rel = root ? `${root}/${name}` : name;
+      const r = await api.codeNewFile(name, root);
+      if (r?.error) setErr(r.error);
+      else {
+        setNewFile(false);
+        setNewName('');
+        setTree({});        // drop the cached listing so the entry appears
+        setOpen((s) => new Set(s).add(root || '.'));
+        await refreshRoots();
+        await load(root || '.');
+        onOpen(rel);
+        setErr(null);
+      }
+    } catch (e) {
+      const msg = (e as { message?: string })?.message || String(e);
+      setErr(msg.replace(/^HTTP \d+:\s*/, ''));
+    } finally { setNewBusy(false); }
+  }, [newName, newBusy, roots, refreshRoots, load, onOpen]);
+
   const toggle = useCallback((dir: string) => {
     setOpen((s) => {
       const n = new Set(s);
@@ -197,14 +355,15 @@ function Explorer({
   useEffect(() => {
     if (!activePath) return;
     const parts = activePath.split('/');
-    /* Only auto-open paths that are actually reachable. The roots are
-       `S9SharedCode/code` and `llm_gatewayV9`, so a file at
-       `S9SharedCode/code/auth.py` yields the candidate `S9SharedCode` —
-       which is inside neither root. Requesting it returned "path outside
-       the code workspace", the error stuck forever (the dir never enters
-       `tree`, so `!(d in tree)` stayed true and every tree change re-fired
-       it), and it MASKED genuine failures: a 503 from /api/code/roots was
-       correctly shown until opening a file replaced it with this. */
+    /* Only auto-open paths that are actually reachable. The roots are the
+       workspace's own top-level folders, so a file at `code_workspace/a.py`
+       yields the candidate `code_workspace` - reachable. For an opened
+       folder, a file at `repo/src/x.py` yields `repo` - which is inside no
+       root. Requesting it returned "path outside the code workspace", the
+       error stuck forever (the dir never enters `tree`, so `!(d in tree)`
+       stayed true and every tree change re-fired it), and it MASKED genuine
+       failures: a 503 from /api/code/roots was correctly shown until opening
+       a file replaced it with this. */
     const roots = Object.keys(tree);
     const need: string[] = [];
     for (let i = 1; i < parts.length; i++) {
@@ -241,6 +400,7 @@ function Explorer({
       busy={busy}
       onOpen={onOpen}
       activePath={activePath}
+      changed={changed}
     />
   );
 
@@ -248,15 +408,123 @@ function Explorer({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-none items-center gap-1.5 px-3 py-2 text-[10.5px] font-bold uppercase tracking-[0.14em] text-zinc-muted">
         Explorer
-        {busy && <span className="ml-auto text-[10px] normal-case text-accent/70">reading…</span>}
+        <button
+          type="button"
+          title="Open a folder as the workspace"
+          aria-label="Open folder"
+          onClick={() => { setAskPath(''); setAsk(true); }}
+          disabled={wsBusy}
+          className="ml-auto rounded p-0.5 text-zinc-muted transition-colors hover:text-accent disabled:opacity-40"
+        >
+          <FolderOpen size={13} />
+        </button>
+        <button
+          type="button"
+          title="New empty playground"
+          aria-label="New playground"
+          onClick={() => void switchWs(() => api.newCodePlayground())}
+          disabled={wsBusy}
+          className="rounded p-0.5 text-zinc-muted transition-colors hover:text-accent disabled:opacity-40"
+        >
+          <FolderPlus size={13} />
+        </button>
+        {/* New file: the console had no way to create one (see createFile). */}
+        <button
+          type="button"
+          title="New file in the workspace"
+          aria-label="New file"
+          onClick={() => { setNewName(''); setNewFile(true); }}
+          disabled={wsBusy}
+          className="rounded p-0.5 text-zinc-muted transition-colors hover:text-accent disabled:opacity-40"
+        >
+          <FilePlus size={13} />
+        </button>
+        {(busy || wsBusy) && <span className="text-[10px] normal-case text-accent/70">reading</span>}
+        {/* The workspace name used to sit on its own line above the tree, at
+            tree-row size and directly over `code_workspace`. It read as an
+            extra, empty folder level. Reset now lives here; the root row below
+            already names the folder. */}
+        {!wsDefault && (
+          <button
+            type="button"
+            onClick={() => void switchWs(() => api.resetCodeWorkspace())}
+            title={`Reset ${wsName || 'this workspace'} to a fresh playground`}
+            className="flex-none normal-case tracking-normal text-zinc-muted transition-colors hover:text-zinc-200"
+          >
+            reset
+          </button>
+        )}
       </div>
+      {newFile && (
+        <form
+          className="flex flex-none items-center gap-1.5 px-3 pb-1.5"
+          onSubmit={(e) => { e.preventDefault(); void createFile(); }}
+        >
+          <input
+            autoFocus
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') { setNewFile(false); setNewName(''); } }}
+            placeholder="notes.md"
+            aria-label="New file name"
+            className="min-w-0 flex-1 rounded border border-white/15 bg-black/40 px-2 py-1 text-xs normal-case text-zinc-100 outline-none focus:border-accent"
+          />
+          <button
+            type="submit"
+            disabled={newBusy || !newName.trim()}
+            className="rounded bg-accent px-2 py-1 text-[10.5px] font-bold text-black disabled:opacity-40"
+          >
+            {newBusy ? 'creating…' : 'Create'}
+          </button>
+          <button
+            type="button"
+            onClick={() => { setNewFile(false); setNewName(''); }}
+            className="rounded px-1.5 py-1 text-[10.5px] normal-case text-zinc-muted hover:text-zinc-200"
+          >
+            cancel
+          </button>
+        </form>
+      )}
+      {ask && (
+        <div className="flex flex-none items-center gap-1 px-3 pb-2">
+          <input
+            autoFocus
+            value={askPath}
+            onChange={(e) => setAskPath(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') { e.preventDefault(); setAsk(false); }
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                const p = askPath.trim();
+                if (p) { setAsk(false); void switchWs(() => api.openCodeWorkspace(p)); }
+              }
+            }}
+            placeholder="folder path, e.g. C:\\dev\\my-repo"
+            aria-label="Folder to open"
+            className="min-w-0 flex-1 rounded border border-glass-border bg-surface-2 px-2 py-1 text-[11px] normal-case text-zinc-100 outline-none focus:border-accent/60"
+          />
+          <button
+            type="button"
+            onClick={() => {
+              const p = askPath.trim();
+              if (p) { setAsk(false); void switchWs(() => api.openCodeWorkspace(p)); }
+            }}
+            className="flex-none rounded px-1.5 py-1 text-[10.5px] normal-case text-accent transition-colors hover:bg-accent/10"
+          >
+            Open
+          </button>
+        </div>
+      )}
       {err && (
-        <p className="px-3 py-1.5 text-[11px] text-amber-400/90">{err}</p>
+        <p className="px-3 py-1.5 text-[11px] text-amber-400/90">
+          {err}{' '}
+          <button onClick={retryExplorer} className="underline">retry</button>
+        </p>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto pb-2">
         <ul>{roots.map((r) => renderDir(r, 0))}</ul>
         {!roots.length && !err && (
-          <p className="px-3 py-2 text-[11px] text-zinc-muted">reading workspace…</p>
+          <p className="px-3 py-2 text-[11px] text-zinc-muted">reading workspace</p>
         )}
       </div>
     </div>
@@ -270,11 +538,12 @@ function Explorer({
    any file below the top level of a root was listed nowhere and could not be
    opened at all. One node type renders both, so a file cannot go missing. */
 function DirNode({
-  name, path, depth, open, toggle, tree, onOpen, activePath, busy,
+  name, path, depth, open, toggle, tree, onOpen, activePath, busy, changed,
 }: {
   name: string; path: string; depth: number; open: Set<string>;
   toggle: (d: string) => void; tree: Record<string, CodeEntry[]>;
   onOpen: (p: string) => void; activePath: string | null; busy: boolean;
+  changed?: Set<string>;
 }) {
   const isOpen = open.has(path);
   return (
@@ -291,8 +560,8 @@ function DirNode({
           ? <ChevronDown size={12} className="flex-none text-zinc-muted" />
           : <ChevronRight size={12} className="flex-none text-zinc-muted" />}
         {isOpen
-          ? <FolderOpen size={12} className="flex-none text-accent/80" />
-          : <Folder size={12} className="flex-none text-accent/60" />}
+          ? <FolderOpen size={12} className="flex-none text-zinc-500" />
+          : <Folder size={12} className="flex-none text-zinc-500" />}
         <span className="truncate">{name}</span>
       </button>
       {isOpen && (
@@ -302,27 +571,34 @@ function DirNode({
             return e.dir ? (
               <DirNode key={child} name={e.name} path={child} depth={depth + 1}
                 open={open} toggle={toggle} tree={tree} onOpen={onOpen}
-                activePath={activePath} busy={busy} />
+                activePath={activePath} busy={busy} changed={changed} />
             ) : (
               <li key={child}>
                 <button
                   type="button"
                   onClick={() => onOpen(child)}
-                  title={child}
+                  title={changed?.has(child)
+                    ? `${child} — changed by the agent, not yet reviewed`
+                    : child}
                   aria-current={activePath === child ? 'true' : undefined}
                   className={`flex w-full items-center gap-1.5 rounded py-[3px] pr-2 text-left text-[12px] ${
                     activePath === child
-                      ? 'bg-accent/10 text-zinc-100'
+                      ? 'bg-white/[0.06] text-zinc-100'
                       : 'text-zinc-400 hover:bg-glass-hover'
                   }`}
                   style={{ paddingLeft: 20 + depth * 12 }}
                 >
                   {e.name.endsWith('.py')
-                    ? <FileCode2 size={12} className="flex-none text-accent/80" />
+                    ? <FileCode2 size={12} className="flex-none text-zinc-500" />
                     : /\.tsx?$/.test(e.name)
-                      ? <FileCode2 size={12} className="flex-none text-sky-400/80" />
+                      ? <FileCode2 size={12} className="flex-none text-zinc-400" />
                       : <FileText size={12} className="flex-none text-zinc-muted" />}
                   <span className="truncate">{e.name}</span>
+                  {changed?.has(child) && (
+                    <span aria-hidden="true"
+                      className="ml-auto h-1.5 w-1.5 flex-none rounded-full"
+                      style={{ background: '#d29922' }} />
+                  )}
                 </button>
               </li>
             );
@@ -330,7 +606,7 @@ function DirNode({
           {!(tree[path] ?? []).length && (
             <li className="py-1 text-[11px] text-zinc-muted"
                 style={{ paddingLeft: 20 + depth * 12 }}>
-              {busy ? 'loading…' : 'empty'}
+              {busy ? 'loading' : 'empty'}
             </li>
           )}
         </ul>
@@ -339,39 +615,13 @@ function DirNode({
   );
 }
 
-/* ── minimap ────────────────────────────────────────────────────────────── */
-
-function Minimap({ lines, cursorLine, height }: {
-  lines: string[]; cursorLine: number; height: number;
-}) {
-  const rows = lines.slice(0, 4000);
-  return (
-    <div aria-hidden className="relative flex-none select-none overflow-hidden border-l border-glass-border bg-surface-0"
-         style={{ width: 74, height }}>
-      <div className="absolute inset-y-0 right-0 w-1.5">
-        {rows.map((l, i) => (
-          <div key={i} className="flex items-end gap-px px-0.5" style={{ height: 3 }}>
-            <span className="h-[1px] flex-none bg-zinc-600/70"
-                  style={{ width: `${Math.min(100, l.trim().length * 2.2)}%` }} />
-          </div>
-        ))}
-      </div>
-      <div className="absolute inset-x-0 bg-accent/10"
-           style={{
-             top: `${(Math.max(0, cursorLine - 1) / Math.max(1, rows.length)) * height}px`,
-             height: Math.max(12, (height / Math.max(1, rows.length)) * 3),
-           }} />
-    </div>
-  );
-}
-
-/* ── find widget ────────────────────────────────────────────────────────── */
+/*  find widget  */
 
 interface FindState { open: boolean; query: string; replace: string; cs: boolean }
 
-function FindWidget({ state, setState, body, taRef, onReveal }: {
+function FindWidget({ state, setState, body, editor, onReveal }: {
   state: FindState; setState: (s: FindState) => void;
-  body: string; taRef: React.RefObject<HTMLTextAreaElement | null>;
+  body: string; editor: EditorHandle | null;
   onReveal: (needle: string, cs: boolean, backwards: boolean, moveFocus?: boolean) => void;
 }) {
   const ref = useRef<HTMLInputElement>(null);
@@ -452,31 +702,27 @@ function FindWidget({ state, setState, body, taRef, onReveal }: {
         />
         <button type="button" disabled={!total}
           onClick={() => {
-            const el = taRef.current;
+            const el = editor;
             if (!el || !state.query) return;
             const hay = state.cs ? body : body.toLowerCase();
             const n = state.cs ? state.query : state.query.toLowerCase();
-            const at = hay.indexOf(n, el.selectionStart);
+            const at = hay.indexOf(n, el.selection().start);
             if (at === -1) return;
             const next = body.slice(0, at) + state.replace + body.slice(at + n.length);
-            const setter = (Object.getOwnPropertyDescriptor(
-              window.HTMLTextAreaElement.prototype, 'value')?.set);
-            setter?.call(el, next);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
             /* Advance the caret past the replacement so the next
                Replace walks on to the following match. The
                selection used to stay put, so every click
                re-found and re-replaced the SAME match and the
                walk never moved. */
             const end = Math.min(at + state.replace.length, next.length);
-            el.setSelectionRange(end, end);
+            el.apply(next, end, end);
           }}
           className="rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-300 disabled:opacity-40 hover:bg-glass-hover">
           Replace
         </button>
         <button type="button" disabled={!total}
           onClick={() => {
-            const el = taRef.current;
+            const el = editor;
             if (!el || !state.query) return;
             const cs = state.cs;
             const n = cs ? state.query : state.query.toLowerCase();
@@ -490,10 +736,7 @@ function FindWidget({ state, setState, body, taRef, onReveal }: {
               i = hay.indexOf(n, last);
             }
             out += body.slice(last);
-            const setter = (Object.getOwnPropertyDescriptor(
-              window.HTMLTextAreaElement.prototype, 'value')?.set);
-            setter?.call(el, out);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.apply(out, 0, 0);
           }}
           className="rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-300 disabled:opacity-40 hover:bg-glass-hover">
           All
@@ -503,7 +746,7 @@ function FindWidget({ state, setState, body, taRef, onReveal }: {
   );
 }
 
-/* ── quick open / command palette ───────────────────────────────────────── */
+/*  quick open / command palette  */
 
 /* Rank `files` against `q`. Shared by the render and by the key handler: the
    handler must rank from what is actually typed, not from state that may not
@@ -607,15 +850,14 @@ function Palette({ mode, files, truncated, onPick, onClose }: {
   );
 }
 
-/* ── the editor ─────────────────────────────────────────────────────────── */
+/*  the editor  */
 
-const BRACKETS: Record<string, [string, string]> = {
-  python: ['(', ')'], typescript: ['(', ')'], typescriptreact: ['(', ')'],
-  javascript: ['(', ')'], json: ['(', ')'], css: ['(', ')'],
-  yaml: ['(', ')'], toml: ['(', ')'], sql: ['(', ')'], html: ['(', ')'],
-};
+/* Monaco owns bracket logic, so this map is gone. It used to drive the
+   hand-written Enter handler's "did the line end in an opener" test. */
 
 export default function Code() {
+  const mainId = useMainId();
+  const sectionActive = useSectionActive();
   const [panes, setPanes] = useState<Pane[]>([]);
   /* The active tab is tracked by PATH, not by index. It was an index, and
      `open()` appended the new pane then set the active index to `active + 1`
@@ -625,7 +867,13 @@ export default function Code() {
   const [activePath, setActivePath] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>(() => loadDrafts());
   const [explorerOn, setExplorerOn] = useState(true);
-  const [minimapOn, setMinimapOn] = useState(true);
+  /* The agent is a pane, not a fixture: on a laptop it was taking more width
+     than the editor it comments on (252px of editor at 1024 wide). Collapsible
+     from the top bar, open by default only when there is room for both. */
+  const [agentOn, setAgentOn] = useState(() => window.innerWidth >= 1280);
+  /* Same reasoning as the agent: a 60px minimap leaves a 250px editor with
+     almost no code. It stays available from the status bar. */
+  const [minimapOn, setMinimapOn] = useState(() => window.innerWidth >= 1280);
   const [wrap, setWrap] = useState(false);
   const [zen, setZen] = useState(false);
   const [palette, setPalette] = useState<'file' | 'cmd' | null>(null);
@@ -635,19 +883,57 @@ export default function Code() {
   const [selLen, setSelLen] = useState(0);
   const [note, setNote] = useState<string | null>(null);
   const [known, setKnown] = useState<string[]>([]);
+  /* Bumped when the workspace re-roots, so the quick-open index is
+     re-read against the new folders instead of the old ones. */
+  const [wsEpoch, setWsEpoch] = useState(0);
+  /* The one path for "the workspace changed on disk outside this view":
+     re-rooting, and the agent's own writes. Drops the quick-open/attach
+     index and bumps the epoch so the explorer re-reads the tree too. */
+  const refreshFromDisk = useCallback(() => {
+    setKnown([]);
+    setWsEpoch((n) => n + 1);
+  }, []);
   /* The file index is capped server-side; when it was, quick
      open must say so instead of silently missing files. */
   const [filesTruncated, setFilesTruncated] = useState(false);
-  const [folded, setFolded] = useState<Set<number>>(new Set());
+  const [folded, setFolded] = useState(0);
   const [outlineOn, setOutlineOn] = useState(false);
+  /* Go-to-definition / find-references / rename. The editor becomes an IDE the
+     moment the caret can ask where a symbol lives; everything below backs that
+     with the AST the agent's own tools use. */
+  const [intelOpen, setIntelOpen] = useState(false);
+  const [intelWord, setIntelWord] = useState('');
+  /* The save review. `open` shows the diff, `confirm` is the user having
+     looked at it, and the note/error say what happened. A save button that
+     writes blind is how a browser tab eats an afternoon. */
+  const [saveDiff, setSaveDiff] = useState(
+    { open: false, confirm: false, note: null as string | null, error: null as string | null });
+  const [saving, setSaving] = useState(false);
+  const [checkedIn, setCheckedIn] = useState<number | null>(null);
   const [problems, setProblems] = useState<CodeProblem[]>([]);
-  /* A fresh array literal in the JSX (`problems.map(...)`) gave <Editor> a new
-     prop identity on every parent render, which defeats its memo entirely - so
-     the editor re-rendered per keystroke no matter what. Derive it once. */
-  const problemLines = useMemo(
-    () => problems.map((p) => ({ line: p.line - 1 })),
-    [problems],
-  );
+  /* One bottom panel, not two. Problems and Terminal used to render as two
+     permanently expanded docks stacked on each other — ~170px of editor at
+     1500px wide, ~330px at 1024 — while the Problems body was three lines of
+     apology. VS Code's panel is a single strip of tabs, collapsed until it has
+     something to say; this follows that. */
+  const [panel, setPanel] = useState<'problems' | 'terminal' | null>(null);
+  const [termStatus, setTermStatus] = useState<TerminalStatus>('connecting');
+  const [termSeen, setTermSeen] = useState(false);
+  /* Stable identity: TerminalSession recreates its WebSocket when onStatus
+     changes, so an inline arrow here would drop the shell on every render. */
+  const onTermStatus = useCallback((s: TerminalStatus) => {
+    setTermStatus(s);
+    setTermSeen(true);
+  }, []);
+  /* Problems go to Monaco as editor markers, which wants the full problem
+     (line, column, message, severity) rather than the line numbers the old
+     overlay-only path needed. */
+  const problemLines = useMemo(() => problems, [problems]);
+  /* Surface the panel when the buffer gains a problem, but never force it back
+     open after the user closed it — `?? 'problems'` only fires from null. */
+  useEffect(() => {
+    if (problems.length > 0) setPanel((p) => p ?? 'problems');
+  }, [problems.length]);
   const [checkNote, setCheckNote] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   /* The project's own checks, run for real. `problems` above is the BUFFER
@@ -663,13 +949,26 @@ export default function Code() {
   const [gitOut, setGitOut] = useState<{ text: string; ok: boolean
     | undefined; error?: string } | null>(null);
   const [gitBusy, setGitBusy] = useState(false);
-  /* The AI half of the editor. One question at a time: a second answer would
-     race the first and the panel would show whichever arrived last. */
-  const [ask, setAsk] = useState({
-    question: '', answer: '', busy: false,
-    error: null as string | null, provider: '', context: [] as string[],
-  });
-  const askAbort = useRef<AbortController | null>(null);
+  /* The AI half of the editor now lives in `AgentPanel`, which owns its own
+     conversation, abort handle and busy state. Keeping a single-question
+     `ask` slice here as well meant two sources of truth for the same thing.
+     `aiModel` is the exception: the panel renders the picker but the choice has
+     to reach the request closure below, so it stays here. Persisted because a
+     reload that silently reverts the model is how you end up paying for an
+     expensive model you did not mean to use. */
+  const [aiModel, setAiModel] = useState(
+    () => localStorage.getItem('aria.code.model') ?? '');
+  /* A write the agent is parked on, waiting for a decision. The run cannot
+     proceed until this clears, which is the whole point: the diff has to be on
+     screen BEFORE the file can change. */
+  const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
+  useEffect(() => {
+    try {
+      if (aiModel) localStorage.setItem('aria.code.model', aiModel);
+      else localStorage.removeItem('aria.code.model');
+    } catch { /* private mode: the picker still works for this session */ }
+  }, [aiModel]);
   const [shortcuts, setShortcuts] = useState(false);
   const [search, setSearch] = useState<{ open: boolean; q: string; hits: CodeMatch[]; busy: boolean }>(
     { open: false, q: '', hits: [], busy: false });
@@ -682,15 +981,49 @@ export default function Code() {
   }, []);
   const [stale, setStale] = useState<string | null>(null);
   const [jump, setJump] = useState<{ path: string; line: number; col: number } | null>(null);
-  const ta = useRef<HTMLTextAreaElement>(null);
-  const scroller = useRef<HTMLDivElement>(null);
+  /* What the agent changed on disk, per path: green/red line marks in the
+     editor (parsed from the diff the permission dialog showed). Cleared
+     when the user saves the file — at that point the change is theirs. */
+  const [agentMarks, setAgentMarks] = useState<Record<string, DiffMarks>>({});
+  /* Set when a write LANDS on disk (not when it is approved: the approval
+     POST returns before the tool has run). The effect below brings the
+     open pane in line with disk - or shows the stale banner, never
+     clobbers a draft. */
+  const [syncPath, setSyncPath] = useState<string | null>(null);
+  /* The write this turn is parked on: its client path, tool name and marks,
+     captured from the permission frame so the matching tool_result can pair
+     with it (the frames carry different ids). */
+  /* Write payloads waiting for their tool_result, in dispatch order. A queue,
+     not a single slot: a turn can park a write and a run_checks together, and
+     matching by tool name FIFO is what keeps the marks on the right file. A
+     refused/failed write consumes its slot too, so it cannot be applied to a
+     later successful call of the same tool. */
+  const pendingWrites = useRef<{ path: string; tool: string; marks: DiffMarks }[]>([]);
+  /* Markdown preview: VS Code's Open Preview, as a toggle. Applies to the
+     active pane only while it is a markdown file. */
+  const [previewMd, setPreviewMd] = useState(false);
+  /* The editing surface is Monaco. Everything this section does by hand goes
+     through this handle rather than a DOM node, which is what keeps Monaco,
+     a future language server and a future Electron host swappable
+     underneath. */
+  const ed = useRef<EditorHandle | null>(null);
 
   const active = panes.findIndex((p) => p.path === activePath);
   const pane = active >= 0 ? panes[active] : null;
   const body = pane?.body ?? '';
   const lang = pane?.file.language ?? 'text';
   const dirty = !!pane && pane.body !== pane.base;
+  const activeMarks = pane ? agentMarks[pane.path] : undefined;
+  /* Explorer dots: which files carry an unreviewed agent change. */
+  const changedPaths = useMemo(() => new Set(Object.keys(agentMarks)), [agentMarks]);
   const lines = useMemo(() => body.split('\n'), [body]);
+
+  /* Buffer vs disk, as a line diff. `pane.base` is the on-disk original and
+     `body` the live buffer: diffing `body` against `pane.body` compared the
+     buffer with itself, so a real edit reviewed as "0 added, 0 removed". */
+  const diffRows = useMemo(
+    () => (pane ? lineDiff(pane.base.split('\n'), pane.body.split('\n')) : []),
+    [pane, body]);
 
   /* The quick-open index: every servable file, not just open tabs. Ctrl+P
      originally listed only files already open, which made it a tab switcher
@@ -706,7 +1039,7 @@ export default function Code() {
       })
       .catch(() => undefined);
     return () => { live = false; ac.abort(); };
-  }, []);
+  }, [wsEpoch]);
 
   /* Newly opened files stay in the list even if the index missed them. */
   useEffect(() => {
@@ -794,6 +1127,9 @@ export default function Code() {
       const body = drafts[path] ?? f.text;
       setPanes((ps) => (ps.some((p) => p.path === path) ? ps : [...ps, { path, file: f, body, base: f.text }]));
       setActivePath(path);
+      /* Remember when this copy was read: the save sends it back so the server
+         can refuse to clobber a file that moved on in the meantime. */
+      setCheckedIn(f.mtime ?? null);
     } catch (e) {
       flash(`cannot open ${path}: ${e instanceof Error ? e.message : 'error'}`);
     }
@@ -831,53 +1167,48 @@ export default function Code() {
   const lastBody = useRef('');
   useEffect(() => { if (pane) lastBody.current = pane.body; }, [pane]);
 
-  /* Wrap the native setter so React sees the change (a controlled textarea
-     ignores a bare `el.value = x`). */
-  const setTextarea = useCallback((el: HTMLTextAreaElement, v: string) => {
-    const setter = Object.getOwnPropertyDescriptor(
-      window.HTMLTextAreaElement.prototype, 'value')?.set;
-    setter?.call(el, v);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  }, []);
+  /* The editor surface is Monaco, so there is no DOM node to poke: the caret
+     and the buffer are read back through the handle instead. */
+  const syncCursor = useCallback((info?: CaretInfo) => {
+    if (!info) {
+      const c = ed.current?.caret();
+      if (!c) return;
+      setCursor(posOf(body, c.offset));
+      setSelLen(c.selLen);
+      return;
+    }
+    setCursor(posOf(body, info.offset));
+    setSelLen(info.selLen);
+  }, [body]);
 
-  const syncCursor = useCallback(() => {
-    const el = ta.current;
-    if (!el) return;
-    setCursor(posOf(el.value, el.selectionStart));
-    setSelLen(el.selectionEnd - el.selectionStart);
-  }, []);
-
-  /* Undo history. `restore` puts a snapshot back into the textarea AND the
-     caret with it, which is the whole point: native Ctrl+Z cannot see the
-     programmatic edits this section makes, so it would step through a history
-     that does not match what the user just did. */
-  /* Restoring from history writes the textarea, which fires `input`, which
-     lands back in `onType` - and `onType` records a snapshot. Without this
-     guard, undoing pushed the pre-undo state onto the undo stack and cleared
-     the redo stack, so redo could never work and repeated undo walked
-     forwards. */
+  /* Undo history. `restore` puts a snapshot back into the editor AND the
+     caret with it, which is the whole point: Monaco's own undo cannot see
+     the programmatic edits this section makes, so it would step through a
+     history that does not match what the user just did. */
+  /* Restoring from history writes the buffer, which would fire Monaco's
+     change event and land back in `onType` - and `onType` records a
+     snapshot. Without this guard, undoing pushed the pre-undo state onto the
+     undo stack and cleared the redo stack, so redo could never work and
+     repeated undo walked forwards. */
   const restoring = useRef(false);
 
   const applyText = useCallback((text: string, start: number, end: number) => {
-    const el = ta.current;
-    if (!el) return;
+    if (!ed.current) return;
     restoring.current = true;
-    setTextarea(el, text);
-    requestAnimationFrame(() => {
-      el.selectionStart = Math.min(start, text.length);
-      el.selectionEnd = Math.min(end, text.length);
-      syncCursor();
-      el.focus();
-      restoring.current = false;
-    });
-  }, [setTextarea, syncCursor]);
+    ed.current.apply(text, Math.min(start, text.length), Math.min(end, text.length));
+    restoring.current = false;
+  }, []);
 
   /* `applyText` is defined below `useHistory` in source order but is needed by
      it, so the indirection goes through a ref rather than reordering hooks. */
   const applyTextRef = useRef<((t: string, s: number, e: number) => void) | null>(null);
   const history = useHistory(useCallback((s: Snapshot) => {
     applyTextRef.current?.(s.text, s.start, s.end);
-  }, []));
+    // The editor model is not the source of truth for Save/drafts. Without
+    // this the next Ctrl+S wrote the pre-undo text back to disk (H8).
+    lastBody.current = s.text;
+    edit(s.text);
+  }, [edit]));
   applyTextRef.current = applyText;
 
   /* Undo history is PER-BUFFER. The stack holds bare snapshots
@@ -893,35 +1224,29 @@ export default function Code() {
     lastPath.current = activePath;
     history.reset('');
     lastBody.current = pane?.body ?? '';
-    setFolded(new Set());
+    setFolded(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePath]);
 
   const replaceRange = useCallback((from: number, to: number, text: string,
-                                     selStart = from + text.length) => {
-    const el = ta.current;
-    if (!el) return;
-    const next = el.value.slice(0, from) + text + el.value.slice(to);
+                                   selStart = from + text.length) => {
+    if (!ed.current) return;
+    const cur = ed.current.text();
+    const sel = ed.current.selection();
+    const next = cur.slice(0, from) + text + cur.slice(to);
     /* Record the state BEFORE the change, with the selection that produced
        it, so undo returns to where the edit started. */
-    history.commit(el.value, el.selectionStart, el.selectionEnd);
+    history.commit(cur, sel.start, sel.end);
     lastBody.current = next;
-    setTextarea(el, next);
-    requestAnimationFrame(() => {
-      el.selectionStart = selStart;
-      el.selectionEnd = selStart;
-      syncCursor();
-      el.focus();
-    });
-  }, [history, setTextarea, syncCursor]);
+    ed.current.apply(next, Math.min(selStart, next.length), Math.min(selStart, next.length));
+  }, [history]);
 
   /* Typed input goes through the same door so Ctrl+Z undoes typing too. */
-  const onType = useCallback((v: string) => {
-    const el = ta.current;
-    if (el && !restoring.current) {
+  const onType = useCallback((v: string, info?: CaretInfo) => {
+    if (!restoring.current) {
       const before = lastBody.current;
       lastBody.current = v;
-      const at = el.selectionStart;
+      const at = info?.offset ?? ed.current?.caret().offset ?? 0;
       history.commit(before, at, at, true);
     } else {
       lastBody.current = v;
@@ -929,13 +1254,10 @@ export default function Code() {
     edit(v);
   }, [edit, history]);
 
-  /* Derived structure, recomputed only when the buffer or language changes. */
+  /* Derived structure, recomputed only when the buffer or language changes.
+     Folding is Monaco's, so this only feeds the outline. */
   const outline = useMemo<Symbol[]>(
     () => (pane ? symbolsOf(pane.body, lang) : []),
-    [pane, lang],
-  );
-  const allFolds = useMemo(
-    () => (pane ? foldRanges(pane.body, lang) : []),
     [pane, lang],
   );
 
@@ -956,57 +1278,6 @@ export default function Code() {
   }
 }, []);
 
-/* Ask the agent about the open file.
-     *  The draft goes up (unsaved edits included) so the answer is about what
-     *  is on screen, not what is on disk. Read-only: the endpoint cannot
-     *  write, so there is no path from this panel to a changed file. */
-const submitAsk = useCallback(async (e: React.FormEvent) => {
-  e.preventDefault();
-  const q = ask.question.trim();
-  if (!q || !pane || ask.busy) return;
-  askAbort.current?.abort();
-  const ac = new AbortController();
-  askAbort.current = ac;
-  setAsk((a) => ({ ...a, busy: true, answer: '', error: null, question: q }));
-  try {
-    for await (const f of api.codeAskStream(q, pane.path, pane.body, ac.signal)) {
-      if (ac.signal.aborted) return;
-      if (f.type === 'delta' && f.text) {
-        setAsk((a) => ({ ...a, answer: a.answer + f.text }));
-      } else if (f.type === 'error') {
-        setAsk((a) => ({
-          ...a, error: f.text || 'the agent could not answer',
-        }));
-      } else if (f.type === 'done') {
-        setAsk((a) => ({
-          ...a, answer: f.answer || a.answer,
-          provider: f.provider || '', busy: false,
-          context: f.context_files || [],
-        }));
-      }
-    }
-  } catch (err) {
-    if (ac.signal.aborted) return;
-    setAsk((a) => ({
-      ...a, busy: false,
-      error: `ask failed: ${err instanceof Error ? err.message : 'error'}`,
-    }));
-  } finally {
-    if (!ac.signal.aborted) setAsk((a) => ({ ...a, busy: false }));
-  }
-}, [ask.question, ask.busy, pane]);
-
-/* Put the answer into the buffer at the caret, as an editable insertion.
-   Not a silent rewrite: the user sees exactly what changed and can undo it,
-   because it goes through the same buffer setter as typing does. */
-const insertAnswerAtCursor = useCallback(() => {
-  if (!ask.answer || !pane) return;
-  const at = offsetOf(pane.body, cursor);
-  const head = pane.body.slice(0, at);
-  edit((head && !head.endsWith('\n') ? head + '\n' : head)
-    + ask.answer + '\n'
-    + pane.body.slice(at));
-}, [ask.answer, pane, cursor, edit]);
 
 /* Run the project's real lint/typecheck/tests.
      * Deliberately NOT auto-run on edit: a test suite takes what it takes, and
@@ -1050,7 +1321,7 @@ const runProjectChecks = useCallback(async () => {
         })
         .catch((e) => {
           /* A failed check used to be swallowed, and the empty
-             problems list then rendered "✓ No syntax errors" —
+             problems list then rendered "“ No syntax errors" —
              the exact opposite of what happened. */
           if (ac.signal.aborted) return;
           setProblems([]);
@@ -1062,7 +1333,7 @@ const runProjectChecks = useCallback(async () => {
       ac.abort();
       window.clearTimeout(t);
       /* The debounce was cancelled before the check ever ran —
-         nothing is in flight, so the "checking…" pill must not
+         nothing is in flight, so the "checking" pill must not
          spin forever. */
       setChecking(false);
     };
@@ -1070,9 +1341,11 @@ const runProjectChecks = useCallback(async () => {
 
   /* The source is read-only from the agent, so it can change underneath a
      draft. Notice that, rather than silently showing text that no longer
-     matches what the server would serve. */
+     matches what the server would serve. (The 20s poll is the backstop; an
+     agent write that lands while the section is open is pushed in through
+     `syncPath` below, immediately.) */
   useEffect(() => {
-    if (!pane || dirty) { setStale(null); return; }
+    if (!sectionActive || !pane || dirty) { setStale(null); return; }
     let live = true;
     const ac = new AbortController();
     const t = window.setInterval(() => {
@@ -1084,174 +1357,88 @@ const runProjectChecks = useCallback(async () => {
         .catch(() => undefined);
     }, 20000);
     return () => { live = false; ac.abort(); window.clearInterval(t); };
-  }, [pane, dirty]);
+  }, [sectionActive, pane, dirty]);
+
+  /* A write just landed on disk. If the file is open in a clean pane, pull
+     the server's copy in - the marks then show exactly what changed. If the
+     pane has unsaved edits, do NOT clobber them: raise the stale banner and
+     let the user decide. If the file is not open at all, open it, the way
+     Cursor puts you in front of what the agent just did. */
+  useEffect(() => {
+    if (!syncPath) return;
+    const p = panes.find((x) => x.path === syncPath);
+    if (p && p.body !== p.base) { setStale(syncPath); return; }
+    void open(syncPath, { reload: true });
+    setSyncPath(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncPath]);
 
   const reveal = useCallback((needle: string, cs: boolean, backwards: boolean,
-                            moveFocus = false) => {
-    const el = ta.current;
-    if (!el || !needle) return;
-    const hay = cs ? el.value : el.value.toLowerCase();
+                              moveFocus = false) => {
+    if (!ed.current || !needle) return;
+    const hay = cs ? body : body.toLowerCase();
     const n = cs ? needle : needle.toLowerCase();
+    const { start, end } = ed.current.selection();
     let at: number;
     if (backwards) {
-      at = hay.lastIndexOf(n, Math.max(0, el.selectionStart - 1));
+      at = hay.lastIndexOf(n, Math.max(0, start - 1));
       if (at === -1) at = hay.lastIndexOf(n);
     } else {
-      at = hay.indexOf(n, el.selectionEnd);
+      at = hay.indexOf(n, end);
       if (at === -1) at = hay.indexOf(n);
     }
     if (at === -1) return;
-    /* Do NOT steal focus here. `el.focus()` ran inside the Find box's Enter
-       handler, so focus moved DURING the keydown and the NEXT Enter was
-       consumed by the editor's own handler — whose Enter branch runs
-       auto-indent. Repeating "find next" therefore silently inserted a
-       newline each time: `import hmac` became `import \n\n\n\n\nhmac`,
-       shredding the statement across six lines with no warning. Focus stays
-       in the Find box so Enter keeps advancing matches; callers that really
-       want the caret in the editor pass moveFocus. */
-    if (moveFocus) el.focus();
-    el.setSelectionRange(at, at + n.length);
+    /* Do NOT steal focus here. The Find box owns focus while it is open, so
+       Enter keeps advancing matches; callers that really want the caret in
+       the editor pass moveFocus. */
+    if (moveFocus) ed.current?.focus();
+    ed.current?.selectAndReveal(at, at + n.length);
     syncCursor();
-    /* Scroll the match into view: measure against the line height the editor
-       uses (leading-[1.55rem] on a 12.5px font). */
-    const line = posOf(el.value, at).line;
-    const lh = 24.8;
-    const top = (line - 1) * lh;
-    const box = scroller.current;
-    if (box && (top < box.scrollTop || top > box.scrollTop + box.clientHeight - lh * 3)) {
-      box.scrollTop = Math.max(0, top - box.clientHeight / 2);
-    }
   }, [syncCursor]);
 
   /* Apply a pending jump-to-line once its file is the active pane. */
   useEffect(() => {
     if (!jump || !pane || pane.path !== jump.path) return;
-    const el = ta.current;
     const off = offsetOf(pane.body, { line: jump.line, col: jump.col });
     setJump(null);
     requestAnimationFrame(() => {
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(off, off);
+      ed.current?.revealOffset(off);
       syncCursor();
-      const box = scroller.current;
-      const lh = 24.8;
-      if (box) box.scrollTop = Math.max(0, (jump.line - 1) * lh - box.clientHeight / 2);
     });
   }, [jump, pane, syncCursor]);
 
-  /* Undo/redo read the live textarea rather than React state, because the
-     textarea is the only thing that always holds the current buffer. */
+  /* Undo/redo read the live editor rather than React state, because the
+     editor is the only thing that always holds the current buffer. */
   const doUndo = useCallback(() => {
-    const el = ta.current;
-    if (!el) return;
-    if (!history.undo({ text: el.value, start: el.selectionStart, end: el.selectionEnd })) {
+    if (!ed.current) return;
+    const { start, end } = ed.current.selection();
+    if (!history.undo({ text: ed.current.text(), start, end })) {
       flash('nothing to undo');
     }
   }, [history, flash]);
 
   const doRedo = useCallback(() => {
-    const el = ta.current;
-    if (!el) return;
-    if (!history.redo({ text: el.value, start: el.selectionStart, end: el.selectionEnd })) {
+    if (!ed.current) return;
+    const { start, end } = ed.current.selection();
+    if (!history.redo({ text: ed.current.text(), start, end })) {
       flash('nothing to redo');
     }
   }, [history, flash]);
 
-  const lineOps = useCallback((kind: 'indent' | 'outdent' | 'comment'
-                                | 'moveUp' | 'moveDown' | 'deleteLine'
-                                | 'dupLine' | 'selectNext' | 'copyUp' | 'copyDown') => {
-    const el = ta.current;
-    if (!el) return;
-    const v = el.value;
-    const startLn = posOf(v, el.selectionStart).line;
-    const endLn = posOf(v, el.selectionEnd).line;
-    const from = offsetOf(v, { line: startLn, col: 1 });
-    const to = offsetOf(v, { line: endLn, col: lineSlice(v, endLn).length + 1 });
-    const block = v.slice(from, to);
-    const blockLines = block.split('\n');
+  /* Line operations run Monaco's own (i.e. VS Code's) actions. They used to
+     be hand-written offset arithmetic over the buffer, which meant two
+     implementations of the same edit — and the comment map here drifted from
+     the language's real comment token. The editor knows how to do all of
+     these, including with a multi-cursor selection. */
+  const lineOps = useCallback((kind: EditorOp) => {
+    if (!ed.current) return;
+    ed.current.runOp(kind);
+    syncCursor();
+  }, [syncCursor]);
 
-    if (kind === 'indent' || kind === 'outdent') {
-      const shifted = blockLines.map((l) =>
-        kind === 'indent' ? '    ' + l : l.replace(/^[ \t]{1,4}/, ''));
-      const joined = shifted.join('\n');
-      replaceRange(from, to, joined, from);
-      requestAnimationFrame(() => {
-        el.selectionStart = from;
-        el.selectionEnd = from + joined.length;
-        syncCursor();
-      });
-      return;
-    }
-    if (kind === 'comment') {
-      const mark = COMMENT[lang] ?? '// ';
-      const allCommented = blockLines.every((l) => !l.trim() || l.trimStart().startsWith(mark.trim()));
-      const shifted = blockLines.map((l) => {
-        if (!l.trim()) return l;
-        if (allCommented) return l.replace(new RegExp(`^(\\s*)${mark.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s?`), '$1');
-        const ind = l.match(/^\s*/)?.[0] ?? '';
-        return `${ind}${mark}${l.slice(ind.length)}`;
-      });
-      const joined = shifted.join('\n');
-      replaceRange(from, to, joined, from);
-      requestAnimationFrame(() => {
-        el.selectionStart = from;
-        el.selectionEnd = from + joined.length;
-        syncCursor();
-      });
-      return;
-    }
-    if (kind === 'deleteLine') {
-      const lineEnd = endLn < offsets(v).length
-        ? offsetOf(v, { line: endLn + 1, col: 1 }) : v.length;
-      const nextFrom = lineEnd < v.length ? lineEnd : from;
-      replaceRange(from, Math.min(lineEnd, v.length), '', nextFrom);
-      return;
-    }
-    if (kind === 'dupLine') {
-      const ls = lineSlice(v, startLn);
-      replaceRange(to, to, `\n${ls}`);
-      return;
-    }
-    if (kind === 'copyUp' || kind === 'copyDown') {
-      const ls = lineSlice(v, startLn);
-      if (kind === 'copyUp') {
-        if (startLn === 1) return;
-        replaceRange(from, from, `${ls}\n`, from);
-      } else {
-        replaceRange(to, to, `\n${ls}`);
-      }
-      return;
-    }
-    if (kind === 'moveUp' || kind === 'moveDown') {
-      if (kind === 'moveUp' && startLn === 1) return;
-      if (kind === 'moveDown' && endLn === lines.length) return;
-      const swap = kind === 'moveUp' ? startLn - 1 : endLn + 1;
-      const other = lineSlice(v, swap);
-      if (kind === 'moveUp') {
-        replaceRange(from, to, `${blockLines[blockLines.length - 1] ? '' : ''}${other}\n${blockLines.join('\n')}`, from);
-      } else {
-        replaceRange(from, to, `${block}\n${other}`, from);
-      }
-      return;
-    }
-    if (kind === 'selectNext') {
-      const word = v.slice(el.selectionStart, el.selectionEnd)
-        || v.slice(from, offsetOf(v, { line: startLn, col: lineSlice(v, startLn).length + 1 }))
-          .match(/[A-Za-z0-9_]+$/)?.[0]
-        || '';
-      if (!word) return;
-      const at = v.indexOf(word, el.selectionEnd);
-      if (at === -1) return;
-      el.focus();
-      el.setSelectionRange(at, at + word.length);
-      syncCursor();
-    }
-  }, [lang, lines.length, replaceRange, syncCursor]);
-
-  /* ── commands ─────────────────────────────────────────────────────────── */
+  /*  commands  */
   const CMDS: { id: string; label: string; run: () => void }[] = useMemo(() => [
-    { id: 'file.quickOpen', label: 'Go to File…', run: () => setPalette('file') },
+    { id: 'file.quickOpen', label: 'Go to File', run: () => setPalette('file') },
     { id: 'file.save', label: 'Save (browser draft only)', run: () => flash('nothing is written to disk — this is a browser draft') },
     { id: 'file.revert', label: 'Revert File to Disk Contents', run: () => {
       if (!pane) return;
@@ -1260,9 +1447,12 @@ const runProjectChecks = useCallback(async () => {
       flash(`reverted ${pane.path} to what the agent serves`);
     } },
     { id: 'view.find', label: 'Find in File', run: () => setFind((f) => ({ ...f, open: true })) },
-    { id: 'view.goto', label: 'Go to Line/Column…', run: () => setGoto('') },
+    { id: 'view.goto', label: 'Go to Line/Column', run: () => setGoto('') },
     { id: 'view.explorer', label: 'Toggle Explorer', run: () => setExplorerOn((v) => !v) },
-    { id: 'view.minimap', label: 'Toggle Minimap', run: () => setMinimapOn((v) => !v) },
+    { id: 'view.minimap', label: 'Toggle Minimap', run: () => setMinimapOn((v) => {
+      ed.current?.setMinimap(!v);
+      return !v;
+    }) },
     { id: 'view.wrap', label: 'Toggle Word Wrap', run: () => setWrap((v) => !v) },
     { id: 'view.zen', label: 'Toggle Zen Mode', run: () => setZen((v) => !v) },
     { id: 'edit.comment', label: 'Toggle Line Comment', run: () => lineOps('comment') },
@@ -1275,18 +1465,20 @@ const runProjectChecks = useCallback(async () => {
     { id: 'edit.selectNext', label: 'Select Next Occurrence', run: () => lineOps('selectNext') },
     { id: 'edit.copyLineUp', label: 'Copy Line Up', run: () => lineOps('copyUp') },
     { id: 'edit.copyLineDown', label: 'Copy Line Down', run: () => lineOps('copyDown') },
-    { id: 'edit.trim', label: 'Trim Trailing Whitespace (draft)', run: () => {
-      const el = ta.current;
-      if (!el) return;
-      const cleaned = el.value.split('\n').map((l) => l.replace(/[ \t]+$/, '')).join('\n');
-      if (cleaned === el.value) { flash('no trailing whitespace'); return; }
-      replaceRange(0, el.value.length, cleaned, el.selectionStart);
-      flash('trimmed trailing whitespace in the draft only');
+    { id: 'edit.trim', label: 'Trim Trailing Whitespace', run: () => {
+      if (!ed.current) return;
+      const before = ed.current.text();
+      const caret0 = ed.current.caret().offset;
+      lineOps('trimTrailing');
+      const after = ed.current.text();
+      if (before === after) flash('no trailing whitespace');
+      else ed.current.revealOffset(Math.min(caret0, after.length));
+      flash('trimmed trailing whitespace');
     } },
     { id: 'edit.undo', label: 'Undo', run: () => doUndo() },
     { id: 'edit.redo', label: 'Redo', run: () => doRedo() },
-    { id: 'view.foldAll', label: 'Fold All', run: () => setFolded(new Set(allFolds.map((f) => f.start))) },
-    { id: 'view.unfoldAll', label: 'Unfold All', run: () => setFolded(new Set()) },
+    { id: 'view.foldAll', label: 'Fold All', run: () => ed.current?.fold('all') },
+    { id: 'view.unfoldAll', label: 'Unfold All', run: () => ed.current?.fold('none') },
     { id: 'view.outline', label: 'Toggle Symbol Outline', run: () => setOutlineOn((v) => !v) },
     { id: 'search.workspace', label: 'Search Across Workspace', run: () => setSearch((s) => ({ ...s, open: true })) },
     { id: 'view.shortcuts', label: 'Keyboard Shortcuts', run: () => setShortcuts(true) },
@@ -1297,7 +1489,7 @@ const runProjectChecks = useCallback(async () => {
         () => flash('clipboard blocked by the browser'),
       );
     } },
-  ], [allFolds, doRedo, doUndo, edit, flash, lineOps, pane, replaceRange]);
+  ], [doRedo, doUndo, edit, flash, lineOps, pane, replaceRange]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1311,6 +1503,13 @@ const runProjectChecks = useCallback(async () => {
            also reached the overlay's own focus-trap handler, so
            two stacked overlays (a go-to box over an open find
            panel, say) both closed on one press. */
+        /* The save review is the last thing rendered, so it is on top and
+           takes Escape before anything under it. DiffView is a plain modal
+           with no key handling of its own. */
+        if (saveDiff.open) {
+          e.preventDefault(); e.stopPropagation();
+          setSaveDiff((s) => ({ ...s, open: false })); return;
+        }
         if (shortcuts) {
           e.preventDefault(); e.stopPropagation();
           setShortcuts(false); return;
@@ -1347,9 +1546,9 @@ const runProjectChecks = useCallback(async () => {
         /* Last resort, and the documented one: Escape leaves the editor. The
            textarea is the only focusable thing in the view, so without this a
            keyboard user who never discovers Shift+Tab has no way out. */
-        if (inField && ta.current && e.target === ta.current) {
+        if (inField && edInFocus(e.target)) {
           e.preventDefault();
-          ta.current.blur();
+          ed.current?.blur();
           return;
         }
       }
@@ -1360,7 +1559,7 @@ const runProjectChecks = useCallback(async () => {
          modals — their shortcuts stay live while the EDITOR itself
          holds the focus. */
       if (palette || shortcuts || goto !== null) return;
-      if ((search.open || find.open) && e.target !== ta.current) return;
+      if ((search.open || find.open) && !edInFocus(e.target)) return;
       if (e.key === ',' && mod && !e.shiftKey) {
         e.preventDefault(); setShortcuts(true); return;
       }
@@ -1377,29 +1576,38 @@ const runProjectChecks = useCallback(async () => {
         else flash('no symbols found in this file');
         return;
       }
+      /* The three IDE gestures: F12 go-to-definition, Shift+F12 find
+         references, F2 rename, Ctrl+S save. Without them the caret can edit
+         text but cannot ask the project anything. */
+      if (e.key === 'F12') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          if (caretWord) { setIntelWord(caretWord); setIntelOpen(true); }
+          else flash('put the caret on a symbol first');
+        } else {
+          void goToDefinition();
+        }
+        return;
+      }
+      if (e.key === 'F2') {
+        e.preventDefault();
+        if (caretWord) { setIntelWord(caretWord); setIntelOpen(true); }
+        else flash('put the caret on a symbol first');
+        return;
+      }
+      /* Ctrl+S opens the save review rather than writing: the diff has to be
+         looked at before anything reaches the disk. */
+      if (mod && e.key.toLowerCase() === 's' && !e.shiftKey) {
+        e.preventDefault();
+        setSaveDiff({ open: true, confirm: false, note: null, error: null });
+        return;
+      }
       if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) {
         e.preventDefault(); doUndo(); return;
       }
       if ((mod && e.key.toLowerCase() === 'y')
           || (mod && e.shiftKey && e.key.toLowerCase() === 'z')) {
         e.preventDefault(); doRedo(); return;
-      }
-      if (mod && e.shiftKey && (e.key === '[' || e.key === ']')) {
-        e.preventDefault();
-        setFolded((s) => {
-          const n = new Set(s);
-          const here = cursor.line - 1;
-          const f = allFolds.find((x) => x.start === here);
-          if (!f) return n;
-          /* Fold the region containing the caret, or the innermost open one. */
-          const target = e.key === ']'
-            ? f
-            : [...allFolds].reverse().find((x) => x.start <= here && x.end >= here) ?? f;
-          if (n.has(target.start)) n.delete(target.start);
-          else n.add(target.start);
-          return n;
-        });
-        return;
       }
       if (mod && e.shiftKey && e.key.toLowerCase() === 'p') {
         e.preventDefault(); setPalette('cmd'); return;
@@ -1425,134 +1633,47 @@ const runProjectChecks = useCallback(async () => {
         setActivePath(panes[i].path);
         return;
       }
-      if (!inField || e.target === ta.current) {
+      if (!inField || edInFocus(e.target)) {
+        /* Fold/unfold the region at the caret. Monaco keys this Ctrl+Shift+[ / ]
+           itself, but this window listener runs in the capture phase and would
+           otherwise race it, so the gesture is claimed here and run through the
+           handle - the same stock actions, one owner. */
+        if (mod && e.shiftKey && (e.key === '[' || e.key === ']')) {
+          e.preventDefault();
+          ed.current?.fold(e.key === '[' ? 'cursor' : 'expand');
+          return;
+        }
         if (mod && e.key === '/') { e.preventDefault(); lineOps('comment'); return; }
         if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); lineOps('selectNext'); return; }
         if (e.shiftKey && e.altKey && e.key === 'ArrowUp') { e.preventDefault(); lineOps('copyUp'); return; }
         if (e.shiftKey && e.altKey && e.key === 'ArrowDown') { e.preventDefault(); lineOps('copyDown'); return; }
-        /* Move the caret to the line above/below, keeping the
-           column. The editor has no real multi-cursor support,
-           so these keys do exactly this — they no longer also
-           push a marker into a cursor count that nothing
-           rendered. */
-        if (e.altKey && e.key === 'ArrowUp' && ta.current) {
-          e.preventDefault();
-          const el = ta.current;
-          const ln = posOf(el.value, el.selectionStart).line;
-          if (ln > 1) {
-            const col = el.selectionStart - offsetOf(el.value, { line: ln, col: 1 }) + 1;
-            const off = offsetOf(el.value, { line: ln - 1, col });
-            el.focus();
-            el.setSelectionRange(off, off);
-          }
-          syncCursor();
-          return;
-        }
-        if (e.altKey && e.key === 'ArrowDown' && ta.current) {
-          e.preventDefault();
-          const el = ta.current;
-          const ln = posOf(el.value, el.selectionStart).line;
-          if (ln < lines.length) {
-            const col = el.selectionStart - offsetOf(el.value, { line: ln, col: 1 }) + 1;
-            const off = offsetOf(el.value, { line: ln + 1, col });
-            el.focus();
-            el.setSelectionRange(off, off);
-          }
-          syncCursor();
-          return;
-        }
+        /* Move the caret a line up/down keeping the column. Monaco does this
+           natively too, but ONLY as part of its own Alt+Up/Down "move line",
+           which SHIFTS the line rather than moving the caret. */
         if (mod && e.shiftKey && e.key.toLowerCase() === 'k') { e.preventDefault(); lineOps('deleteLine'); return; }
       }
-      /* Tab inserts an indent, but ONLY the unmodified one. Both Tab and Shift+Tab
-         used to be swallowed and turned into four spaces, so keyboard focus could
-         never leave the textarea at all - a hard keyboard trap (WCAG 2.1.2 No
-         Keyboard Trap). Shift+Tab now falls through to the browser, which is the
-         standard way out; Escape is a second escape hatch below. */
-      if (e.key === 'Tab' && !e.shiftKey && !mod && e.target === ta.current) {
-        e.preventDefault();
-        const el = ta.current!;
-        replaceRange(el.selectionStart, el.selectionEnd, '    ');
-        return;
-      }
-      if (e.key === 'Enter' && e.target === ta.current) {
-        /* Keep the previous line's indentation, and open a block if the line
-           ends in a colon — the two cases that matter when editing Python or
-           YAML by hand. */
-        const el = ta.current!;
-        const line = lineSlice(el.value, posOf(el.value, el.selectionStart).line);
-        const ind = line.match(/^\s*/)?.[0] ?? '';
-        const opens = /[:{]\s*$/.test(line.trimEnd());
-        const next = posOf(el.value, el.selectionEnd);
-        const brace = BRACKETS[lang];
-        const before = el.value[el.selectionStart - 1];
-        const after = el.value[el.selectionStart];
-        if (brace && before === brace[0] && after === brace[1]) {
-          e.preventDefault();
-          const at = el.selectionStart;
-          replaceRange(at, at + 1, `\n${ind}    \n${ind}`, at + ind.length + 5);
-          return;
-        }
-        e.preventDefault();
-        const at = next.line === next.col ? el.selectionStart : el.selectionStart;
-        replaceRange(at, at, `\n${ind}${opens ? '    ' : ''}`);
-        return;
-      }
-      if (['(', '[', '{', '"', "'", '`'].includes(e.key) && e.target === ta.current) {
-        const el = ta.current!;
-        const pairs: Record<string, string> = { '(': ')', '[': ']', '{': '}', '"': '"', "'": "'", '`': '`' };
-        const close = pairs[e.key];
-        if (el.selectionStart !== el.selectionEnd) {
-          e.preventDefault();
-          const a = el.selectionStart;
-          const b = el.selectionEnd;
-          replaceRange(a, b, e.key + el.value.slice(a, b) + close, a + 1);
-          return;
-        }
-        /* Only auto-close when it is unambiguous: not before a word character,
-           not when the very next character already is the closing one. */
-        const nextCh = el.value[el.selectionStart] ?? '';
-        if (!/[A-Za-z0-9_]/.test(nextCh)) {
-          e.preventDefault();
-          /* This handler runs BEFORE the browser inserts the character, so the
-             buffer still ends at `selectionStart`. The pair is inserted there
-             and the caret goes one past the opener, i.e. between the two. */
-          replaceRange(el.selectionStart, el.selectionStart,
-            e.key + close, el.selectionStart + 1);
-        }
-        return;
-      }
-      if (e.key === 'Backspace' && e.target === ta.current) {
-        const el = ta.current!;
-        if (el.selectionStart !== el.selectionEnd) return;
-        /* Opener -> closer. This used to be keyed by the closing delimiter
-           while being looked up with the character BEFORE the caret, which is
-           the opening one - so the lookup always missed and Backspace deleted
-           only half of an auto-inserted pair, leaving a stray `)`. */
-        const closer: Record<string, string> = { '(': ')', '[': ']', '{': '}', '"': '"', "'": "'", '`': '`' };
-        const before = el.value[el.selectionStart - 1] ?? '';
-        const after = el.value[el.selectionStart] ?? '';
-        if (closer[before] && closer[before] === after) {
-          e.preventDefault();
-          replaceRange(el.selectionStart - 1, el.selectionStart + 1, '');
-        }
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [active, allFolds, body, close, cursor.line, doRedo, doUndo,
-      find.open, flash, goto, lang, lineOps, offsetOf, outline, palette, panes.length,
-      replaceRange, search.open, shortcuts, syncCursor]);
+      /* Everything the editor now owns natively — Tab indent, Enter
+         auto-indent and colon-block opening, bracket/quote auto-close and
+         wrap-around-selection, Backspace pair deletion, Alt+Up/Down line
+         moves — is GONE from here, deliberately. These used to be ~100 lines
+         of offset arithmetic over the textarea's value. They are gone because
+         Monaco implements every one of them, keyed the way VS Code keys
+         them, and works with multi-cursor selection as well. Two
+         implementations of the same edit is exactly how they drift, and the
+         bug report here was "backspace left a stray )".
 
-  /* Scroll the active line into view when the cursor moves by keyboard. */
-  useEffect(() => {
-    const box = scroller.current;
-    if (!box) return;
-    const lh = 24.8;
-    const top = (cursor.line - 1) * lh;
-    if (top < box.scrollTop || top > box.scrollTop + box.clientHeight - lh * 3) {
-      box.scrollTop = Math.max(0, top - box.clientHeight / 2);
-    }
-  }, [cursor.line]);
+         The Tab handler also had a side effect worth remembering: by
+         swallowing Tab it was a keyboard trap (WCAG 2.1.2) — focus could
+         never leave the editor except through the Escape hatch below. */
+  }
+  window.addEventListener('keydown', onKey, true);
+  return () => window.removeEventListener('keydown', onKey, true);
+}, [active, body, close, cursor.line, doRedo, doUndo,
+    find.open, flash, goto, lang, lineOps, offsetOf, outline, palette, panes.length, saveDiff.open,
+    replaceRange, search.open, shortcuts, syncCursor]);
+
+  /* The caret's scroll-into-view is Monaco's job. The hand-written version
+     below measured a scroll container that no longer exists. */
 
   const gotoLine = (raw: string) => {
     const m = raw.match(/^(\d+)(?::(\d+))?$/);
@@ -1564,15 +1685,190 @@ const runProjectChecks = useCallback(async () => {
     setGoto(null);
   };
 
+  /* The identifier under the caret, so F12/F2 have something to ask about. */
+  const caretWord = useWordAtCursor(body, cursor.line, cursor.col, !!pane);
+
+  /** Open a file (if it is not already) and put the caret on `line`. */
+  const jumpTo = useCallback(async (file: string, line: number) => {
+    if (!file) return;
+    if (pane?.path !== file) await open(file);
+    setJump({ path: file, line, col: 1 });
+  }, [open, pane?.path]);
+
+  const goToDefinition = useCallback(async () => {
+    if (!pane) return;
+    if (!caretWord) { flash('put the caret on a symbol first'); return; }
+    try {
+      const r = await api.codeIntel('definition', {
+        path: pane.path, name: caretWord,
+        line: cursor.line, col: cursor.col,
+      });
+      if (r.found && r.file && r.line) {
+        await jumpTo(r.file, r.line);
+      } else {
+        flash(`no definition of ${caretWord} found`);
+      }
+    } catch {
+      flash('definition lookup failed');
+    }
+  }, [pane, caretWord, cursor.line, cursor.col, jumpTo, flash]);
+
+  /* Accept or refuse the agent's pending write. The pane/tree/marks sync
+     happens when the write LANDS on disk (its tool_result frame), not here:
+     this POST returns as soon as the decision is recorded, and reloading
+     immediately could read the pre-write bytes. */
+  const decideEdit = useCallback(async (id: string, approve: boolean) => {
+    setEditBusy(true);
+    try {
+      await api.codePermission(id, approve);
+      setPendingEdit(null);
+    } catch { /* a 404 means the run already moved on; close either way */ }
+    finally { setEditBusy(false); }
+  }, []);
+
+  /* Ctrl+S writes the buffer to disk. Gated on the client twice over: the
+     diff has to be looked at, and the server re-checks the mtime it handed
+     us so a change made elsewhere in between is not silently overwritten.
+     Writes are atomic, with a timestamped backup of what was there. */
+  const saveToDisk = useCallback(async (confirm = false) => {
+    if (!pane) return;
+    if (!dirty) {
+      flash(`${pane.path} already matches disk - nothing written`);
+      return;
+    }
+    if (saving) return;
+    setSaving(true);
+    try {
+      const res = await api.codeWrite(pane.path, body, {
+        confirm,
+        mtime: checkedIn ?? undefined,
+      });
+      if (res?.ok) {
+        setPanes((ps) => ps.map((p) => (p.path === pane.path
+          ? { ...p, base: body, file: { ...p.file, text: body, version: String(Date.now()) } }
+          : p)));
+        setSaveDiff({ open: false, confirm: false, note: 'written', error: null });
+        setCheckedIn(null);
+        /* The file now matches disk with the agent's change folded in, so
+           the green/red marks have served their purpose. */
+        setAgentMarks((m) => {
+          if (!(pane.path in m)) return m;
+          const next = { ...m };
+          delete next[pane.path];
+          return next;
+        });
+        flash(`wrote ${pane.path} to disk`);
+      } else {
+        setSaveDiff((s) => ({
+          ...s,
+          confirm: false,
+          error: res?.error || 'write refused by the agent',
+        }));
+      }
+    } catch {
+      setSaveDiff((s) => ({ ...s, confirm: false, error: 'write failed - is the agent up?' }));
+    } finally {
+      setSaving(false);
+    }
+  }, [pane, body, dirty, saving, checkedIn, flash]);
+
+  /* Keep one file's agent change: the bytes stay exactly as they are on disk,
+     only the review marks go. */
+  const keepChange = useCallback(async (path: string) => {
+    try {
+      const r = await api.codeKeep(path);
+      if (!r?.ok) throw new Error(r?.error || 'the server did not keep it');
+      setAgentMarks((m) => {
+        if (!(path in m)) return m;
+        const next = { ...m };
+        delete next[path];
+        return next;
+      });
+      flash(`kept ${path} as the agent left it`);
+    } catch (e) {
+      /* Keep only clears the marks once the snapshot is actually gone. The
+         old order - clear first, request second, swallow the error - made a
+         failed Keep look successful: the marks vanished while the server
+         still listed the file as unreviewed. */
+      flash(`could not keep ${path}: ${e instanceof Error ? e.message : 'request failed'}`);
+    }
+  }, [flash]);
+
+  /* Revert one file to the snapshot taken before the agent first wrote it.
+     A file the agent CREATED is removed and its pane closed - keeping a tab
+     open on a file that no longer exists was how the old flow lied. */
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const revertChange = useCallback(async (path: string) => {
+    setReviewBusy(true);
+    try {
+      const r = await api.codeRevert(path);
+      if (r?.ok) {
+        setAgentMarks((m) => {
+          const next = { ...m };
+          delete next[path];
+          return next;
+        });
+        setStale(null);
+        refreshFromDisk();
+        if (r.deleted) {
+          const idx = panes.findIndex((p) => p.path === path);
+          if (idx >= 0) close(idx);
+          flash(`reverted: removed ${path} (the agent had created it)`);
+        } else {
+          void open(path, { reload: true });
+          flash(`reverted ${path} to before the agent touched it`);
+        }
+      } else {
+        flash(r?.error || 'nothing to revert for this file');
+      }
+    } catch {
+      flash('revert failed - is the agent up?');
+    } finally {
+      setReviewBusy(false);
+    }
+  }, [flash, panes, close, open, refreshFromDisk]);
+
+  /* An unreviewed change survives a page reload: the server keeps the
+     snapshots, so re-mark the files it lists. Session-local marks (a change
+     made while this page is open) win over the fetch. */
+  useEffect(() => {
+    let live = true;
+    const ac = new AbortController();
+    api.codeChanges(ac.signal).then((r) => {
+      if (!live || !r?.changes?.length) return;
+      setAgentMarks((m) => {
+        const next = { ...m };
+        for (const c of r.changes!) {
+          if (c.path && !(c.path in next)) {
+            next[c.path] = parseUnifiedMarks(String(c.diff || ''));
+          }
+        }
+        return next;
+      });
+    }).catch(() => undefined);
+    return () => { live = false; ac.abort(); };
+  }, []);
+
   return (
-    <div className="flex h-full flex-col lg:flex-row">
+    /* `.ide` scopes the editor palette (index.css): graphite chrome, a denser
+       type scale and square rows. The rest of the console keeps its own look,
+       so the editor reads as an editor without a second design system. */
+    <div className="ide flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         {!zen && (
           <TopBar crumb="Code">
             {dirty && <Pill tone="info">browser draft</Pill>}
-            <Pill tone="warn">read-only source</Pill>
+            <button type="button" onClick={() => setAgentOn((v) => !v)}
+              aria-pressed={agentOn}
+              title={agentOn ? 'Hide the agent panel' : 'Show the agent panel'}
+              className={`flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] transition-colors ${
+                agentOn
+                  ? 'border-zinc-600 bg-white/[0.07] text-zinc-200'
+                  : 'border-glass-border text-zinc-400 hover:bg-glass-hover'}`}>
+              <Sparkles size={11} /> Agent
+            </button>
             <button type="button" title="Command palette (Ctrl+Shift+P)"
               onClick={() => setPalette('cmd')}
               className="rounded border border-glass-border px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-glass-hover">
@@ -1589,11 +1885,14 @@ const runProjectChecks = useCallback(async () => {
           {/* Explorer */}
           {!zen && explorerOn && (
             <aside aria-label="Explorer"
-              className="flex max-h-[34vh] w-full flex-none flex-col border-b border-glass-border bg-surface-0 lg:max-h-none lg:w-[268px] lg:border-b-0 lg:border-r">
-              <Explorer onOpen={open} activePath={pane?.path ?? null} />
-              <div className="flex-none border-t border-glass-border px-3 py-1.5 text-[10px] text-zinc-muted">
-                read-only · {panes.length} open
-              </div>
+              className="flex max-h-[34vh] w-full flex-none flex-col border-b border-glass-border bg-surface-0 lg:max-h-none lg:w-[232px] lg:border-b-0 lg:border-r xl:w-[260px]">
+              <Explorer
+                onOpen={open}
+                activePath={pane?.path ?? null}
+                onWorkspaceChange={refreshFromDisk}
+                reloadAt={wsEpoch}
+                changed={changedPaths}
+              />
             </aside>
           )}
 
@@ -1611,8 +1910,8 @@ const runProjectChecks = useCallback(async () => {
                       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setActivePath(p.path); } }}
                       onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); close(i); } }}
                       title={p.path}
-                      className={`group flex flex-none cursor-pointer items-center gap-1.5 border-r border-glass-border px-2.5 py-1.5 text-[11.5px] ${
-                        i === active ? 'bg-surface-1 text-zinc-100' : 'text-zinc-400 hover:bg-glass-hover'}`}>
+                      className={`group flex flex-none cursor-pointer items-center gap-1.5 border-t border-transparent px-3 py-1.5 text-[11.5px] ${
+                        i === active ? 'border-accent bg-surface-1 text-zinc-100' : 'text-zinc-400 hover:bg-glass-hover'}`}>
                       {isDirty
                         ? <Circle size={9} className="flex-none fill-accent text-accent" />
                         : <span className="w-[9px] flex-none" />}
@@ -1646,7 +1945,7 @@ const runProjectChecks = useCallback(async () => {
             {/* Breadcrumbs */}
             {pane && !zen && (
               <nav aria-label="Breadcrumbs"
-                className="flex flex-none items-center gap-1 overflow-x-auto border-b border-glass-border px-3 py-1 text-[11px] text-zinc-muted">
+                className="flex flex-none items-center gap-1 overflow-x-auto border-b border-glass-border bg-surface-1 px-3 py-1 text-[11px] text-zinc-muted">
                 {pane.path.split('/').map((seg, i, arr) => (
                   <span key={i} className="flex items-center gap-1 whitespace-nowrap">
                     {i > 0 && <ChevronRight size={10} className="text-zinc-muted/60" />}
@@ -1654,23 +1953,112 @@ const runProjectChecks = useCallback(async () => {
                   </span>
                 ))}
                 <span className="ml-auto flex items-center gap-1">
-                  <span className="whitespace-nowrap">{LANG_LABEL[lang] ?? lang}</span>
+                  {/* Editor actions live on the editor's own toolbar. They used
+                      to sit in the agent panel header, which read as if the AI
+                      owned go-to-definition and saving. */}
+                  <button type="button" onClick={() => void goToDefinition()}
+                    title="Go to definition (F12)"
+                    disabled={!caretWord}
+                    className="flex flex-none items-center gap-1 rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40">
+                    <FileCode2 size={11} /> <span className="hidden xl:inline">Definition</span>
+                  </button>
+                  <button type="button"
+                    onClick={() => { if (caretWord) { setIntelWord(caretWord); setIntelOpen(true); } else flash('put the caret on a symbol first'); }}
+                    title="Find references (Shift+F12)"
+                    disabled={!caretWord}
+                    className="flex flex-none items-center gap-1 rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40">
+                    <Globe size={11} /> <span className="hidden xl:inline">References</span>
+                  </button>
+                  <button type="button" onClick={() => setSaveDiff((s) => ({ ...s, open: true }))}
+                    title="Save to disk (Ctrl+S)"
+                    disabled={!pane || !dirty}
+                    className="flex flex-none items-center gap-1 rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40">
+                    <Save size={11} /> <span className="hidden xl:inline">Save</span>
+                  </button>
+                  {lang === 'markdown' && (
+                    <button type="button" onClick={() => setPreviewMd((v) => !v)}
+                      aria-pressed={previewMd}
+                      title={previewMd
+                        ? 'Back to the source'
+                        : 'Render this draft as markdown (the file on disk is untouched)'}
+                      className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10.5px] ${
+                        previewMd
+                          ? 'border-sky-400/50 text-sky-300'
+                          : 'border-glass-border text-zinc-400 hover:text-zinc-200'}`}>
+                      <Eye size={11} /> {previewMd ? 'Edit' : 'Preview'}
+                    </button>
+                  )}
+                  {/* The language moved to the status bar; showing it here as
+                      well was the second place saying the same thing. */}
                 </span>
               </nav>
             )}
 
-            <FindWidget state={find} setState={setFind} body={body} taRef={ta}
-              onReveal={reveal} />
+            {/* What the agent changed in this file, and the two ways out.
+                The lines themselves carry the marks (green added, yellow
+                edited, red deleted); this bar recounts them and waits for the
+                user's verdict - the write is ALREADY on disk, so Keep only
+                dismisses the review and Revert restores the snapshot. */}
+            {pane && activeMarks && (
+              <div className="flex flex-none items-center gap-2 border-b border-glass-border px-3 py-1 text-[11px] text-zinc-300"
+                   style={{ background: 'rgba(63, 185, 80, 0.07)' }}>
+                <span className="h-2 w-2 flex-none rounded-[2px]"
+                      style={{ background: '#3fb950' }} />
+                <span className="whitespace-nowrap">agent changed this file</span>
+                {activeMarks.added.length > 0 && (
+                  <span className="whitespace-nowrap" style={{ color: '#3fb950' }}>
+                    +{activeMarks.added.length} added
+                  </span>
+                )}
+                {activeMarks.modified.length > 0 && (
+                  <span className="whitespace-nowrap" style={{ color: '#d29922' }}>
+                    ~{activeMarks.modified.length} edited
+                  </span>
+                )}
+                {activeMarks.deleted > 0 && (
+                  <span className="whitespace-nowrap" style={{ color: '#f85149' }}>
+                    −{activeMarks.deleted} deleted
+                  </span>
+                )}
+                <span className="flex-1" />
+                {reviewBusy && <Loader2 size={11} className="animate-spin text-zinc-400" />}
+                <button type="button"
+                  onClick={() => void revertChange(pane.path)}
+                  disabled={reviewBusy}
+                  title="Put the file back exactly as it was before the agent touched it"
+                  className="flex-none whitespace-nowrap rounded border border-glass-border px-2 py-[2px] text-[11px] text-zinc-300 hover:border-rose-400/60 hover:text-rose-300 disabled:opacity-50">
+                  Revert
+                </button>
+                <button type="button"
+                  onClick={() => keepChange(pane.path)}
+                  disabled={reviewBusy}
+                  title="Keep the agent's change and clear the marks"
+                  className="flex-none whitespace-nowrap rounded border border-emerald-500/40 px-2 py-[2px] text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50">
+                  Keep
+                </button>
+              </div>
+            )}
+
+            <FindWidget state={find} setState={setFind} body={body}
+              editor={ed.current} onReveal={reveal} />
 
             {/* Editor */}
             {!pane ? (
-              <div className="flex min-h-0 flex-1 items-center justify-center">
+              /* bg-surface-1, not the app void: with no file open the column is
+                 transparent, so the empty state sat on #090909 - a near-black
+                 slab flanked by #181818 chrome, the loudest "unfinished" signal
+                 in the section. It now paints the same surface the editor will. */
+              <div className="flex min-h-0 flex-1 items-center justify-center bg-surface-1">
                 <Empty icon={<Code2 size={22} />}
                   title="Pick a file to start editing"
-                  sub="Ctrl+P opens any file in the two service trees. Edits stay in this browser; nothing is written to disk." />
+                  /* Was "nothing is written to disk", which stopped being true
+                     when the agent gained gated write tools. The honest split is
+                     about WHO writes: your buffer stays here until you press
+                     save, and the agent's writes wait for your approval. */
+                  sub="Ctrl+P opens any file in the workspace. Your edits stay in this browser until you save; the agent writes straight to the workspace, marks every change, and you Keep or Revert each file afterwards." />
               </div>
             ) : (
-              <div className="flex min-h-0 flex-1">
+              <div className="relative flex min-h-0 flex-1">
                 {outlineOn && (
                   <aside aria-label="Symbol outline"
                     className="hidden max-h-[30vh] w-[210px] flex-none flex-col overflow-y-auto border-r border-glass-border bg-surface-0 lg:block">
@@ -1679,13 +2067,11 @@ const runProjectChecks = useCallback(async () => {
                     </div>
                     {outline.length ? outline.map((s, i) => (
                       <button key={`${s.line}-${s.name}-${i}`} type="button"
-                        onClick={() => replaceRange(
-                          offsetOf(body, { line: s.line, col: 1 }),
-                          offsetOf(body, { line: s.line, col: 1 }), '')}
+                        onClick={() => ed.current?.revealLine(s.line + 1)}
                         className={`flex w-full items-baseline gap-1.5 px-3 py-0.5 text-left text-[11.5px] hover:bg-glass-hover ${
                           cursor.line === s.line + 1 ? 'bg-accent/10 text-zinc-100' : 'text-zinc-400'}`}>
                         <span className={s.kind === 'class' ? 'text-amber-200' : 'text-emerald-300'}>
-                          {s.kind === 'class' ? 'C' : s.kind === 'section' ? '§' : 'ƒ'}
+                          {s.kind === 'class' ? 'C' : s.kind === 'section' ? '§' : '†'}
                         </span>
                         <span className="truncate">{s.name}</span>
                       </button>
@@ -1696,254 +2082,322 @@ const runProjectChecks = useCallback(async () => {
                     )}
                   </aside>
                 )}
-                <Editor
-                  body={body}
-                  lang={lang}
-                  path={pane.path}
-                  folded={folded}
-                  cursorLine={cursor.line - 1}
-                  caretOffset={ta.current?.selectionStart ?? -1}
-                  selectionStart={ta.current?.selectionStart ?? 0}
-                  selectionEnd={ta.current?.selectionEnd ?? 0}
-                  problems={problemLines}
-                  ariaLabel={`Editor for ${pane.path}`}
-                  wrap={wrap}
-                  onChange={onType}
-                  onCursor={syncCursor}
-                  onFoldToggle={(line) => setFolded((s) => {
-                    const n = new Set(s);
-                    if (n.has(line)) n.delete(line); else n.add(line);
-                    return n;
-                  })}
-                  registerRef={(el) => { ta.current = el; }}
-                  scrollerRef={scroller}
-                />
-                {minimapOn && (
-                  <Minimap lines={lines} cursorLine={cursor.line}
-                    height={scroller.current?.clientHeight ?? 400} />
+                {/* Monaco owns folding, the minimap, find/replace and every
+                    keyboard editing behaviour, so none of that is drawn here
+                    any more. Markdown files can swap it for the rendered
+                    draft - READMEs and notes are written to be read. */}
+                {previewMd && lang === 'markdown' ? (
+                  <div
+                    className="prose-chat absolute inset-0 overflow-y-auto bg-surface-0 px-5 py-4 text-[13px] leading-relaxed text-zinc-200"
+                    /* renderMarkdown is the console's own safe renderer (the
+                       Chat section renders every answer with it): it escapes
+                       the source first, so a draft can contain anything. */
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(body) }}
+                  />
+                ) : (
+                  <MonacoEditor
+                    body={body}
+                    lang={lang}
+                    path={pane.path}
+                    problems={problemLines}
+                    marks={activeMarks ?? null}
+                    ariaLabel={`Editor for ${pane.path}`}
+                    wrap={wrap}
+                    onChange={(v, info) => onType(v, info)}
+                    onCursor={(info) => syncCursor(info)}
+                    onHandle={(h) => { ed.current = h; }}
+                    onFoldChange={setFolded}
+                  />
                 )}
               </div>
             )}
 
-            {/* Problems — real diagnostics, not an apology. */}
-            <div className="max-h-[40vh] flex-none overflow-y-auto border-t border-glass-border bg-surface-0">
-              <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-glass-border bg-surface-0 px-3 py-1.5">
-                <Terminal size={12} className="text-zinc-muted" />
-                <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-zinc-muted">
+            {/* Bottom panel — one strip, VS Code style. Collapsed until it has
+                something to show, so the editor keeps the height. */}
+            <div className="flex flex-none flex-col border-t border-glass-border bg-surface-0">
+              <div role="tablist" aria-label="Editor panel"
+                className="flex h-[28px] flex-none items-center gap-0.5 px-1.5">
+                <button type="button" role="tab"
+                  aria-selected={panel === 'problems'}
+                  onClick={() => setPanel(panel === 'problems' ? null : 'problems')}
+                  className={`flex h-full items-center gap-1.5 border-t-2 px-2.5 text-[11.5px] font-medium transition-colors ${
+                    panel === 'problems'
+                      ? 'border-accent text-zinc-100'
+                      : 'border-transparent text-zinc-500 hover:bg-surface-2 hover:text-zinc-300'}`}>
+                  <CircleDot size={11} />
                   Problems
-                </span>
-                {checking
-                  ? <Pill tone="muted">checking…</Pill>
-                  : <Pill tone={problems.length ? 'err' : 'ok'}>
-                      {problems.length} problem{problems.length === 1 ? '' : 's'}
-                    </Pill>}
-                {checkNote && <Pill tone="muted">{checkNote}</Pill>}
+                  <span className={`rounded-sm px-1 text-[10px] tabular-nums ${
+                    problems.length ? 'bg-danger-dim text-danger' : 'bg-white/5 text-zinc-500'}`}>
+                    {problems.length}
+                  </span>
+                </button>
+                <button type="button" role="tab"
+                  aria-selected={panel === 'terminal'}
+                  onClick={() => setPanel(panel === 'terminal' ? null : 'terminal')}
+                  className={`flex h-full items-center gap-1.5 border-t-2 px-2.5 text-[11.5px] font-medium transition-colors ${
+                    panel === 'terminal'
+                      ? 'border-accent text-zinc-100'
+                      : 'border-transparent text-zinc-500 hover:bg-surface-2 hover:text-zinc-300'}`}>
+                  <Terminal size={11} />
+                  Terminal
+                  {termSeen && (
+                    <span className={`h-1.5 w-1.5 rounded-full ${
+                      termStatus === 'open' ? 'bg-emerald-400'
+                        : termStatus === 'connecting' ? 'bg-amber-400'
+                        : termStatus === 'error' ? 'bg-rose-400' : 'bg-zinc-500'}`} />
+                  )}
+                </button>
                 <span className="flex-1" />
                 {/* The project's REAL checks, not the buffer parser. `/api/code/check`
                     judges this draft with ast.parse; this runs pytest/tsc/npm test/
                     ruff/cargo/go vet. Slow by nature — that is the point, and it is
                     the only signal that catches a change which parses but is wrong. */}
                 <button type="button"
-                  onClick={runProjectChecks}
+                  onClick={() => { setPanel('problems'); void runProjectChecks(); }}
                   disabled={checksBusy}
                   aria-label="Run the project's lint, typecheck and tests"
-                  className="flex flex-none items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400 disabled:opacity-60">
-                  {checksBusy ? <Loader2 size={11} className="animate-spin" />
-                    : <Play size={11} />}
+                  className="flex h-[21px] flex-none items-center gap-1 rounded border border-white/10 px-1.5 text-[10.5px] font-semibold text-zinc-400 hover:border-zinc-600 hover:text-zinc-200 disabled:opacity-60">
+                  {checksBusy ? <Loader2 size={10} className="animate-spin" />
+                    : <Play size={10} />}
                   {checksBusy ? 'running…' : 'Run checks'}
                 </button>
-              </div>
-
-              {checks && (
-                <div className="border-b border-glass-border">
-                  <div className="flex items-center gap-2 px-3 py-1.5">
-                    <Pill tone={checks.ok ? 'ok' : 'err'}>
-                      {checks.ok ? 'all checks passed'
-                        : 'checks failed'}
-                    </Pill>
-                    <span className="text-[11px] text-zinc-muted">
-                      {checks.checks_run} checker{checks.checks_run === 1 ? '' : 's'}
-                      {checks.cwd ? ` · ${checks.cwd}` : ''}
-                    </span>
-                  </div>
-                  {checks.error && (
-                    <p className="px-3 pb-2 text-[11.5px] text-amber-300">
-                      {checks.error}
-                    </p>
-                  )}
-                  {checks.results.map((r) => (
-                    <details key={r.tool} className="border-t border-glass-border/60">
-                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[11.5px] hover:bg-glass-hover">
-                        {r.ok ? <CircleCheck size={11} className="flex-none text-emerald-400" />
-                          : <CircleDot size={11} className="flex-none text-rose-400" />}
-                        <span className="font-semibold">{r.tool}</span>
-                        <Pill tone={r.ok ? 'ok' : 'err'}>
-                          {r.exit_code == null ? 'error' : `exit ${r.exit_code}`}
-                        </Pill>
-                        <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-muted">
-                          {(r.stdout || r.error || r.stderr || '').trim().split('\n').slice(-1)[0]}
-                        </span>
-                      </summary>
-                      <pre className="max-h-56 overflow-auto whitespace-pre-wrap px-3 pb-2 text-[11px] leading-relaxed text-zinc-300">
-                        {[r.stdout, r.stderr, r.error].filter(Boolean).join('\n')}
-                      </pre>
-                    </details>
-                  ))}
-                </div>
-              )}
-
-              {problems.length > 0 ? (
-                <ul className="divide-y divide-glass-border">
-                  {problems.map((p, i) => (
-                    <li key={`${p.line}-${p.col}-${i}`}>
-                      <button type="button"
-                        onClick={() => replaceRange(
-                          offsetOf(body, { line: p.line, col: p.col }),
-                          offsetOf(body, { line: p.line, col: p.col }), '')}
-                        className="flex w-full items-start gap-2 px-3 py-1.5 text-left text-[11.5px] hover:bg-glass-hover">
-                        <CircleDot size={11} className="mt-[3px] flex-none text-rose-400" />
-                        <span className="flex-none tabular-nums text-zinc-muted">
-                          {p.line}:{p.col}
-                        </span>
-                        <span className="min-w-0 flex-1 text-zinc-200">{p.message}</span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <ul className="space-y-1.5 px-3 py-2.5 text-[11.5px] text-zinc-400">
-                  <li className="flex items-start gap-2">
-                    {problems.length === 0 && !checkNote && (
-                      <>
-                        <span className="mt-[3px] flex-none text-emerald-400">✓</span>
-                        <span>No syntax errors{lang === 'python'
-                          ? ' — the draft was parsed with Python’s own ast module.'
-                          : ' in the delimiters of this draft.'}</span>
-                      </>
-                    )}
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <TriangleAlert size={12} className="mt-0.5 flex-none text-amber-400/80" />
-                    <span>Type errors, completion and go-to-definition still need a
-                      language server, which this section does not run. These are
-                      syntax checks only.</span>
-                  </li>
-                  <li className="flex items-start gap-2">
-                    <Play size={12} className="mt-0.5 flex-none text-zinc-muted" />
-                    <span>“Run checks” above runs the project’s own lint,
-                      typecheck and tests. Syntax-only until you do.</span>
-                  </li>
-                </ul>
-              )}
-            </div>
-          </div>
-
-          {/* Ask — the AI half of the editor.
-              *  Read-only on purpose: the agent sees the draft and the project
-              *  and answers, but a question must never rewrite files behind the
-              *  user's back. Applying an answer is a separate, visible act. */}
-          <div className="flex min-h-0 flex-1 flex-col border-t border-glass-border bg-surface-1">
-            <div className="flex flex-none items-center gap-2 border-b border-glass-border px-3 py-2">
-              <Sparkles size={12} className="flex-none text-violet-300" />
-              <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-zinc-muted">
-                Ask
-              </span>
-              {ask.busy
-                ? <Pill tone="muted">thinking…</Pill>
-                : ask.answer && <Pill tone="ok">answered</Pill>}
-              <span className="flex-1" />
-              {ask.answer && (
-                <button type="button"
-                  onClick={() => setAsk({ question: '', answer: '', busy: false, error: null, provider: '', context: [] })}
-                  aria-label="Clear the answer"
-                  className="flex-none text-zinc-muted hover:text-zinc-200">
-                  <X size={12} />
-                </button>
-              )}
-            </div>
-
-            <form
-              onSubmit={submitAsk}
-              className="flex flex-none gap-2 border-b border-glass-border p-2">
-              <input
-                value={ask.question}
-                onChange={(e) => setAsk((a) => ({ ...a, question: e.target.value }))}
-                placeholder={pane
-                  ? `About ${pane.path.split('/').pop()}…`
-                  : 'Open a file to ask about it…'}
-                disabled={!pane || ask.busy}
-                aria-label="Ask the agent about this code"
-                className="min-w-0 flex-1 rounded-md border border-white/10 bg-surface-0 px-2 py-1.5 text-[12px] outline-none focus:border-violet-400 disabled:opacity-50" />
-              <button type="submit"
-                disabled={!pane || ask.busy || !ask.question.trim()}
-                aria-label="Send question"
-                className="flex flex-none items-center rounded-md border border-white/10 px-2.5 text-[11px] font-semibold hover:border-violet-400 disabled:opacity-50">
-                {ask.busy
-                  ? <Loader2 size={12} className="animate-spin" />
-                  : <Sparkles size={12} />}
-              </button>
-            </form>
-
-            <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2.5">
-              {/* Review what is on disk, above the answer. An edit nobody
-                  looked at is an edit nobody approved. */}
-              <div className="mb-3">
-                <div className="flex items-center gap-1">
-                  {(['status', 'diff', 'log'] as const).map((t) => (
-                    <button key={t} type="button"
-                      onClick={() => loadGit(t)}
-                      disabled={gitBusy}
-                      className={`rounded px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide ${
-                        gitView === t
-                          ? 'bg-violet-500/25 text-violet-200'
-                          : 'text-zinc-muted hover:text-zinc-200'}`}>
-                      {t}
-                    </button>
-                  ))}
-                  <span className="flex-1" />
-                  {gitBusy && <Loader2 size={11} className="animate-spin text-zinc-muted" />}
-                </div>
-                {gitOut && (
-                  gitOut.error
-                    ? <p className="mt-1 text-[11px] text-amber-300">{gitOut.error}</p>
-                    : (gitOut.text.trim()
-                      ? <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap text-[10.5px] leading-relaxed text-zinc-300">
-                        {gitOut.text.slice(0, 40_000)}
-                      </pre>
-                      : <p className="mt-1 text-[11px] text-zinc-muted">
-                        nothing to show — no uncommitted changes
-                      </p>)
+                {panel && (
+                  <button type="button" onClick={() => setPanel(null)}
+                    title="Hide panel"
+                    aria-label="Hide panel"
+                    className="flex h-[21px] w-[21px] flex-none items-center justify-center rounded text-zinc-500 hover:text-zinc-200">
+                    <ChevronDown size={12} />
+                  </button>
                 )}
               </div>
 
-              <hr className="mb-3 border-glass-border" />
-
-              {ask.error ? (
-                <p className="text-[11.5px] text-rose-300">{ask.error}</p>
-              ) : ask.answer ? (
-                <>
-                  <pre className="whitespace-pre-wrap break-words text-[11.5px] leading-relaxed text-zinc-200">
-                    {ask.answer}
-                  </pre>
-                  {ask.context.length > 0 && (
-                    <p className="mt-2 text-[10.5px] text-zinc-muted">
-                      Grounded in: {ask.context.join(', ')}
-                    </p>
+              {panel === 'problems' && (
+                <div className="max-h-[30vh] overflow-y-auto border-t border-glass-border">
+                  {checks && (
+                    <div className="border-b border-glass-border">
+                      <div className="flex items-center gap-2 px-3 py-1.5">
+                        <Pill tone={checks.ok ? 'ok' : 'err'}>
+                          {checks.ok ? 'all checks passed' : 'checks failed'}
+                        </Pill>
+                        <span className="text-[11px] text-zinc-muted">
+                          {checks.checks_run} checker{checks.checks_run === 1 ? '' : 's'}
+                          {checks.cwd ? ` · ${checks.cwd}` : ''}
+                        </span>
+                      </div>
+                      {checks.error && (
+                        <p className="px-3 pb-2 text-[11.5px] text-amber-300">
+                          {checks.error}
+                        </p>
+                      )}
+                      {checks.results.map((r) => (
+                        <details key={r.tool} className="border-t border-glass-border/60">
+                          <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[11.5px] hover:bg-glass-hover">
+                            {r.ok ? <CircleCheck size={11} className="flex-none text-emerald-400" />
+                              : <CircleDot size={11} className="flex-none text-rose-400" />}
+                            <span className="font-semibold">{r.tool}</span>
+                            <Pill tone={r.ok ? 'ok' : 'err'}>
+                              {r.exit_code == null ? 'error' : `exit ${r.exit_code}`}
+                            </Pill>
+                            <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-muted">
+                              {(r.stdout || r.error || r.stderr || '').trim().split('\n').slice(-1)[0]}
+                            </span>
+                          </summary>
+                          <pre className="max-h-56 overflow-auto whitespace-pre-wrap px-3 pb-2 text-[11px] leading-relaxed text-zinc-300">
+                            {[r.stdout, r.stderr, r.error].filter(Boolean).join('\n')}
+                          </pre>
+                        </details>
+                      ))}
+                    </div>
                   )}
-                  <button type="button"
-                    onClick={insertAnswerAtCursor}
-                    className="mt-2 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400">
-                    Insert at cursor
-                  </button>
-                </>
-              ) : (
-                <p className="text-[11.5px] text-zinc-muted">
-                  {pane
-                    ? 'Ask about the open file. The agent reads your draft — unsaved edits included — and the surrounding project, and answers with file names and line numbers.'
-                    : 'Open a file first. The answer is grounded in what you are actually looking at, not in what the model remembers.'}
-                </p>
+
+                  {problems.length > 0 ? (
+                    <ul className="divide-y divide-glass-border">
+                      {problems.map((p, i) => (
+                        <li key={`${p.line}-${p.col}-${i}`}>
+                          <button type="button"
+                            onClick={() => replaceRange(
+                              offsetOf(body, { line: p.line, col: p.col }),
+                              offsetOf(body, { line: p.line, col: p.col }), '')}
+                            className="flex w-full items-start gap-2 px-3 py-1.5 text-left text-[11.5px] hover:bg-glass-hover">
+                            <CircleDot size={11} className="mt-[3px] flex-none text-rose-400" />
+                            <span className="flex-none tabular-nums text-zinc-muted">
+                              {p.line}:{p.col}
+                            </span>
+                            <span className="min-w-0 flex-1 text-zinc-200">{p.message}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <ul className="space-y-1 px-3 py-2 text-[11.5px] text-zinc-400">
+                      <li className="flex items-start gap-2">
+                        <span className="mt-[2px] flex-none text-emerald-400">✓</span>
+                        <span>{checking ? 'checking the draft…' : (checkNote
+                          ?? (lang === 'python'
+                            ? 'No syntax errors — parsed with Python’s own ast module.'
+                            : 'No syntax errors in the delimiters of this draft.'))}</span>
+                      </li>
+                      <li className="pl-5 text-[11px] text-zinc-500">
+                        Syntax only — type errors and go-to-definition need a language
+                        server. Run checks runs the project’s own lint, typecheck and tests.
+                      </li>
+                    </ul>
+                  )}
+                </div>
               )}
+
+              <div className={panel === 'terminal' ? 'h-[220px]' : 'h-0 overflow-hidden'}>
+                <TerminalDock bare open={panel === 'terminal'} onStatus={onTermStatus} />
+              </div>
             </div>
+          </div>
+
+          {/* The agent. Tool-using, so it reads and searches the project on its
+              own instead of being handed a context slice; the trace of what it
+              did is part of the answer, not a debug log. It owns its own
+              conversation, abort handle and model pick. Hidden with CSS rather
+              than unmounted, so collapsing the pane cannot eat a typed draft. */}
+          <div className={agentOn
+            ? 'flex min-h-0 min-w-0 w-full flex-none lg:w-[340px] xl:w-[400px] 2xl:w-[440px]'
+            : 'hidden'}>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col border-t border-glass-border bg-surface-0 lg:border-t-0">
+            {/* No second "AGENT" bar above the panel's own header: the header
+                already carries the sparkle, the conversation title and the
+                file chip, and a title row over a title row is just chrome. */}
+            <AgentPanel
+              path={pane?.path ?? ''}
+              body={body}
+              model={aiModel}
+              onModelChange={setAiModel}
+              onAsk={async (q, hist, onStep, onMeta, signal, onText, extra) => {
+                let answer = '';
+                /* A run that ends without `done` is a broken stream, not a
+                   finished answer. The server always sends done on a clean
+                   stop; the old loop just fell out and returned whatever
+                   partial text it had accumulated, which read as success. */
+                let sawDone = false;
+                /* Reasoning arrives as a stream of small deltas. Turning each
+                   one into its own step is what produced a wall of identical
+                   "thinking" rows - one per word. They accumulate into ONE row
+                   instead, and a tool call or answer token closes it, so the
+                   activity still reads think -> call -> result -> think. */
+                let thinkRow: string | null = null;
+                let thinkBuf = '';
+                let thinkN = 0;
+                const closeThink = () => { thinkRow = null; thinkBuf = ''; };
+                for await (const f of api.codeAgentStream(
+                  q, pane?.path ?? '', body, hist, signal,
+                  aiModel || undefined, undefined, extra, true)) {
+                  if (f.type === 'delta' && f.text) {
+                    closeThink();
+                    answer += f.text;
+                    onText?.(f.text);
+                  } else if (f.type === 'tool_call') {
+                    closeThink();
+                    onStep({ id: f.id, label: f.name ?? 'tool',
+                             detail: briefArgs(f), kind: 'call' });
+                  } else if (f.type === 'tool_result') {
+                    closeThink();
+                    /* Pair the result with its parked write (permission and
+                       tool_result carry different ids). Consume the slot on
+                       failure too: a refused write must not leave marks
+                       behind for a later call of the same tool. */
+                    const wi = pendingWrites.current.findIndex(
+                      (w) => w.tool === f.name);
+                    const w = wi >= 0 ? pendingWrites.current[wi] : null;
+                    if (wi >= 0) pendingWrites.current.splice(wi, 1);
+                    if (f.ok !== false && w && f.name && WRITE_TOOLS.has(f.name)) {
+                      /* A write tool succeeded, so the workspace changed on
+                         disk behind the explorer's back. Re-read the tree now
+                         - not at the end of the turn - so the new file shows
+                         up as soon as it exists. (A file the agent had just
+                         created used to stay invisible, and a folder already
+                         showing "empty" kept saying "empty", until the user
+                         collapsed and re-expanded it by hand.) */
+                      refreshFromDisk();
+                      setAgentMarks((m) => ({ ...m, [w.path]: w.marks }));
+                      setSyncPath(w.path);
+                    }
+                    onStep({ id: f.id, label: f.name ?? 'tool',
+                             detail: outcomeBrief(f), kind: f.ok === false ? 'err' : 'ok' });
+                  } else if (f.type === 'write') {
+                    /* Auto mode: the write is already dispatched - no
+                       decision is expected. Park the payload; the matching
+                       tool_result applies the marks and syncs the pane. No
+                       activity row here: the tool_call frame right after
+                       this one already shows the write in the trace. */
+                    closeThink();
+                    if (WRITE_TOOLS.has(String(f.tool || ''))) {
+                      pendingWrites.current.push({
+                        path: String(f.path || ''),
+                        tool: String(f.tool || ''),
+                        marks: parseUnifiedMarks(String(f.diff || '')),
+                      });
+                    }
+                  } else if (f.type === 'permission') {
+                    /* The run is now parked in the server, waiting on this
+                       decision. Showing the dialog is what releases it - the
+                       loop does not continue until the operator chooses. */
+                    closeThink();
+                    /* Agent-relative args.path is NOT a client path: the
+                       server sends the client-visible one alongside. */
+                    if (WRITE_TOOLS.has(String(f.tool || ''))) {
+                      pendingWrites.current.push({
+                        path: String(f.path || ''),
+                        tool: String(f.tool || ''),
+                        marks: parseUnifiedMarks(String(f.diff || '')),
+                      });
+                    }
+                    setPendingEdit({
+                      id: String(f.id || ''), tool: String(f.tool || 'write'),
+                      summary: String(f.summary || ''), diff: String(f.diff || ''),
+                    });
+                    onStep({ id: f.id, label: f.tool ?? 'write',
+                             detail: f.summary ?? 'waiting for your approval',
+                             kind: 'ask' });
+                  } else if (f.type === 'thinking' && f.text) {
+                    if (thinkRow === null) { thinkRow = `think-${thinkN++}`; thinkBuf = f.text; }
+                    else thinkBuf += f.text;
+                    onStep({ id: thinkRow, label: 'thinking', text: thinkBuf, kind: 'think' });
+                  } else if (f.type === 'done') {
+                    sawDone = true;
+                    if (typeof f.answer === 'string') answer = f.answer;
+                    /* The model that actually answered, not the one asked
+                       for: with Auto the gateway picks, and echoing the
+                       request would be a lie the user cannot trace. */
+                    if (f.model || f.provider) {
+                      onStep({ label: 'model',
+                               detail: [f.model, f.provider].filter(Boolean).join(' · '),
+                               kind: 'model' });
+                    }
+                    /* A stopped run is not an error - it is a run that hit a
+                       stated limit. Surface the reason instead of pretending
+                       the (possibly empty) answer is complete. */
+                    if (f.stopped) {
+                      onStep({ label: 'stopped', detail: f.stopped, kind: 'err' });
+                    }
+                    onMeta({
+                      model: f.model, thinking: f.thinking,
+                      usage: f.input_tokens != null && f.output_tokens != null
+                        ? { input: f.input_tokens, output: f.output_tokens }
+                        : undefined,
+                    });
+                  } else if (f.type === 'error') {
+                    throw new Error(f.text || 'the agent stopped');
+                  }
+                }
+                if (!sawDone) {
+                  throw new Error('the agent stream ended before the run finished');
+                }
+                return answer;
+              }}
+              files={known}
+              gitView={gitView}
+              gitBusy={gitBusy}
+              gitOut={gitOut ? { text: gitOut.text, ok: !!gitOut.ok } : null}
+              onGit={(t) => loadGit(t)}
+            />
+          </div>
           </div>
         </div>
 
@@ -2042,55 +2496,68 @@ const runProjectChecks = useCallback(async () => {
           </div>
         )}
 
-        {/* Status bar */}
-        <div className="flex flex-none flex-wrap items-center gap-x-3 gap-y-0.5 border-t border-glass-border bg-surface-0 px-3 py-1 text-[10.5px] text-zinc-muted">
-          <span className="flex items-center gap-1">
-            <Columns2 size={10} /> {pane ? LANG_LABEL[lang] ?? lang : 'no file'}
+        {/* Status bar. The agent-writes notice lives HERE, not in the top bar:
+            it is standing context about how this workspace behaves, and the
+            status bar is where an editor keeps that (branch, remote,
+            encoding). In the top bar it competed with the breadcrumb for
+            attention every second. */}
+        <div className="ide-status flex flex-none items-center gap-x-3 overflow-hidden whitespace-nowrap border-t border-glass-border bg-surface-0 px-3 py-1 text-[10.5px] text-zinc-muted">
+          <span className="hidden flex-none items-center gap-1 text-zinc-500 xl:flex" title="The coding agent writes straight to the workspace; every change is marked in the editor and can be kept or reverted per file afterwards.">
+            <ShieldQuestion size={10} /> agent auto-applies · review after
           </span>
-          <span>Ln {cursor.line}, Col {cursor.col}</span>
-          {selLen > 0 && <span>({selLen} selected)</span>}
-          {folded.size > 0 && <span>{folded.size} folded</span>}
           {problems.length > 0 && (
-            <span className="text-rose-400">{problems.length} error{problems.length === 1 ? '' : 's'}</span>
+            <span className="flex-none text-rose-400">{problems.length} error{problems.length === 1 ? '' : 's'}</span>
           )}
-          <button type="button" onClick={() => setOutlineOn((v) => !v)}
-            aria-pressed={outlineOn} title="Toggle symbol outline"
-            className={`rounded px-1 ${outlineOn ? 'text-accent' : 'hover:text-zinc-300'}`}>
-            <ListTree size={10} />
-          </button>
-          <button type="button" onClick={() => setShortcuts(true)}
-            title="Keyboard shortcuts (Ctrl+,)"
-            className="rounded px-1 hover:text-zinc-300">
-            <Keyboard size={10} />
-          </button>
-          <span>UTF-8</span>
-          <span>Spaces: 4</span>
-          <span>{body.length} chars</span>
-          <button type="button" onClick={() => setWrap((v) => !v)}
-            aria-pressed={wrap} title="Toggle word wrap"
-            className={`rounded px-1 ${wrap ? 'text-accent' : 'hover:text-zinc-300'}`}>
-            <WrapText size={10} />
-          </button>
-          <button type="button" onClick={() => setMinimapOn((v) => !v)}
-            aria-pressed={minimapOn} title="Toggle minimap"
-            className={`rounded px-1 ${minimapOn ? 'text-accent' : 'hover:text-zinc-300'}`}>
-            <Maximize2 size={10} />
-          </button>
-          {!zen && (
-            <button type="button" onClick={() => setExplorerOn((v) => !v)}
-              aria-pressed={explorerOn} title="Toggle explorer"
-              className={`rounded px-1 ${explorerOn ? 'text-accent' : 'hover:text-zinc-300'}`}>
-              {explorerOn ? <PanelLeftClose size={10} /> : <PanelLeftOpen size={10} />}
-            </button>
-          )}
-          <button type="button" onClick={() => setZen((v) => !v)}
-            aria-pressed={zen} title="Zen mode"
-            className={`rounded px-1 ${zen ? 'text-accent' : 'hover:text-zinc-300'}`}>
-            <Square size={9} />
-          </button>
-          <span className="ml-auto flex items-center gap-1.5" role="status">
-            {note && <span className="text-accent/90">{note}</span>}
-            {!note && <span>draft stays in this browser — nothing is written to disk</span>}
+          {/* Right cluster in VS Code's order: cursor, then text settings, then
+              the toggles. The language used to sit on the far left wearing an
+              icon, in front of Ln/Col, which read like a stray filter chip. */}
+          <span className="ml-auto flex min-w-0 flex-none items-center gap-x-3">
+            <span className="flex-none">Ln {cursor.line}, Col {cursor.col}</span>
+            {selLen > 0 && <span className="hidden flex-none xl:inline">({selLen} selected)</span>}
+            {folded > 0 && <span className="hidden flex-none xl:inline">{folded} folded</span>}
+            <span className="hidden flex-none xl:inline">Spaces: 4</span>
+            <span className="hidden flex-none xl:inline">UTF-8</span>
+            <span className="hidden flex-none 2xl:inline">{body.length} chars</span>
+            <span className="flex-none">{pane ? LANG_LABEL[lang] ?? lang : 'no file'}</span>
+            <span className="flex flex-none items-center gap-0.5">
+              <button type="button" onClick={() => setOutlineOn((v) => !v)}
+                aria-pressed={outlineOn} title="Toggle symbol outline"
+                className={`rounded px-1 ${outlineOn ? 'text-accent' : 'hover:text-zinc-300'}`}>
+                <ListTree size={10} />
+              </button>
+              <button type="button" onClick={() => setShortcuts(true)}
+                title="Keyboard shortcuts (Ctrl+,)"
+                className="rounded px-1 hover:text-zinc-300">
+                <Keyboard size={10} />
+              </button>
+              <button type="button" onClick={() => setWrap((v) => !v)}
+                aria-pressed={wrap} title="Toggle word wrap"
+                className={`rounded px-1 ${wrap ? 'text-accent' : 'hover:text-zinc-300'}`}>
+                <WrapText size={10} />
+              </button>
+              <button type="button" onClick={() => setMinimapOn((v) => !v)}
+                aria-pressed={minimapOn} title="Toggle minimap"
+                className={`rounded px-1 ${minimapOn ? 'text-accent' : 'hover:text-zinc-300'}`}>
+                <Maximize2 size={10} />
+              </button>
+              {!zen && (
+                <button type="button" onClick={() => setExplorerOn((v) => !v)}
+                  aria-pressed={explorerOn} title="Toggle explorer"
+                  className={`rounded px-1 ${explorerOn ? 'text-accent' : 'hover:text-zinc-300'}`}>
+                  {explorerOn ? <PanelLeftClose size={10} /> : <PanelLeftOpen size={10} />}
+                </button>
+              )}
+              <button type="button" onClick={() => setZen((v) => !v)}
+                aria-pressed={zen} title="Zen mode"
+                className={`rounded px-1 ${zen ? 'text-accent' : 'hover:text-zinc-300'}`}>
+                <Square size={9} />
+              </button>
+            </span>
+          </span>
+          <span className="flex min-w-0 items-center" role="status">
+            {note
+              ? <span className="truncate text-accent/90">{note}</span>
+              : <span className="hidden truncate 2xl:inline">draft stays in this browser until saved</span>}
           </span>
         </div>
 
@@ -2112,6 +2579,32 @@ const runProjectChecks = useCallback(async () => {
           <GotoBox initial={goto} max={lines.length}
             onCancel={() => setGoto(null)} onGo={gotoLine} />
         )}
+        {/* The save review: the buffer against what is on disk, as a real
+            diff, before anything is written. */}
+        {saveDiff.open && pane && (
+          <DiffView
+            title="Save to disk"
+            subtitle={`${pane.path} — ${diffRows.filter((r) => r.kind === 'add').length} added, ${diffRows.filter((r) => r.kind === 'del').length} removed`}
+            rows={diffRows}
+            applyLabel={saving ? 'writing…' : 'Save to disk'}
+            onApply={() => void saveToDisk(true)}
+            onClose={() => setSaveDiff((s) => ({ ...s, open: false }))}
+            busy={saving}
+            note={saveDiff.note}
+            error={saveDiff.error}
+          />
+        )}
+        {/* References / rename / hover, on the word at the caret. */}
+        {intelOpen && pane && (
+          <IntelModal path={pane.path} word={intelWord}
+            onJump={(f, l) => { setIntelOpen(false); void jumpTo(f, l); }}
+            onClose={() => setIntelOpen(false)} />
+        )}
+        {/* The agent's write gate. Mounted outside <main> because it is modal
+            over the whole panel, and it has no backdrop-dismiss: a write that
+            is neither accepted nor refused must not proceed. */}
+        <EditPermissionDialog pending={pendingEdit} busy={editBusy}
+          onDecide={decideEdit} />
       </main>
     </div>
   );

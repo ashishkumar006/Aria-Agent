@@ -416,6 +416,23 @@ def _start_index(request: Request, doc_id: str) -> None:
     t.start()
 
 
+def index_document(doc_id: str, app) -> None:
+    """Start indexing for a document created outside a request.
+
+    Inbound channel attachments are ingested by the Telegram poller, which has
+    no Starlette Request to hand `_start_index`. Indexing only needs the app's
+    embedder registry (for the memory plane and the embedder itself), so a
+    one-attribute stand-in is enough. Without this the file was stored and
+    then sat in `pending` forever: no indexer, never READY, so it could not be
+    enabled and `search_knowledge` never saw a chunk of it.
+    """
+    class _Req:
+        def __init__(self, application):
+            self.app = application
+
+    _start_index(_Req(app), doc_id)
+
+
 # ── registry ↔ drawer reconciliation ──────────────────────────────────
 # The registry's `embedded_indices`/`chunk_count` record what WAS
 # embedded; the plane's document drawer holds what IS recallable.
@@ -457,6 +474,13 @@ def _reconcile_registry_with_plane(request: Request) -> None:
                 live[r.doc.doc_id] = live.get(r.doc.doc_id, 0) + 1
         jobs = _doc_jobs
         for doc in reg.list():
+            if doc.status == FAILED:
+                # A parse failure is terminal until the user asks for a
+                # reindex. Such a document never reached chunking, so its
+                # `index_version` is still 0; treating that as "indexed
+                # under an old format" reset it to PENDING and started
+                # another doomed parse on every documents request.
+                continue
             if doc.index_version != INDEX_FORMAT_VERSION:
                 if doc.id in jobs and jobs[doc.id].is_alive():
                     # An indexer owns this document; its run()
@@ -706,6 +730,42 @@ _SOURCE_CONTENT_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
 }
+
+
+@_doc_router.get("/v1/documents/{doc_id}/preview")
+async def documents_preview(doc_id: str, max_pages: int = 12):
+    """Rasterise/preview a stored upload without shipping the whole file.
+
+    The console's PDF preview used a blob URL and the browser's PDF plugin,
+    which is unavailable in some Electron configurations. The gateway already
+    has a renderer that reads the delivered bytes; exposing it here keeps the
+    preview identical to what the user downloaded and avoids a second full
+    file transfer just to discover that the plugin drew nothing.
+    """
+    reg = _docs()
+    doc = reg.get(doc_id)
+    if doc is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"no such document {doc_id}"})
+    fmt = (doc.doc_type or "").lower()
+    if fmt not in {"pdf", "docx", "xlsx"}:
+        return JSONResponse(status_code=415, content={
+            "error": f"no server-side preview for {fmt or 'this file type'}"})
+    data = reg.read_source(doc_id)
+    if data is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "source file is missing"})
+    try:
+        import docpreviewimg
+        out = await asyncio.to_thread(
+            docpreviewimg.render_preview, fmt, data, None,
+            max(1, min(int(max_pages or 12), 24)),
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "error": f"{type(e).__name__}: {e}"[:300]})
+    out["format"] = fmt
+    return JSONResponse(content=out)
 
 
 @_doc_router.get("/v1/documents/{doc_id}/source")

@@ -55,9 +55,29 @@ from integrations_api import router as integrations_router
 from memory_api import router as memory_router
 from docgen_api import router as docgen_router
 
-DEFAULT_ORDER = ["gemini35lite", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github", "kilo"]
-ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
-ROUTER_ORDER = [x.strip() for x in os.getenv("ROUTER_ORDER", ",".join(DEFAULT_ROUTER_ORDER)).split(",") if x.strip()]
+# The failover ladder. nvidia/groq/cerebras/openrouter/github were removed at
+# the operator's request (see providers.DISABLED_PROVIDERS), so the ladder is
+# now Gemini first and Kilo as the cross-vendor backstop - two independent
+# vendors, which is what makes a failover worth having.
+#
+# The filter matters as much as the list: LLM_ORDER may still name a disabled
+# provider in the environment, and an entry here that cannot be constructed
+# turns into a wasted failover attempt against a provider that was never there.
+DEFAULT_ORDER = ["gemini35lite", "gemini", "kilo"]
+_ORDER_RAW = [x.strip() for x in
+              os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
+ORDER = [x for x in _ORDER_RAW if x not in P.DISABLED_PROVIDERS] or list(DEFAULT_ORDER)
+_ROUTER_RAW = [x.strip() for x in
+               os.getenv("ROUTER_ORDER", ",".join(DEFAULT_ROUTER_ORDER)).split(",")
+               if x.strip()]
+ROUTER_ORDER = [x for x in _ROUTER_RAW
+                if x not in P.DISABLED_PROVIDERS] or list(DEFAULT_ROUTER_ORDER)
+
+# How often to re-read the Kilo catalogue so the model list and the pool's
+# default track upstream without a restart. Deliberately slow: it is a UI
+# convenience, and every poll is a third-party request.
+_KILO_ROSTER_REFRESH_SECONDS = max(
+    300.0, float(os.getenv("KILO_ROSTER_REFRESH_SECONDS", "1800") or 1800))
 # NOTE (M1): only GATEWAY_V9_PORT is honoured. A stale GATEWAY_V3_PORT=8101
 # line from the V3 era must NOT move V9 off 8109 (every client — agent
 # gateway.py, dashboards, tests — targets :8109), so it is deliberately
@@ -77,11 +97,14 @@ if _AGENT_ROUTING_PATH.exists():
         print(f"[gateway] failed to parse agent_routing.yaml: {e!r}")
         AGENT_ROUTING = {}
 
-# Tier -> worker failover order. TINY prefers small fast workers; LARGE prefers
-# long-context Gemini; HUGE is rejected (no summarizer agent exists yet).
+# Tier -> worker failover order. Both tiers now run Gemini then Kilo, so a tier
+# classification no longer changes WHICH vendors answer - only the order within
+# them. The removed providers were the fast/small half of both lists, and they
+# are gone from the pool entirely (providers.DISABLED_PROVIDERS), so keeping
+# them here would only add attempts that cannot succeed.
 TIER_TO_ORDER = {
-    "TINY":  ["github", "openrouter", "groq", "nvidia", "cerebras", "gemini35lite", "gemini", "kilo"],
-    "LARGE": ["gemini35lite", "gemini", "groq", "nvidia", "cerebras", "github", "openrouter", "kilo"],
+    "TINY":  ["gemini35lite", "kilo", "gemini"],
+    "LARGE": ["gemini", "gemini35lite", "kilo"],
 }
 
 # Router envelope: cap the sample at ~800 chars (first 400 + last 400).
@@ -129,6 +152,22 @@ def _parse_tier(text: str) -> Optional[str]:
         if tier in up:
             return tier
     return None
+
+
+def _explicit_provider_for(model: str, agent, providers) -> str | None:
+    """The provider an EXPLICIT model id should pin, or None to keep routing.
+
+    An explicit id - the console's model picker passed it - is honoured
+    through the global table first, then the code-only table even for a
+    non-code agent: the user asked for that model, so it must not silently
+    drop to the failover ladder. Returned only when that provider is wired,
+    so an id whose key is missing falls back instead of 400-ing on an
+    unknown provider.
+    """
+    if not model:
+        return None
+    routed = P.route_for_model(model, agent) or P.CODE_MODEL_ROUTES.get(model)
+    return routed if routed in providers else None
 
 
 async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, prompt_text: str):
@@ -265,6 +304,40 @@ async def lifespan(app: FastAPI):
     app.state.router = Router(app.state.providers, expand_order(ORDER, app.state.providers))
     app.state.router_pool = RouterPool(app.state.router_providers,
                                        expand_order(ROUTER_ORDER, app.state.router_providers))
+    # Kilo model discovery. Registers every upstream model id so a caller can
+    # pass `model="vendor/name"` and land on kilo without naming the provider.
+    # Needs no key, so it runs even when kilo is unwired. Guarded and bounded:
+    # a slow or dead roster endpoint must never hold up startup, and the
+    # gateway keeps the static KILO_MODEL fallback either way.
+    app.state.kilo_models = None
+    app.state.kilo_roster_task = None
+    try:
+        import kilo_models as _KM
+
+        async def _kilo_roster_loop():
+            """Keep the catalogue current without a restart.
+
+            Kilo adds, renames and retires models continuously - the hardcoded
+            default rotted into a 404 that way. Polling means the picker and
+            the pool's default track reality on their own. The interval is
+            generous because this is a UI convenience, not correctness:
+            correctness comes from the guard that ignores a route whose
+            provider is not wired.
+            """
+            first = await _KM.prime_routes(app.state.providers)
+            if first:
+                log.info("kilo: %d model ids routable for coding agents", first)
+            while True:
+                await asyncio.sleep(_KILO_ROSTER_REFRESH_SECONDS)
+                try:
+                    await _KM.get_models(force=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - never kill the loop
+                    log.warning("kilo catalogue refresh failed: %s", e)
+        app.state.kilo_roster_task = asyncio.ensure_future(_kilo_roster_loop())
+    except Exception as _e:  # noqa: BLE001 - discovery is strictly optional
+        log.warning("kilo model discovery unavailable at startup: %s", _e)
     app.state.embedders, app.state.embed_order = E.build_embedders()
     # Inbound Telegram. Long-polls in-process because a webhook needs a public
     # HTTPS URL (Telegram cannot reach 127.0.0.1) and no `setWebhook` call
@@ -272,7 +345,7 @@ async def lifespan(app: FastAPI):
     # pairing, unreachable on a local install. See telegram_poller.py.
     try:
         import telegram_poller as _TGP
-        app.state.telegram_poller = _TGP.start()
+        app.state.telegram_poller = _TGP.start(app)
     except Exception as _e:
         print(f"[telegram] poller not started: {type(_e).__name__}")
     yield
@@ -281,6 +354,11 @@ async def lifespan(app: FastAPI):
         _TGP.stop()
     except Exception:
         pass
+    # The roster poller sleeps for up to half an hour; cancel it explicitly or
+    # shutdown blocks on it and uvicorn waits out the timeout.
+    task = getattr(app.state, "kilo_roster_task", None)
+    if task is not None and not task.done():
+        task.cancel()
 
 
 app = FastAPI(title="LLM Gateway V9", lifespan=lifespan,
@@ -370,6 +448,12 @@ app.include_router(deploy_router)
 from parts.api import router as parts_router
 app.include_router(parts_router)
 
+# Optimisation + geometry-for-viewer. Separate from `parts.api` because these
+# endpoints return the triangle soup and the objective, which is what an
+# agentic optimise/measure loop needs, rather than a validation report.
+from parts.optimise_api import router as parts_optimise_router
+app.include_router(parts_optimise_router)
+
 
 def _normalize_messages(req: ChatRequest):
     if req.messages:
@@ -436,7 +520,31 @@ def _est_tokens(messages, system_blocks, max_tokens):
     return chars // 4 + min(max_tokens, 8192)
 
 
-def _backoff_for(err: Exception, has_model_override: bool = False):
+def _backoff_for(err: Exception, has_model_override: bool = False,
+                 provider: str = ""):
+    # Kilo is deliberately exempt from the long backoffs below.
+    #
+    # Kilo fronts ~400 model ids behind ONE endpoint, so a 429/RPD on any single
+    # id says nothing about the other 399 - and a 1-hour blackball on the only
+    # free tool-calling provider we have is a self-inflicted outage. Observed
+    # live: one 429 with "per day" in the message took the whole free tier
+    # offline for 3600s, and every code-agent and tool-calling run after it had
+    # nowhere to go. A few seconds is enough to stop a hot retry loop without
+    # taking the catalogue down with it.
+    if provider == "kilo":
+        msg = str(err).lower()
+        status = getattr(err, "status", None)
+        if status == 429:
+            if "queue" in msg:
+                return 5, "kilo queue full"
+            return 10, "kilo rate limited"
+        if status and 500 <= status < 600:
+            return 10, f"kilo upstream {status}"
+        if status == 402:
+            return 0, ""
+        if status in (401, 403):
+            return 0, ""
+        return 0, ""
     msg = str(err).lower()
     status = getattr(err, "status", None)
     if status == 429:
@@ -564,11 +672,17 @@ async def chat(req: ChatRequest):
     required_caps = _required_caps(req)
 
     # V9: model-name routing. If the caller passes only `model=` (no `provider=`),
-    # resolve the provider from the MODEL_ROUTES registry so the gateway uses that
+    # resolve the provider from the model-route registry so the gateway uses that
     # specific backend. This lets any service call the gateway with just a model
-    # name and have it routed to the right provider (e.g. Kilo-served models).
+    # name and have it routed to the right backend (e.g. Kilo-served models).
+    #
+    # Two tables, deliberately: MODEL_ROUTES is global, CODE_MODEL_ROUTES is
+    # consulted only when the caller tagged the request as a coding agent.
+    # Kilo's catalogue lives in the second one, so a Kilo id passed by the
+    # document pipeline or chat is ignored instead of silently rerouting
+    # authoring work onto a free coding model.
     if req.model and not req.provider:
-        routed = P.MODEL_ROUTES.get(req.model)
+        routed = _explicit_provider_for(req.model, req.agent, router.providers)
         if routed:
             req.provider = routed
             explicit_override = True
@@ -583,11 +697,17 @@ async def chat(req: ChatRequest):
             req.provider = pinned
             explicit_override = True
 
-    # V9: Kilo's free models (stepfun/step-3.7-flash:free, tencent/hy3:free)
-    # reason by default, which adds a long thinking delay. Unless the caller
-    # explicitly asks for reasoning, force it OFF for Kilo so calls return fast.
-    # The caller can still pass reasoning="low"|"medium"|"high" to opt in.
-    _kilo_resolved = (req.provider == "kilo") or (req.model and P.MODEL_ROUTES.get(req.model) == "kilo")
+    # V9: Kilo's free models reason by default, which adds a long thinking
+    # delay. Unless the caller explicitly asks for reasoning, force it OFF for
+    # Kilo so calls return fast. The caller can still pass
+    # reasoning="low"|"medium"|"high" to opt in.
+    # route_for_model, not a raw MODEL_ROUTES lookup: the routing block above has
+    # already resolved a code-scoped Kilo id into req.provider, and a direct
+    # dict get would miss it for coding-agent calls.
+    _kilo_resolved = (req.provider == "kilo") or (
+        bool(req.model)
+        and P.route_for_model(req.model, req.agent) == "kilo"
+        and "kilo" in router.providers)
     if _kilo_resolved and req.reasoning is None:
         req.reasoning = "off"
 
@@ -671,6 +791,8 @@ async def chat(req: ChatRequest):
                             agg.append(chunk)
                             if chunk.startswith("[[TOOL_CALL_DELTA]]"):
                                 yield f"data: {json.dumps({'provider': name, 'tool_call_delta': chunk[len('[[TOOL_CALL_DELTA]] '):]})}\n\n"
+                            elif chunk.startswith("[[REASONING_DELTA]]"):
+                                yield f"data: {json.dumps({'provider': name, 'reasoning_delta': json.loads(chunk[len('[[REASONING_DELTA]] '):])})}\n\n"
                             else:
                                 yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
                         text = "".join(agg)
@@ -686,7 +808,7 @@ async def chat(req: ChatRequest):
                                     prompt_chars=len(prompt_text), response_chars=len(text),
                                     override=req.provider, attempted=_attempts_str(all_attempts),
                                     agent=req.agent, session=req.session, retries=retries)
-                        yield f"data: {json.dumps({'done': True, 'provider': name})}\n\n"
+                        yield f"data: {json.dumps({'done': True, 'provider': name, 'model': req.model or provider.model})}\n\n"
                     except Exception as e:
                         db.log_call(provider=name, model=req.model or provider.model,
                                     status="error", error=str(e)[:500],
@@ -790,6 +912,7 @@ async def chat(req: ChatRequest):
                 provider=name,
                 model=result["model"],
                 text=result["text"],
+                reasoning=result.get("reasoning", "") or "",
                 tool_calls=[ToolCall(**tc) for tc in result["tool_calls"]],
                 stop_reason=result["stop_reason"],
                 input_tokens=result["input_tokens"],
@@ -807,7 +930,8 @@ async def chat(req: ChatRequest):
 
         except P.ProviderError as e:
             last_err = str(e)
-            secs, reason = _backoff_for(e, has_model_override=bool(req.model))
+            secs, reason = _backoff_for(e, has_model_override=bool(req.model),
+                                            provider=name)
             if secs > 0:
                 router.state[name].mark_unavailable(secs, reason)
             db.log_call(provider=name, model=req.model or provider.model,
@@ -827,7 +951,8 @@ async def chat(req: ChatRequest):
             raise
         except Exception as e:
             last_err = str(e)
-            secs, reason = _backoff_for(e, has_model_override=bool(req.model))
+            secs, reason = _backoff_for(e, has_model_override=bool(req.model),
+                                            provider=name)
             if secs > 0:
                 router.state[name].mark_unavailable(secs, reason)
             db.log_call(provider=name, model=req.model or provider.model,
@@ -1109,6 +1234,60 @@ async def list_providers():
         "shortcuts": SHORTCUTS,
         "limits": LIMITS,
         "models": {n: p.model for n, p in r.providers.items()},
+        # Kilo fronts ~400 models behind one provider entry, so the static
+        # `models` map above shows only its default. This is a summary;
+        # the full roster lives at /v1/providers/kilo/models.
+        "kilo": {
+            "wired": "kilo" in r.providers,
+            "default_model": getattr(r.providers.get("kilo"), "model", None),
+            "model_ids_discovered": len(P.KILO_MODEL_IDS),
+            # Kilo ids route for agent="code" only. Reported separately from
+            # the global table so it is visible that the catalogue is NOT
+            # reachable from chat or the document pipeline.
+            "code_routable": len(P.CODE_MODEL_ROUTES),
+            "code_agents": sorted(P.CODE_AGENTS),
+            # Any Kilo id that leaked into the global table would let chat and
+            # the document pipeline reach the coding catalogue. Designed to be
+            # 0; surfaced so a regression is visible rather than silent.
+            "leaked_global": sum(
+                1 for mid, p in P.MODEL_ROUTES.items() if p == "kilo"),
+            "discovered": bool(getattr(app.state, "kilo_models", None)),
+        },
+    }
+
+
+@app.get("/v1/providers/kilo/models")
+async def list_kilo_models(refresh: bool = False, all: bool = False):
+    """The live Kilo roster, for a model picker.
+
+    Kilo's /models endpoint needs no auth, so this works before a key is
+    saved -- which is the point: the picker should show what a key buys.
+    `?refresh=true` bypasses the TTL cache. A failed fetch degrades to the
+    last good roster with `stale: true`; it never 500s and never empties a
+    roster we already had.
+    """
+    import kilo_models as KM
+    roster = await KM.get_models(force=refresh)
+    free = [m for m in roster["models"] if m["is_free"]]
+    # The model the pool is actually configured with, so the picker can
+    # pre-select it. Read from the wired provider rather than recomputed:
+    # an explicit KILO_MODEL outranks the derived choice, and echoing the
+    # recomputed value would hide that.
+    wired = app.state.providers.get("kilo") if getattr(app.state, "providers", None) else None
+    default = getattr(wired, "model", None) or KM.pick_default_model(roster["models"])
+    return {
+        "base_url": roster["base_url"],
+        "count": roster["count"],
+        "free_count": roster["free_count"],
+        "stale": roster["stale"],
+        "error": roster["error"],
+        "fetched_at": roster["fetched_at"] or None,
+        "default": default,
+        "configured": bool(getattr(app.state, "providers", {}) and "kilo" in app.state.providers),
+        # Free-first is the default ordering upstream: free, then largest
+        # context. Callers that want everything send ?all=true.
+        "free": free if not all else roster["models"],
+        "models": roster["models"] if all else free,
     }
 
 

@@ -115,7 +115,16 @@ export function renderMarkdown(src: string, headingOffset = 0,
       // The closing fence may be missing mid-stream; that is expected while
       // text is still arriving, so emit what we have rather than dropping it.
       const cls = lang ? ` class="language-${esc(lang)}"` : '';
-      html += `<pre><code${cls}>${esc(buf.join('\n'))}</code></pre>`;
+      // A code block gets its own header so the language is visible and the
+      // copy control belongs to THIS block. The button carries its label in
+      // text as well as aria-label, because an icon-only control that is
+      // copied into a report or printed loses its meaning entirely.
+      const label = lang ? lang : 'text';
+      html += `<div class="code-block" data-code-block>` +
+        `<div class="code-block-bar"><span class="code-lang">${esc(label)}</span>` +
+        `<button type="button" class="code-copy" data-copy-code ` +
+        `aria-label="Copy code">Copy</button></div>` +
+        `<pre><code${cls}>${esc(buf.join('\n'))}</code></pre></div>`;
       continue;
     }
 
@@ -197,6 +206,39 @@ export function renderMarkdown(src: string, headingOffset = 0,
   }
   closeLists();
   return html;
+}
+
+/** Copy the code block whose button was clicked.
+ *
+ * The markdown renderer emits HTML strings, so the click is handled by
+ * delegation on the prose container rather than by a React component per
+ * fence. `textContent` is read from the DOM, not from the source string, so
+ * escaped entities are copied as the characters the user sees.
+ */
+export async function copyCodeFromClick(e: { target: EventTarget | null }): Promise<void> {
+  const el = e.target instanceof Element
+    ? e.target.closest<HTMLButtonElement>('[data-copy-code]')
+    : null;
+  if (!el) return;
+  const block = el.closest('[data-code-block]');
+  const code = block?.querySelector('code')?.textContent ?? '';
+  if (!code) return;
+  const original = el.textContent || 'Copy';
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+    await navigator.clipboard.writeText(code);
+    el.textContent = 'Copied';
+    el.dataset.state = 'ok';
+  } catch {
+    el.textContent = 'Copy failed';
+    el.dataset.state = 'fail';
+  }
+  el.disabled = true;
+  window.setTimeout(() => {
+    el.textContent = original;
+    el.disabled = false;
+    delete el.dataset.state;
+  }, 1400);
 }
 
 export type RunStatus = 'ok' | 'err' | 'warn' | 'info' | 'muted';

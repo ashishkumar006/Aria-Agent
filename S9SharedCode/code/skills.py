@@ -249,6 +249,102 @@ class SkillRegistry:
 
 # ── input resolution + prompt rendering ──────────────────────────────────────
 
+def _upstream_entry(inp: str, upstream: AgentResult) -> dict:
+    """Serialise one completed upstream result for a prompt."""
+    out_obj = upstream.output
+    # Browser nodes serialise a huge `content` a11y dump BEFORE
+    # the compact `actions` summary in the JSON. render_prompt caps
+    # INPUTS at 20 KB, so `content` eats the whole budget and the
+    # `actions` list (the actual extracted titles/prices) gets
+    # truncated out. Downstream Distiller nodes then see no
+    # structured data, emit `{}`, and the auto-Critic fails —
+    # triggering a recovery replan that re-runs the same
+    # browser→distiller chain and loops. Truncate `content` here
+    # so the `actions` summary survives within the budget.
+    if isinstance(out_obj, dict) and upstream.agent_name == "browser":
+        content = out_obj.get("content")
+        if isinstance(content, str) and len(content) > 1500:
+            # Preserve STRUCTURED CARD DATA (appended at end by
+            # skill.py) which was previously truncated first.
+            # Keep head prose + full structured block when present.
+            marker = "--- STRUCTURED CARD DATA"
+            if marker in content:
+                head, _, struct = content.partition(marker)
+                # Budget: 800 head + full struct (capped 4k).
+                head_keep = head[:800]
+                struct_keep = (marker + struct)[:4000]
+                new_content = head_keep + "\n\n" + struct_keep + " …[truncated]"
+            else:
+                new_content = content[:1500] + " …[truncated]"
+            out_obj = {**out_obj, "content": new_content}
+    return {"id": inp, "kind": "upstream",
+            "skill": upstream.agent_name, "output": out_obj}
+
+
+# How far back a skipped node's lineage is searched for usable results, and
+# how many recovered results are handed to its consumer. Two levels is the
+# real shape (formatter ← author ← researchers, or formatter ← reviewers ←
+# workers); deeper than that stops being "the data this node stood on".
+_RECOVER_MAX_DEPTH = 2
+_RECOVER_MAX_ENTRIES = 8
+
+
+def _usable_result(result) -> bool:
+    """True when an upstream result is worth putting in a prompt.
+
+    A FAILED node still carries an AgentResult (`success=False`, usually
+    `output={}`), so "the attribute exists" is not the same as "there is data".
+    The first version of the recovery tested `isinstance(result, AgentResult)`
+    only, which meant the live failure - a skipped author whose result was an
+    empty failure object - still resolved as `kind: upstream` with `output: {}`
+    and the formatter wrote "No information ... was provided". Requiring
+    success AND a non-empty output is what actually distinguishes "this node
+    has findings" from "this node died".
+    """
+    if not isinstance(result, AgentResult) or not result.success:
+        return False
+    out = result.output
+    return bool(out)
+
+
+def _recover_upstream(nid: str, graph_nodes, *, depth: int = _RECOVER_MAX_DEPTH,
+                      seen: set | None = None,
+                      limit: int = _RECOVER_MAX_ENTRIES) -> list[dict]:
+    """The completed results a skipped node was built on, newest layer first.
+
+    A node that dies (transient provider fault, cancellation) leaves its
+    consumer an empty slot even though the work it depended on may have
+    succeeded. Live case: a standard research plan funnelled three researchers
+    into one `author` and then the formatter; the gateway returned 502 to the
+    author, the author was skipped, and the formatter - whose only input was
+    that author - answered "No information or input data was provided by the
+    upstream nodes" while two complete researchers sat on disk. Recover the
+    nearest completed ancestors instead of discarding them.
+    """
+    seen = set() if seen is None else seen
+    if depth <= 0 or nid in seen:
+        return []
+    seen.add(nid)
+    out: list[dict] = []
+    for up in graph_nodes[nid].get("inputs") or []:
+        if len(out) >= limit:
+            break
+        if (not isinstance(up, str) or not up.startswith("n:")
+                or up not in graph_nodes or up in seen):
+            continue
+        res = graph_nodes[up].get("result")
+        if _usable_result(res):
+            entry = _upstream_entry(up, res)
+            entry["recovered_via"] = nid
+            out.append(entry)
+            seen.add(up)
+        else:
+            out.extend(_recover_upstream(
+                up, graph_nodes, depth=depth - 1, seen=seen,
+                limit=limit - len(out)))
+    return out[:limit]
+
+
 def resolve_inputs(node_inputs: list[str], graph_nodes, query: str) -> list[dict]:
     """Materialise each input id into a dict the prompt can serialise.
 
@@ -261,6 +357,11 @@ def resolve_inputs(node_inputs: list[str], graph_nodes, query: str) -> list[dict
     `graph_nodes` is the nx node-view dict from flow.Graph; we read each
     upstream node's `result` attribute (set when the orchestrator marks
     the node complete).
+
+    A missing `n:` input (skipped or failed) is still reported as
+    `upstream-missing`, but the completed results it depended on are appended
+    after it so one dead node cannot starve its consumer of work that already
+    succeeded. See `_recover_upstream`.
     """
     out = []
     for inp in node_inputs:
@@ -268,37 +369,17 @@ def resolve_inputs(node_inputs: list[str], graph_nodes, query: str) -> list[dict
             out.append({"id": "USER_QUERY", "kind": "query", "value": query})
         elif inp.startswith("n:") and inp in graph_nodes:
             upstream = graph_nodes[inp].get("result")
-            if isinstance(upstream, AgentResult):
-                out_obj = upstream.output
-                # Browser nodes serialise a huge `content` a11y dump BEFORE
-                # the compact `actions` summary in the JSON. render_prompt caps
-                # INPUTS at 20 KB, so `content` eats the whole budget and the
-                # `actions` list (the actual extracted titles/prices) gets
-                # truncated out. Downstream Distiller nodes then see no
-                # structured data, emit `{}`, and the auto-Critic fails —
-                # triggering a recovery replan that re-runs the same
-                # browser→distiller chain and loops. Truncate `content` here
-                # so the `actions` summary survives within the budget.
-                if isinstance(out_obj, dict) and upstream.agent_name == "browser":
-                    content = out_obj.get("content")
-                    if isinstance(content, str) and len(content) > 1500:
-                        # Preserve STRUCTURED CARD DATA (appended at end by
-                        # skill.py) which was previously truncated first.
-                        # Keep head prose + full structured block when present.
-                        marker = "--- STRUCTURED CARD DATA"
-                        if marker in content:
-                            head, _, struct = content.partition(marker)
-                            # Budget: 800 head + full struct (capped 4k).
-                            head_keep = head[:800]
-                            struct_keep = (marker + struct)[:4000]
-                            new_content = head_keep + "\n\n" + struct_keep + " …[truncated]"
-                        else:
-                            new_content = content[:1500] + " …[truncated]"
-                        out_obj = {**out_obj, "content": new_content}
-                out.append({"id": inp, "kind": "upstream",
-                            "skill": upstream.agent_name, "output": out_obj})
+            if _usable_result(upstream):
+                out.append(_upstream_entry(inp, upstream))
             else:
-                out.append({"id": inp, "kind": "upstream-missing", "output": None})
+                marker = {"id": inp, "kind": "upstream-missing", "output": None,
+                          "note": ("this node produced no usable result - any "
+                                   "completed results it depended on are "
+                                   "included after this entry")}
+                if isinstance(upstream, AgentResult) and upstream.error:
+                    marker["error"] = str(upstream.error)[:300]
+                out.append(marker)
+                out.extend(_recover_upstream(inp, graph_nodes))
         elif inp.startswith("art:"):
             try:
                 blob = artifacts_svc.get_bytes(inp)
@@ -319,6 +400,10 @@ UNTRUSTED_TOOLS = (
     "wikipedia_search", "openalex_search", "arxiv_search", "extract_tables",
     "search_knowledge", "github_query", "notion_query", "gmail_query",
     "slack_history", "index_document", "read_file", "list_dir",
+    # Code intelligence reads whatever is in the workspace, which is the same
+    # exposure as reading a file: it must be untrusted-guarded too.
+    "document_symbols", "find_references", "blast_radius",
+    "preview_edit", "apply_symbol_edit",
 )
 
 
@@ -644,6 +729,19 @@ def _strip_answer_envelope(text: str) -> str:
     """
     raw = (text or "").strip()
     if not raw or not raw.lstrip().startswith("{"):
+        # A fenced envelope AFTER prose. Observed live: a section call wrote
+        # a two-sentence summary, then ```json {"final_answer": "..."}```.
+        # The leading-brace branch below never sees it, so the summary AND
+        # the raw JSON both shipped to the user (a 18k-char answer with a
+        # JSON block in the middle).
+        for m in re.finditer(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.S):
+            obj = _lenient_json(m.group(1).strip())
+            if isinstance(obj, dict):
+                for key in ("final_answer", "answer", "section", "text",
+                            "content"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
         return raw
     obj = _lenient_json(raw)
     if isinstance(obj, dict):
@@ -853,9 +951,14 @@ def _document_title(parsed: dict, query: str) -> str:
     # instruction. Tried BEFORE the first heading: "the engineering of Roman
     # aqueduct systems" names the whole document, whereas the first heading is
     # one section of it.
-    q = " ".join(str(query or "").split())
+    q = str(query or "").strip()
     # "Create a document." is the Authoring page's own prefix.
     q = re.sub(r"^\s*create a document\s*[.:]?\s*", "", q, flags=re.I)
+    # Everything after the first blank line is instructions to the agent, not
+    # the subject. A delegated brief puts the user's words in the first
+    # paragraph and the agent's own instructions in the second.
+    q = q.strip().split("\n\n", 1)[0]
+    q = " ".join(q.split())
     # "Write a comprehensive treatise of about 60 pages on ..." - keep the
     # subject, drop the instruction and the length.
     q = re.sub(r"^\s*(?:please\s+)?(?:write|produce|create|generate|make|"
@@ -1135,7 +1238,15 @@ async def _sectioned_final_answer(skill: "Skill", rendered: str,
     """
     import asyncio as _aio
 
-    entries = [e for e in (resolved or []) if isinstance(e, dict)]
+    # Only entries that actually carry material can become a section. A
+    # `upstream-missing` marker (the recovery path appends one for every node
+    # that died) and USER_QUERY are routing context, not research: handing
+    # the section writer an empty slot produced a summary plus a raw JSON
+    # envelope in the live degradation run.
+    entries = [e for e in (resolved or [])
+               if isinstance(e, dict)
+               and e.get("kind", "upstream") not in
+               ("query", "upstream-missing", "artifact-missing")]
     if len(entries) < 2:
         return None
 
@@ -1364,7 +1475,8 @@ _LENGTH_TIERS: tuple[tuple[int, str, re.Pattern[str]], ...] = (
      re.compile(
          r"(create|produce|make|generate|write|render|build|give)\s+(me\s+)?"
          r"(a|an|the)?\s*(new\s+)?"
-         r"(detailed\s+|full\s+|complete\s+|comprehensive\s+)?"
+         r"(detailed\s+|full\s+|complete\s+|comprehensive\s+|neat\s+|"
+         r"polished\s+|professional\s+)?"
          r"(pdf|docx?|pptx|xlsx?|powerpoint|deck|word document|"
          r"spreadsheet|report|document|whitepaper)\b", re.I)),
     (0, "a brief", re.compile(
@@ -1403,6 +1515,13 @@ def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
     and `length_contract` reads it via `ceiling_for`.
     """
     q = str(query or "")
+    # The Authoring page prefixes every brief with "Create a document." so the
+    # run is recognised as authoring. That prefix is the CONSOLE's sentence,
+    # not the user's: letting it match the "produce a document" tier put a
+    # 1,000-word floor on "a board note on onboarding" and similar briefs that
+    # asked for something short. Judge the brief the user actually wrote.
+    q = re.sub(r"(?i)^\s*create a (?:document|report|deck|presentation)"
+               r"\s*[.:]?\s*", "", q)
     if skill_name == "deck":
         n = 0
         m = re.search(r"(\d{1,3})\s*[- ]?\s*(?:slide|page|deck)", q, re.I)
@@ -1418,25 +1537,29 @@ def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
         n = max(6, min(40, n))
         return n * 35, f"a {n}-slide deck"
 
+    # An explicit LIMIT in the request outranks an explicit count: "at most
+    # 200 words" and "a one-page summary" name both a number and a cap, and
+    # reading the number as a floor made the contract demand the exact size
+    # the user said not to exceed.
+    limit = ceiling_for(q, skill_name)
     # Explicit word counts.
     m = re.search(r"(\d[\d,]{2,7})\s*(?:words?|w)\b", q, re.I)
     if m:
         v = int(m.group(1).replace(",", ""))
         if 20 <= v <= 200000:
+            if limit and v <= limit:
+                return 0, f"the requested {v:,} words at most"
             return min(v, _MAX_WORDS_PER_RENDER), f"the requested {v:,} words"
     # Explicit page counts, at ~450 words of solid prose per page.
     m = re.search(r"(\d{1,4})\s*\+?\s*pages?\b", q, re.I)
     if m:
         v = int(m.group(1))
         if 1 <= v <= 2000:
-            return min(max(150, v * 450), _MAX_WORDS_PER_RENDER), \
-                f"the requested {v} page(s)"
+            words = min(max(150, v * 450), _MAX_WORDS_PER_RENDER)
+            if limit and words <= limit:
+                return 0, f"the requested {v} page(s) at most"
+            return words, f"the requested {v} page(s)"
 
-    # An explicit LIMIT in the request outranks a genre word. "a TL;DR of this
-    # report" contains "report", but it is a 120-word ceiling the user set; a
-    # 1,200-word floor there would make the contract demand two numbers at
-    # once and the model could satisfy neither.
-    limit = ceiling_for(q, skill_name)
     for floor, label, pat in _LENGTH_TIERS:
         if not pat.search(q):
             continue
@@ -1448,6 +1571,38 @@ def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
     # Nothing was asked for. Imposing a number here is what produced 700-word
     # documents from every brief, including the ones that said "comprehensive".
     return 0, "whatever the material genuinely supports"
+
+
+_SMALL_COUNTS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def _explicit_unit_cap(q: str) -> int:
+    """Words for "two paragraphs", "three sentences", "5 bullets".
+
+    The old ceiling parser only recognised `one paragraph` and numbers with
+    `at most`; "two paragraphs on X" fell through to no cap at all, so the
+    author was free to write ten pages (H6). Units are deliberately small:
+    these are shape instructions, not targets.
+    """
+    m = re.search(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})"
+        r"[\s-]*(sentences?|paragraphs?|bullets?|bullet points?)\b",
+        q, re.I)
+    if not m:
+        return 0
+    n = _SMALL_COUNTS.get(m.group(1).lower())
+    if n is None:
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            return 0
+    unit = m.group(2).lower()
+    per = 30 if unit.startswith("sentence") else (
+        20 if unit.startswith("bullet") else 120)
+    return max(1, n) * per
 
 
 def ceiling_for(query: str, skill_name: str = "") -> int:
@@ -1467,6 +1622,9 @@ def ceiling_for(query: str, skill_name: str = "") -> int:
     if m:
         v = int(m.group(1).replace(",", ""))
         return v * 450 if "page" in m.group(0).lower() else v
+    unit_cap = _explicit_unit_cap(q)
+    if unit_cap:
+        return unit_cap
     if re.search(r"\b(tl;?dr|in (?:a )?few (?:lines|words)|"
                  r"(?:one|single|1)[\s-]?(?:sentence|paragraph|bullet)|"
                  r"bullet points only)\b", q, re.I):
@@ -1582,15 +1740,15 @@ def _format_requested_in(text: str) -> str:
         r"xlsx|csv|excel|deck)\b",
         r"\ban?\s+(pdf|pptx|docx|xlsx)\s+(?:file|document|brief|note|"
         r"report|deck|presentation|summary|workbook)\b",
-        r"\b\d+[\s-]*slide\s+deck\b",
-        r"\b(?:a|an|the)\s+(?:short\s+|brief\s+)?deck\b",
-        r"\b(?:presentation|slides)\s+(?:on|about|for)\b",
+        r"\b\d+[\s-]*slide\s+(deck)\b",
+        r"\b(?:a|an|the)\s+(?:short\s+|brief\s+)?(deck)\b",
+        r"\b(presentation|slides)\s+(?:on|about|for)\b",
     ]
     canon = {
         "pdf": "pdf",
         "worddocument": "docx", "wordfile": "docx", "docx": "docx",
         "powerpoint": "pptx", "pptx": "pptx", "deck": "pptx",
-        "presentation": "pptx", "slidedeck": "pptx",
+        "presentation": "pptx", "slides": "pptx", "slidedeck": "pptx",
         "spreadsheet": "xlsx", "workbook": "xlsx", "excel": "xlsx",
         "xlsx": "xlsx", "csv": "xlsx",
     }
@@ -1601,8 +1759,7 @@ def _format_requested_in(text: str) -> str:
             # instruction.
             if m.start() <= best_pos:
                 continue
-            key = re.sub(r"[^a-z]", "", m.group(0)) if m.lastindex is None \
-                else re.sub(r"[^a-z]", "", m.group(1))
+            key = re.sub(r"[^a-z]", "", m.group(1))
             fmt = canon.get(key, "")
             if fmt:
                 best_pos, best_fmt = m.start(), fmt
@@ -2538,10 +2695,14 @@ _TOOL_CATALOG = {
     # silently dropping them.
     "read_file": {
         "name": "read_file",
-        "description": "Read a UTF-8 text file from the sandbox.",
+        "description": "Read a UTF-8 text file from the sandbox, optionally one line range. A large file is paginated: pass offset (1-based start line) and/or limit, and use next_offset to read on.",
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "default": 1},
+                "limit": {"type": "integer", "default": 0},
+            },
             "required": ["path"],
         },
     },
@@ -2575,6 +2736,21 @@ _TOOL_CATALOG = {
             "required": [],
         },
     },
+    "run_command": {
+        "name": "run_command",
+        "description": "Run a PowerShell command inside the workspace and return its real exit code, stdout and stderr. Use for a specific build/test/git command the checker does not cover. The child is bounded (timeout, output cap, process-tree kill, credential-scrubbed environment) and the call is approval-gated. It is not a filesystem jail: prefer read_file/edit_file for file work.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string",
+                            "description": "PowerShell command to run"},
+                "cwd": {"type": "string", "default": ".",
+                        "description": "Workspace-relative directory to run in"},
+                "timeout": {"type": "integer", "default": 120},
+            },
+            "required": ["command"],
+        },
+    },
     "git_inspect": {
         "name": "git_inspect",
         "description": "See what changed: target='status' for changed files, 'diff' for the patch, 'log' for recent commits. Use 'diff' to review your own edits before declaring the work done.",
@@ -2602,22 +2778,90 @@ _TOOL_CATALOG = {
             "required": ["name"],
         },
     },
+    "document_symbols": {
+        "name": "document_symbols",
+        "description": "The file's outline: classes, functions, methods, constants. Read this before editing so you know what exists. Exact for Python (ast), conservative elsewhere.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    "find_references": {
+        "name": "find_references",
+        "description": "Every USE of a symbol, EXCLUDING docstrings, comments and string literals, with the declaration reported separately. Use this instead of find_symbol when you need to know what a change would touch.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "path": {"type": "string", "default": "."},
+                "max_hits": {"type": "integer", "default": 200},
+            },
+            "required": ["name"],
+        },
+    },
+    "blast_radius": {
+        "name": "blast_radius",
+        "description": "What a change to this symbol would touch: files ranked by reference count, plus a low/medium/high risk. Ask this BEFORE editing anything shared.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "path": {"type": "string", "default": "."},
+                "max_files": {"type": "integer", "default": 50},
+            },
+            "required": ["name"],
+        },
+    },
+    "preview_edit": {
+        "name": "preview_edit",
+        "description": "Render a symbol edit as a unified diff. WRITES NOTHING. Target the symbol BY NAME so you never compute line:column and cannot edit the wrong function.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "name": {"type": "string"},
+                "code": {"type": "string"},
+                "mode": {"type": "string", "enum": ["replace", "insert_after"],
+                         "default": "replace"},
+            },
+            "required": ["path", "name", "code"],
+        },
+    },
+    "apply_symbol_edit": {
+        "name": "apply_symbol_edit",
+        "description": "Apply a symbol edit that preview_edit showed you. WRITES TO DISK. Always preview first - the diff is the only way to confirm you changed the intended symbol.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "name": {"type": "string"},
+                "code": {"type": "string"},
+                "mode": {"type": "string", "enum": ["replace", "insert_after"],
+                         "default": "replace"},
+            },
+            "required": ["path", "name", "code"],
+        },
+    },
     "search_files": {
         "name": "search_files",
-        "description": "Regex-search file contents inside the sandbox (the coder's grep); skips binaries, caps hits.",
+        "description": "Regex-search file contents inside the sandbox (this is the grep). Skips binaries, caps hits. Use `include` to scope to a file glob (e.g. \"*.py\") and `ignore_case` for a case-insensitive match.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string"},
                 "path": {"type": "string", "default": "."},
                 "max_hits": {"type": "integer", "default": 20},
+                "include": {"type": "string", "default": "",
+                            "description": "fnmatch glob of files to search, e.g. *.py (empty = all)."},
+                "ignore_case": {"type": "boolean", "default": False},
             },
             "required": ["pattern"],
         },
     },
     "create_file": {
         "name": "create_file",
-        "description": "Create a new file in the sandbox; errors if it exists.",
+        "description": "Create a new file in the sandbox; errors if it exists. Missing parent folders are created automatically.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2625,6 +2869,15 @@ _TOOL_CATALOG = {
                 "content": {"type": "string"},
             },
             "required": ["path", "content"],
+        },
+    },
+    "make_dir": {
+        "name": "make_dir",
+        "description": "Create a directory in the sandbox, including any missing parents; succeeds if it already exists. Call this when asked to create a folder.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
         },
     },
     "update_file": {
@@ -2920,6 +3173,8 @@ policy_notes: list | None = None,
             output={"content": _text, "path": str(_raw_path or ""), "goal": _goal},
             provider=_reply.get("provider", ""),
             cost=float((_reply.get("input_tokens") or 0) + (_reply.get("output_tokens") or 0)),
+            input_tokens=int(_reply.get("input_tokens") or 0),
+            output_tokens=int(_reply.get("output_tokens") or 0),
             elapsed_s=time.time() - started,
             error=None if _text else "vision returned no text",
         ), rendered
@@ -2999,10 +3254,29 @@ policy_notes: list | None = None,
                     "trace": cres.trace, "error": cres.error,
                     "cost": cost},
             cost=float(cost.get("total_tokens", 0) or 0),
+            input_tokens=int(cost.get("input_tokens", 0) or 0),
+            output_tokens=int(cost.get("output_tokens", 0) or 0),
             elapsed_s=time.time() - started,
         ), rendered
 
     tools = tool_payload(skill.tools_allowed)
+    # The AUTHORITATIVE record of what the run actually produced.
+    #
+    # A run is told "report the filename to the user", so the model's JSON
+    # carries an `artifact` field - and the model will happily INVENT one.
+    # Observed for real: a node that never called render_document returned
+    # {"artifact": "art:doc-gen-pipeline", ...}, the receipt announced a
+    # created PDF, and the download button answered 400 "malformed artifact
+    # id" because nothing had been rendered at all. The model's own report
+    # is untrusted input, so the tool's return value is captured here and
+    # used to overwrite whatever the model claimed.
+    #
+    # Initialised OUTSIDE `if tools:`: the unparseable-reply path below reads
+    # `render_errors` for EVERY skill, and a no-tools skill (planner,
+    # formatter) whose reply is not JSON raised UnboundLocalError there -
+    # masking the real "returned no usable JSON" failure with a crash.
+    produced: list[dict] = []
+    render_errors: list[str] = []
     if tools:
         # Multi-turn tool-use loop. mcp_runner opens one MCP stdio session
         # per skill invocation, dispatches each tool_call the model emits,
@@ -3010,18 +3284,7 @@ policy_notes: list | None = None,
         from mcp_runner import run_with_tools
         import outcomes as _outcomes
 
-        # The AUTHORITATIVE record of what the run actually produced.
-        #
-        # A run is told "report the filename to the user", so the model's JSON
-        # carries an `artifact` field - and the model will happily INVENT one.
-        # Observed for real: a node that never called render_document returned
-        # {"artifact": "art:doc-gen-pipeline", ...}, the receipt announced a
-        # created PDF, and the download button answered 400 "malformed artifact
-        # id" because nothing had been rendered at all. The model's own report
-        # is untrusted input, so the tool's return value is captured here and
-        # used to overwrite whatever the model claimed.
-        produced: list[dict] = []
-        render_errors: list[str] = []
+        # (produced/render_errors are initialised above, before the branch.)
 
         # The user's setup panel is a DECISION, not a suggestion.
         #
@@ -3610,4 +3873,10 @@ policy_notes: list | None = None,
         successors=successors,
         elapsed_s=time.time() - started,
         provider=reply.get("provider", ""),
+        # Per-node token accounting for the Runs stats. `reply` carries the
+        # loop's ACCUMULATED total (see mcp_runner._absorb), not just the
+        # final turn, so a researcher that searched and fetched for several
+        # turns reports what the node actually spent.
+        input_tokens=int(reply.get("input_tokens") or 0),
+        output_tokens=int(reply.get("output_tokens") or 0),
     ), rendered

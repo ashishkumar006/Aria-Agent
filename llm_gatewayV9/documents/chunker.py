@@ -500,7 +500,17 @@ def _chunk_section(
                     lines.append(hdr)
                 lines.extend(" | ".join(str(c).strip() for c in r)
                              for r in group)
-            for piece in _split_by_chars(lines, MAX_CHUNK_CHARS):
+            pieces = _split_by_chars(lines, MAX_CHUNK_CHARS)
+            # The header is line zero of `lines`, so a character split (as
+            # opposed to a row-group split) leaves every later piece without
+            # its column names. That is the same failure the row grouping
+            # exists to prevent, only at a different boundary.
+            if len(pieces) > 1 and hdr and lines and lines[0] == hdr:
+                pieces = [pieces[0]] + [
+                    p if p.startswith(hdr + "\n") else hdr + "\n" + p
+                    for p in pieces[1:]
+                ]
+            for piece in pieces:
                 # A group label becomes part of the breadcrumb, so a retrieved
                 # fragment carries "BREAKFAST" as its heading instead of the
                 # meal name being trapped in the body text where a citation

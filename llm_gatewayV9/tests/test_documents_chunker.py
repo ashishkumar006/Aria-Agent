@@ -274,6 +274,19 @@ def test_table_header_is_repeated_on_every_chunk():
         assert "q1_revenue" in c.text
 
 
+def test_header_is_repeated_when_a_wide_table_splits_by_chars():
+    """A character split is still a chunk boundary: it needs the header too."""
+    header = ["region", "notes", "value"]
+    body = [[f"r{i}", "x" * 1900, str(i)] for i in range(8)]
+    blocks = [Block(kind="heading", text="Wide", level=1),
+              Block(kind="table", header=header, rows=[header] + body)]
+    chunks = [c for c in chunk_blocks(blocks, target_words=20_000)
+              if c.kind == "table"]
+    assert len(chunks) > 1, "expected a character split"
+    for c in chunks:
+        assert "region" in c.text and "notes" in c.text, c.text[:80]
+
+
 def test_table_chunks_are_atomic():
     blocks = [Block(kind="heading", text="T", level=1),
               Block(kind="table", header=["a", "b"],

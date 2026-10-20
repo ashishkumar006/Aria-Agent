@@ -570,3 +570,87 @@ def test_the_chat_turn_targets_the_lightweight_stream_not_the_dag():
     assert '"/api/chat"' not in src and "'/api/chat'" not in src, (
         "the channel turn targets the research DAG endpoint; a Telegram "
         "message would launch a multi-node paid run")
+
+
+# ── a long answer is split, not cut at 3500 ───────────────────────────────
+
+def test_chunks_keep_every_character_and_respect_the_limit():
+    text = "\n\n".join("Sentence number %d is here. " % i * 40
+                       for i in range(12))
+    pieces = channel_chat._chunks(text)
+    assert len(pieces) > 1
+    assert all(len(p) <= channel_chat._MAX_REPLY for p in pieces)
+    assert " ".join(" ".join(pieces).split()) == " ".join(text.split())
+
+
+def test_a_long_channel_answer_arrives_as_several_messages(monkeypatch):
+    """Live: asking Telegram for a report sent ONE message containing the
+    first 3500 characters of a 17k-character report - the rest never arrived,
+    although the console path chunks."""
+    long_answer = "\n\n".join(f"Paragraph {i}. " * 60 for i in range(8))
+    sent = []
+
+    monkeypatch.setattr(channel_chat, "_ask_agent",
+                        lambda text, cid, atts=None:
+                        (long_answer, "", []))
+    import notify
+    monkeypatch.setattr(
+        notify, "send_channel_message",
+        lambda ch, text, **kw: (sent.append((text, kw)),
+                                {"delivered": True})[1])
+
+    out = channel_chat._run_turn("telegram", "555", "the report", "ct-long")
+
+    assert out["ok"] is True
+    assert out["chunks"] == len(sent) > 1
+    assert all(len(text) <= channel_chat._MAX_REPLY for text, _ in sent)
+    assert " ".join(" ".join(t for t, _ in sent).split()) == \
+        " ".join(long_answer.split()), "chunking must not drop characters"
+
+
+def test_media_rides_the_first_chunk_only(monkeypatch):
+    long_answer = "\n\n".join(f"Paragraph {i}. " * 60 for i in range(6))
+    sent = []
+
+    monkeypatch.setattr(channel_chat, "_ask_agent",
+                        lambda text, cid, atts=None:
+                        (long_answer, "", [{"artifact": "art:x",
+                                            "filename": "evs.pdf"}]))
+    monkeypatch.setattr(channel_chat, "_channel_media",
+                        lambda ch, produced: [{"filename": "evs.pdf",
+                                               "data_b64": "JVBERi0=",
+                                               "caption": "evs.pdf"}])
+    import notify
+    monkeypatch.setattr(
+        notify, "send_channel_message",
+        lambda ch, text, **kw: (sent.append(kw),
+                                {"delivered": True})[1])
+
+    out = channel_chat._run_turn("telegram", "555", "make a pdf", "ct-media")
+
+    assert out["ok"] is True
+    assert sent[0].get("media"), "the attachment must be on the first message"
+    assert all(not kw.get("media") for kw in sent[1:])
+
+
+def test_a_failed_chunk_says_how_much_arrived(monkeypatch):
+    long_answer = "\n\n".join(f"Paragraph {i}. " * 60 for i in range(6))
+    calls = []
+
+    monkeypatch.setattr(channel_chat, "_ask_agent",
+                        lambda text, cid, atts=None: (long_answer, "", []))
+    import notify
+
+    def _send(ch, text, **kw):
+        calls.append(text)
+        if len(calls) == 2:
+            return {"delivered": False, "error": "telegram 429"}
+        return {"delivered": True}
+
+    monkeypatch.setattr(notify, "send_channel_message", _send)
+
+    out = channel_chat._run_turn("telegram", "555", "q", "ct-fail")
+
+    assert out["ok"] is True
+    assert "telegram 429" in out["error"]
+    assert "after 1 of" in out["error"]

@@ -1,4 +1,5 @@
-"""The chat stream must report what the turn actually produced.
+"""The chat stream must report what the turn actually produced, and must not
+lose the user's question when the turn is interrupted.
 
 The Chat view showed nothing visual because the `done` frame carried no file
 list: the DAG path sends `files` from a `produced_files.json` sidecar, and chat
@@ -186,3 +187,90 @@ def test_every_block_type_in_the_schema_is_documented():
     undocumented = [b for b in block_enum if b not in desc]
     assert not undocumented, (
         f"block types accepted but not documented: {undocumented}")
+
+
+# ── an interrupted turn must not swallow the question ────────────────────────
+
+
+def _stub_chat(monkeypatch, text="ok"):
+    """Neutralise everything the lightweight turn reaches out to."""
+    import gateway
+    import mcp_runner
+
+    class _LLM:
+        def chat(self, **kwargs):
+            return {"text": text}
+
+    async def _run_with_tools(**kwargs):
+        return {"text": text}
+
+    async def _msgs(messages, query, *a, **k):
+        return messages, []
+
+    async def _mem(messages, query, *a, **k):
+        return messages
+
+    monkeypatch.setattr(gateway, "LLM", _LLM)
+    monkeypatch.setattr(mcp_runner, "run_with_tools", _run_with_tools)
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+    monkeypatch.setattr(agent_server, "_with_doc_context", _msgs)
+    monkeypatch.setattr(agent_server, "_with_chat_memory", _mem)
+    monkeypatch.setattr(agent_server, "_capture_preference_bg", lambda *a, **k: None)
+    monkeypatch.setattr(agent_server, "_capture_observation_bg", lambda *a, **k: None)
+
+    async def _cost(cid, *a, **k):
+        return None
+
+    async def _delta(cid, before, *a, **k):
+        return None
+
+    monkeypatch.setattr(agent_server, "_acost_breakdown", _cost)
+    monkeypatch.setattr(agent_server, "_session_cost_delta", _delta)
+
+
+def _messages(cid):
+    """Whatever the store holds for this conversation, however it is stored."""
+    with agent_server._CHAT_THREADS_LOCK:
+        return list((agent_server._chat_threads_load().get(cid, {}) or {}).get("messages")
+                    or [])
+
+
+def test_the_question_is_stored_before_the_answer_is_known(client, monkeypatch):
+    """Walk away mid-turn ("Start new chat", a closed tab) and the user's own
+    message must still be there.
+
+    The turn used to be written in one block AFTER the answer finished
+    streaming, so a client that disconnected lost both halves: the user had
+    paid for the tokens and came back to an empty thread with nothing in the UI
+    saying the turn had ever existed. The question half is now written up
+    front, which is what this asserts - by abandoning the stream after the
+    first frame and then reading the store.
+    """
+    _stub_chat(monkeypatch)
+    cid = "ct-interrupted-test"
+    with client.stream("POST", "/api/chat/simple/stream", headers=HDR,
+                      json={"conversation_id": cid, "query": "will you survive?"}) as r:
+        assert r.status_code == 200, r.read().decode("utf-8", "replace")[:200]
+        # Consume only the first frame, then hang up mid-answer.
+        for _line in r.iter_lines():
+            if _line:
+                break
+    msgs = _messages(cid)
+    assert any(m.get("role") == "user" and m.get("content") == "will you survive?"
+               for m in msgs), (
+        f"the interrupted turn lost the user's message; stored={msgs!r}")
+
+
+def test_a_completed_turn_stores_the_question_exactly_once(client, monkeypatch):
+    """The question is written up front and the answer at the end, so the
+    question must not also be appended again at the end - or every reopened
+    transcript would show it twice."""
+    _stub_chat(monkeypatch)
+    cid = "ct-once-test"
+    r = client.post("/api/chat/simple/stream", headers=HDR,
+                    json={"conversation_id": cid, "query": "how many times?"})
+    assert r.status_code == 200, r.text
+    r.read()
+    users = [m for m in _messages(cid) if m.get("role") == "user"]
+    assert len(users) == 1, f"the question was stored {len(users)} times"
+    assert users[0].get("content") == "how many times?"

@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  previewDocument, SAMPLE_SPEC, PAGE_SIZES, STYLES, CITATIONS, SLIDE_SIZES,
-  MARGINS, LENGTHS, DEFAULT_SETUP,
+  previewDocument, previewStoredDocument, SAMPLE_SPEC, PAGE_SIZES, STYLES,
+  CITATIONS, SLIDE_SIZES, MARGINS, LENGTHS, DEFAULT_SETUP,
   type DocSetup, type DocPreviewResult,
 } from './docpreview';
 
 /** Which document is on screen. */
 type Source =
   | { kind: 'spec'; setup: DocSetup }
-  | { kind: 'artifact'; artifact: string; format: string; label: string };
+  | { kind: 'artifact'; artifact: string; format: string; label: string }
+  | { kind: 'document'; docId: string; format: string; label: string };
 
 function classNames(...xs: (string | false | undefined)[]) {
   return xs.filter(Boolean).join(' ');
@@ -278,7 +279,9 @@ export function DocumentViewer({ source }: { source: Source }) {
   const abort = useRef<AbortController | null>(null);
   const key = source.kind === 'spec'
     ? `spec:${JSON.stringify(source.setup)}`
-    : `artifact:${source.artifact}`;
+    : source.kind === 'artifact'
+      ? `artifact:${source.artifact}`
+      : `document:${source.docId}`;
 
   useEffect(() => {
     abort.current?.abort();
@@ -287,11 +290,16 @@ export function DocumentViewer({ source }: { source: Source }) {
     setBusy(true);
     setErr('');
     setPage(0);
-    const payload = source.kind === 'spec'
-      ? { format: previewFormat(source.setup.format),
-          spec: SAMPLE_SPEC(source.setup) }
-      : { artifact: source.artifact, format: source.format };
-    previewDocument(payload, ctl.signal)
+    const request = source.kind === 'spec'
+      ? previewDocument({
+          format: previewFormat(source.setup.format),
+          spec: SAMPLE_SPEC(source.setup),
+        }, ctl.signal)
+      : source.kind === 'artifact'
+        ? previewDocument(
+            { artifact: source.artifact, format: source.format }, ctl.signal)
+        : previewStoredDocument(source.docId, ctl.signal);
+    request
       .then((r) => { if (!ctl.signal.aborted) setData(r); })
       .catch((e) => {
         if (!ctl.signal.aborted) setErr(String(e?.message || e));
@@ -318,7 +326,7 @@ export function DocumentViewer({ source }: { source: Source }) {
     <div className="docview">
       <div className="docview-bar">
         <span className="docview-title">
-          {source.kind === 'artifact' ? source.label : 'Layout preview'}
+          {source.kind === 'spec' ? 'Layout preview' : source.label}
         </span>
         {data && (
           <span className="docview-meta">

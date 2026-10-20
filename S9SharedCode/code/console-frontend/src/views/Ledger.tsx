@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Receipt } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Stat, SkipLink } from '../components/ui';
+import { useMainId, useActivePoll, useSectionActive } from '../components/KeepAlive';
 import { api, CONF, displayTopic, type SkillRow, type TurnRow } from '../api';
 
 export default function Ledger() {
+  const mainId = useMainId();
   const [scope, setScope] = useState<'all' | 'one'>('all');
   const [cid, setCid] = useState('');
   const [rows, setRows] = useState<SkillRow[]>([]);
@@ -101,15 +103,16 @@ export default function Ledger() {
     );
   }, []);
 
+  const active = useSectionActive();
+  useEffect(() => { if (active) refreshRecent(); }, [active, refreshRecent]);
   useEffect(() => {
-    refreshRecent();
-    // Keep the picker fresh while it is the active scope: a
-    // conversation created after mount was unreachable in the
-    // picker until a full reload.
-    if (scope !== 'one') return;
+    // Keep the picker fresh while it is the active scope: a conversation
+    // created after mount was unreachable in the picker until a full
+    // reload. Hidden sections do not poll (H26).
+    if (!active || scope !== 'one') return;
     const t = setInterval(refreshRecent, CONF.pollSlowMs);
     return () => clearInterval(t);
-  }, [refreshRecent, scope]);
+  }, [active, refreshRecent, scope]);
 
   // Bumped per load: the 15s poll can be slower than its own
   // interval on a slow API, and an older response landing after
@@ -185,11 +188,7 @@ export default function Ledger() {
     }
   }, [scope, appliedCid]);
 
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => {
-    const t = setInterval(load, CONF.pollSlowMs);
-    return () => clearInterval(t);
-  }, [load]);
+  useActivePoll(load, CONF.pollSlowMs);
 
   const applyScope = (s: 'all' | 'one') => {
     setScope(s);
@@ -245,7 +244,7 @@ export default function Ledger() {
         </div>
         <div className="mt-auto hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">refresh {CONF.pollSlowMs / 1000}s</div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Ledger" />
         <div className="min-h-0 flex-1 overflow-y-auto">
           {/* A failed refresh with rows still on screen used to
@@ -299,7 +298,11 @@ export default function Ledger() {
               </span>
             )}
           </div>
-          <section className="mx-3.5 overflow-x-auto rounded-[10px] border border-white/10 bg-[#0e0e12]">
+          {/* min-h because the skeleton is 3 rows and the real table is a dozen
+              skill rows: the page grew under the reader as it arrived (0.09
+              CLS on tablet). Reserving a table's worth of height holds the
+              spend and turn-history sections below it still. */}
+          <section className="mx-3.5 min-h-[300px] overflow-x-auto rounded-[10px] border border-white/10 bg-[#0e0e12]">
             {!nodeLoaded ? <Skel n={3} /> : nodeHealth?.rows?.length ? (
               <table className="w-full min-w-[640px] border-collapse text-[12.5px]">
                 <thead>

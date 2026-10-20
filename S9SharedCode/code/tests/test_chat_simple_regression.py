@@ -140,12 +140,16 @@ def test_both_chat_endpoints_share_one_tool_list():
     They are two copies of the same block; a fix applied to one and not the
     other is exactly how they drifted apart in the first place.
     """
-    from skills import tool_payload
-
+    # `tool_payload(_CHAT_TOOLS)` alone is no longer the whole story: the two
+    # hand-off tools are appended by `_chat_tool_payload()`, because they are
+    # answered by the agent process rather than the MCP child. Assert against
+    # the builder the endpoints actually call, or this test would pass while
+    # the hand-off never reached the model.
     expected = {t["name"] if isinstance(t, dict) else t
-                for t in tool_payload(agent_server._CHAT_TOOLS)}
+                for t in agent_server._chat_tool_payload()}
 
-    assert "render_document" in expected
+    assert "delegate_authoring" in expected, (
+        "chat must be able to reach the authoring agent")
     assert "schedule_task" in expected
 
     # Both handlers reference the same module-level constant, so there is no
@@ -205,5 +209,9 @@ def test_chat_simple_with_tools_on_advertises_the_catalog(client, no_llm):
     assert no_llm["tools"] == 1
     names = {t["name"] if isinstance(t, dict) else t
              for t in (no_llm["payloads"][0] or [])}
-    assert "render_document" in names
+    assert "delegate_authoring" in names, (
+        "the schema chat actually sends must carry the hand-off tools")
     assert "schedule_task" in names
+    assert "render_document" not in names, (
+        "chat hands documents to the authoring agent instead of rendering "
+        "them itself")

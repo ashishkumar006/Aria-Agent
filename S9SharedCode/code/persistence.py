@@ -147,6 +147,33 @@ class SessionStore:
         except Exception:
             return {}
 
+    @property
+    def run_meta_path(self) -> Path:
+        """Run-level metadata written the moment a run starts.
+
+        `kind` is the one field so far: it tells the console (and the sidebar
+        filters) whether a session is a research run, an authoring run, or a
+        DAG-mode chat - decided by the CALLER, not inferred later from the
+        skills a run happened to emit. Without it a just-started run was
+        invisible until its planner had produced a second node, so a new
+        research topic vanished from the sidebar the instant the user looked
+        away.
+        """
+        return self.dir / "run_meta.json"
+
+    def write_run_meta(self, meta: dict) -> None:
+        _atomic_write(self.run_meta_path,
+                      json.dumps(meta or {}, indent=2, default=str))
+
+    def read_run_meta(self) -> dict:
+        if not self.run_meta_path.exists():
+            return {}
+        try:
+            blob = json.loads(self.run_meta_path.read_text(encoding="utf-8-sig"))
+            return blob if isinstance(blob, dict) else {}
+        except Exception:
+            return {}
+
     def write_graph(self, graph_obj: nx.DiGraph) -> None:
         """Serialise the DiGraph to JSON via nx.node_link_data. Per-node
         `result` is an AgentResult (Pydantic) — dump it to a dict so the

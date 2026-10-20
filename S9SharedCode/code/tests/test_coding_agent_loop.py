@@ -74,14 +74,12 @@ def test_the_prompt_forbids_claiming_success_without_a_check():
 
 
 def test_run_checks_reports_a_real_exit_code(monkeypatch, sandbox):
-    import subprocess
+    import sandbox as _sandbox
 
-    class _P:
-        returncode = 1
-        stdout = "2 failed"
-        stderr = "Traceback..."
+    def _run(*a, **k):
+        return _sandbox.ExecResult(False, 1, "2 failed", "Traceback...", 5)
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    monkeypatch.setattr(mcp._sandbox, "run", _run)
     (sandbox / "pyproject.toml").write_text("[tool.pytest]", encoding="utf-8")
     out = mcp.run_checks(str(sandbox))
     assert out["ok"] is False
@@ -90,14 +88,12 @@ def test_run_checks_reports_a_real_exit_code(monkeypatch, sandbox):
 
 
 def test_run_checks_passes_only_on_exit_zero(monkeypatch, sandbox):
-    import subprocess
+    import sandbox as _sandbox
 
-    class _P:
-        returncode = 0
-        stdout = "42 passed"
-        stderr = ""
+    def _run(*a, **k):
+        return _sandbox.ExecResult(True, 0, "42 passed", "", 5)
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    monkeypatch.setattr(mcp._sandbox, "run", _run)
     (sandbox / "pyproject.toml").write_text("[tool.pytest]", encoding="utf-8")
     out = mcp.run_checks(str(sandbox))
     assert out["ok"] is True, out
@@ -107,6 +103,28 @@ def test_run_checks_says_so_when_nothing_is_detected(sandbox):
     out = mcp.run_checks(str(sandbox))
     assert out["ok"] is False
     assert "no checker detected" in out["error"]
+
+
+def test_run_checks_accepts_the_file_the_agent_just_edited(monkeypatch, sandbox):
+    """Live transcript: the model called run_checks("sort_example.py") after
+    editing it, got "'sort_example.py' is not a directory", retried the same
+    call, and the loop guard killed the turn. A file argument means the
+    project that file lives in."""
+    import sandbox as _sandbox
+
+    def _run(*a, **k):
+        return _sandbox.ExecResult(True, 0, "ok", "", 5)
+
+    monkeypatch.setattr(mcp._sandbox, "run", _run)
+    (sandbox / "pyproject.toml").write_text("[tool.pytest]", encoding="utf-8")
+    f = sandbox / "sort_example.py"
+    f.write_text("def bubble(a):\n    return sorted(a)\n", encoding="utf-8")
+    out = mcp.run_checks(str(f))
+    assert out["ok"] is True, out
+    assert out["results"], out
+    # A genuinely missing path still gets the honest error.
+    miss = mcp.run_checks(str(sandbox / "nope" / "x.py"))
+    assert miss["ok"] is False
 
 
 def test_find_symbol_separates_definitions_from_usages(sandbox):

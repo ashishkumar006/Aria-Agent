@@ -208,7 +208,8 @@ def test_gemini_tool_result_is_labelled_with_the_function_that_was_called():
     msgs = [
         {"role": "user", "content": "find it"},
         {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "call_abc", "name": "web_search", "arguments": {"q": "x"}}]},
+            {"id": "call_abc", "name": "web_search", "arguments": {"q": "x"},
+             "provider_meta": {"thoughtSignature": "SIG"}}]},
         {"role": "tool", "tool_call_id": "call_abc", "content": "RESULT"},
     ]
     contents = _gemini()._translate_messages(msgs)
@@ -220,7 +221,8 @@ def test_gemini_tool_result_is_labelled_with_the_function_that_was_called():
 def test_gemini_tool_result_prefers_an_explicit_name():
     msgs = [
         {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "call_abc", "name": "web_search", "arguments": {}}]},
+            {"id": "call_abc", "name": "web_search", "arguments": {},
+             "provider_meta": {"thoughtSignature": "SIG"}}]},
         {"role": "tool", "tool_call_id": "call_abc", "tool_name": "override",
          "content": "R"},
     ]

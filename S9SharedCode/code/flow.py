@@ -31,7 +31,7 @@ import turnlog
 from gateway import ensure_gateway
 from persistence import SessionStore
 from skills import ROOT as _SROOT
-from recovery import handle_critic_verdict, plan_recovery
+from recovery import RecoveryDecision, handle_critic_verdict, plan_recovery
 from schemas import AgentResult, NodeState
 from skills import SkillRegistry, run_skill
 
@@ -82,6 +82,36 @@ NODE_BUDGET_S: dict[str, float] = {
     "default": 90.0,
 }
 BUDGET_WARN_RATIO = 0.7
+
+
+# BaseExceptionGroup is Python 3.11+. On older interpreters the tuple matches
+# nothing, so isinstance(x, ()) is always False and _readable_exc degrades to
+# the plain formatting below.
+try:  # pragma: no cover - version guard
+    _BaseEG: tuple = (BaseExceptionGroup,)  # type: ignore[name-defined]
+except NameError:  # pragma: no cover
+    _BaseEG = ()
+
+
+def _readable_exc(exc: BaseException) -> str:
+    """A one-line error that names the REAL cause, not a TaskGroup wrapper.
+
+    A skill that runs tools inside an anyio/asyncio task group (the MCP stdio
+    session) surfaces a failure as
+    `ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)` — a
+    string that names neither what broke nor where. Unwrap the group(s) to the
+    first leaf that is not a bare cancellation and report that instead, so the
+    node's error and the run's degraded-detail say something actionable.
+    """
+    cur: BaseException = exc
+    for _ in range(8):
+        if not isinstance(cur, _BaseEG) or not cur.exceptions:
+            break
+        nxt = next((x for x in cur.exceptions
+                    if not isinstance(x, asyncio.CancelledError)),
+                   cur.exceptions[0])
+        cur = nxt
+    return f"{type(cur).__name__}: {cur}"
 
 
 def _budget_note(skill_name: str, spent_by_skill: dict) -> str:
@@ -170,12 +200,23 @@ class Graph:
 
         # Pass 1: add the new nodes; build a label → assigned-id map.
         label_to_id: dict[str, str] = {}
+        # Sibling POSITION → assigned id. The Planner is asked for node ids,
+        # but it routinely emits zero-based positions instead ("inputs": ["0"]
+        # meaning "the first node I listed"). Live: a researcher was wired
+        # correctly but the formatter, told `["0"]`, fell through to the
+        # fallback below and was wired to the PLANNER — so it received the
+        # planner's node list as its INPUTS, reported "upstream findings were
+        # not provided", and the user got a 272-char apology after a
+        # successful 112s research node. Positions are unambiguous when in
+        # range, so resolve them.
+        idx_to_id: dict[str, str] = {}
         pending: list[tuple[str, list[str]]] = []
-        for spec in result.successors:
+        for _idx, spec in enumerate(result.successors):
             label = (spec.metadata or {}).get("label")
             new_id = self.add_node(spec.skill, inputs=[],
                                    metadata=spec.metadata)
             added.append(new_id)
+            idx_to_id[str(_idx)] = new_id
             # Map BOTH the explicit metadata.label AND the skill name to the
             # assigned id, so cross-skill references like "n:distiller" or
             # bare "distiller" resolve even when the Planner forgot to set
@@ -222,11 +263,18 @@ class Graph:
                 if inp.startswith("art:"):
                     resolved.append(inp)
                     continue
+                # Bare position of a sibling in THIS plan ("0", "1", ...).
+                # Checked after the id forms so a real id always wins.
+                if inp.isdigit() and inp in idx_to_id:
+                    resolved.append(idx_to_id[inp])
+                    continue
                 # Unresolvable input — fall back to the parent so the child
                 # has at least one upstream dependency to wait on. This still
                 # leaks the parent's output into INPUTS, but only when the
                 # Planner emitted a bad input name; it is not the fan-out
                 # path. A future round may want to fail loudly here instead.
+                print(f"[flow] {new_id}: unresolvable input {inp!r}; "
+                      f"falling back to {src_nid}")
                 resolved.append(src_nid)
             self.g.nodes[new_id]["inputs"] = resolved
             for inp in resolved:
@@ -281,6 +329,211 @@ _RESEARCH_SKILLS = ("retriever", "researcher", "browser", "distiller",
                     "summariser")
 _AUTHORING_SKILLS = ("author", "deck")
 
+# Sessions whose research plan has already been stripped of authoring nodes.
+# A second planner node (a recovery replan) must not re-run the rewrite.
+_RESEARCH_TEXT_ONLY_SESSIONS: set[str] = set()
+
+
+def ensure_research_is_text_only(graph: Graph, session_id: str = "") -> list[str]:
+    """A Research run answers in the transcript; it must never render a file.
+
+    Research and Authoring share one planner and one skill registry, so the
+    planner can always reach for `author`. Observed live: a delegated research
+    request ("...give me a proper report") planned
+    `planner -> researchers -> author -> formatter`, the author rendered a PDF,
+    and the answer pointed at a download instead of giving the report. Asking
+    the planner not to is not enough - it is a model, and a document is the
+    flattering answer to the word "report" - so the shape is enforced here:
+    every author/deck node is removed, and the nodes downstream of it read the
+    evidence directly. A terminal author (no formatter in the plan) becomes the
+    formatter, which is the node that writes prose.
+
+    Idempotent per session, like `ensure_authoring_research`.
+
+    Returns the ids changed, for logging and tests.
+    """
+    if session_id:
+        if session_id in _RESEARCH_TEXT_ONLY_SESSIONS:
+            return []
+        _RESEARCH_TEXT_ONLY_SESSIONS.add(session_id)
+    changed: list[str] = []
+    for nid in list(graph.g.nodes):
+        if graph.g.nodes[nid]["skill"] not in _AUTHORING_SKILLS:
+            continue
+        preds = list(graph.g.nodes[nid].get("inputs") or [])
+        succ = list(graph.g.successors(nid))
+        if not succ:
+            # Terminal author: keep the node and its inputs, but let the
+            # formatter write the report instead of the renderer.
+            graph.g.nodes[nid]["skill"] = "formatter"
+            changed.append(nid)
+            continue
+        for s in succ:
+            ins = list(graph.g.nodes[s].get("inputs") or [])
+            new: list[str] = []
+            for i in ins:
+                replacements = preds if i == nid else [i]
+                for r in replacements:
+                    if r not in new:
+                        new.append(r)
+            graph.g.nodes[s]["inputs"] = new
+            graph.g.remove_edge(nid, s)
+            for p in new:
+                if p.startswith("n:") and p in graph.g.nodes:
+                    graph.g.add_edge(p, s)
+        graph.g.remove_node(nid)
+        changed.append(nid)
+    return changed
+
+
+def _consumers_have_other_evidence(graph: Graph, nid: str) -> bool:
+    """Can the failed node be skipped without starving its consumers?
+
+    A fan-out worker shares its consumers with its siblings. When the
+    surviving siblings already carry the majority of every consumer's data
+    inputs, the run continues on what was produced instead of paying a
+    recovery planner to redo the fan-out. Live evidence for the alternative:
+    two failed researchers of three queued TWO recovery planners, each
+    re-emitted the full chain, and the run delivered the document twice while
+    the original author waited on a node that would never complete.
+
+    A consumer with no surviving sibling (a sole dependency) keeps the node
+    alive for replanning — a chain must not silently lose its only evidence.
+    """
+    succs = [s for s in graph.g.successors(nid)
+             if graph.g.nodes[s]["skill"] != "critic"]
+    if not succs:
+        return False
+    for s in succs:
+        others = [
+            p for p in graph.g.predecessors(s)
+            if p != nid and p.startswith("n:") and p in graph.g.nodes
+            and graph.g.nodes[p]["skill"] not in ("planner", "critic")
+        ]
+        total = len(others) + 1          # this failed node was one data input
+        alive = sum(1 for p in others
+                    if graph.g.nodes[p]["status"] == "complete")
+        if alive * 2 < total:            # survivors are a minority: recover
+            return False
+    return True
+
+
+def _recovery_targets(graph: Graph, nid: str) -> list[str]:
+    """The failed nodes a completed recovery planner is replacing.
+
+    Filtered to targets that are actually `failed`: a critic-fail recovery
+    targets a COMPLETE node and must keep the old no-splice behaviour.
+    """
+    md = graph.g.nodes[nid].get("metadata") or {}
+    ids = md.get("recovers_all") or md.get("recovers") or []
+    if isinstance(ids, str):
+        ids = [ids]
+    return [r for r in ids if isinstance(r, str) and r in graph.g.nodes
+            and graph.g.nodes[r]["status"] == "failed"]
+
+
+def _annotate_failure_report(graph: Graph, nid: str, fr: str) -> str:
+    """Extend a failure report with the failed node's brief and its waiting
+    consumers, so the recovery planner scopes its plan to the missing piece
+    instead of re-emitting the pipeline that already exists around it."""
+    d = graph.g.nodes[nid]
+    q = str((d.get("metadata") or {}).get("question") or "").strip()
+    if q:
+        fr += f"\nits brief was: {q[:300]}"
+    waiting = [s for s in graph.g.successors(nid)
+               if graph.g.nodes[s]["status"] in ("pending", "running")]
+    if waiting:
+        fr += ("\nexisting nodes already wait on this output: "
+               + ", ".join(f"{s} ({graph.g.nodes[s]['skill']})"
+                           for s in waiting))
+    return fr
+
+
+def _splice_recovery(graph: Graph, added: list[str],
+                     rec_ids: list[str]) -> bool:
+    """Rewire a recovery plan in place of the FAILED node(s) it replaces.
+
+    A replan used to splice its nodes BESIDE the original chain, so the plan's
+    own author/formatter rendered a second document while the original
+    consumers waited forever on a node stuck in `failed` (ready_nodes never
+    releases on a failed predecessor). One request, two deliverables. Here the
+    plan REPLACES the failure instead:
+
+      - nodes whose skill already exists downstream of the failure are pruned
+        — a second author re-renders the deliverable rather than finishing it;
+      - the remaining plan terminals are wired into every waiting consumer,
+        in the failed node's place;
+      - the failed node is marked skipped, which releases its subtree exactly
+        once, on the original downstream chain.
+
+    Returns True when the graph changed (caller persists the graph).
+    """
+    kept = [n for n in added if n in graph.g.nodes]
+    if not kept:
+        # The planner planned nothing. Release the consumers anyway; their
+        # prompt carries the upstream-missing marker from resolve_inputs.
+        for r in rec_ids:
+            graph.mark(r, "skipped", error="recovery plan was empty")
+        return True
+    failed_skills = {graph.g.nodes[r]["skill"] for r in rec_ids}
+    occupied: set[str] = set()
+    for r in rec_ids:
+        for d in nx.descendants(graph.g, r):
+            occupied.add(graph.g.nodes[d]["skill"])
+    occupied -= failed_skills
+    occupied.discard("critic")
+    pruned = {n for n in kept if graph.g.nodes[n]["skill"] in occupied}
+    # Reconnect kept consumers of pruned nodes to the pruned node's own
+    # inputs (a replacement chain with an interior duplicate role).
+    for n in list(pruned):
+        repl = [p for p in (graph.g.nodes[n].get("inputs") or [])
+                if p in graph.g.nodes and p not in pruned]
+        for c in list(graph.g.successors(n)):
+            if c in pruned:
+                continue
+            ins = list(graph.g.nodes[c].get("inputs") or [])
+            new: list[str] = []
+            for i in ins:
+                for rr in (repl if i == n else [i]):
+                    if rr not in new:
+                        new.append(rr)
+            graph.g.nodes[c]["inputs"] = new
+            graph.g.remove_edge(n, c)
+            for p in new:
+                if p.startswith("n:") and p in graph.g.nodes:
+                    graph.g.add_edge(p, c)
+    for n in pruned:
+        graph.g.remove_node(n)
+    kept = [n for n in kept if n not in pruned]
+    terminals = [n for n in kept
+                 if not any(s in kept for s in graph.g.successors(n))]
+    if not terminals:
+        # Everything was a duplicate role. Dropping the inputs would also
+        # drop the honest upstream-missing marker, so the failures are simply
+        # skipped and the consumers proceed with what they already have.
+        for r in rec_ids:
+            graph.mark(r, "skipped",
+                       error="recovery plan duplicated the waiting pipeline")
+        return True
+    for r in rec_ids:
+        for s in list(graph.g.successors(r)):
+            if s not in graph.g.nodes:
+                continue
+            graph.g.remove_edge(r, s)
+            ins = list(graph.g.nodes[s].get("inputs") or [])
+            new = []
+            for i in ins:
+                for rr in (terminals if i == r else [i]):
+                    if rr not in new:
+                        new.append(rr)
+            graph.g.nodes[s]["inputs"] = new
+            for t in new:
+                if t.startswith("n:") and t in graph.g.nodes:
+                    graph.g.add_edge(t, s)
+        graph.mark(r, "skipped",
+                   error=f"replaced by recovery plan ({', '.join(terminals)})")
+    return True
+
 
 def _fallback_facets(query: str) -> list[str]:
     """Facets to research when the planner wrote no research_plan.
@@ -292,6 +545,15 @@ def _fallback_facets(query: str) -> list[str]:
     """
     import re as _re
     q = " ".join(str(query or "").split())
+    # Strip the Authoring console's own prefix AND the task verb together.
+    # The console prefixes every brief with "Create a document.\n\n" and then
+    # the task ("Write a comprehensive treatise of about 60 pages on X").
+    # The old pattern matched only the verb...about/on/of, so with the
+    # "Create a document." prefix in front nothing matched and the whole raw
+    # prompt became the facet - a logged run emitted a section titled
+    # "Create a document. Write a comprehensive tre..." verbatim.
+    q = _re.sub(r"(?i)^\s*create a (?:document|report|deck|presentation)"
+                r"\s*[.:]?\s*", "", q)
     # Strip the authoring instruction so the worker is asked to RESEARCH a
     # subject, not to obey an order. "write a 6 page report on the Bluebook"
     # becomes "the Bluebook", and each facet then reads as a research
@@ -300,7 +562,20 @@ def _fallback_facets(query: str) -> list[str]:
                 r"(write|create|make|build|generate|draft|produce|prepare|"
                 r"give me|turn)\b[^.?]*?\b(about|on|regarding|covering|for|of)\s+",
                 "", q, count=1)
-    q = q.strip(" ?.!") or "the subject of the requested document"
+    # A surviving length clause ("60 pages", "under 200 words") is not a topic.
+    q = _re.sub(r"(?i)\b(?:about|around|roughly)?\s*\d+\s*(?:page|pages|word|"
+                r"words)\b", "", q)
+    q = q.strip(" ?.!;:,.") or "the subject of the requested document"
+    # Stripping the length clause can leave a leading preposition or article
+    # dangling ("on the engineering of Roman aqueducts"). Clean it or the
+    # facet reads as a fragment.
+    q = _re.sub(r"(?i)^\s*(?:on|of|about|regarding|covering|for|the|a|an)\b\s*",
+                "", q)
+    q = _re.sub(r"(?i)^\s*(?:on|of|about|regarding|covering|for|the|a|an)\b\s*",
+                "", q)
+    q = q.strip(" ?.!;:,.") or "the subject of the requested document"
+    if not q:
+        q = "the subject of the requested document"
     return [
         f"{q}: what it is, how it works, and the current state of it",
         f"{q}: specific evidence, figures, examples and primary sources",
@@ -308,7 +583,13 @@ def _fallback_facets(query: str) -> list[str]:
     ]
 
 
-def ensure_authoring_research(graph: Graph, query: str) -> list[str]:
+# Sessions whose authoring research fan-out has already been spliced. A second
+# planner node in the same session must NOT add a second identical fan-out.
+_AUTHORING_RESEARCH_SESSIONS: set[str] = set()
+
+
+def ensure_authoring_research(graph: Graph, query: str,
+                              session_id: str = "") -> list[str]:
     """Make an authoring plan research the way a Research question does.
 
     The Authoring section is a Research request with a document at the end of
@@ -323,8 +604,20 @@ def ensure_authoring_research(graph: Graph, query: str) -> list[str]:
     `retriever` and a small fan-out of `researcher` nodes spliced above it,
     and its inputs are rewired to read them.
 
+    IDEMPOTENT PER SESSION. This ran once per COMPLETED PLANNER NODE, so a
+    second planner node - a recovery replan, or the sectioned expansion - ran
+    it again and spliced a SECOND identical researcher fan-out. Measured:
+    12 researcher nodes for 6 facets, nodes 1-6 repeated verbatim as 7-12,
+    ~50% of every run's research spend spent producing nothing. The
+    skill check at the call site prevented applying this twice for ONE
+    planner node; it did nothing about a second planner node.
+
     Returns the ids added, for logging and tests.
     """
+    if session_id:
+        if session_id in _AUTHORING_RESEARCH_SESSIONS:
+            return []
+        _AUTHORING_RESEARCH_SESSIONS.add(session_id)
     added: list[str] = []
     for nid in list(graph.g.nodes):
         if graph.g.nodes[nid]["skill"] not in _AUTHORING_SKILLS:
@@ -702,13 +995,40 @@ class Executor:
     def __init__(self, registry: SkillRegistry | None = None):
         ensure_gateway()
         self.registry = registry or SkillRegistry()
+        # Planner-only run parameters, set by run() (see _research_depth_note
+        # in agent_server). Empty means "no operator override".
+        self._run_note = ""
 
     async def run(self, query: str, *, session_id: str | None = None,
                      resume: bool = False,
                      doc_setup: dict | None = None,
-                     should_cancel: Callable[[], bool] | None = None) -> str:
+                     should_cancel: Callable[[], bool] | None = None,
+                     run_note: str = "",
+                     run_kind: str = "") -> str:
         sid = session_id or f"s8-{uuid.uuid4().hex[:8]}"
         store = SessionStore(sid)
+        # Planner-only run parameters (the operator's research depth, etc.).
+        # Deliberately NOT part of `query`: every node reads the query, and a
+        # worker that read "deliver a final report as Markdown" wrote a report
+        # instead of its JSON contract and failed (see agent_server's
+        # _research_depth_note). Only the planner - the node that sets the
+        # fleet size - is told.
+        self._run_note = (run_note or "").strip()
+        # The run's KIND decides which plan shapes are legal. Research answers
+        # in the transcript; Authoring renders a file. They share one planner,
+        # so the contract is enforced in `ensure_research_is_text_only` rather
+        # than requested from the model.
+        self._run_kind = (run_kind or "").strip().lower()
+        # Persist the run's KIND up front so the sidebar can list a run from the
+        # moment it starts, before it has produced a single node. `authoring`
+        # (file-rendering) and `research` runs share the session store; without
+        # this a just-started research run was invisible until its planner
+        # emitted a second skill.
+        if run_kind:
+            try:
+                store.write_run_meta({"kind": run_kind})
+            except Exception as e:  # pragma: no cover - never block a run
+                print(f"[run_meta] skipped: {e!r}")
         run_start_iso = datetime.now(timezone.utc).isoformat()
         if resume:
             existing = store.read_graph()
@@ -869,11 +1189,21 @@ class Executor:
             # BaseException must not abort the whole fan-out batch. Results
             # that come back as exceptions are coerced to failed AgentResults
             # below (see _run_one's own Exception catch for the common case).
+            # Per-node prompt note: the soft time-budget reminder, plus the
+            # operator's planner-only run note. Both ride the same channel
+            # (render_prompt appends it verbatim) rather than the query, which
+            # every worker reads.
+            def _node_note(_nid: str) -> str:
+                _sk = graph.g.nodes[_nid]["skill"]
+                _n = _budget_note(_sk, spent_by_skill)
+                if _sk == "planner" and self._run_note:
+                    _n = f"{self._run_note}\n\n{_n}" if _n else self._run_note
+                return _n
+
             outcomes = await asyncio.gather(*[
                 self._run_one(nid, graph, sid, query, store, memory_hits,
                               prior_turns, policy_notes,
-                              _budget_note(graph.g.nodes[nid]["skill"],
-                                           spent_by_skill),
+                              _node_note(nid),
                               doc_setup)
                 for nid in batch],
                                             return_exceptions=True)
@@ -881,9 +1211,14 @@ class Executor:
             coerced: list[tuple[str, AgentResult, str]] = []
             for nid, outcome in zip(batch, outcomes):
                 if isinstance(outcome, BaseException):
+                    # Cancellation is not a node failure: coercing it let the
+                    # loop dispatch the next batch after the run's task was
+                    # already cancelled (C7).
+                    if isinstance(outcome, asyncio.CancelledError):
+                        raise outcome
                     skill_name = graph.g.nodes[nid]["skill"]
                     outcome = (nid, AgentResult(success=False, agent_name=skill_name,
-                                                error=f"exception: {type(outcome).__name__}: {outcome}"),
+                                                error=f"exception: {_readable_exc(outcome)}"),
                                "(exception escaped dispatcher)")
                 coerced.append(outcome)
             outcomes = coerced
@@ -910,6 +1245,16 @@ class Executor:
                       f"({result.elapsed_s:.1f}s)"
                       + (f"  err={result.error[:80]}" if result.error else ""))
 
+            # PASS 2 — act on the outcomes. Every mark happened in pass 1, so
+            # each decision below (absorb vs replan, and the recovery
+            # planner's `prior_complete`) sees the whole batch as it really
+            # ended. Interleaving marks with decisions made a still-unmarked
+            # sibling invisible: two recovery planners both ran with
+            # prior_complete=[] and re-researched facets the batch had just
+            # finished.
+            replans: list[tuple[str, RecoveryDecision]] = []
+            for nid, result, prompt in outcomes:
+
                 if result.success:
                     if graph.g.nodes[nid]["skill"] == "critic":
                         if handle_critic_verdict(nid, result, graph,
@@ -930,13 +1275,47 @@ class Executor:
                             print(f"[{nid}] planner short-circuit: direct "
                                   f"answer, no downstream nodes")
                             continue
-                    graph.extend_from(nid, result, registry=self.registry)
+                    added = graph.extend_from(nid, result,
+                                              registry=self.registry)
                     # Authoring gets the Research chain, enforced rather than
                     # requested: see ensure_authoring_research. Runs after
                     # extend_from so the planner's nodes exist, and only for
                     # the planner so it cannot be applied twice.
                     if graph.g.nodes[nid]["skill"] == "planner":
-                        _added = ensure_authoring_research(graph, query)
+                        _rec_md = graph.g.nodes[nid].get("metadata") or {}
+                        _is_rec = bool(_rec_md.get("recovers")
+                                       or _rec_md.get("recovers_all"))
+                        # Research answers in the transcript. Strip any
+                        # author/deck node the planner reached for BEFORE the
+                        # authoring guard, so a research run cannot be turned
+                        # into a document run by a model that liked the word
+                        # "report". The session guard would skip a recovery
+                        # planner (the session is already in the set), so a
+                        # recovery replan forces the rewrite — it must not
+                        # re-introduce an authoring node the first planner
+                        # was never allowed to keep.
+                        if getattr(self, "_run_kind", "") == "research":
+                            _changed = ensure_research_is_text_only(
+                                graph,
+                                session_id="" if _is_rec else session_id)
+                            if _changed:
+                                print(f"[{nid}] research is text-only: "
+                                      f"removed {len(_changed)} authoring "
+                                      f"node(s) {_changed}")
+                                store.write_graph(graph.g)
+                        # Splice a recovery plan in place of the failed node
+                        # it replaces: prune duplicate downstream roles,
+                        # rewire the waiting consumers to the plan's
+                        # terminals, and release the original chain.
+                        _rec_ids = _recovery_targets(graph, nid)
+                        if _rec_ids:
+                            _splice_recovery(graph, added, _rec_ids)
+                            print(f"[{nid}] recovery plan spliced for "
+                                  f"{', '.join(_rec_ids)}; waiting nodes "
+                                  f"rewired to the plan")
+                            store.write_graph(graph.g)
+                        _added = ensure_authoring_research(
+                            graph, query, session_id=session_id)
                         if _added:
                             store.write_graph(graph.g)
                     if graph.g.nodes[nid]["skill"] == "formatter":
@@ -955,10 +1334,15 @@ class Executor:
                             try:
                                 store.write_plan({
                                     "topic": str(_plan.get("topic"))[:200],
+                                    # No cap. This slice silently truncated the
+                                    # stored plan to 8 facets while the graph
+                                    # kept every one, so the plan the console
+                                    # showed and the plan that actually ran
+                                    # disagreed.
                                     "facets": [str(f)[:200] for f in
-                                               (_plan.get("facets") or [])][:8],
+                                               (_plan.get("facets") or [])],
                                     "source_hints": [str(s)[:40] for s in
-                                                     (_plan.get("source_hints") or [])][:8],
+                                                     (_plan.get("source_hints") or [])],
                                     "depth": str(_plan.get("depth") or "standard")[:20],
                                 })
                                 print(f"[{nid}] research plan stored: "
@@ -993,6 +1377,27 @@ class Executor:
                         ))
                         print(f"  -> {nid} skipped ({decision.reason}, "
                               f"skill={failed_skill}): {decision.note}")
+                        continue
+                    # Absorb a survivable fan-out failure before paying for a
+                    # replan. When the failed node's siblings already carry
+                    # the majority of every consumer's evidence, the run
+                    # continues on what was produced; recovery here used to
+                    # re-emit the whole pipeline beside the original chain.
+                    if _consumers_have_other_evidence(graph, nid):
+                        why = (f"{failed_skill} failed, but its siblings' "
+                               f"results already cover every waiting "
+                               f"consumer; absorbed instead of re-planned")
+                        graph.mark(nid, "skipped", error=why)
+                        store.write_node(NodeState(
+                            node_id=nid, skill=failed_skill, status="skipped",
+                            inputs=graph.g.nodes[nid]["inputs"],
+                            result=result, prompt_sent=prompt,
+                            started_at=time.time() - result.elapsed_s,
+                            completed_at=time.time(),
+                        ))
+                        print(f"  -> {nid} skipped (absorbed, "
+                              f"{decision.reason}, skill={failed_skill}); "
+                              f"sibling evidence carries the consumers")
                         continue
                     # action == "replan" — but cap repeated replans so a
                     # persistently failing provider can't loop forever.
@@ -1033,35 +1438,69 @@ class Executor:
                                    error=f"recovery cap "
                                          f"({MAX_RECOVERY_ATTEMPTS}) reached")
                         continue
-                    # Recovery Planner amnesia fix: pass the ids of nodes that
-                    # have already completed successfully so the recovery
-                    # Planner can wire them by id in its successor plan
-                    # instead of re-emitting fresh fan-out siblings that
-                    # duplicate work already done. Excludes planner nodes
-                    # (routing context, not data) and critic nodes (verdicts,
-                    # not data); their outputs are not useful upstream input
-                    # for a recovery plan. planner.md teaches the recovery
-                    # Planner what to do with these n:* refs.
-                    prior_complete = [
-                        n for n, d in graph.g.nodes(data=True)
-                        if d.get("status") == "complete"
-                        and d["skill"] not in ("planner", "critic")
-                        and isinstance(d.get("result"), AgentResult)
-                    ]
-                    recovery_inputs = ["USER_QUERY"] + prior_complete
-                    rec_nid = graph.add_node(
-                        "planner", inputs=recovery_inputs,
-                        metadata={"failure_report": decision.failure_report,
-                                  "recovers": nid,
-                                  "recovery_reason": decision.reason,
-                                  "prior_complete": prior_complete},
-                    )
-                    print(f"  -> recovery ({decision.reason}): planner node "
-                          f"{rec_nid} queued for {nid}"
-                          + (f"; reusing {len(prior_complete)} prior result(s): "
-                             f"{', '.join(prior_complete)}" if prior_complete else ""))
+                    # Collected, not queued one-by-one: ONE recovery planner
+                    # per failed batch. Two failed siblings used to get two
+                    # planners, each blind to the other, each re-emitting the
+                    # full remaining pipeline (two authors, two PDFs).
+                    replans.append((nid, decision))
+
+            if replans:
+                # Recovery Planner amnesia fix: pass the ids of nodes that
+                # have already completed successfully so the recovery
+                # Planner can wire them by id in its successor plan instead
+                # of re-emitting fresh fan-out siblings that duplicate work
+                # already done. Excludes planner nodes (routing context, not
+                # data) and critic nodes (verdicts, not data); their outputs
+                # are not useful upstream input for a recovery plan.
+                # planner.md teaches the recovery Planner what to do with
+                # these n:* refs. Computed AFTER pass 1 marked the batch, so
+                # a same-batch completion is visible instead of looking like
+                # a node that never ran.
+                prior_complete = [
+                    n for n, d in graph.g.nodes(data=True)
+                    if d.get("status") == "complete"
+                    and d["skill"] not in ("planner", "critic")
+                    and isinstance(d.get("result"), AgentResult)
+                ]
+                reports = [
+                    _annotate_failure_report(
+                        graph, _nid,
+                        _dec.failure_report or f"node={_nid}")
+                    for _nid, _dec in replans
+                ]
+                rec_nid = graph.add_node(
+                    "planner",
+                    inputs=["USER_QUERY"] + prior_complete,
+                    metadata={"failure_report": "\n".join(reports),
+                              "recovers": replans[0][0],
+                              "recovers_all": [n for n, _ in replans],
+                              "recovery_reason": replans[0][1].reason,
+                              "prior_complete": prior_complete},
+                )
+                print(f"  -> recovery ({replans[0][1].reason}): planner "
+                      f"node {rec_nid} queued for "
+                      f"{', '.join(n for n, _ in replans)}"
+                      + (f"; reusing {len(prior_complete)} prior result(s): "
+                         f"{', '.join(prior_complete)}" if prior_complete else ""))
 
             store.write_graph(graph.g)
+
+        # Orphan sweep: at loop exit a node still `pending` can never become
+        # ready — its predecessor chain ends in a failure that was never
+        # replaced. Graphs audited from three days of runs carried these
+        # leftovers ("formatter" pending forever behind a dead researcher),
+        # and a persisted run with permanent pending nodes reads as
+        # never-finished in the console. Mark them skipped, with the reason.
+        orphans = [n for n, d in graph.g.nodes(data=True)
+                   if d["status"] == "pending"]
+        if orphans:
+            for nid in orphans:
+                graph.mark(nid, "skipped",
+                           error="orphaned: an upstream node never produced "
+                                 "a result")
+            store.write_graph(graph.g)
+            print(f"[flow] {len(orphans)} orphaned pending node(s) marked "
+                  f"skipped: {', '.join(orphans)}")
 
         fallback_output: dict | None = None
         fallback_skill = "?"
@@ -1415,7 +1854,7 @@ class Executor:
                                               budget_note=budget_note)
         except Exception as e:  # pragma: no cover - dispatcher fault path
             result = AgentResult(success=False, agent_name=skill_name,
-                                 error=f"exception: {type(e).__name__}: {e}")
+                                 error=f"exception: {_readable_exc(e)}")
             prompt = "(exception before prompt-render)"
         return nid, result, prompt
 

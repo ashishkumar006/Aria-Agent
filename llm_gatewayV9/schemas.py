@@ -120,6 +120,10 @@ class ChatResponse(BaseModel):
     provider: str
     model: str
     text: str = ""
+    # The model's own reasoning, when the upstream separates it (Kilo's free
+    # tier does). Deliberately NOT merged into `text`: a caller that renders
+    # `text` as the answer must never show the model thinking out loud.
+    reasoning: str = ""
     tool_calls: list[ToolCall] = Field(default_factory=list)
     stop_reason: Literal["tool_use", "end_turn", "max_tokens", "error"] = "end_turn"
     input_tokens: int = 0

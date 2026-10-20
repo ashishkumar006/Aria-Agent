@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Boxes } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, Stat, SkipLink } from '../components/ui';
+import { useMainId, useActivePoll } from '../components/KeepAlive';
 import { api, CONF, type ToolSpec } from '../api';
 
 const PACKS = [
@@ -11,6 +12,17 @@ const PACKS = [
       'extract_tables', 'search_knowledge', 'index_document',
       'verify_citations', 'recall_preferences', 'remember_preference',
       'search_files'] },
+  /* The code workspace is the one pack whose tools all share a repository
+     context: reading structure, finding callers, making a previewed edit and
+     then running the project's own checks. It deliberately overlaps Workspace
+     Files on the basic file verbs - those tools belong to both workflows, and
+     hiding them here would make the coding pack look incomplete. */
+  { id: 'coding', name: 'Coding Agent', ico: '</>',
+    desc: 'Explore a repository, trace references and blast radius, preview and apply edits, then run tests and commands.',
+    tools: ['list_dir', 'read_file', 'search_files', 'document_symbols',
+      'find_references', 'blast_radius', 'git_inspect', 'read_artifact',
+      'preview_edit', 'run_checks', 'run_command', 'edit_file', 'create_file',
+      'make_dir', 'update_file', 'delete_file', 'apply_symbol_edit'] },
   { id: 'comms', name: 'Messaging', ico: '✉',
     desc: 'Email, Telegram, Slack and Discord — read, send and stay in the loop.',
     tools: ['send_email', 'gmail_query', 'gmail_refresh_token', 'send_telegram',
@@ -27,11 +39,16 @@ const PACKS = [
     tools: ['github_query', 'notion_query', 'computer_action'] },
 ];
 
+function packsOf(tool: string): string[] {
+  return PACKS.filter((p) => p.tools.includes(tool)).map((p) => p.name);
+}
+
 function packOf(tool: string): string {
-  return PACKS.find((p) => p.tools.includes(tool))?.name || 'Other';
+  return packsOf(tool)[0] || 'Other';
 }
 
 export default function Skills() {
+  const mainId = useMainId();
   const [catalog, setCatalog] = useState<ToolSpec[]>([]);
   const [disabled, setDisabled] = useState<Set<string>>(new Set());
   // Non-empty when the guard read failed: the withheld set is then UNKNOWN,
@@ -78,14 +95,10 @@ export default function Skills() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
-
   /* The same /api/tools data is polled every 15s on Apps. Without this, a
-     toggle made in Apps (or another tab) never appears here until reload. */
-  useEffect(() => {
-    const t = setInterval(load, CONF.pollSlowMs);
-    return () => clearInterval(t);
-  }, [load]);
+     toggle made in Apps (or another tab) never appears here until reload.
+     Hidden views stop polling and refresh the moment they return (H26). */
+  useActivePoll(load, CONF.pollSlowMs);
 
   /* Single-tool toggle with the same pending-state discipline as flipPack:
      without it a double-click fired two POSTs that resolved in either
@@ -125,7 +138,10 @@ export default function Skills() {
     // enabled:true for every tool and changed nothing (two of the three
     // label states were dead). Enable only when every tool is withheld.
     const off = p.tools.filter((t) => disabled.has(t)).length;
-    const enable = off === p.tools.length;
+    // With the guard unreadable the withheld set is empty in local state, so
+    // "off === length" is never true: the button could only ever disable,
+    // never recover a withheld pack (H11). Treat the action as Enable.
+    const enable = !!guardError || off === p.tools.length;
     setPackBusy(id);
     try {
       // Do not swallow per-tool failures: `.catch(() => null)` made a pack
@@ -156,7 +172,7 @@ export default function Skills() {
   const rows = catalog.filter((t) =>
     !ql || t.name.toLowerCase().includes(ql) ||
     (t.description || '').toLowerCase().includes(ql) ||
-    packOf(t.name).toLowerCase().includes(ql));
+    packsOf(t.name).some((p) => p.toLowerCase().includes(ql)));
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
@@ -206,7 +222,7 @@ export default function Skills() {
           </div>
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Skills">
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter tools" className="w-44 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
         </TopBar>
@@ -243,7 +259,8 @@ export default function Skills() {
             <p role="alert" className="mx-3.5 mb-3 mt-3 rounded-[10px] border border-amber-400/40 bg-amber-400/5 px-3.5 py-2.5 text-[12.5px] text-amber-200">
               Could not read which tools are withheld ({guardError.slice(0, 160)}).
               The counts are unknown, not zero — check the agent before assuming
-              every tool is live.
+              every tool is live.{' '}
+              <button onClick={() => load()} className="underline">retry</button>
             </p>
           )}
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">CAPABILITY PACKS</div>
@@ -255,10 +272,13 @@ export default function Skills() {
           )}
           <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3 px-3.5">
             {PACKS.filter((p) => !ql || p.name.toLowerCase().includes(ql) || p.tools.some((t) => t.includes(ql))).map((p) => {
-              const live = p.tools.filter((t) => known.has(t) && !disabled.has(t)).length;
+              const live = guardError
+                ? 0
+                : p.tools.filter((t) => known.has(t) && !disabled.has(t)).length;
               const off = p.tools.length - live;
+              const enable = !!guardError || off === p.tools.length;
               return (
-                <div key={p.id} className={`rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5 ${off === p.tools.length ? 'opacity-60' : ''}`}>
+                <div key={p.id} className={`rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5 ${!guardError && off === p.tools.length ? 'opacity-60' : ''}`}>
                   <div className="mb-2 flex items-center gap-2.5">
                     <span className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-lg border border-violet-400/30 bg-violet-400/10 text-[17px]">{p.ico}</span>
                     <span className="text-[13.5px] font-bold">{p.name}</span>
@@ -270,14 +290,16 @@ export default function Skills() {
                     ))}
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-zinc-muted">{live}/{p.tools.length} live</span>
+                    <span className="text-[11px] text-zinc-muted">
+                      {guardError ? 'counts unknown' : `${live}/${p.tools.length} live`}
+                    </span>
                     <button
                       onClick={() => flipPack(p.id)}
                       disabled={packBusy === p.id}
-                      aria-label={`${off ? 'Enable' : 'Disable'} pack ${p.name || p.id}`}
+                      aria-label={`${enable ? 'Enable' : 'Disable'} pack ${p.name || p.id}`}
                       className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs hover:border-violet-400 disabled:opacity-50"
                     >
-                      {packBusy === p.id ? 'Saving…' : off ? 'Enable pack' : 'Disable pack'}
+                      {packBusy === p.id ? 'Saving…' : enable ? 'Enable pack' : 'Disable pack'}
                     </button>
                   </div>
                 </div>
@@ -307,8 +329,10 @@ export default function Skills() {
                 {rows.map((t) => {
                   const off = disabled.has(t.name);
                   // Guard unreadable: "live" is not knowable, so the row
-                  // must not claim it. The button still works — the write
-                  // is authoritative — but the state cell says unknown.
+                  // must not claim it. Enable is the recovery action: it
+                  // revives a tool that was withheld before the failed read,
+                  // and is a no-op for one already live (H11).
+                  const enable = !!guardError || off;
                   const state = guardError ? 'unknown' : off ? 'withheld' : 'live';
                   return (
                     <tr key={t.name} className="border-b border-white/5 hover:bg-white/[0.02]">
@@ -320,12 +344,12 @@ export default function Skills() {
                       </td>
                       <td className="px-2.5 py-2 text-right">
                         <button
-                          onClick={() => flip(t.name, off)}
+                          onClick={() => flip(t.name, enable)}
                           disabled={toolBusy.has(t.name)}
-                          aria-label={`${off ? 'Enable' : 'Withhold'} tool ${t.name}`}
+                          aria-label={`${enable ? 'Enable' : 'Withhold'} tool ${t.name}`}
                           className="rounded-md border border-white/15 px-2.5 py-1 text-xs hover:border-violet-400 disabled:opacity-50"
                         >
-                          {toolBusy.has(t.name) ? 'Saving…' : off ? 'Enable' : 'Withhold'}
+                          {toolBusy.has(t.name) ? 'Saving…' : enable ? 'Enable' : 'Withhold'}
                         </button>
                       </td>
                     </tr>

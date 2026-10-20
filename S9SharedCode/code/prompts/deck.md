@@ -51,15 +51,16 @@ speaker notes came out as eleven blank slides. Use these shapes verbatim:
   different thing and is dropped.
 - `{"type": "numbers", "items": ["step 1", "step 2"]}` — numbered list.
 - `{"type": "table", "header": ["Col A", "Col B"], "rows": [["a1", "b1"]]}`
-- `{"type": "chart", "chart": "bar|line|pie", "title": "...",
+- `{"type": "chart", "kind": "bar|line|pie", "title": "...",
   "categories": ["Q1", "Q2"],
   "series": [{"name": "IVF", "data": [94, 91]}], "caption": "..."}`
   — renders as a native, editable chart in the deck. Plot only numbers you
   actually have.
 - `{"type": "image", "document": "doc-...", "page": 3, "caption": "..."}`
   — reuses a figure from the user's own uploaded document. No web images.
-- `{"type": "note", "text": "Speaker note for this slide."}` — goes to the
-  notes page, never on the slide face.
+- `{"type": "note", "text": "Speaker note for this slide."}` — the pptx
+  speaker-notes placeholder. Never on the slide face, and it does not exist
+  in a PDF: for a pdf deck, put the same text in a `paragraph`.
 - `{"type": "pagebreak"}` — start a new slide.
 
 A worked slide:

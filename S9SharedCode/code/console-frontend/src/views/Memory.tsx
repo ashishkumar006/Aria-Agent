@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Database, SearchX, Trash2 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, SkipLink } from '../components/ui';
+import { useMainId } from '../components/KeepAlive';
 import { api, type MemItem } from '../api';
 
 /* The four memory types the agent actually works with. This list used to be
@@ -70,6 +71,7 @@ function cutOff(desc?: string): boolean {
 }
 
 export default function Memory() {
+  const mainId = useMainId();
   /* '' means no kind filter (all memory). */
   const [kindFilter, setKindFilter] = useState('');
   const [items, setItems] = useState<MemItem[]>([]);
@@ -80,6 +82,8 @@ export default function Memory() {
   const [hide, setHide] = useState(true);
   const [profileEnabled, setProfileEnabled] = useState(false);
   const [profileNote, setProfileNote] = useState('');
+  /** the profile read failed; distinct from "the profile is switched off". */
+  const [profileErr, setProfileErr] = useState(false);
   const [observations, setObservations] = useState<{
     id: string; observation: string; evidence: string; confidence?: number;
     seen_count?: number;
@@ -149,10 +153,12 @@ export default function Memory() {
       setProfileEnabled(d.enabled);
       setObservations(d.observations || []);
       setProfileNote(d.note || '');
+      setProfileErr(false);
     } catch {
       setProfileEnabled(false);
       setObservations([]);
       setProfileNote('Could not load the profile.');
+      setProfileErr(true);
     }
   }, []);
 
@@ -371,7 +377,7 @@ export default function Memory() {
           })}
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <h1 className="sr-only">Memory</h1>
         <TopBar crumb="Memory">
           <input
@@ -423,7 +429,12 @@ export default function Memory() {
             pattern drawn from past conversations, and the quoted line under it
             is the only thing supporting it. Showing the evidence is what lets
             the user judge an entry — and spot the ones that are wrong. */}
-        <div className="mx-3.5 mt-2.5 rounded-[10px] border border-white/10 bg-[#0e0e12]">
+        {/* min-h, because this panel renders its header alone while the profile
+            fetch is in flight and then fills with observation rows. Growing
+            from ~1 row to N moved the results list and the whole sidebar
+            beneath it - 0.25 CLS on tablet, the worst left on the site. It is
+            a bounded panel, so a floor is honest. */}
+        <div className="mx-3.5 mt-2.5 min-h-[180px] rounded-[10px] border border-white/10 bg-[#0e0e12]">
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 border-b border-white/10 px-3 py-2">
             <span className="text-[11px] font-bold tracking-[0.12em] text-zinc-muted">WHAT WE'VE NOTICED</span>
             {profileEnabled ? (
@@ -443,7 +454,12 @@ export default function Memory() {
                 </button>
               </>
             ) : (
-              <span className="text-[11.5px] text-zinc-muted">{profileNote}</span>
+              <span className="text-[11.5px] text-zinc-muted">
+                {profileNote}
+                {profileErr && (
+                  <> <button onClick={() => void loadProfile()} className="underline">retry</button></>
+                )}
+              </span>
             )}
           </div>
           {profileEnabled && observations.length > 0 && (
@@ -452,14 +468,14 @@ export default function Memory() {
                cap a long profile pushes everything below it off-screen with
                no way to reach it - the page looked stuck. The header stays
                put; only the rows scroll. */
-            <ul className="max-h-[34vh] divide-y divide-white/5 overflow-y-auto">
+            <ul className="max-h-[34vh] overflow-x-hidden overflow-y-auto divide-y divide-white/5">
               {observations.map((o) => {
                 const seen = o.seen_count ?? 1;
                 return (
                 <li key={o.id} className="px-3 py-2.5">
                   <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-[12.5px] leading-snug text-zinc-100">{o.observation}</p>
+                    <div className="min-w-0 flex-1">
+                      <p className="break-words text-[12.5px] leading-snug text-zinc-100">{o.observation}</p>
                       {o.evidence && (
                         <p className="mt-1 break-words border-l-2 border-violet-400/40 pl-2 text-[11.5px] italic text-zinc-muted">
                           “{o.evidence}”
@@ -525,12 +541,21 @@ export default function Memory() {
           </button>
         </h2>
         <div id="remember-form" className={`${formOpen ? 'block' : 'hidden'} lg:block`}>
-          <div className="mx-3.5 mt-2.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
+          {/* Measured: this card rendered 36px tall and settled at 360px, and
+              the sidebar growing past the viewport is what pushed the page
+              around (0.13 CLS on desktop). Reserving its real height stops the
+              shift whatever inside it is late. */}
+          <div className="mx-3.5 mt-2.5 min-h-[356px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
             <div className="mb-1 hidden text-[10px] font-bold tracking-[0.12em] text-zinc-muted lg:block">REMEMBER</div>
             <div className="flex flex-wrap items-end gap-2.5">
               <label className="text-[11px] text-zinc-muted">kind<br />
                 <select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Memory kind" className="mt-1 rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-xs outline-none">
-                  <option>fact</option><option>preference</option><option>tool_outcome</option><option>scratchpad</option>
+                  {/* `observation` was missing here while the sidebar filter,
+                      the "what we've noticed" section and 20 stored records
+                      all used it: the console showed a whole type of memory
+                      the user could filter for but not add to. Same five kinds
+                      as KINDS, kept in step deliberately. */}
+                  <option>fact</option><option>preference</option><option>observation</option><option>tool_outcome</option><option>scratchpad</option>
                 </select>
               </label>
               <label className="min-w-[220px] flex-1 text-[11px] text-zinc-muted">descriptor<br />
@@ -550,7 +575,13 @@ export default function Memory() {
             {out && <div className="mt-2 text-[11px] text-zinc-muted" role="status">{out}</div>}
           </div>
         </div>
-        <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-3.5">
+        {/* `min-h` reserves the results region before the fetch lands. Without
+            it the list went from a 3-row skeleton to N rows of full-width
+            memory cards, and the scroll container resized under the user -
+            CLS 0.25 on tablet, 0.22 on mobile. Reserving one viewport's worth
+            means the scrollbar and the content below hold still while data
+            arrives. */}
+        <div className="min-h-[60vh] space-y-2.5 overflow-y-auto p-3.5">
           {!loaded && <Skel />}
           {loaded && !loadError && !items.length && submitted && (
             /* An empty list behind a query is a search result, not a lack of

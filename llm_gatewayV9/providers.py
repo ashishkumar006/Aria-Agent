@@ -291,10 +291,20 @@ class OpenAICompatProvider(BaseProvider):
             if r == "system":
                 continue          # already merged above, in order
             if r == "tool":
+                tc_content = (m.get("content", "")
+                              if isinstance(m.get("content"), str)
+                              else json.dumps(m.get("content")))
+                # Kilo's Cohere-backed ids 400 the WHOLE request when a tool
+                # result is empty: "all elements in tool_results must have the
+                # 'outputs' property specified". Measured live: the identical
+                # turn with `content: ""` is a 502 while `content: "{}"` is a
+                # 200, so a researcher that called a tool returning nothing
+                # killed the node. `(no output)` says the same thing to the
+                # model and keeps the turn valid.
                 out.append({
                     "role": "tool",
                     "tool_call_id": m.get("tool_call_id") or m.get("id") or "",
-                    "content": m.get("content", "") if isinstance(m.get("content"), str) else json.dumps(m.get("content")),
+                    "content": tc_content if tc_content.strip() else "(no output)",
                 })
                 continue
             if r == "assistant" and m.get("tool_calls"):
@@ -421,11 +431,18 @@ class OpenAICompatProvider(BaseProvider):
             choice = (d.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
             text = msg.get("content") or ""
-            # V9: some free models (e.g. stepfun/step-3.7-flash:free via Kilo)
-            # emit their answer in a `reasoning` field and leave `content`
-            # empty. Fall back to `reasoning` so the text isn't lost.
-            if not text and isinstance(msg.get("reasoning"), str):
-                text = msg["reasoning"]
+            # Reasoning is its own channel, NOT a fallback for the answer.
+            # Some free models served via Kilo (cohere/north-mini-code:free,
+            # measured) return content=null, a few hundred chars of monologue
+            # in `reasoning`, AND tool_calls. This code used to copy
+            # `reasoning` into `text` so the text was not "lost" - which meant
+            # the model thinking out loud was served to the user as the
+            # answer. Keep both: `reasoning` is surfaced, `text` stays the
+            # answer, and the fallback only applies when the model produced no
+            # tool calls either (a tool-less caller still deserves a reply).
+            reasoning_text = msg.get("reasoning")
+            if not isinstance(reasoning_text, str):
+                reasoning_text = ""
             tool_calls_out = []
             for tc in (msg.get("tool_calls") or []):
                 fn = tc.get("function") or {}
@@ -446,8 +463,11 @@ class OpenAICompatProvider(BaseProvider):
             stop_norm = "tool_use" if tool_calls_out else (
                 "max_tokens" if stop == "length" else "end_turn"
             )
+            if not text and reasoning_text and not tool_calls_out:
+                text = reasoning_text
             return {
                 "text": text or "",
+                "reasoning": reasoning_text,
                 "tool_calls": tool_calls_out,
                 "input_tokens": usage.get("prompt_tokens", 0) or 0,
                 "output_tokens": usage.get("completion_tokens", 0) or 0,
@@ -496,6 +516,17 @@ class OpenAICompatProvider(BaseProvider):
                         delta = d["choices"][0].get("delta", {})
                         if delta.get("content"):
                             yield delta["content"]
+                        # Reasoning models (DeepSeek/Qwen/Kimi and others) stream
+                        # their chain of thought on a SEPARATE field. It is not
+                        # the answer, so it goes out on its own sentinel and the
+                        # gateway forwards it as a `reasoning_delta` frame for the
+                        # UI to show collapsed.
+                        _rc = delta.get("reasoning_content")
+                        if _rc is None:
+                            _rt = delta.get("reasoning")
+                            _rc = _rt if isinstance(_rt, str) else None
+                        if _rc:
+                            yield "[[REASONING_DELTA]] " + json.dumps(_rc)
                         if delta.get("tool_calls"):
                             yield "[[TOOL_CALL_DELTA]] " + json.dumps(delta["tool_calls"])
                     except Exception:
@@ -606,6 +637,25 @@ class GeminiProvider(BaseProvider):
 
     def _translate_messages(self, messages):
         contents = []
+        # Thought signatures already seen in this conversation, oldest first.
+        # Gemini 3 returns a signature on the functionCall parts it emits, and
+        # REQUIRES one on every functionCall part it is handed back. Measured
+        # live against gemini-3.1/3.5-flash-lite: a parallel batch of six calls
+        # came back with a signature on the first part only, and sometimes with
+        # none at all; replaying such a turn later 400s with "Function call is
+        # missing a thought_signature in functionCall parts ... position N",
+        # which the router reports as a 502 and the node dies. The signatures
+        # themselves are opaque and not bound to the individual call: sending a
+        # prior signature for the unsigned parts was accepted (200) where the
+        # same request as received was a 400, so fill the gaps with the newest
+        # one available rather than losing the whole run.
+        seen_signatures: list[str] = []
+        # Calls with no signature anywhere to borrow (the very first tool batch
+        # of a conversation, when the model returned none at all) cannot be
+        # replayed as functionCall parts: Gemini 400s on any unsigned part. They
+        # are rendered as prose instead, and their results as prose replies, so
+        # the content still reaches the model without an invalid turn.
+        texted_ids: set[str] = set()
         # `functionResponse.name` must match the `functionCall` it answers.
         # The canonical tool message carries only `tool_call_id` + `content`
         # (that is what the module docstring documents and what
@@ -626,6 +676,13 @@ class GeminiProvider(BaseProvider):
                 continue
             if r == "tool":
                 tcid = str(m.get("tool_call_id") or m.get("id") or "")
+                if tcid in texted_ids:
+                    contents.append({
+                        "role": "user",
+                        "parts": [{"text": "[tool result] "
+                                   + str(m.get("content") or "")}],
+                    })
+                    continue
                 name = (m.get("tool_name") or m.get("name")
                         or names_by_id.get(tcid) or "tool")
                 contents.append({
@@ -642,7 +699,19 @@ class GeminiProvider(BaseProvider):
                 parts = []
                 if m.get("content"):
                     parts.append({"text": m["content"]})
-                for tc in (m.get("tool_calls") or []):
+                tool_calls = m.get("tool_calls") or []
+                this_turn: list[str] = []
+                for tc in tool_calls:
+                    meta = tc.get("provider_meta") or {}
+                    sig = meta.get("thoughtSignature")
+                    if sig:
+                        this_turn.append(sig)
+                # Prefer this turn's own signature (the first part that has
+                # one); otherwise the newest signature from an earlier turn.
+                fallback_sig = (this_turn[0] if this_turn
+                                else (seen_signatures[-1]
+                                      if seen_signatures else None))
+                for tc in tool_calls:
                     part = {
                         "functionCall": {
                             "name": tc["name"],
@@ -650,9 +719,18 @@ class GeminiProvider(BaseProvider):
                         }
                     }
                     meta = tc.get("provider_meta") or {}
-                    if meta.get("thoughtSignature"):
-                        part["thoughtSignature"] = meta["thoughtSignature"]
+                    sig = meta.get("thoughtSignature") or fallback_sig
+                    if not sig:
+                        texted_ids.add(str(tc.get("id") or ""))
+                        parts.append({"text": (
+                            f"[tool call] {tc['name']}("
+                            f"{json.dumps(tc.get('arguments') or {}, ensure_ascii=False)})"
+                        )})
+                        continue
+                    part["thoughtSignature"] = sig
                     parts.append(part)
+                if this_turn:
+                    seen_signatures.extend(this_turn)
                 if not parts:
                     parts = [{"text": ""}]
                 contents.append({"role": "model", "parts": parts})
@@ -1147,19 +1225,111 @@ def model_capabilities(provider_name: str, model: str, default_caps: dict) -> di
 # the gateway picks the right backend.
 MODEL_ROUTES: dict[str, str] = {}
 
+# Model-name routes that apply ONLY to coding-agent requests.
+#
+# Kilo's ~400 catalogue ids live here rather than in MODEL_ROUTES on purpose.
+# MODEL_ROUTES is consulted for every caller, so a Kilo id in it would let the
+# document pipeline, chat and the router pool all land on a free coding model
+# just because something passed a matching id. The coding agent is the only
+# consumer that is meant to reach Kilo by model name, so its routes are gated
+# on the caller's agent tag (see CODE_AGENTS).
+CODE_MODEL_ROUTES: dict[str, str] = {}
+
+# Request `agent` values allowed to use CODE_MODEL_ROUTES.
+CODE_AGENTS = frozenset({"code"})
+
+# Every Kilo model id we have discovered from the upstream roster. Kept
+# separate from the route tables because discovery is async and happens after
+# build_providers(); register_kilo_model_routes() folds these in.
+KILO_MODEL_IDS: set[str] = set()
+
+# Providers this gateway will never route to, whatever the environment says.
+# The operator does not want these on the failover ladder at all, and the point
+# is that they cannot be reached: leaving their API keys in the environment and
+# only editing LLM_ORDER would still let an explicit `provider=` request, a
+# shortcut alias, or a stale LLM_ORDER entry construct one. So the list is
+# applied at the single point where providers become reachable -
+# build_providers()/build_router_providers() - rather than at the call sites
+# that would have to remember to filter.
+DISABLED_PROVIDERS: frozenset[str] = frozenset({
+    "nvidia", "groq", "cerebras", "openrouter", "github",
+})
+
+
+def route_for_model(model: str, agent: str | None = None) -> str | None:
+    """Resolve a bare model id to a provider.
+
+    Global routes first, then the coding-agent-only table. Order matters: a
+    globally-registered id wins even for a coding request, so scoping can
+    never shadow an explicitly configured provider elsewhere.
+    """
+    if not model:
+        return None
+    hit = MODEL_ROUTES.get(model)
+    if hit:
+        return hit
+    if agent in CODE_AGENTS:
+        return CODE_MODEL_ROUTES.get(model)
+    return None
+
+
+# Ids that route to Kilo even when the roster could not be fetched, so a
+#
+# These used to include `tencent/hy3:free` and `stepfun/step-3.7-flash:free`.
+# Both are dead upstream — Kilo now serves `tencent/hy3` and
+# `stepfun/step-3.7-flash` as PAID models, with no `:free` variant — so a
+# request routed to them 404'd. Do not add ids here without checking the live
+# roster; `kilo_models.pick_default_model` derives the real default from it.
+_KILO_FALLBACK_IDS = ("kilo-auto/free",
+                      "cohere/north-mini-code:free",
+                      "nvidia/nemotron-3-super-120b-a12b:free")
+
+# Used only until discovery runs. Defined here rather than imported from
+# kilo_models because build_providers() must not depend on an async module at
+# import time; kilo_models.SAFE_DEFAULT_MODEL is the same value and the two are
+# asserted equal in the tests.
+_KILO_SAFE_DEFAULT = "kilo-auto/free"
+
+
+def register_kilo_model_routes(model_ids) -> int:
+    """Register each discovered Kilo model id for CODING-AGENT requests only.
+
+    Kilo fronts ~400 models behind one endpoint, so without this a caller who
+    knows the id they want still has to know which provider serves it. Ids
+    with no "/" are rejected: they would shadow same-named models from other
+    providers, and every real Kilo id is "vendor/model".
+    """
+    added = 0
+    for mid in model_ids or ():
+        mid = str(mid).strip()
+        if "/" not in mid:
+            continue
+        # Track every discovered id even if it is already routed: KILO_MODEL_IDS
+        # is the authoritative discovered set, and register_model_routes()
+        # rebuilds the tables from it. Skipping here would let a rebuild drop
+        # an id that happens to equal the configured default.
+        if mid not in KILO_MODEL_IDS:
+            KILO_MODEL_IDS.add(mid)
+        if CODE_MODEL_ROUTES.get(mid) == "kilo":
+            continue
+        CODE_MODEL_ROUTES[mid] = "kilo"
+        added += 1
+    return added
+
 
 def register_model_routes(providers: dict) -> None:
-    """(Re)build the model-name → provider table from the wired pool."""
+    """(Re)build the model-name → provider tables from the wired pool."""
     MODEL_ROUTES.clear()
+    CODE_MODEL_ROUTES.clear()
     if "kilo" in providers:
-        # A single Kilo instance forwards ANY model name passed via
-        # `model=`, so both known Kilo models are registered for
-        # model-name-only routing.
+        # A single Kilo instance forwards ANY model name passed via `model=`.
+        # All of these are coding-agent-only (CODE_MODEL_ROUTES): the Kilo
+        # catalogue must never be reachable from the document pipeline or
+        # chat just because a matching id was passed.
         kilo_model = getattr(providers["kilo"], "model", "")
-        for _m in ("stepfun/step-3.7-flash:free", "tencent/hy3:free",
-                   kilo_model):
+        for _m in (*_KILO_FALLBACK_IDS, kilo_model, *sorted(KILO_MODEL_IDS)):
             if _m:
-                MODEL_ROUTES[_m] = "kilo"
+                CODE_MODEL_ROUTES[_m] = "kilo"
     if "gemini35lite" in providers:
         # Caller passes model="gemini-3.5-flash-lite" with no provider and
         # it lands on the gemini35lite instance.
@@ -1270,11 +1440,19 @@ def build_providers(cache_store):
         # Ollama is keyless (local daemon) so it never fans out.
         if os.getenv("ENABLE_OLLAMA_LLM", "false").lower() in ("1", "true", "yes"):
             out["ollama"] = OllamaProvider(om, os.getenv("OLLAMA_URL", "http://localhost:11434"))
-    # V9: Kilo Code Gateway — OpenAI-compatible. Serves free models like
-    # stepfun/step-3.7-flash:free and tencent/hy3:free. A single Kilo provider
-    # instance forwards ANY model name passed via `model=`.
+    # V9: Kilo Code Gateway — OpenAI-compatible, ~400 models, 15 of them free.
+    # A single Kilo provider instance forwards ANY model name passed via
+    # `model=`, and the ids reachable that way are registered for coding
+    # agents only (see CODE_MODEL_ROUTES).
+    #
+    # The default is NOT the right place to hardcode a model: build_providers()
+    # runs before discovery, so whatever goes here is a guess. Kilo renames and
+    # retires models continuously — the previous guess, `tencent/hy3:free`, is
+    # no longer served at all. SAFE_DEFAULT_MODEL is the fallback for when the
+    # roster cannot be read, and kilo_models.pick_default_model replaces it
+    # with the live best free tool-calling model moments after startup.
     _kilo_base = os.getenv("KILO_BASE_URL", "https://api.kilo.ai/api/gateway")
-    _kilo_model = os.getenv("KILO_MODEL", "tencent/hy3:free")
+    _kilo_model = os.getenv("KILO_MODEL", "") or _KILO_SAFE_DEFAULT
     _fan_out(out, "kilo",
              _key_list("KILO_API_KEY", "KILO_API_KEYS"),
              lambda k: KiloProvider(k, _kilo_model, _kilo_base))
@@ -1285,6 +1463,10 @@ def build_providers(cache_store):
     for name, p in out.items():
         p.capabilities = model_capabilities(_base_provider(name), p.model, getattr(p, "capabilities", {}))
     register_model_routes(out)
+    # Drop the disabled providers LAST, so a removed one cannot be reachable
+    # even if it was constructed above or fanned out over several API keys.
+    for _dead in DISABLED_PROVIDERS:
+        out.pop(_dead, None)
     return out
 
 
@@ -1306,22 +1488,54 @@ ROUTER_DEFAULTS = {
 
 
 def build_router_providers():
-    """Router pool — same provider classes as workers, but separate instances
+    """Router pool - same provider classes as workers, but separate instances
     with router-specific (smaller/faster) model defaults. Uses the same API keys
     as workers; per-provider rate budgets are independent because the providers
     we picked (Cerebras, Groq, NVIDIA, GitHub) all meter per-model, not per-key.
+
+    Only providers named in ROUTER_ORDER are constructed. Previously every
+    router provider was built unconditionally and ROUTER_ORDER merely chose
+    the failover order, so "disable the router pool" left live instances
+    sitting in app.state - visible in /v1/routers and still holding API keys in
+    memory. Filtering here makes the setting mean what it says.
     """
+    allowed = {p.strip() for p in
+               (os.getenv("ROUTER_ORDER", "").split(",")) if p.strip()}
+    if not allowed:
+        # No override: fall back to the shipped default rather than silently
+        # building nothing.
+        from router import DEFAULT_ROUTER_ORDER
+        allowed = set(DEFAULT_ROUTER_ORDER)
+    # Same rule as the worker pool: a disabled provider is not constructed here
+    # either, so the router pool cannot route or auto-classify through one.
+    allowed -= set(DISABLED_PROVIDERS)
     out = {}
-    _fan_out(out, "cerebras",
-             _key_list("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
-             lambda k: CerebrasProvider(k, os.getenv("ROUTER_CEREBRAS_MODEL", ROUTER_DEFAULTS["cerebras"])))
-    _fan_out(out, "groq",
-             _key_list("GROQ_API_KEY", "GROQ_API_KEYS"),
-             lambda k: GroqProvider(k, os.getenv("ROUTER_GROQ_MODEL", ROUTER_DEFAULTS["groq"])))
-    _fan_out(out, "nvidia",
-             _key_list("NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
-             lambda k: NvidiaProvider(k, os.getenv("ROUTER_NVIDIA_MODEL", ROUTER_DEFAULTS["nvidia"])))
-    _fan_out(out, "github",
-             _key_list("GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
-             lambda k: GitHubProvider(k, os.getenv("ROUTER_GITHUB_MODEL", ROUTER_DEFAULTS["github"])))
+    if "cerebras" in allowed:
+        _fan_out(out, "cerebras",
+                 _key_list("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
+                 lambda k: CerebrasProvider(k, os.getenv("ROUTER_CEREBRAS_MODEL", ROUTER_DEFAULTS["cerebras"])))
+    if "groq" in allowed:
+        _fan_out(out, "groq",
+                 _key_list("GROQ_API_KEY", "GROQ_API_KEYS"),
+                 lambda k: GroqProvider(k, os.getenv("ROUTER_GROQ_MODEL", ROUTER_DEFAULTS["groq"])))
+    if "nvidia" in allowed:
+        _fan_out(out, "nvidia",
+                 _key_list("NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
+                 lambda k: NvidiaProvider(k, os.getenv("ROUTER_NVIDIA_MODEL", ROUTER_DEFAULTS["nvidia"])))
+    if "github" in allowed:
+        _fan_out(out, "github",
+                 _key_list("GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
+                 lambda k: GitHubProvider(k, os.getenv("ROUTER_GITHUB_MODEL", ROUTER_DEFAULTS["github"])))
+    # Kilo joins the router pool so it is a visible, managed member rather than
+    # something only reachable by knowing the provider name. Its model default
+    # is the free tool-calling model read from the live catalogue at startup
+    # (see kilo_models.pick_default_model) - NOT a literal, because Kilo
+    # retires ids and a baked-in name rots into a 404.
+    if "kilo" in allowed:
+        _fan_out(out, "kilo",
+                 _key_list("KILO_API_KEY", "KILO_API_KEYS"),
+                 lambda k: KiloProvider(
+                     k, os.getenv("ROUTER_KILO_MODEL",
+                                  os.getenv("KILO_MODEL", "")) or _KILO_SAFE_DEFAULT,
+                     os.getenv("KILO_BASE_URL", "https://api.kilo.ai/api/gateway")))
     return out

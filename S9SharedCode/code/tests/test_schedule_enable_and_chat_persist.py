@@ -117,6 +117,41 @@ def test_re_enabling_does_not_fire_a_one_shot_whose_time_has_passed(sched):
     assert out.get("hint"), "must say what to do instead"
 
 
+def test_re_enabling_clears_the_cancel_marker(sched):
+    """Cancel sets `_cancelled`; if enable leaves it, the row reports armed
+    but `_worker_tick` skips it forever."""
+    sid = sched.schedule("morning briefing", "in 2h")
+    assert sched.cancel(sid) is True
+    assert sched._SCHEDULES[sid]["_cancelled"] is True
+
+    out = sched.set_enabled(sid, True)
+    assert out["ok"] is True
+    assert "_cancelled" not in sched._SCHEDULES[sid]
+
+
+def test_manual_disable_also_marks_cancelled(sched):
+    """A disable can race an in-flight worker snapshot, which checks only
+    `_cancelled` after the snapshot."""
+    sid = sched.schedule("morning briefing", "in 2h")
+    assert sched.set_enabled(sid, False)["enabled"] is False
+    assert sched._SCHEDULES[sid]["_cancelled"] is True
+
+
+def test_a_re_enabled_schedule_actually_reaches_the_worker(sched, monkeypatch):
+    sid = sched.schedule("morning briefing", "in 2h")
+    sched.cancel(sid)
+    assert sched.set_enabled(sid, True)["ok"] is True
+
+    spec = sched._SCHEDULES[sid]
+    spec["next_fire"] = time.time() - 1
+    sched._HEAP = [(spec["next_fire"], sid)]
+    fired = []
+    monkeypatch.setattr(sched, "_fire", lambda s, _snap: fired.append(s))
+
+    sched._worker_tick()
+    assert fired == [sid], "the worker skipped a re-enabled schedule"
+
+
 def test_set_enabled_reports_an_unknown_id(sched):
     out = sched.set_enabled("sch-nope", True)
     assert out["ok"] is False

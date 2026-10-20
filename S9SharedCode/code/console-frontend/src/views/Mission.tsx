@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Terminal } from 'lucide-react';
 import { Rail, TopBar, Empty, Stat, SkipLink } from '../components/ui';
+import { useMainId, useSectionActive } from '../components/KeepAlive';
 import { api, CONF, type FeedEvent } from '../api';
 
 const LEVELS = ['all', 'run', 'sched', 'tool', 'info', 'err'] as const;
 
 export default function Mission() {
+  const mainId = useMainId();
+  const active = useSectionActive();
   const [all, setAll] = useState<FeedEvent[]>([]);
   const [level, setLevel] = useState<(typeof LEVELS)[number]>('all');
   const [q, setQ] = useState('');
@@ -45,10 +48,11 @@ export default function Mission() {
   }, []);
 
   useEffect(() => {
+    if (!active) return;
     tick();
     const t = setInterval(() => { if (!pausedRef.current) tick(); }, CONF.pollLiveMs);
     return () => clearInterval(t);
-  }, [tick]);
+  }, [active, tick]);
 
   const counts = { run: 0, sched: 0, tool: 0, info: 0, err: 0 };
   for (const e of all) {
@@ -81,7 +85,7 @@ export default function Mission() {
         </div>
         <div className="mt-auto hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">poll {CONF.pollLiveMs / 1000}s · guarded</div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Console">
           <span
             role="status"

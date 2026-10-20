@@ -66,14 +66,18 @@ is below the length floor below, expand the document and call it again.
    - Prefer their facts, figures and terminology over your own recollection.
    - Where they disagree, say so in the document rather than silently picking
      one side.
-   - Attribute claims that came from a specific source ("per the uploaded
-     Bluebook", "according to X") so the reader can tell what is sourced.
+   - Attribute claims that came from a specific source in the sentence
+     ("per the uploaded Bluebook", "according to X") so the reader can tell
+     what is sourced. Do NOT attach bracketed reference numbers or inline
+     citation markers to individual claims - the reference list at the end of
+     the document covers this, and per-claim markers cost measurable length.
    - Never invent a figure, a citation or a quotation to fill a section. If a
      section has no supporting evidence, write the analysis that the evidence
      DOES support, or state plainly in the summary that this part is
      unsourced.
    - **Ship a `references` list whenever you used the research inputs.** Pass
-     the sources you actually leaned on as `references`, and set
+     the sources you actually leaned on as `references` and they are rendered
+     as a single Sources section at the END of the document; set
      `citation_style` to the field's convention: `ieee` for engineering and
      technical reports, `apa` for social science, `vancouver` or `ama` for
      medical, `mla` or `chicago` for humanities, `bluebook` for legal. A
@@ -113,25 +117,27 @@ is below the length floor below, expand the document and call it again.
      {"type": "bullets", "items": ["one idea", "another idea"]}
      {"type": "numbers", "items": ["step one", "step two"]}
      {"type": "table", "header": ["Col A", "Col B"], "rows": [["a1", "b1"]]}
-     {"type": "quote", "text": "A definition or verbatim line."}
-     {"type": "note", "text": "A note that is not part of the visible flow."}
-     {"type": "pagebreak"}
+      {"type": "quote", "text": "A definition or verbatim line."}
+      {"type": "pagebreak"}
 
-   The items of `bullets`/`numbers` MUST be a list. A single-item list is
-   fine; `{"type": "bullet", "text": "..."}` is a different thing and is
-   dropped.
+    These are the block types this renderer accepts: `cover`, `heading`,
+    `paragraph`, `bullets`, `numbers`, `quote`, `table`, `image`, `pagebreak`,
+    and `chart`. **Anything else is silently dropped** — a `note` block, a
+    `bullet` instead of `bullets`, an unlisted type — produces nothing at all,
+    so do not emit one. There is no "notes" or "aside" block: put the content in
+    a paragraph or drop it.
 
    SHOW THE DATA. A comparison the reader has to hold in their head is a
    comparison they will not trust. When you have numbers, prefer a block
    over prose describing them:
 
-     {"type": "chart", "chart": "bar", "title": "Recall at scale",
+     {"type": "chart", "kind": "bar", "title": "Recall at scale",
       "categories": ["1M", "10M", "100M"],
       "series": [{"name": "IVF", "data": [94, 91, 82]},
                  {"name": "HNSW", "data": [96, 97, 95]}],
       "caption": "Illustrative figures."}
 
-   `chart` is one of `bar`, `line` or `pie`. It renders as a real vector
+   `kind` is one of `bar`, `line` or `pie`. It renders as a real vector
    chart in a PDF and as a native, editable chart in a deck. Only plot
    numbers you actually have — an invented series is worse than no chart.
    A `table` beside the chart is good when the exact values matter.

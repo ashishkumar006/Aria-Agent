@@ -1,12 +1,13 @@
 """
 MCP server for EAGV3 Session 9 (carried forward from Session 7).
 
-38 tools, stdio transport:
+stdio transport. The authoritative tool list is the @mcp.tool() definitions
+below; the most-used ones:
     web_search, fetch_url, verify_citations,
     arxiv_search, wikipedia_search, openalex_search, news_search,
     fetch_pdf, extract_tables, wayback_fetch,
-    read_file, list_dir, create_file, update_file, edit_file,
-    delete_file, search_files,
+    read_file, list_dir, create_file, make_dir, update_file, edit_file,
+    delete_file, search_files, run_command, run_checks,
     index_document, search_knowledge,
     send_telegram, send_email, create_calendar_event, calendar_query,
     computer_action,
@@ -40,9 +41,11 @@ File tools are sandboxed under ./sandbox/. Run:  python mcp_server.py
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -60,9 +63,10 @@ for _s in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
         pass
 del _s
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+import code_intel as _code_intel
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -73,6 +77,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 import artifacts as _artifacts  # noqa: E402
 import memory as _memory  # noqa: E402
+import sandbox as _sandbox  # noqa: E402
 
 MAX_SEARCH_RESULTS = 5  # hard cap — Tavily prices per result
 
@@ -80,8 +85,12 @@ load_dotenv(Path(__file__).parent / ".env")
 
 mcp = FastMCP("eagv3-s9-server")
 
-SANDBOX = Path(__file__).parent / "sandbox"
-SANDBOX.mkdir(exist_ok=True)
+# Default is the scratch dir beside this file, but the coding agent must work
+# in the USER'S project, not an empty sandbox: /api/code/agent spawns this
+# server with ARIA_SANDBOX pointing at the project root (see
+# mcp_runner.run_with_tools). Every other skill keeps the default.
+SANDBOX = Path(os.environ.get("ARIA_SANDBOX") or (Path(__file__).parent / "sandbox"))
+SANDBOX.mkdir(parents=True, exist_ok=True)
 
 # NOTE: web-search usage accounting (Tavily monthly cap) moved to the
 # gateway with the search logic (integrations/websearch.py). Nothing here
@@ -94,6 +103,75 @@ def _safe(path: str) -> Path:
     if p != base and base not in p.parents:
         raise ValueError(f"Path '{path}' escapes the sandbox")
     return p
+
+
+#: Vendored / build directories pruned from a walk, in place, so a repo-wide
+#: search neither pays to stat tens of thousands of `node_modules` entries nor
+#: reports a definition from inside a dependency.
+_VENDOR_DIRS = {
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist",
+    "build", "out", ".next", ".nuxt", ".cache", ".tox", "site-packages",
+    ".idea", ".vscode", "target", "vendor", "coverage", "htmlcov",
+}
+
+
+def _is_secret_file(name: str) -> bool:
+    """Credential-shaped files the tools never list, search, read or edit.
+
+    A workspace can legitimately contain an .env; the tools must not ship its
+    keys to whichever model is driving the session, in a search hit or a
+    read_file result. `.env.example` is documentation, not a secret, and
+    stays visible - every other `.env.*` variant is treated as secret.
+
+    The predicate lives in code_intel so repo-wide symbol scans
+    (`find_references`, `blast_radius`) apply exactly the same rule; a second
+    copy here is how those two tools ended up reading what read_file blocked.
+    """
+    return _code_intel.is_secret_name(name)
+
+
+def _refuse_secret(p: Path) -> None:
+    """Raise for a credential-shaped target. Used by every write tool."""
+    if _is_secret_file(p.name):
+        raise ValueError(
+            f"refusing to modify '{p.name}': credential-shaped files are "
+            "never read, listed, searched or written by tools")
+
+
+def _walk_files(root: Path):
+    """Every regular file under `root` (or `root` itself if it is a file).
+
+    Deliberately `os.walk`, not `Path.rglob`. A repo root can hold a dangling
+    junction or a symlink to a removed target — this project has one at
+    `build_llm_deck/node_modules` — and `rglob` calls `scandir` on it and raises
+    `FileNotFoundError [WinError 3]`, which aborted the ENTIRE search. So a
+    repo-wide `search_files` / `find_symbol` from the root returned nothing at
+    all, and a tool-driven model looped to its hop cap hunting a symbol that
+    was right there. `os.walk` ignores scandir errors (default `onerror`) and,
+    with `followlinks=False`, does not descend into links, so one bad entry
+    cannot take a search down.
+    """
+    if root.is_file():
+        if not _is_secret_file(root.name):
+            yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(
+            root, onerror=lambda _e: None, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in _VENDOR_DIRS]
+        for fn in sorted(filenames):
+            if _is_secret_file(fn):
+                continue
+            yield Path(dirpath) / fn
+
+
+#: Per-call ceiling for `read_file`, kept under mcp_runner's 32 KB message cap
+#: so a full page plus its metadata still arrives whole rather than being cut
+#: again in transit. A file larger than this is returned in pages that each
+#: name the next `offset` — the alternative, returning the whole thing and
+#: letting the runner clip it, is what made the model re-read the same head
+#: over and over.
+_READ_FILE_MAX_CHARS = 24_000
 
 
 # ── untrusted-content neutraliser ───────────────────────────────────────────
@@ -1149,6 +1227,7 @@ def delete_file(path: str) -> dict:
     directories (list first, delete contents explicitly). Example:
     delete_file("draft.txt")."""
     p = _safe(path)
+    _refuse_secret(p)
     if not p.exists():
         raise ValueError(f"File '{path}' does not exist")
     if p.is_dir():
@@ -1162,13 +1241,18 @@ def delete_file(path: str) -> dict:
 
 
 @mcp.tool()
-def search_files(pattern: str, path: str = ".", max_hits: int = 20) -> dict:
-    """Regex-search file contents inside the sandbox (the coder skill's
-    grep). Skips binary files; caps hits. Example:
-    search_files("def fetch_", ".", 10)."""
+def search_files(pattern: str, path: str = ".", max_hits: int = 20,
+                 include: str = "", ignore_case: bool = False) -> dict:
+    """Regex-search file contents inside the sandbox (this is the grep).
+
+    Skips binary files; caps hits. `include` is an fnmatch glob to scope the
+    search to matching files, e.g. "*.py" or "*test*"; empty means every file.
+    `ignore_case` makes the match case-insensitive. Example:
+    search_files("def fetch_", ".", 10, "*.py")."""
     import re as _re
+    import fnmatch as _fnmatch
     try:
-        rx = _re.compile(pattern)
+        rx = _re.compile(pattern, _re.IGNORECASE if ignore_case else 0)
     except _re.error as e:
         raise ValueError(f"bad regex {pattern!r}: {e}")
     try:
@@ -1178,33 +1262,41 @@ def search_files(pattern: str, path: str = ".", max_hits: int = 20) -> dict:
     root = _safe(path)
     if not root.exists():
         raise ValueError(f"Path '{path}' does not exist")
+    glob = str(include or "").strip()
     hits = []
     files_scanned = 0
-    todo = [root] if root.is_dir() else [root.parent]
-    only = None if root.is_dir() else {root.name}
-    for base in todo:
-        for f in sorted(base.rglob("*")):
-            if len(hits) >= n or files_scanned > 2000:
-                break
-            if not f.is_file() or (only and f.name not in only):
-                continue
+    # One resilient walk (see _walk_files): a bad link under a vendored dir
+    # must not abort the whole search.
+    for f in _walk_files(root):
+        if len(hits) >= n or files_scanned > 2000:
+            break
+        if not f.is_file():
+            continue
+        if glob:
             try:
-                if f.stat().st_size > 1_000_000:
-                    continue
-                text = f.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue  # binary or unreadable — skip, don't fail
-            files_scanned += 1
-            for i, line in enumerate(text.splitlines(), 1):
-                if rx.search(line):
-                    try:
-                        rel = str(f.relative_to(_safe(".")))
-                    except ValueError:
-                        rel = f.name
-                    hits.append({"file": rel, "line": i,
-                                 "text": line.strip()[:300]})
-                    if len(hits) >= n:
-                        break
+                rel = f.relative_to(root).as_posix()
+            except ValueError:
+                rel = f.name
+            if not (_fnmatch.fnmatch(f.name, glob)
+                    or _fnmatch.fnmatch(rel, glob)):
+                continue
+        try:
+            if f.stat().st_size > 1_000_000:
+                continue
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue  # binary or unreadable — skip, don't fail
+        files_scanned += 1
+        for i, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                try:
+                    rel = str(f.relative_to(_safe(".")))
+                except ValueError:
+                    rel = f.name
+                hits.append({"file": rel, "line": i,
+                             "text": line.strip()[:300]})
+                if len(hits) >= n:
+                    break
     return {"pattern": pattern, "hits": hits, "n_hits": len(hits),
             "files_scanned": files_scanned,
             "truncated": len(hits) >= n or files_scanned > 2000}
@@ -1321,13 +1413,55 @@ def read_artifact(artifact_id: str, offset: int = 0,
 
 
 @mcp.tool()
-def read_file(path: str) -> dict:
-    """Read a UTF-8 text file from the sandbox. Example: read_file("notes.txt")."""
+def read_file(path: str, offset: int = 1, limit: int = 0) -> dict:
+    """Read a UTF-8 text file from the sandbox, optionally a line range.
+
+    `offset` is the first line (1-based); `limit` is how many lines, 0 meaning
+    "to the end". A large file is capped and the result says so via
+    `truncated` / `next_offset`, so page with `read_file(path, next_offset)`
+    instead of re-reading the same head. `line_count` is the whole file's
+    length, so you can jump straight to a line you saw in a search hit.
+
+    Example: read_file("agent_server.py", 3920, 20).
+    """
     p = _safe(path)
-    text = p.read_text(encoding="utf-8")
+    if _is_secret_file(p.name):
+        raise ValueError(
+            f"'{path}' is a secret file (.env-style) and is never read")
+    raw = p.read_text(encoding="utf-8")
+    lines = raw.splitlines(keepends=True)
+    total = len(lines)
+    # 1-based, clamped. A model that has just seen "line 3929" should be able to
+    # ask for it and get it, however large the file is.
+    try:
+        off = int(offset) if offset else 1
+    except (TypeError, ValueError):
+        off = 1
+    try:
+        lim = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        lim = 0
+    start = max(0, min(off - 1, total))
+    sel = lines[start:] if lim <= 0 else lines[start:start + max(0, lim)]
+    text = "".join(sel)
+    truncated = False
+    if len(text) > _READ_FILE_MAX_CHARS:
+        # Cut on a line boundary: a half-line would misreport line numbers and
+        # invites the model to paste a broken snippet.
+        cut = text[:_READ_FILE_MAX_CHARS]
+        nl = cut.rfind("\n")
+        text = cut[:nl + 1] if nl > 0 else cut
+        truncated = True
+    end_line = start + text.count("\n")   # last line fully included
     return {
         "path": path,
         "size_bytes": p.stat().st_size,
+        "line_count": total,
+        "start_line": start + 1,
+        "end_line": end_line,
+        "returned_lines": text.count("\n") + (0 if text.endswith("\n") else 1),
+        "truncated": truncated,
+        "next_offset": (end_line + 1) if truncated else None,
         "content": text,
         "encoding": "utf-8",
     }
@@ -1346,6 +1480,8 @@ def list_dir(path: str = ".") -> dict:
     entries = []
     names: list[str] = []
     for child in sorted(p.iterdir()):
+        if not child.is_dir() and _is_secret_file(child.name):
+            continue
         is_dir = child.is_dir()
         entries.append({
             "name": child.name,
@@ -1367,6 +1503,98 @@ def list_dir(path: str = ".") -> dict:
 
 _CHECK_TIMEOUT_S = 180
 _CHECK_OUTPUT_CAP = 24_000
+_RUN_OUTPUT_CAP = 64_000
+
+#: Commands the shell must never run, even when the operator has enabled
+#: auto-approve. This is a guard-rail, not a jail: it stops the
+#: credential-read and machine-destruction shapes a model actually emits,
+#: while `sandbox.py` provides the resource boundary. Anything genuinely
+#: dangerous the list misses is still visible in the audit log and was
+#: approval-gated in manual mode.
+_DANGEROUS_COMMANDS = [
+    (re.compile(r"\bformat\s+[a-z]:", re.I), "format a drive"),
+    (re.compile(r"\bdiskpart\b", re.I), "diskpart"),
+    (re.compile(r"\bbcdedit\b", re.I), "boot configuration"),
+    (re.compile(r"\bshutdown(\.exe)?\s+[/-]", re.I),
+     "shut down or restart the machine"),
+    (re.compile(r"\b(Restart-Computer|Stop-Computer)\b", re.I),
+     "shut down or restart the machine"),
+    (re.compile(r"\breg\s+delete\b", re.I), "delete registry keys"),
+    (re.compile(r"\b(net\s+user|New-LocalUser|Add-LocalGroupMember)\b", re.I),
+     "change local accounts"),
+    (re.compile(r"\b(Set|Add)-MpPreference\b", re.I), "change Defender"),
+    (re.compile(r"\b(Remove-Item|rd|rmdir|del)\b[^\n]*\b[a-zA-Z]:\\", re.I),
+     "delete by absolute path"),
+    (re.compile(r"\b(Remove-Item|rm|ri|erase|rmdir|rd|del)\b[^\n]*\s[/\\]\s*$",
+                re.I), "delete a drive root"),
+    (re.compile(r"\b(rm|ri|erase|rmdir|rd|del)\b[^\n]*"
+                r"(\s-(r|f|rf|recurse|force)\b|/[fsq]\b)", re.I),
+     "delete recursively or forcibly"),
+    (re.compile(r"(^|[\s\"'=;|&(])\.\.([\\/]|$)", re.I),
+     "traverse outside the workspace"),
+    (re.compile(r"\btaskkill\b[^\n]*/im\b", re.I), "kill processes by name"),
+    (re.compile(r"\bStop-Process\b", re.I), "kill processes"),
+    (re.compile(r"\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|"
+                r"(checkout|restore)\s+--\s+\.)", re.I),
+     "discard uncommitted work"),
+    (re.compile(r"\bgit\s+push\b[^\n]*--force", re.I), "force-push"),
+    (re.compile(r"\b(Invoke-Expression|iex)\b[^\n]*DownloadString", re.I),
+     "execute downloaded code"),
+    (re.compile(r"\bSet-ExecutionPolicy\b", re.I), "change execution policy"),
+    (re.compile(r"(\$env:(USERPROFILE|APPDATA|LOCALAPPDATA)|\$HOME\b|~[\\/])",
+                re.I), "reach into the user profile"),
+    (re.compile(r"\.env(?!\.example)\b|\bid_rsa\b|\.ssh\b|\.aws\b|"
+                r"\.config[\\/]gcloud", re.I), "read credential-shaped files"),
+    (re.compile(r"\$env:[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I),
+     "read a credential environment variable"),
+    (re.compile(r"(?i)(?<![a-z])(hklm|hkcu|registry)::?\\"), "registry access"),
+    (re.compile(r"\\\\[a-z0-9._-]+\\", re.I), "UNC path access"),
+]
+_EXEC_AUDIT = Path(__file__).parent / "state" / "code_exec_audit.jsonl"
+_AUDIT_LOCK = threading.Lock()
+
+
+def _audit_exec(entry: dict) -> None:
+    """Append one JSON line, best-effort: auditing must never fail a command."""
+    try:
+        _EXEC_AUDIT.parent.mkdir(parents=True, exist_ok=True)
+        with _AUDIT_LOCK:
+            try:
+                if _EXEC_AUDIT.stat().st_size > 5 * 1024 * 1024:
+                    _EXEC_AUDIT.replace(_EXEC_AUDIT.with_suffix(".jsonl.1"))
+            except OSError:
+                pass
+            with _EXEC_AUDIT.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _refuse_command(command: str, root: Path) -> str:
+    """Return a refusal reason, or '' when the command may run."""
+    for rx, why in _DANGEROUS_COMMANDS:
+        if rx.search(command):
+            return f"refused: {why} is not allowed through this tool"
+    # Drive-qualified paths are allowed only under the workspace. Checking the
+    # literal path is deliberately conservative: it is better to ask the model
+    # for a relative path than to hand it C:\Users.
+    base = str(root.resolve()).lower().rstrip("\\")
+    for m in re.finditer(r"(?i)\b([a-z]:\\[^\s\"'|;>)]*)", command):
+        raw = m.group(1).rstrip("\\").lower()
+        if raw == base or raw.startswith(base + "\\"):
+            continue
+        return ("refused: absolute paths outside the workspace are not "
+                "allowed; use a path relative to cwd")
+    return ""
+
+#: The check subprocess inherits this server's environment, which was spawned
+#: with the operator's real one - including every key loaded from .env. The
+#: agent can trigger run_checks, so a test script must not be able to read
+#: those keys; drop credential-shaped names and this app's own ARIA_* config.
+#: The scrub lives in sandbox.py so run_command gets exactly the same one.
+def _check_env() -> dict:
+    """A scrubbed environment for the project's own commands."""
+    return _sandbox.clean_env()
 
 # Detected from what the project actually contains, not from a language guess.
 # Each entry: (marker file, resolved executable name, argv AFTER that exe).
@@ -1404,13 +1632,19 @@ def run_checks(path: str = ".", timeout: int = 0) -> dict:
     what to fix, and a check you did not run tells you nothing. `ok` is true
     only when the command exited 0.
 
-    `target` narrows the run to one command when a project has several (e.g.
-    "tsc" or "pytest"). Example: run_checks(".", "tsc")."""
+    `path` may name a FILE - the project it lives in is the scope, which is
+    what "run the checks after editing this file" means. `timeout` is seconds
+    (10-900; 0 uses the 180s default).
+    Example: run_checks(".")"""
     import shlex
     import shutil
-    import subprocess
 
     root = _safe(path or ".")
+    if root.is_file():
+        # Callers legitimately hand in the file they just edited; the checks
+        # run against its project directory. Without this the tool answered
+        # "'x.py' is not a directory" and a model in a loop just tried again.
+        root = root.parent
     if not root.is_dir():
         return {"ok": False, "error": f"'{path}' is not a directory"}
 
@@ -1448,27 +1682,29 @@ def run_checks(path: str = ".", timeout: int = 0) -> dict:
                                       f"runner is missing from PATH"})
             continue
         argv = f["argv"]
-        try:
-            proc = subprocess.run(argv, cwd=str(root), capture_output=True,
-                                  text=True, timeout=to)
-        except subprocess.TimeoutExpired:
+        res = _sandbox.run(argv, cwd=str(root), timeout_s=to,
+                           env=_check_env(), max_output=_CHECK_OUTPUT_CAP)
+        if res.timed_out:
             all_ok = False
             results.append({"tool": f["tool"], "ok": False, "exit_code": None,
-                            "error": f"timed out after {to}s"})
+                            "error": res.error or f"timed out after {to}s"})
             continue
-        except Exception as e:
+        if res.exit_code is None and res.error:
             all_ok = False
             results.append({"tool": f["tool"], "ok": False, "exit_code": None,
-                            "error": f"{type(e).__name__}: {e}"})
+                            "error": res.error})
             continue
-        out = (proc.stdout or "")[-_CHECK_OUTPUT_CAP:]
-        err = (proc.stderr or "")[-_CHECK_OUTPUT_CAP:]
-        rc = proc.returncode
+        out = res.stdout
+        err = res.stderr
+        rc = res.exit_code
         ok = rc == 0
         all_ok = all_ok and ok
-        results.append({"tool": f["tool"], "ok": ok, "exit_code": rc,
-                        "command": shlex.join(argv[1:]),
-                        "stdout": out, "stderr": err})
+        entry = {"tool": f["tool"], "ok": ok, "exit_code": rc,
+                 "command": shlex.join(argv[1:]),
+                 "stdout": out, "stderr": err}
+        if res.truncated:
+            entry["truncated"] = True
+        results.append(entry)
     return {"ok": all_ok, "path": path,
             "checks_run": len(results),
             "results": results,
@@ -1476,6 +1712,89 @@ def run_checks(path: str = ".", timeout: int = 0) -> dict:
                      "At least one check FAILED - read stdout/stderr, fix the "
                      "cause, and run this again. Do not report the work as "
                      "done until this returns ok.")}
+
+
+@mcp.tool()
+def run_command(command: str, cwd: str = ".", timeout: int = 0) -> dict:
+    """Run a PowerShell command in the workspace and return its real output.
+
+    This is the escape hatch `run_checks` cannot cover: build a specific
+    target, run one failing test, inspect `git` history, install nothing.
+    The command starts in `cwd` (a directory inside the workspace; paths that
+    escape it are refused) and runs non-interactively with the operator's
+    credential-shaped environment variables removed.
+
+    It is bounded: a wall-clock timeout (default 120s, max 600s) kills the
+    whole process tree, output is capped and truncated with a flag, and the
+    child runs in a Windows Job Object / POSIX process group with memory and
+    process limits. A guard also refuses drive-qualified paths outside the
+    workspace, profile/credential paths, registry access, and
+    machine-destructive commands. That guard is a heuristic, not a kernel
+    jail: network access and commands it does not recognise are still
+    possible, which is why this is approval-gated like a write and every
+    attempt is written to state/code_exec_audit.jsonl. Use the file tools for
+    reading and editing; use this for commands.
+
+    `timeout` is seconds; 0 uses the 120s default. Example:
+    run_command("npm run build", timeout=180)"""
+    import shutil as _shutil
+
+    command = str(command or "").strip()
+    if not command:
+        return {"ok": False, "error": "command is empty"}
+    if len(command) > 20_000:
+        return {"ok": False, "error": "command is longer than 20,000 characters"}
+    shell = _shutil.which("pwsh.exe") or _shutil.which("powershell.exe")
+    if not shell:
+        return {"ok": False,
+                "error": "no PowerShell on PATH (looked for pwsh.exe and "
+                         "powershell.exe)"}
+    try:
+        root = _safe(cwd or ".")
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not root.is_dir():
+        return {"ok": False, "error": f"'{cwd}' is not a directory"}
+
+    audit = {"ts": datetime.now(timezone.utc).isoformat(),
+             "tool": "run_command", "command": command[:4000],
+             "cwd": cwd, "root": str(root)}
+    refusal = _refuse_command(command, root)
+    if refusal:
+        _audit_exec({**audit, "refused": refusal, "ok": False})
+        return {"ok": False, "refused": True, "error": refusal,
+                "command": command[:2000], "cwd": cwd}
+
+    # -EncodedCommand takes base64 UTF-16LE, which sidesteps every quoting
+    # problem an arbitrary PowerShell snippet would otherwise create. The
+    # prologue pins UTF-8 on both sides and propagates the exit code: a
+    # native child's $LASTEXITCODE wins, otherwise $? decides, so "ok" here
+    # means what a terminal would call success.
+    script = (
+        "$ProgressPreference='SilentlyContinue';"
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
+        "$OutputEncoding=[System.Text.UTF8Encoding]::new($false);\n"
+        "& {\n" + command + "\n}\n"
+        "$__aria_ok=$?; $__aria_ec=$LASTEXITCODE;"
+        "if ($null -ne $__aria_ec) { exit $__aria_ec };"
+        "if (-not $__aria_ok) { exit 1 }; exit 0")
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    argv = [shell, "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]
+    to = int(timeout) if timeout else 120
+    to = max(5, min(to, 600))
+    res = _sandbox.run(argv, cwd=str(root), timeout_s=to,
+                       env=_check_env(), max_output=_RUN_OUTPUT_CAP)
+    _audit_exec({**audit, "ok": res.ok, "exit_code": res.exit_code,
+                 "duration_ms": res.duration_ms, "timed_out": res.timed_out,
+                 "truncated": res.truncated, "sandbox": res.backend,
+                 "error": res.error})
+    return {"ok": res.ok, "exit_code": res.exit_code,
+            "stdout": res.stdout, "stderr": res.stderr,
+            "duration_ms": res.duration_ms, "timed_out": res.timed_out,
+            "truncated": res.truncated, "sandbox": res.backend,
+            "shell": Path(shell).name, "cwd": cwd, "command": command[:2000],
+            "error": res.error}
 
 
 @mcp.tool()
@@ -1505,7 +1824,7 @@ def git_inspect(path: str = ".", target: str = "status",
         return {"ok": False, "error": f"'{path}' is not inside a git "
                                       f"repository - nothing to review"}
 
-    argv = [exe, "-C", str(root)]
+    argv = [exe, "--no-pager", "-C", str(root)]
     if t == "status":
         argv += ["status", "--porcelain=v1"]
     elif t == "diff":
@@ -1513,7 +1832,8 @@ def git_inspect(path: str = ".", target: str = "status",
     else:
         argv += ["log", "--oneline", "-n", "20"]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     cap = max(1_000, min(int(max_chars or 20_000), 200_000))
@@ -1550,7 +1870,7 @@ def find_symbol(name: str, path: str = ".", max_hits: int = 40) -> dict:
     defs, uses = [], []
     if not root.exists():
         return {"ok": False, "error": f"'{path}' does not exist"}
-    for f in sorted(root.rglob("*")):
+    for f in _walk_files(root):
         if len(defs) + len(uses) >= n * 2:
             break
         if not f.is_file() or f.suffix.lower() in (
@@ -1577,22 +1897,167 @@ def find_symbol(name: str, path: str = ".", max_hits: int = 40) -> dict:
             "definition_count": len(defs), "usage_count": len(uses)}
 
 
+# --------------------------------------------------------------------------
+# Code intelligence.
+#
+# `find_symbol` above is regex: it cannot tell a definition from a call site,
+# so the same text matched imports, comments and string literals. That is why
+# "update every caller of X" was never safe to ask. These use Python's `ast`
+# for .py and a conservative scanner elsewhere, and report whether the result
+# is exact rather than pretending a guess is a fact.
+#
+# `preview_edit` is the safety primitive: it renders the diff and writes
+# NOTHING. Applying is a separate, explicit call.
+# --------------------------------------------------------------------------
+
+
+@mcp.tool()
+def document_symbols(path: str) -> dict:
+    """The file's outline: classes, functions, methods and constants.
+
+    Use this before editing so you know what is there. For Python the outline
+    comes from `ast` and is exact; other languages get a conservative keyword
+    scan, and `exact` says which you got.
+
+    Example: document_symbols("skills.py")"""
+    try:
+        p = _safe(path)
+        _refuse_secret(p)
+        return _code_intel.document_symbols(str(p))
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "file": path, "symbols": []}
+
+
+@mcp.tool()
+def find_references(name: str, path: str = ".", max_hits: int = 200) -> dict:
+    """Every USE of a symbol, with its declaration reported separately.
+
+    Unlike a text search this EXCLUDES occurrences inside docstrings, comments
+    and string literals - counting those is how an agent ends up "renaming"
+    its own documentation. The declaration comes back under `definitions`;
+    everything else under `references`.
+
+    Example: find_references("ensure_authoring_research", ".")"""
+    try:
+        p = _safe(path)
+        if p.is_file():
+            _refuse_secret(p)
+        r = _code_intel.find_references(name, str(p), max_hits=max_hits)
+        r["exact"] = bool(r.get("exact"))
+        return r
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "symbol": name, "references": [], "definitions": []}
+
+
+@mcp.tool()
+def blast_radius(name: str, path: str = ".", max_files: int = 50) -> dict:
+    """What a change to this symbol would touch, grouped by file and ranked.
+
+    Ask this BEFORE editing anything shared. `risk` is low/medium/high by how
+    many files are involved, and `blast` lists the files in descending order of
+    how many references each has - the ones at the top are what your change is
+    most likely to break.
+
+    Example: blast_radius("run_skill", "S9SharedCode/code")"""
+    try:
+        p = _safe(path)
+        if p.is_file():
+            _refuse_secret(p)
+        return _code_intel.blast_radius(name, str(p), max_files=max_files)
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "symbol": name, "blast": []}
+
+
+@mcp.tool()
+def preview_edit(path: str, name: str, code: str,
+                 mode: str = "replace") -> dict:
+    """Render a symbol edit as a diff. WRITES NOTHING.
+
+    This is the safe way to propose a change: see the exact patch first, then
+    call `apply_symbol_edit` to commit it. `mode` is `replace` (swap the whole
+    body of `name`) or `insert_after` (add `code` just after it).
+
+    Addressing the target BY NAME means you never compute line:column, so a
+    file that shifted since you read it cannot make you edit the wrong
+    function.
+
+    Example: preview_edit("app.py", "main", "def main():\\n    print('hi')")"""
+    try:
+        p = _safe(path)
+        _refuse_secret(p)
+        ch = _code_intel.preview(str(p), name, code, mode=mode)
+        return {
+            "ok": bool(ch.after or not ch.before),
+            "path": ch.path,
+            "mode": ch.kind,
+            "detail": ch.detail,
+            "notes": ch.notes,
+            "diff": _code_intel.diff_for(ch),
+            "applied": False,
+        }
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "applied": False, "diff": ""}
+
+
+@mcp.tool()
+def apply_symbol_edit(path: str, name: str, code: str,
+                      mode: str = "replace") -> dict:
+    """Apply a symbol edit that `preview_edit` showed you.
+
+    Same arguments and semantics, but this one WRITES. Always preview first:
+    the diff is the only way to see that you changed the intended symbol.
+
+    Example: apply_symbol_edit("app.py", "main", "def main(): pass")"""
+    try:
+        p = _safe(path)
+        _refuse_secret(p)
+        ch = _code_intel.preview(str(p), name, code, mode=mode)
+        if not ch.before and not ch.after:
+            return {"ok": False, "error": ch.detail, "applied": False}
+        out = _code_intel.apply_change(ch)
+        out["detail"] = ch.detail
+        out["applied"] = bool(out.get("written"))
+        return out
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "applied": False}
+
+
 @mcp.tool()
 def create_file(path: str, content: str) -> dict:
-    """Create a new file in the sandbox; errors if it exists. Example: create_file("hello.txt", "hi")."""
+    """Create a new file in the sandbox; errors if it exists. Missing parent folders are created. Example: create_file("src/hello.txt", "hi")."""
     p = _safe(path)
+    _refuse_secret(p)
     if p.exists():
         raise ValueError(f"File '{path}' already exists")
-    if not p.parent.exists():
-        raise ValueError(f"Parent directory of '{path}' does not exist")
+    # Parents are made here rather than demanded of the model: writing
+    # "src/new/mod.py" without a prior mkdir is the natural edit, and the
+    # strict parent check it replaced turned every such write into a dead end
+    # (the model had no tool to create a folder at all).
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return {"ok": True, "path": path, "size_bytes": p.stat().st_size}
+
+
+@mcp.tool()
+def make_dir(path: str) -> dict:
+    """Create a directory in the sandbox, including missing parents; succeeds if it already exists. Example: make_dir("data/raw")."""
+    p = _safe(path)
+    _refuse_secret(p)
+    created = not p.exists()
+    p.mkdir(parents=True, exist_ok=True)
+    return {"ok": True, "path": path, "created": created}
 
 
 @mcp.tool()
 def update_file(path: str, content: str) -> dict:
     """Overwrite an existing sandbox file. Example: update_file("hello.txt", "new body")."""
     p = _safe(path)
+    _refuse_secret(p)
     if not p.exists():
         raise ValueError(f"File '{path}' does not exist")
     p.write_text(content, encoding="utf-8")
@@ -1603,6 +2068,7 @@ def update_file(path: str, content: str) -> dict:
 def edit_file(path: str, find: str, replace: str, replace_all: bool = False) -> dict:
     """Find-and-replace inside a sandbox file. Example: edit_file("hello.txt", "foo", "bar")."""
     p = _safe(path)
+    _refuse_secret(p)
     text = p.read_text(encoding="utf-8")
     count = text.count(find)
     if count == 0:
@@ -2143,8 +2609,14 @@ def schedule_task(query: str, when: str, conversation_id: str = "",
     """Schedule a task/reminder to run at a future time, optionally notifying
     the user over a chat channel — including BEFORE it runs.
 
-    `when` accepts natural language ('in 1h', 'tomorrow 9am', 'daily@09:00')
-    or an ISO datetime.
+    `when` accepts natural language ('in 1h', 'tomorrow 9am', 'today 14:30',
+    '2:30pm', 'daily@09:00') or an ISO datetime.
+
+    When the user names a clock time ('remind me at 9am'), pass exactly that
+    time — '9am', or 'today 9am' — NEVER a relative delay you computed
+    yourself. If the time has already passed today the tool refuses and says
+    so; the right answer then is to schedule 'tomorrow 9am' or ask the user
+    which day they meant, not to silently shift the reminder.
 
     Notification arguments (all optional; without them the task just runs and
     records locally, which is what it always did):
@@ -2241,7 +2713,8 @@ def schedule_task(query: str, when: str, conversation_id: str = "",
         # up or scheduled a second copy.
         return {"ok": False, "error": str(e),
                 "accepted_when": ["in 30m", "in 1h", "tomorrow 9am",
-                                  "daily@09:00", "every 30m",
+                                  "today 14:30", "2:30pm", "daily@09:00",
+                                  "every 30m",
                                   "an ISO datetime or epoch seconds in the "
                                   "FUTURE"]}
     except Exception as e:

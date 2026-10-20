@@ -15,6 +15,7 @@ re-exports the V9 `LLM` client and a module-level `embed()` helper.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -178,6 +179,97 @@ class _RoutedLLM:
             response_format=response_format, auto_route=auto_route,
             agent=agent, session=session,
         )
+
+    async def stream_chat(self, *, messages, tools=None, tool_choice="auto",
+                          provider: str = None, model: str = None,
+                          max_tokens=2048, temperature=0.7,
+                          agent=None, session=None):
+        """Stream /v1/chat and yield events as they arrive.
+
+        Async on purpose: it runs on the caller's event loop, so a callback that
+        touches an asyncio.Queue (the streaming endpoint does) is safe. An
+        earlier sync-generator design iterated inside a worker thread and put
+        onto that queue from the wrong thread.
+
+        Yields plain dicts:
+          {"type": "text", "text": <delta>}            - one per token group
+          {"type": "tool_calls", "tool_calls": [...]}  - once, before "done"
+          {"type": "done", "provider": <name>}
+
+        Tool calls arrive from the gateway as OpenAI streaming fragments
+        (partial JSON keyed by index), so they are accumulated here and only
+        handed out whole; the loop never sees a half-built call.
+        """
+        body = {
+            "messages": messages, "stream": True,
+            "max_tokens": max_tokens, "temperature": temperature,
+            "provider": provider or _DEFAULT_PROVIDER,
+            "model": model or _DEFAULT_MODEL,
+            "agent": agent, "session": session,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = tool_choice or "auto"
+        headers = {"Content-Type": "application/json"}
+        tok = _gateway_token()
+        if tok:
+            headers["X-Gateway-Token"] = tok
+        acc: dict[int, dict] = {}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as c:
+            async with c.stream("POST", f"{GATEWAY_URL}/v1/chat", json=body,
+                                headers=headers) as r:
+                if r.status_code != 200:
+                    raw = (await r.aread()).decode("utf-8", "ignore")[:300]
+                    raise RuntimeError(f"gateway HTTP {r.status_code}: {raw}")
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        d = json.loads(line[6:])
+                    except Exception:
+                        continue
+                    if d.get("error"):
+                        raise RuntimeError(str(d["error"])[:300])
+                    if d.get("delta"):
+                        yield {"type": "text", "text": str(d["delta"])}
+                    if d.get("reasoning_delta"):
+                        # The model's reasoning, on its own channel. The panel
+                        # renders it collapsed; it is never part of the answer.
+                        yield {"type": "thinking", "text": str(d["reasoning_delta"])}
+                    frag = d.get("tool_call_delta")
+                    if frag:
+                        try:
+                            pieces = json.loads(frag)
+                        except Exception:
+                            pieces = []
+                        for pc in (pieces if isinstance(pieces, list) else []):
+                            idx = int(pc.get("index") or 0)
+                            slot = acc.setdefault(
+                                idx, {"id": "", "name": "", "arguments": ""})
+                            if pc.get("id"):
+                                slot["id"] = pc["id"]
+                            fn = pc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["arguments"] += fn["arguments"]
+                    if d.get("done"):
+                        yield {"type": "done",
+                               "provider": d.get("provider") or ""}
+        if acc:
+            calls = []
+            for idx in sorted(acc):
+                slot = acc[idx]
+                raw_args = slot["arguments"].strip()
+                try:
+                    parsed = json.loads(raw_args) if raw_args else {}
+                except Exception:
+                    parsed = {}
+                calls.append({"id": slot["id"] or f"call_{idx}",
+                              "name": slot["name"],
+                              "arguments": parsed if isinstance(parsed, dict) else {},
+                              "provider_meta": None})
+            yield {"type": "tool_calls", "tool_calls": calls}
 
     def vision(self, image, prompt, *, system=None, provider: str = None,
                model: str = None, max_tokens=800, temperature: float = 0.0,

@@ -6,13 +6,30 @@
  * single instance, handles aria:// deep links, and kills its children
  * on quit. Static console pages keep working in any browser in parallel.
  */
-const { app, BrowserWindow, Menu, Tray, globalShortcut, shell, Notification, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, Tray, nativeImage, globalShortcut, shell, Notification, ipcMain, nativeTheme } = require('electron');
 const { spawn } = require('child_process');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
 
-const ROOT = path.resolve(__dirname, '..');
+// In the repo the app sits at agent-desktop/ and the backends are its
+// siblings. In a packaged portable build it runs from
+// dist\Aria\resources\app, so a pointer file next to Aria.exe names the
+// repository it should drive. A packaged app without that pointer logs the
+// fallback and shows the boot splash's manual commands rather than pretending
+// it can find the services.
+const ROOT = (() => {
+  if (app.isPackaged) {
+    try {
+      const pointer = path.join(path.dirname(process.execPath), 'aria-root.txt');
+      const target = fs.readFileSync(pointer, 'utf8').trim();
+      if (target && fs.existsSync(path.join(target, 'S9SharedCode'))) {
+        return target;
+      }
+    } catch (e) { /* fall through */ }
+  }
+  return path.resolve(__dirname, '..');
+})();
 const GATEWAY_DIR = path.join(ROOT, 'llm_gatewayV9');
 const AGENT_DIR = path.join(ROOT, 'S9SharedCode', 'code');
 const AGENT_URL = process.env.ARIA_AGENT_URL || 'http://localhost:8500/console';
@@ -192,7 +209,8 @@ function handleDeepLink(url) {
   if (!url || !url.startsWith('aria://')) return;
   const page = url.replace('aria://', '').split('/')[0] || 'chat';
   const known = { chat: 'console', runs: 'runs', memory: 'memory', research: 'research',
-    scheduler: 'scheduler', apps: 'apps',
+    scheduler: 'scheduler', apps: 'apps', code: 'code', authoring: 'authoring',
+    documents: 'documents', parts: 'parts',
     skills: 'skills', ledger: 'ledger', console: 'mission', settings: 'settings' };
   const target = 'http://localhost:8500/' + (known[page] || 'console');
   if (win) {
@@ -200,6 +218,43 @@ function handleDeepLink(url) {
     if (win.isMinimized()) win.restore();
     win.focus();
   }
+}
+
+// Page zoom. Chromium's own Ctrl+plus/minus/0 shortcuts are not wired up in a
+// BrowserWindow unless an application menu exposes them, and with the menu
+// hidden the window had no way to zoom at all. Handle the keys directly on the
+// webContents so they work no matter which element has focus, and expose the
+// same three actions through the hidden menu for discoverability.
+const MIN_ZOOM_LEVEL = -3;
+const MAX_ZOOM_LEVEL = 5;
+
+function applyZoom(wc, delta) {
+  if (!wc || wc.isDestroyed()) return;
+  if (delta === 0) {
+    wc.setZoomLevel(0);
+    return;
+  }
+  const current = wc.getZoomLevel();
+  const next = Math.max(MIN_ZOOM_LEVEL, Math.min(MAX_ZOOM_LEVEL, current + delta));
+  wc.setZoomLevel(next);
+}
+
+function bindZoom(wc) {
+  wc.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || input.alt) return;
+    if (!input.control && !input.meta) return;
+    const key = input.key;
+    if (key === '+' || key === '=') {
+      event.preventDefault();
+      applyZoom(wc, 1);
+    } else if (key === '-' || key === '_') {
+      event.preventDefault();
+      applyZoom(wc, -1);
+    } else if (key === '0') {
+      event.preventDefault();
+      applyZoom(wc, 0);
+    }
+  });
 }
 
 async function createWindow() {
@@ -236,7 +291,13 @@ async function createWindow() {
     // on every page for no gain. The accelerators still work either way.
     autoHideMenuBar: true,
     backgroundColor: '#090909',
+    // Created hidden and shown on `ready-to-show` (below): without this the
+    // window appears a beat before its first paint, so a cold launch flashed a
+    // bare frame over the desktop before the splash or the console drew.
+    show: false,
     title: 'Aria',
+    icon: fs.existsSync(path.join(__dirname, 'icon.png'))
+      ? path.join(__dirname, 'icon.png') : undefined,
     // Drop the Windows title bar and draw our own ~34px strip (see the
     // `aria-dragbar` rule in console-frontend/src/index.css). `hidden` keeps
     // the frame's resize borders; `hiddenInset` is macOS-only. minWidth/
@@ -253,6 +314,13 @@ async function createWindow() {
       sandbox: true,
     },
   });
+
+  bindZoom(win.webContents);
+
+  // The window was created with `show: false`. `ready-to-show` fires once the
+  // first frame has painted, so showing here means the user never sees an empty
+  // window — only the boot splash or the console itself.
+  win.once('ready-to-show', () => { if (win && !win.isDestroyed()) win.show(); });
 
   const ok = await healthy(AGENT_BASE + '/api/health');
   await win.loadURL(ok ? AGENT_URL : errorPage());
@@ -283,6 +351,14 @@ async function createWindow() {
 
   const submenu = [
     { label: 'Reload console', accelerator: 'CmdOrCtrl+R', click: () => win && win.reload() },
+    { type: 'separator' },
+    { label: 'Zoom in', accelerator: 'CmdOrCtrl+Plus',
+      click: () => win && applyZoom(win.webContents, 1) },
+    { label: 'Zoom out', accelerator: 'CmdOrCtrl+-',
+      click: () => win && applyZoom(win.webContents, -1) },
+    { label: 'Actual size', accelerator: 'CmdOrCtrl+0',
+      click: () => win && applyZoom(win.webContents, 0) },
+    { type: 'separator' },
     { label: 'Open gateway dashboard', click: () => shell.openExternal('http://localhost:8109/') },
   ];
   if (!app.isPackaged) {
@@ -302,9 +378,29 @@ async function createWindow() {
 }
 
 function setupTray() {
-  // No icon asset yet — tray activates once an icon file ships.
-  // Keeping the hook (no-op) so the wiring point is explicit.
-  tray = null;
+  // A tray icon keeps the app in reach when the window is minimized, which is
+  // the difference between "a browser tab in a frame" and a desktop app.
+  const iconPath = path.join(__dirname, 'icon.png');
+  if (!fs.existsSync(iconPath)) return;
+  try {
+    tray = new Tray(nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 }));
+    tray.setToolTip('Aria');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Open Aria', click: () => { if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); } } },
+      { label: 'Open Code', click: () => handleDeepLink('aria://code') },
+      { type: 'separator' },
+      { label: 'Quit', role: 'quit' },
+    ]));
+    tray.on('click', () => {
+      if (!win) return;
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    });
+  } catch (e) {
+    log('tray failed: ' + e.message);
+    tray = null;
+  }
 }
 
 // Keep-warm: a tiny HEAD ping every 20s stops the servers' event loops
@@ -341,6 +437,12 @@ if (!gotLock) {
   });
 
   app.whenReady().then(async () => {
+    // Force dark native chrome. The console draws itself, but the surfaces the
+    // shell does NOT own — context menus, native file/print dialogs and the
+    // overlay scrollbars of anything Chromium renders natively — follow the OS
+    // theme, which on a light Windows desktop means a white flash inside an
+    // otherwise black app.
+    nativeTheme.themeSource = 'dark';
     if (process.platform === 'win32' || process.platform === 'darwin') {
       try { app.setAsDefaultProtocolClient('aria'); } catch (e) { log('protocol failed: ' + e.message); }
     }

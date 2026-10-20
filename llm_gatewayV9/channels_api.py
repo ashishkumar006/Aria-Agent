@@ -49,6 +49,10 @@ ALLOWED_KEYS = frozenset({
     "GEMINI_API_KEYS", "NVIDIA_API_KEYS", "GROQ_API_KEYS",
     "CEREBRAS_API_KEYS", "OPEN_ROUTER_API_KEYS", "GITHUB_ACCESS_TOKENS",
     "KILO_API_KEYS",
+    # Kilo's primary key must be writable too: PROVIDER_POOLS advertises
+    # KILO_API_KEY in /v1/config/keys, so refusing it here made the one key a
+    # user actually has impossible to save from the dashboard.
+    "KILO_API_KEY",
     # gateway mode switch (reversible, localhost-only like the rest)
     "GATEWAY_GEMINI_ONLY",
     # voice model paths (weights live in S9SharedCode, not the gateway dir)
@@ -310,6 +314,27 @@ def _record_inbound(name: str, msg) -> dict:
             "policy": {"verdict": verdict, "rule": rule}}
 
 
+def _attachment_refs(msg, limit: int = 4) -> list[dict]:
+    """Attachment metadata for the agent, from pydantic models or dicts.
+
+    `ChannelMessage.attachments` holds `Attachment` models. Calling `.get`
+    on them raised AttributeError, which killed the forward before it opened
+    a connection: the ledger shows two agent-forward errors at the exact
+    second two files were sent, and the agent never saw the attachment
+    messages at all. Converting through `model_dump` is the one place that
+    difference is handled.
+    """
+    out = []
+    for a in list(getattr(msg, "attachments", None) or [])[:limit]:
+        if hasattr(a, "model_dump"):
+            a = a.model_dump()
+        if not isinstance(a, dict):
+            continue
+        out.append({k: a.get(k) for k in
+                    ("kind", "name", "mime", "size", "file_id")})
+    return out
+
+
 def _forward_to_agent(name: str, msg, paired_as: str) -> dict:
     """Hand an inbound message to the agent, which decides what to do with it.
 
@@ -355,10 +380,7 @@ def _forward_to_agent(name: str, msg, paired_as: str) -> dict:
         # the Documents store by the poller, so the agent only needs to know
         # one exists and what to call it. Inlining the bytes here would put a
         # multi-megabyte blob in a JSON body on the hot path.
-        atts = []
-        for a in list(getattr(msg, "attachments", None) or [])[:4]:
-            atts.append({k: a.get(k) for k in
-                         ("kind", "name", "mime", "size", "file_id")})
+        atts = _attachment_refs(msg)
         r = httpx.post(f"{agent.rstrip('/')}/api/channel/inbound",
                        headers={"X-Aria-Token": tok},
                        json={"channel": name,

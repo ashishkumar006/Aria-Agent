@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { FileText, Upload, RefreshCw, Trash2, Search, Eye, Download } from 'lucide-react';
 import { Rail, TopBar, Empty, Stat, Pill, Skel, SkipLink } from '../components/ui';
 import { useFocusTrap } from '../lib/a11y';
+import { useMainId, useRefreshOnActive, useSectionActive } from '../components/KeepAlive';
 import { api, type DocItem } from '../api';
+
+/* The viewer imports the setup panel's machinery, so it is loaded only when a
+   preview opens rather than on the Documents route. */
+const DocumentViewer = lazy(() =>
+  import('./DocSetup').then((m) => ({ default: m.DocumentViewer })));
+
+/* Formats the gateway can render from the stored bytes. Text-like uploads keep
+   the iframe path because there is no meaningful page image to rasterise. */
+const SERVER_PREVIEW_TYPES = new Set(['pdf', 'docx', 'xlsx']);
 
 /* Statuses the gateway reports. A document may only be ENABLED when it is
    `ready`; anything else means its vectors are incomplete, and enabling it
@@ -18,6 +28,7 @@ const MB = (n: number) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB`
   : n > 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
 export default function Documents() {
+  const mainId = useMainId();
   const [docs, setDocs] = useState<DocItem[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -30,10 +41,11 @@ export default function Documents() {
   const [q, setQ] = useState('');
   const [hits, setHits] = useState<any[] | null>(null);
   const [searching, setSearching] = useState(false);
-  const [preview, setPreview] = useState<{ doc: DocItem; url: string } | null>(null);
+  const [preview, setPreview] = useState<{ doc: DocItem; url?: string } | null>(null);
   const [previewing, setPreviewing] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
   const reqRef = useRef(0);
+  const previewReq = useRef(0);
 
   const load = useCallback(async () => {
     try {
@@ -47,23 +59,35 @@ export default function Documents() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  const active = useSectionActive();
+  useRefreshOnActive(active, load);
   // Indexing runs in the background, so poll until nothing is in flight.
+  // Hidden views stop polling; coming back refreshes immediately (H26).
   useEffect(() => {
+    if (!active) return;
+    if (!docs.length) load();
     const t = setInterval(() => {
       if (docs.some((d) => ['pending', 'parsing', 'chunking', 'embedding'].includes(d.status))) load();
     }, 3000);
     return () => clearInterval(t);
-  }, [docs, load]);
+  }, [active, docs, load]);
 
   const open = async (d: DocItem) => {
+    /* Sequence-guard the detail read. Clicking doc A then doc B fired two
+       requests; if A's slower response landed last it painted A's metadata
+       under B's selected row, and the user acted on the wrong document. */
+    const req = ++reqRef.current;
     setSel(d);
     setDetail(null);
     setNote('');
     try {
       const r = await api.documentDetail(d.id);
+      if (req !== reqRef.current) return;
       setDetail(r.document ?? null);
-    } catch (e) { setNote(String((e as Error)?.message || e)); }
+    } catch (e) {
+      if (req !== reqRef.current) return;
+      setNote(String((e as Error)?.message || e));
+    }
   };
 
   const upload = async (files: FileList | File[]) => {
@@ -137,19 +161,41 @@ export default function Documents() {
     finally { setBusy(''); }
   };
 
-  /* The preview renders the browser's own viewer over a blob URL,
-     so PDFs open inline with page navigation, zoom and download
-     and no extra dependency. Blob URLs must be revoked or the
-     document bytes leak for the life of the page. */
+  /* Open the modal immediately, then let the server render PDF/DOCX/XLSX.
+     The old path downloaded the whole upload before showing anything and
+     handed it to the browser's PDF plugin - a blank frame wherever Electron
+     did not provide that plugin, and a full second copy of every file even
+     when it did. Text-like formats still use a blob because their bytes are
+     what the iframe is meant to display. */
   const previewDoc = async (d: DocItem) => {
+    const req = ++previewReq.current;
+    setNote('');
     setPreviewing(d.id);
+    setPreview((p) => {
+      if (p?.url) URL.revokeObjectURL(p.url);
+      return { doc: d };
+    });
+    if (SERVER_PREVIEW_TYPES.has((d.doc_type || '').toLowerCase())) {
+      setPreviewing('');
+      return;
+    }
     try {
       const blob = await api.documentContent(d.id);
-      setPreview((p) => { if (p) URL.revokeObjectURL(p.url); return null; });
-      setPreview({ doc: d, url: URL.createObjectURL(blob) });
+      if (req !== previewReq.current) return;
+      const url = URL.createObjectURL(blob);
+      setPreview((p) => {
+        if (req !== previewReq.current) { URL.revokeObjectURL(url); return p; }
+        if (p?.url) URL.revokeObjectURL(p.url);
+        return { doc: d, url };
+      });
     } catch (e) {
-      setNote(String((e as Error)?.message || e));
-    } finally { setPreviewing(''); }
+      if (req === previewReq.current) {
+        setPreview(null);
+        setNote(String((e as Error)?.message || e));
+      }
+    } finally {
+      if (req === previewReq.current) setPreviewing('');
+    }
   };
 
   const downloadDoc = async (d: DocItem) => {
@@ -167,7 +213,12 @@ export default function Documents() {
   };
 
   const closePreview = () => {
-    setPreview((p) => { if (p) URL.revokeObjectURL(p.url); return null; });
+    previewReq.current += 1;
+    setPreviewing('');
+    setPreview((p) => {
+      if (p?.url) URL.revokeObjectURL(p.url);
+      return null;
+    });
   };
 
   const search = async () => {
@@ -203,7 +254,7 @@ export default function Documents() {
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Documents">
           <input
             value={q}
@@ -449,16 +500,17 @@ export default function Documents() {
               <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
                 <FileText size={15} className="text-zinc-muted" />
                 <span className="flex-1 truncate text-[14px] font-bold">{preview.doc.filename}</span>
-                <a href={preview.url} download={preview.doc.filename}
+                <button type="button" onClick={() => downloadDoc(preview.doc)}
                   aria-label={`Download ${preview.doc.filename}`}
                   className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400">
                   <Download size={12} className="inline" /> download
-                </a>
+                </button>
                 <button onClick={closePreview} aria-label="Close preview"
                   className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5">×</button>
               </div>
-              {/* Sandboxed, and this is load-bearing rather than cosmetic.
-                  preview.url is a blob: URL, so the document shares this
+              {/* The browser-viewer fallback is sandboxed, and this is
+                  load-bearing rather than cosmetic. preview.url is a blob:
+                  URL, so the document shares this
                   page's own origin — an uploaded .html file would otherwise
                   run with full same-origin privileges, read the
                   `aria-token` meta tag out of the parent document, and issue
@@ -478,9 +530,27 @@ export default function Documents() {
                   not blocked. Dropping `allow-same-origin` breaks PDFs again.
                   DocSetup.tsx and Apps.tsx sandbox differently because they
                   render HTML via srcDoc and a URL, never a blob. */}
-              <iframe src={preview.url} title={`Preview of ${preview.doc.filename}`}
-                sandbox="allow-same-origin" referrerPolicy="no-referrer"
-                className="min-h-0 flex-1 w-full rounded-b-[10px] bg-white" />
+              {SERVER_PREVIEW_TYPES.has((preview.doc.doc_type || '').toLowerCase()) ? (
+                <div className="docview-frame m-3 flex min-h-0 flex-1">
+                  <Suspense fallback={
+                    <div className="p-3 text-[11.5px] text-zinc-muted">loading the preview…</div>
+                  }>
+                    <DocumentViewer source={{
+                      kind: 'document', docId: preview.doc.id,
+                      format: preview.doc.doc_type,
+                      label: preview.doc.filename,
+                    }} />
+                  </Suspense>
+                </div>
+              ) : preview.url ? (
+                <iframe src={preview.url} title={`Preview of ${preview.doc.filename}`}
+                  sandbox="allow-same-origin" referrerPolicy="no-referrer"
+                  className="min-h-0 flex-1 w-full rounded-b-[10px] bg-white" />
+              ) : (
+                <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-[12.5px] text-zinc-muted">
+                  {previewing === preview.doc.id ? 'loading the preview…' : 'No preview available.'}
+                </div>
+              )}
             </div>
           </div>
         )}

@@ -10,9 +10,10 @@ not either is installed.
 Conventions
 -----------
 `signed_volume` is positive for a closed mesh whose triangles wind
-counter-clockwise when viewed from outside. Volume is the divergence-theorem
-sum, not a signed-tetrahedron decomposition, so an open mesh reports the volume
-of whatever it currently encloses (usually meaninglessly small) rather than
+counter-clockwise when viewed from outside. It is the divergence-theorem sum
+measured from the mesh's area-weighted centroid, not from the world origin, so
+it is translation-invariant. An open mesh reports the volume of whatever it
+encloses around that reference (usually meaninglessly small) rather than
 erroring. Callers that care check `watertight` first.
 """
 from __future__ import annotations
@@ -80,8 +81,19 @@ class Geometry:
 
     @property
     def signed_volume(self) -> float:
-        """Enclosed volume; positive when wound outward."""
-        return float(np.einsum("ij,ij->i", self.corner_a, np.cross(self.corner_b, self.corner_c)).sum() / 6.0)
+        """Enclosed volume; positive when wound outward.
+
+        Measured from `reference` (the area-weighted centroid), not the world
+        origin. The two agree for a closed mesh, but an open mesh's sum is
+        translation-dependent: a triangle a million millimetres from the origin
+        used to report a million-scale "volume" that was pure coordinate
+        offset. The reference cancels that offset and makes the documented
+        "volume of whatever it encloses" true.
+        """
+        a = self.corner_a - self.reference
+        b = self.corner_b - self.reference
+        c = self.corner_c - self.reference
+        return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
 
     @property
     def boundary_edge_count(self) -> int:

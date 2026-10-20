@@ -22,7 +22,8 @@ import pytest
 import agent_server
 import gateway
 
-KEYS = ["k-abort-at-started", "k-gateway-down", "k-midbody", "k-normal"]
+KEYS = ["k-abort-at-started", "k-gateway-down", "k-midbody", "k-normal",
+        "k-h5-lock"]
 
 
 @pytest.fixture(autouse=True)
@@ -127,3 +128,83 @@ def test_an_empty_idem_key_is_harmless():
     """Templated runs pass no key; the finally must tolerate that."""
     resp = agent_server._stream_run("hello", None, idem_key="")
     _drain(resp)   # must not raise
+
+def test_the_worker_starts_before_the_first_frame_and_survives_abort(monkeypatch):
+    """C5: navigating away at `started` must not destroy the run.
+
+    The thread used to start only after `started` (and after gateway warmup),
+    so Starlette closing the generator at that first yield left no worker.
+    """
+    import threading
+    import time
+
+    started = threading.Event()
+    release = threading.Event()
+
+    monkeypatch.setattr(agent_server, "_GATEWAY_WARMUP_THREAD", None)
+    monkeypatch.setattr(agent_server, "_EMBEDDER_WARMUP_THREAD", None)
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+    monkeypatch.setattr(agent_server, "_session_cost_breakdown",
+                        lambda sid: {})
+    monkeypatch.setattr(agent_server, "_session_cost_delta",
+                        lambda sid, before: {})
+    monkeypatch.setattr(agent_server, "_record_turn_cost",
+                        lambda *a, **k: None)
+
+    def _run(*_a, **_k):
+        started.set()
+        release.wait(3)
+        return "finished after the client left"
+
+    monkeypatch.setattr(agent_server, "_run_orchestrator", _run)
+
+    key = "k-worker-before-frame"
+    agent_server._inflight_run_release(key)
+    assert agent_server._inflight_run_claim(key, "ct-c5-worker") == ""
+    resp = agent_server._stream_run("hello", "ct-c5-worker",
+                                    idem_key=key)
+
+    async def _abort_at_first():
+        async for _frame in resp.body_iterator:
+            break
+        await resp.body_iterator.aclose()
+
+    asyncio.run(_abort_at_first())
+    assert started.wait(1), "the worker did not start before the first frame"
+    # The worker owns the claim while it is still running.
+    assert agent_server._inflight_run_lookup(key) == "ct-c5-worker"
+    release.set()
+    deadline = time.time() + 3
+    while agent_server._inflight_run_lookup(key) and time.time() < deadline:
+        time.sleep(0.02)
+    assert agent_server._inflight_run_lookup(key) == ""
+
+
+def test_a_completed_run_releases_its_session_turn_lock(monkeypatch):
+    """H5: the per-session lock must not survive the run.
+
+    Cost deltas are exact only because a session runs one turn at a time.
+    A leaked lock would hang every later chat/research turn on that session.
+    """
+    monkeypatch.setattr(agent_server, "_GATEWAY_WARMUP_THREAD", None)
+    monkeypatch.setattr(agent_server, "_EMBEDDER_WARMUP_THREAD", None)
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+    monkeypatch.setattr(agent_server, "_session_cost_breakdown",
+                        lambda sid: {})
+    monkeypatch.setattr(agent_server, "_session_cost_delta",
+                        lambda sid, before: {})
+    monkeypatch.setattr(agent_server, "_record_turn_cost",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(agent_server, "_run_orchestrator",
+                        lambda *_a, **_k: "done")
+
+    sid = "s8-h5-lock"
+    monkeypatch.setattr(agent_server, "resolve_session",
+                        lambda _cid: sid)
+    resp = agent_server._stream_run("hello", "ct-h5-lock",
+                                    idem_key="k-h5-lock")
+    frames = _drain(resp)
+    assert frames, "stream produced no frames"
+    lock = agent_server._turn_lock(sid)
+    assert lock.acquire(blocking=False), "turn lock leaked after the run"
+    lock.release()

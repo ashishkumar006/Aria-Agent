@@ -182,3 +182,35 @@ def test_a_document_deleted_mid_index_gets_no_orphan_chunks(tmp_path):
     idx._store_chunks(doc.id, [0], [[0.1]], {"embed_model": "m"})
     assert plane.drawers["document"].records == {}, (
         "chunks were written for a deleted document")
+
+
+def test_a_parse_failure_is_not_reindexed_on_every_request(tmp_path,
+                                                          monkeypatch):
+    """A failed parse must stay failed, not loop pending -> parse -> failed.
+
+    The reconcile treated `index_version == 0` as "indexed under an older
+    parser format", but a document that never reached chunking keeps 0 by
+    definition. Every documents request reset it to PENDING and started
+    another doomed parse, so the console showed `pending` forever with no
+    error - exactly what a malformed PDF produced live.
+    """
+    reg = R.Registry(tmp_path / "documents.json")
+    doc = reg.add(filename="broken.pdf", doc_type="pdf", size_bytes=8)
+    reg.write_source(doc.id, b"not a pdf")
+    reg.set_status(doc.id, R.FAILED, "could not parse the file: bad xref")
+
+    starts: list[str] = []
+    monkeypatch.setattr(M, "_docs", lambda: reg)
+    monkeypatch.setattr(M, "_plane", lambda r: _Plane())
+    monkeypatch.setattr(M, "_start_index",
+                        lambda req, doc_id: starts.append(doc_id))
+
+    class _Req:
+        pass
+
+    M._reconcile_registry_with_plane(_Req())
+
+    got = reg.get(doc.id)
+    assert got.status == R.FAILED, got.to_dict()
+    assert got.error == "could not parse the file: bad xref"
+    assert starts == [], "a terminal parse failure was re-driven"

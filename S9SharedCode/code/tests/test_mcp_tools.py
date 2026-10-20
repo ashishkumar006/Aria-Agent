@@ -34,7 +34,7 @@ def _all_tool_names() -> list[str]:
 
 EXPECTED_TOOLS = [
     "web_search", "fetch_url",
-    "read_file", "list_dir", "create_file", "update_file", "edit_file",
+    "read_file", "list_dir", "create_file", "make_dir", "update_file", "edit_file",
     "index_document", "send_telegram", "send_email", "create_calendar_event",
     "computer_action", "search_knowledge",
     "github_query", "slack_message", "slack_refresh_token", "discord_message", "notion_query", "gmail_query",
@@ -92,6 +92,23 @@ class TestLocalTools:
         mcp.create_file("_mcp_test_exists.txt", "first")
         with pytest.raises(ValueError, match="already exists"):
             mcp.create_file("_mcp_test_exists.txt", "second")
+
+    def test_make_dir_nested_and_idempotent(self, tmp_path, monkeypatch):
+        """make_dir creates parents and succeeds when the folder already exists."""
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        r = mcp.make_dir("a/b/c")
+        assert r["ok"] is True and r["created"] is True
+        assert (tmp_path / "a" / "b" / "c").is_dir()
+        r2 = mcp.make_dir("a/b/c")
+        assert r2["ok"] is True and r2["created"] is False
+
+    def test_create_file_makes_missing_parents(self, tmp_path, monkeypatch):
+        """The natural edit - write src/new/mod.py - no longer dead-ends."""
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        r = mcp.create_file("src/pkg/mod.py", "x = 1\n")
+        assert r["ok"] is True
+        assert (tmp_path / "src" / "pkg" / "mod.py").read_text(
+            encoding="utf-8") == "x = 1\n"
 
     def test_read_missing_file_raises(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
@@ -217,3 +234,82 @@ class TestGatedTools:
         monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
         with pytest.raises(FileNotFoundError):
             mcp.index_document("_no_such_file_xyz.txt")
+
+
+# ── secrets and subprocess environment ───────────────────────────────────────
+
+class TestSecretHygiene:
+    """A secret file is invisible to every tool, not just read_file.
+
+    The block existed only in read_file/list_dir/search_files; the symbol and
+    edit tools went around it, so `.env` was readable via document_symbols and
+    overwritable via update_file.
+    """
+
+    def test_no_tool_reads_or_lists_a_dotenv(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        (tmp_path / ".env").write_text("API_KEY=super-secret\n", encoding="utf-8")
+        (tmp_path / ".env.example").write_text("API_KEY=\n", encoding="utf-8")
+        (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            mcp.read_file(".env")
+        listing = json.dumps(mcp.list_dir("."))
+        assert "super-secret" not in listing
+        assert ".env.example" in listing, "documentation must stay visible"
+        hits = mcp.search_files("super-secret", ".")
+        assert hits.get("hits") == [], hits
+
+    def test_symbol_tools_refuse_a_secret_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        (tmp_path / ".env").write_text("def leaked():\n    pass\n",
+                                       encoding="utf-8")
+        out = mcp.document_symbols(".env")
+        assert out["ok"] is False and "refusing" in out["error"]
+        prev = mcp.preview_edit(".env", "leaked", "def leaked(): pass")
+        assert prev["ok"] is False and "refusing" in prev["error"]
+
+    def test_repo_wide_scans_skip_secret_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        (tmp_path / ".env").write_text("KEY=leaked_marker\n", encoding="utf-8")
+        (tmp_path / "app.py").write_text("x = leaked_marker\n", encoding="utf-8")
+        out = mcp.find_references("leaked_marker", ".")
+        files = [r["file"] for r in out.get("references", [])]
+        assert files and all(".env" not in f for f in files), files
+
+    def test_write_tools_refuse_a_secret_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        (tmp_path / ".env").write_text("A=1\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            mcp.create_file(".env.local", "B=2\n")
+        with pytest.raises(ValueError):
+            mcp.update_file(".env", "B=2\n")
+        with pytest.raises(ValueError):
+            mcp.edit_file(".env", "A=1", "A=2")
+        with pytest.raises(ValueError):
+            mcp.delete_file(".env")
+        assert (tmp_path / ".env").read_text(encoding="utf-8") == "A=1\n"
+
+    def test_run_checks_does_not_inherit_credentials(self, tmp_path, monkeypatch):
+        """run_checks executes the project's own scripts; those must not see
+        the operator's keys, which this server was spawned with."""
+        import sandbox as _sandbox
+
+        seen = {}
+
+        def _run(argv, **kwargs):
+            seen.update(kwargs)
+            return _sandbox.ExecResult(True, 0, "ok", "", 5)
+
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        monkeypatch.setattr(mcp._sandbox, "run", _run)
+        monkeypatch.setenv("ARIA_TEST_API_KEY", "sk-do-not-leak")
+        monkeypatch.setenv("SOME_PASSWORD", "hunter2")
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest]\n",
+                                                encoding="utf-8")
+        out = mcp.run_checks(".")
+        assert out["ok"] is True, out
+        env = seen.get("env") or {}
+        assert "ARIA_TEST_API_KEY" not in env
+        assert "SOME_PASSWORD" not in env
+        assert "PATH" in env, "the subprocess still needs a usable environment"

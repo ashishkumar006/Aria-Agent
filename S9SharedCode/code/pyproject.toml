@@ -32,6 +32,10 @@ dependencies = [
     "prefab-cloud-python>=0.12.1",
     "prefab-ui",
     "pypdf>=6.19.0",
+    # Integrated terminal (agent_server.py `/api/terminal` WebSocket). Windows
+    # has no stdlib PTY; pywinpty wraps ConPTY. POSIX uses the stdlib `pty`,
+    # so this is pulled in on Windows only.
+    "pywinpty>=2.0.13; sys_platform == 'win32'",
 ]
 
 [dependency-groups]

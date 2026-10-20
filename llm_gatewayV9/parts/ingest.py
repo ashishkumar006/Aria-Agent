@@ -180,13 +180,41 @@ def _load_with_trimesh(
 ) -> tuple[np.ndarray, np.ndarray, str, list[str]]:
     """Read through trimesh without letting it repair the file on the way in.
 
-    Unverified against a live trimesh: this venv has no trimesh installed, so
-    the branch is exercised only by a stub in the test suite.
+    trimesh's own failures are re-raised as `MeshIntegrityError`. Without this
+    a TRUNCATED file - a supported format containing a broken mesh - surfaced as
+    whatever exception trimesh happened to raise, which the API mapped to 415
+    `unsupported_format`. That tells the client "we do not support STL", which
+    is false and sends them looking for a different format instead of
+    re-exporting the part.
     """
     trimesh = backends.require("trimesh")
     notes: list[str] = []
-    loaded = trimesh.load(BytesIO(data), file_type=fmt, process=False)
+    try:
+        loaded = trimesh.load(BytesIO(data), file_type=fmt, process=False)
+    except NotImplementedError as exc:
+        # trimesh raises this when the EXTENSION is one it does not claim. The
+        # format is genuinely unsupported here, so it stays a 415 rather than
+        # being folded into the integrity bucket below.
+        raise UnsupportedFormatError(
+            f"trimesh does not support {fmt!r}", fmt=fmt) from exc
+    except Exception as exc:  # noqa: BLE001 - any reader failure is the same class of problem
+        raise MeshIntegrityError(
+            f"trimesh could not read this {fmt.upper()} file: "
+            f"{type(exc).__name__}: {exc}",
+            fmt=fmt,
+        ) from exc
     geometry = getattr(loaded, "geometry", None)
+    if geometry is not None and len(geometry) == 0:
+        # ZERO bodies is not a multi-body file, it is a file that yielded
+        # nothing at all - typically truncated mid-facet. The multi-body check
+        # below used to catch this and report `unsupported_format` ("v1
+        # validates one body at a time"), which tells the client their FORMAT
+        # is wrong when the format is fine and the FILE is broken.
+        raise MeshIntegrityError(
+            f"the {fmt.upper()} file yielded no geometry; it is most likely "
+            f"truncated or not actually a mesh",
+            fmt=fmt, bodies=0,
+        )
     if geometry is not None and len(geometry) != 1:
         # Concatenating separate bodies produces a mesh whose edges are shared
         # by surfaces that do not meet, so every topology number below becomes

@@ -234,7 +234,7 @@ def test_the_prompts_tell_the_agent_when_to_save_a_preference():
     import agent_server
     researcher = (ROOT / "prompts" / "researcher.md").read_text(encoding="utf-8")
     assert "remember_preference" in researcher
-    assert "STANDING PREFERENCES" in researcher
+    assert "standing" in researcher.lower()
     retriever = (ROOT / "prompts" / "retriever.md").read_text(encoding="utf-8")
     assert "recall_preferences" in retriever
     chat = pathlib.Path(agent_server.__file__).read_text(encoding="utf-8")

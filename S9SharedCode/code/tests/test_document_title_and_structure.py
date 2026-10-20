@@ -57,6 +57,22 @@ def test_a_first_heading_is_the_last_resort_title():
     assert t and not t.lower().startswith("create a document"), t
 
 
+def test_a_delegated_brief_names_the_document_not_the_instruction():
+    """A chat-delegated document must not be filed under the agent's own
+    instruction. Observed live: the PDF came back named
+    `You-are-the-authoring-agent.-Produce-a-finished-document-and-render-it-as-a-real.pdf`.
+    The brief now leads with the user's words, and the instruction is a second
+    paragraph that the title fallback ignores."""
+    from agent_server import _authoring_brief
+    q = _authoring_brief("One-page brief comparing REST and GraphQL. As a PDF.",
+                         "pdf")
+    t = skills._document_title({}, q)
+    assert "authoring agent" not in t.lower(), t
+    assert "render_document" not in t, t
+    assert "REST" in t and "GraphQL" in t, t
+    assert len(t) < 120, t
+
+
 def test_a_bare_prompt_still_yields_something_short():
     for q in ("", "   ", "?", "!!!"):
         t = skills._document_title({}, q)

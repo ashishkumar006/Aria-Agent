@@ -21,6 +21,8 @@ def test_an_explicit_format_request_in_the_brief_is_honoured():
         ("A formal policy memo. Produce a word document.", "docx"),
         ("A budget spreadsheet for three sites. As a spreadsheet.", "xlsx"),
         ("A 10-slide deck on the four-day week.", "pptx"),
+        ("A short deck.", "pptx"),
+        ("Put together slides on pricing.", "pptx"),
         ("A briefing on cloud migration. Produce a PDF file.", "pdf"),
         ("Write it as a pdf, not a docx.", "pdf"),
     ]
@@ -41,7 +43,7 @@ def test_a_passing_mention_does_not_pin_the_format():
         "Compare PDF and DOCX export paths for the new renderer.",
         "A briefing note about the PDF standard.",
         "Why do DOCX files bloat when embedded fonts are used?",
-        "A short deck.",
+        "Compare deck and PDF export paths.",
     ):
         assert skills._format_requested_in(text) == "", (
             f"{text!r} was read as a format request")
@@ -80,21 +82,28 @@ def test_the_detected_format_reaches_a_real_tool_call(monkeypatch):
     state = {"n": 0}
 
     async def fake_reply(**kw):
+        """One faithful tool hop: run the prepare hook, dispatch the renderer,
+        report the outcome, then return final text.
+
+        This used to return a tool_call and rely on the REAL `run_with_tools`
+        to dispatch it - but `run_with_tools` itself is what this fake
+        replaces, so nothing dispatched. The test passed only because the
+        harness fallback then made a live model call and rendered whatever it
+        got back; when the model answered with no blocks the assertion failed.
+        Emulating the hop keeps the test offline and deterministic."""
         state["n"] += 1
-        if state["n"] == 1:
-            return {
-                "text": "",
-                "provider": "t",
-                "tool_calls": [{
-                    "id": "c1", "name": "render_document",
-                    # the model does not say which format - exactly the
-                    # failure that produced a .docx for "As a PDF."
-                    "arguments": {"title": "T", "blocks": [
-                        {"type": "heading", "level": 1, "text": "H"},
-                        {"type": "paragraph", "text": "P"}]},
-                }],
-            }
-        return {"text": json.dumps({"filename": "x.pptx", "sections": ["a"]}),
+        args = {"title": "T", "blocks": [
+            {"type": "heading", "level": 1, "text": "H"},
+            {"type": "paragraph", "text": "P"}]}
+        prep = kw.get("prepare_fn")
+        if prep:
+            args = prep("render_document", args) or args
+        got = _fake(**args)
+        on_outcome = kw.get("on_outcome")
+        if on_outcome:
+            on_outcome("render_document", args, True, json.dumps(got), 0.0)
+        return {"text": json.dumps({"filename": got["filename"],
+                                    "sections": ["a"]}),
                 "provider": "t", "tool_calls": []}
 
     skill = skills.SkillRegistry().get("author")

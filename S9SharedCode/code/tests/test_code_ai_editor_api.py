@@ -85,6 +85,17 @@ def test_checks_reports_honest_failures():
 
 
 def test_checks_defaults_to_a_real_root():
-    """An empty path must not run pytest in whatever the cwd happens to be."""
+    """An empty path must not run pytest in whatever the cwd happens to be.
+
+    The default is the live WORKSPACE, not a hardcoded list of roots: the
+    workspace refactor moved this from `_CODE_ROOTS` to `_code_workspace()` so
+    an opened folder or a playground is what gets checked. Asserting the old
+    literal made this test fail for a reason that had nothing to do with the
+    property it exists to protect.
+    """
     src = inspect.getsource(agent_server.code_checks)
-    assert "_CODE_ROOTS" in src, "checks has no default working directory"
+    assert "_code_workspace()" in src, "checks has no default working directory"
+    # And it must resolve to a directory that actually exists, or the "default"
+    # is a path to nothing.
+    base, allowed = agent_server._code_workspace()
+    assert any(p.is_dir() for p in allowed) or base.is_dir()

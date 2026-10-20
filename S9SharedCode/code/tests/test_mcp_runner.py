@@ -36,6 +36,152 @@ class _Script:
         return self._replies[0]
 
 
+def _ledger_hop_test(**kw):
+    """Three hops: hop 0 and 1 call tools, hop 2 sees the ledger for both.
+    Returns the messages each hop was handed (snapshotted)."""
+    seen: list = []
+
+    class _Spy:
+        async def __call__(self, messages):
+            seen.append(list(messages))
+            n = len(seen)
+            if n <= 2:
+                return {"text": "", "reasoning": "SOME PRIVATE REASONING",
+                        "tool_calls": [_tc(f"list_dir{n}", {"path": "."})],
+                        "provider": "f"}
+            return {"text": "all done", "provider": "f"}
+
+    async def _dispatch(name, args):
+        return "TOOL RESULT"
+
+    out = asyncio.run(mr.run_tool_loop(
+        messages=[{"role": "user", "content": "what is here?"}],
+        chat_fn=_Spy(), dispatch_fn=_dispatch, max_hops=kw.pop("max_hops", 0), **kw))
+    return out, seen
+
+
+class TestProgressLedger:
+    """The loop must hand the model a record of what it ALREADY did, or each hop
+    re-derives its plan and repeats its own work. Observed live: four identical
+    README reads in one turn, each preceded by the same reasoning paragraph."""
+
+    def test_ledger_is_carried_into_the_next_assistant_turn(self):
+        out, seen = _ledger_hop_test()
+        assert out["text"] == "all done"
+        assert len(seen) == 3
+        # The FIRST assistant turn is written before any call has completed, so
+        # it carries no ledger yet; the second one must.
+        assistants = [m for m in seen[2] if m.get("role") == "assistant"]
+        assert len(assistants) == 2
+        content = assistants[-1]["content"]
+        assert "already done this run" in content
+        assert "list_dir1(.)" in content
+        assert assistants[-1]["tool_calls"], "tool_calls were lost"
+
+    def test_first_assistant_turn_has_no_ledger_yet(self):
+        """Nothing has run at that point, so the note must not be invented."""
+        _, seen = _ledger_hop_test()
+        first = [m for m in seen[1] if m.get("role") == "assistant"][0]
+        assert first["content"] == ""
+        assert first["tool_calls"]
+
+    def test_tool_result_still_follows_the_assistant_turn(self):
+        _, seen = _ledger_hop_test()
+        assert [m.get("role") for m in seen[1]] == ["user", "assistant", "tool"]
+
+    def test_reasoning_is_NOT_echoed_back(self):
+        """Regression guard. Echoing the free-form reasoning was tried first and
+        the model copied it straight back out: every hop's thinking block became
+        a superset of the last, all opening with the same sentence (252 -> 1138
+        -> 1272 -> 4320 chars). The ledger must carry facts, never the prose."""
+        _, seen = _ledger_hop_test()
+        for msgs in seen[2:]:
+            for m in msgs:
+                if m.get("role") == "assistant":
+                    assert "SOME PRIVATE REASONING" not in str(m.get("content"))
+
+    def test_ledger_is_bounded(self):
+        """A long run must not grow the ledger without limit."""
+
+        class _Spy:
+            def __init__(self):
+                self.n = 0
+
+            async def __call__(self, messages):
+                self.n += 1
+                return {"text": "", "provider": "f",
+                        "tool_calls": [_tc(f"t{self.n}", {"n": self.n})]}
+
+        seen = []
+        spy = _Spy()
+
+        async def _chat(messages):
+            seen.append(list(messages))
+            return await spy(messages)
+
+        async def _dispatch(name, args):
+            return "R"
+
+        asyncio.run(mr.run_tool_loop(
+            messages=[{"role": "user", "content": "hi"}],
+            chat_fn=_chat, dispatch_fn=_dispatch, max_hops=40))
+        last = [m for m in seen[-1] if m.get("role") == "assistant"][-1]
+        entries = last["content"].split(";")
+        assert len(entries) <= mr.PROGRESS_LEDGER_CALLS + 1
+        assert spy.n > mr.PROGRESS_LEDGER_CALLS, "test did not exceed the bound"
+
+    def test_truncated_read_is_reported_with_its_next_offset(self):
+        """The whole point of the ledger's outcome column: a read that came back
+        cut off must say so, or the model re-issues the identical call hoping for
+        the rest (observed live: seven identical README reads, then a blank
+        answer)."""
+
+        class _Spy:
+            def __init__(self):
+                self.n = 0
+
+            async def __call__(self, messages):
+                self.n += 1
+                return {"text": "", "provider": "f",
+                        "tool_calls": [_tc(f"c{self.n}", {"path": "README.md"})]}
+
+        async def _dispatch(name, args):
+            return ('{"path": "README.md", "line_count": 663, '
+                    '"end_line": 492, "truncated": true, '
+                    '"next_offset": 492}')
+
+        seen = []
+        spy = _Spy()
+
+        async def _chat(messages):
+            seen.append(list(messages))
+            return await spy(messages)
+
+        asyncio.run(mr.run_tool_loop(
+            messages=[{"role": "user", "content": "read it"}],
+            chat_fn=_chat, dispatch_fn=_dispatch, max_hops=3))
+        content = [m for m in seen[-1] if m.get("role") == "assistant"][-1]["content"]
+        assert "continue at offset=492" in content
+
+    def test_stopped_with_no_answer_says_why(self):
+        """A run the guard stops carries its reason on `note`; the caller turns
+        that into something the user can see rather than a blank reply."""
+
+        class _Spy:
+            async def __call__(self, messages):
+                return {"text": "", "provider": "f",
+                        "tool_calls": [_tc("read_file", {"path": "README.md"})]}
+
+        async def _dispatch(name, args):
+            return "SAME RESULT EVERY TIME"
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[{"role": "user", "content": "read it"}],
+            chat_fn=_Spy(), dispatch_fn=_dispatch, max_hops=0))
+        assert "already-successful" in (out.get("note") or "")
+        assert not out["text"].strip(), "the model produced no answer here"
+
+
 class TestRunToolLoop:
     def test_clean_finish_no_tools(self):
         chat = _Script([{"text": "done", "provider": "fake"}])
@@ -158,7 +304,9 @@ class TestRunToolLoop:
 
     def test_on_event_reports_tool_progress(self):
         """Live progress: one tool_call then one tool_result per call, in
-        order, carrying the tool name — the chat SSE status frames."""
+        order, carrying the tool name AND the call id — the chat SSE status
+        frames. The id lets the panel update one activity row in place instead
+        of rendering the call and its result as two."""
         events: list = []
 
         async def _dispatch(name, args):
@@ -173,10 +321,11 @@ class TestRunToolLoop:
             on_event=lambda k, p: events.append((k, p))))
         assert out["text"] == "here you go"
         assert events == [("tool_call", {"name": "web_search",
-                                          "arguments": {}}),
+                                          "arguments": {}, "id": "t1"}),
                           ("tool_result", {"name": "web_search",
                                             "ok": True,
-                                            "result": "tool-result"})]
+                                            "result": "tool-result",
+                                            "id": "t1"})]
 
     def test_on_event_survives_callback_error(self):
         """A broken progress callback must never break the tool loop —
@@ -215,6 +364,101 @@ class TestRunToolLoop:
         assert out["text"] == "recovered"
         assert "tool error" in [m.get("content", "") for m in messages_seen
                                 if m.get("role") == "tool"][0]
+
+    def test_parallel_tool_calls_run_concurrently(self):
+        """Several calls in ONE turn are dispatched together, not one by one.
+
+        Reading matching files is the common case: the wall-clock cost must be
+        the slowest read, not the sum. Three 50 ms reads finish in well under
+        the 150 ms a serial loop would take.
+        """
+        import time
+
+        async def _dispatch(name, args):
+            await asyncio.sleep(0.05)
+            return f"r:{args.get('path')}"
+
+        chat = _Script([
+            {"text": "", "provider": "f", "tool_calls": [
+                _tc("read_file", {"path": "a"}, "1"),
+                _tc("read_file", {"path": "b"}, "2"),
+                _tc("read_file", {"path": "c"}, "3")]},
+            {"text": "all read", "provider": "f"},
+        ])
+        msgs: list = []
+        t0 = time.perf_counter()
+        out = asyncio.run(mr.run_tool_loop(
+            messages=msgs, chat_fn=chat, dispatch_fn=_dispatch))
+        elapsed = time.perf_counter() - t0
+        assert out["text"] == "all read"
+        assert elapsed < 0.12, f"looked serial ({elapsed:.3f}s for 3x50ms)"
+        # Results ride back in the assistant's call order, so the tool messages
+        # line up with the tool_call ids the model sent.
+        assert [m["content"] for m in msgs if m.get("role") == "tool"] == \
+            ["r:a", "r:b", "r:c"]
+        assert [m["tool_call_id"] for m in msgs if m.get("role") == "tool"] == \
+            ["1", "2", "3"]
+
+    def test_parallel_events_report_the_batch(self):
+        """Both calls are announced before either result, so a parallel batch
+        reads as a batch in the transcript."""
+        events: list = []
+
+        async def _dispatch(name, args):
+            return "ok"
+
+        chat = _Script([
+            {"text": "", "provider": "f", "tool_calls": [
+                _tc("read_file", {"path": "a"}, "1"),
+                _tc("search_files", {"pattern": "x"}, "2")]},
+            {"text": "done", "provider": "f"},
+        ])
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=chat, dispatch_fn=_dispatch,
+            on_event=lambda k, p: events.append((k, p.get("name")))))
+        assert out["text"] == "done"
+        assert events[:2] == [("tool_call", "read_file"),
+                              ("tool_call", "search_files")]
+        assert {e for e in events[2:]} == {("tool_result", "read_file"),
+                                           ("tool_result", "search_files")}
+
+    def test_unlimited_hops_run_to_completion(self):
+        """max_hops=0 is no ceiling: a long, genuinely progressing run finishes
+        with its answer instead of dying on a hop cap."""
+        state = {"n": 0}
+
+        async def _chat(messages):
+            state["n"] += 1
+            if state["n"] >= 15:
+                return {"text": "finished", "provider": "f"}
+            # Vary args so neither guard fires: real forward motion.
+            return {"text": "", "provider": "f",
+                    "tool_calls": [_tc("read_file", {"path": f"f{state['n']}"},
+                                       str(state["n"]))]}
+
+        async def _dispatch(name, args):
+            return "body"
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=_dispatch, max_hops=0))
+        assert out["text"] == "finished", out
+
+    def test_no_progress_run_stops_instead_of_spinning_forever(self):
+        """With no hop cap, a run that never gets a successful result must still
+        stop: this is the backstop that replaces the fixed ceiling."""
+        async def _chat(messages):
+            # A DIFFERENT failing call each hop: varying args defeat the repeat
+            # guard, so only the no-progress guard can end this.
+            n = len([m for m in messages if m.get("role") == "tool"])
+            return {"text": "", "provider": "f",
+                    "tool_calls": [_tc("read_file", {"path": f"x{n}"}, str(n))]}
+
+        async def _dispatch(name, args):
+            raise RuntimeError("nope")
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=_dispatch, max_hops=0))
+        assert "error" in out and "no successful tool result" in out["error"]
 
 
 if __name__ == "__main__":

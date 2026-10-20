@@ -1,9 +1,15 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { BrowserRouter, useLocation } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { STALE_TOKEN_EVENT } from './api';
 import ErrorBoundary from './components/ErrorBoundary';
 import TitleBar from './components/TitleBar';
+import CommandPalette from './components/CommandPalette';
+import { GatewayDownBanner, HealthProvider } from './components/ui';
+import { Toaster } from 'sonner';
+import { KeepAliveHost } from './components/KeepAlive';
+import { copyCodeFromClick } from './components/markdown';
+import { prefetchAll } from './lib/prefetch';
 
 /* Route-split: each view (and the heavy @xyflow/react DAG code pulled in
    by Runs/Research) loads on demand instead of bloating first paint. */
@@ -20,45 +26,29 @@ const Mission = lazy(() => import('./views/Mission'));
 const Settings = lazy(() => import('./views/Settings'));
 const Code = lazy(() => import('./views/Code'));
 const Authoring = lazy(() => import('./views/Authoring'));
+const Parts = lazy(() => import('./views/Parts'));
 
-/* The split chunks, kept as thunks so we can warm them before they are
-   needed. Suspense otherwise blanks the whole shell on every hop to a
-   section that hasn't been visited yet, because the fallback replaces the
-   rail and header too. */
-const CHUNKS = [
-  () => import('./views/Chat'),
-  () => import('./views/Runs'),
-  () => import('./views/Memory'),
-  () => import('./views/Documents'),
-  () => import('./views/Research'),
-  () => import('./views/Scheduler'),
-  () => import('./views/Skills'),
-  () => import('./views/Apps'),
-  () => import('./views/Ledger'),
-  () => import('./views/Mission'),
-  () => import('./views/Settings'),
-  () => import('./views/Code'),
-];
-
-function preloadAll() {
-  for (const load of CHUNKS) void load().catch(() => undefined);
-}
-
-/* Warm the split chunks as soon as the browser is idle so that only the
-   very first paint can suspend; afterwards every hop is served from the
-   module cache and renders straight into place. */
+/* Warm the split chunks shortly after first paint so that only the very
+   first section can suspend; afterwards every hop is served from the module
+   cache and renders straight into place. The route→chunk map lives in
+   lib/prefetch so the rail can also warm a section on hover — that is what
+   keeps a hop to an unvisited section instant instead of showing the full
+   shell-skeleton fallback. */
 function Preloader() {
   const loc = useLocation();
   useEffect(() => {
-    const idle = (globalThis as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback;
+    const idle = (globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number }).requestIdleCallback;
     const cancel = idle
       ? (globalThis as unknown as { cancelIdleCallback?: (id: number) => void }).cancelIdleCallback
       : undefined;
     if (idle) {
-      const id = idle(() => preloadAll());
+      /* `timeout` bounds the wait: without it the browser is free to defer
+         these imports indefinitely on a busy page, which is exactly the case
+         (a live stream) where a later hop then still suspends. */
+      const id = idle(() => prefetchAll(), { timeout: 2000 });
       return () => cancel?.(id);
     }
-    const t = window.setTimeout(preloadAll, 200);
+    const t = window.setTimeout(prefetchAll, 200);
     return () => window.clearTimeout(t);
   }, []);
   /* Touching loc keeps this mounted across route changes. */
@@ -139,41 +129,115 @@ function StaleTokenNotice() {
   );
 }
 
+/* Every section, in one registry. Order is only for stable DOM ordering; the
+   `id` is the route path and is what the keep-alive host keys on. Kept beside
+   the CHUNKS preloader list above so the two cannot drift. */
+const SECTIONS = [
+  { id: '/research', render: () => <Research /> },
+  { id: '/console', render: () => <Chat /> },
+  { id: '/runs', render: () => <Runs /> },
+  { id: '/memory', render: () => <Memory /> },
+  { id: '/documents', render: () => <Documents /> },
+  { id: '/scheduler', render: () => <Scheduler /> },
+  { id: '/skills', render: () => <Skills /> },
+  { id: '/apps', render: () => <Apps /> },
+  { id: '/ledger', render: () => <Ledger /> },
+  { id: '/mission', render: () => <Mission /> },
+  { id: '/settings', render: () => <Settings /> },
+  { id: '/code', render: () => <Code /> },
+  { id: '/authoring', render: () => <Authoring /> },
+  { id: '/parts', render: () => <Parts /> },
+] as const;
+
+/** Map a raw pathname onto a registered section id. */
+function sectionFor(pathname: string): string {
+  const known = SECTIONS.some((s) => s.id === pathname);
+  if (known) return pathname;
+  // Strip a trailing slash so /runs/ and /runs are the same section; keeping
+  // them distinct would mount the view twice.
+  const trimmed = pathname.replace(/\/+$/, '') || '/';
+  if (SECTIONS.some((s) => s.id === trimmed)) return trimmed;
+  return '/research';
+}
+
+/* The part that must live INSIDE <BrowserRouter>.
+
+   `useLocation()` reads the Router context, and `App` is the component that
+   RETURNS the router - so calling it in `App`'s own body reads a context that
+   does not exist yet and throws "useLocation() may be used only in the context
+   of a <Router> component", blanking the whole console. The hook therefore
+   belongs in a child that the router already wraps. */
+function RouterShell() {
+  const { pathname } = useLocation();
+  /* One delegated listener serves every renderMarkdown surface - chat, run
+     reports, the inspector and authoring. Attaching it only to the chat
+     containers left the same Copy button inert everywhere else. */
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      const target = e.target;
+      if (target instanceof Element
+          && target.closest('[data-copy-code]')) {
+        void copyCodeFromClick(e);
+      }
+    };
+    document.addEventListener('click', onClick);
+    return () => document.removeEventListener('click', onClick);
+  }, []);
+  return (
+    <ErrorBoundary>
+      <HealthProvider>
+      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <Preloader />
+      <StaleTokenNotice />
+      {/* One gateway-down strip for the whole shell: the Rail's dot is desktop
+          only, so a failed gateway was invisible on a phone and on every page
+          that never checked health. */}
+      <GatewayDownBanner />
+      {/* The Electron shell hides the OS title bar (`titleBarStyle:
+          'hidden'`), which would otherwise leave the window with no way to
+          be moved or closed. This draws the replacement. It renders nothing
+          outside Electron — see TitleBar — so the browser build is
+          unaffected. */}
+      <TitleBar />
+      {/* Global command palette (Ctrl/Cmd+K) and the toast surface. Both live
+          inside the router so the palette can navigate and toasts survive a
+          section switch. */}
+      <CommandPalette />
+      <Toaster
+        position="bottom-right"
+        theme="dark"
+        closeButton
+        offset={16}
+        toastOptions={{ duration: 4000 }}
+      />
+      <Suspense fallback={<Fallback />}>
+        {/* The sections are the only flexible child: the title bar and status
+            banners keep their natural height, and the active view scrolls
+            inside this box instead of growing the document. */}
+        <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Keep-alive routing.
+            `<Routes>` unmounts the outgoing view on every navigation, so a
+            section switch discarded that view's state, in-flight fetches and
+            scroll position and refetched from scratch - the chunks were
+            already cached (see CHUNKS), the *component* was not. This mounts
+            each section once and hides the inactive ones with CSS, and
+            `lib/getCache` stops the network round-trip on top of that. */}
+        <KeepAliveHost sections={SECTIONS} current={sectionFor(pathname)} />
+        </main>
+      </Suspense>
+      </div>
+      </HealthProvider>
+    </ErrorBoundary>
+  );
+}
+
 /* Aria console SPA — one React tree for every section. The server serves
    this same bundle at each route; the router picks the view client-side,
    so hopping sections never reloads the document. */
 export default function App() {
   return (
     <BrowserRouter>
-      <ErrorBoundary>
-        <Preloader />
-        <StaleTokenNotice />
-        {/* The Electron shell hides the OS title bar (`titleBarStyle:
-            'hidden'`), which would otherwise leave the window with no way to
-            be moved or closed. This draws the replacement. It renders nothing
-            outside Electron — see TitleBar — so the browser build is
-            unaffected. */}
-        <TitleBar />
-        <Suspense fallback={<Fallback />}>
-          <Routes>
-            <Route path="/" element={<Navigate to="/research" replace />} />
-            <Route path="/console" element={<Chat />} />
-            <Route path="/runs" element={<Runs />} />
-            <Route path="/memory" element={<Memory />} />
-            <Route path="/documents" element={<Documents />} />
-            <Route path="/research" element={<Research />} />
-            <Route path="/scheduler" element={<Scheduler />} />
-            <Route path="/skills" element={<Skills />} />
-            <Route path="/apps" element={<Apps />} />
-            <Route path="/ledger" element={<Ledger />} />
-            <Route path="/mission" element={<Mission />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/code" element={<Code />} />
-            <Route path="/authoring" element={<Authoring />} />
-            <Route path="*" element={<Navigate to="/research" replace />} />
-          </Routes>
-        </Suspense>
-      </ErrorBoundary>
+      <RouterShell />
     </BrowserRouter>
   );
 }

@@ -144,7 +144,13 @@ def test_ee01_mcp_tool_catalogue():
     # The count is deliberately an equality, not a floor: every addition has to
     # be a decision. `tests/test_mcp_tool_reachability.py` separately proves
     # all of them are also ADVERTISED, which registration alone does not.
-    assert len(tools) == 49, f"expected 49 tools, got {len(tools)}"
+    # 54 = 49 + 5 code-intelligence tools (document_symbols,
+    # find_references, blast_radius, preview_edit, apply_symbol_edit).
+    # 56 = + make_dir (BUG-035: folders were impossible) and + run_command,
+    # the PowerShell escape hatch for a specific command the checker does not
+    # cover (bounded + approval-gated).
+    # Keeps this file in step with tests/comprehensive/test_mcp_tools.py.
+    assert len(tools) == 56, f"expected 56 tools, got {len(tools)}"
     for expected in ("run_checks", "git_inspect", "find_symbol",
                      "list_scheduled", "web_search", "read_file", "list_dir",
                      "search_knowledge", "github_query", "read_artifact",

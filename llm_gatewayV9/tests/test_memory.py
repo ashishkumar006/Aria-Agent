@@ -218,6 +218,48 @@ class TestSessions:
         hits = await s2.read("live fact")
         assert len(hits) == 1
 
+    async def test_zeroed_index_rebuilds_from_stored_embeddings(self, tmp_path):
+        """A crash can leave both index files zero-filled. The store still
+        carries every vector, so startup must reconstruct instead of
+        disabling vector search for that drawer."""
+        s1 = MemoryService(tmp_path, embed_fn=_fake_embed, expected_dim=64)
+        await s1.add_fact("recoverable fact", source="t", run_id="r1")
+        s1.persist_index()
+        for name in ("index.faiss", "index_ids.json"):
+            (tmp_path / name).write_bytes(b"\x00" * 128)
+
+        s2 = MemoryService(tmp_path, embed_fn=_fake_embed, expected_dim=64)
+        assert s2.index is not None
+        assert s2.stats()["vector_enabled"] is True
+        assert s2.index.size == 1
+        assert list(tmp_path.glob("*.corrupt-*"))
+        hits = await s2.read("recoverable fact")
+        assert len(hits) == 1 and "recoverable" in hits[0].descriptor
+
+    async def test_ids_count_mismatch_rebuilds(self, tmp_path):
+        s1 = MemoryService(tmp_path, embed_fn=_fake_embed, expected_dim=64)
+        await s1.add_fact("counted fact", source="t", run_id="r1")
+        s1.persist_index()
+        (tmp_path / "index_ids.json").write_text("[]", encoding="utf-8")
+
+        s2 = MemoryService(tmp_path, embed_fn=_fake_embed, expected_dim=64)
+        assert s2.index is not None
+        assert s2.index.size == 1
+        hits = await s2.read("counted fact")
+        assert len(hits) == 1
+
+    async def test_missing_sidecar_rebuilds(self, tmp_path):
+        s1 = MemoryService(tmp_path, embed_fn=_fake_embed, expected_dim=64)
+        await s1.add_fact("partial fact", source="t", run_id="r1")
+        s1.persist_index()
+        (tmp_path / "index_ids.json").unlink()
+
+        s2 = MemoryService(tmp_path, embed_fn=_fake_embed, expected_dim=64)
+        assert s2.index is not None
+        assert s2.index.size == 1
+        hits = await s2.read("partial fact")
+        assert len(hits) == 1
+
 
 # ── concurrency ────────────────────────────────────────────────────────────
 

@@ -1,8 +1,8 @@
-"""Config-driven tracker apps (Apps page).
+﻿"""Config-driven tracker apps (Apps page).
 
-Specs validate loudly (→ HTTP 400/409), the runner filters + diffs, and
+Specs validate loudly (â†’ HTTP 400/409), the runner filters + diffs, and
 failures are recorded per-app instead of raised. Network is monkeypatched
-— no live HTTP in tests. S9_STATE_DIR is pinned at tmp and the module
+â€” no live HTTP in tests. S9_STATE_DIR is pinned at tmp and the module
 reloaded per test so suites never touch live state/apps/.
 
 Run:  uv run python -m pytest tests/test_apps.py -q
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -169,3 +171,33 @@ def test_json_feed_dotpath_and_match(apps, monkeypatch):
     r = apps.refresh_app("j")
     assert r["count"] == 1
     assert apps.get_app("j")["items"] == [{"k": "x", "v": 1}]
+
+def test_start_creates_the_refresh_worker(apps, monkeypatch):
+    """`_worker` named both the thread and the loop, so `is_alive()` raised
+    AttributeError and start() swallowed it: the worker never existed."""
+    started = threading.Event()
+    monkeypatch.setattr(apps, "_seed", lambda: None)
+    monkeypatch.setattr(apps, "_worker_loop", lambda: started.set())
+
+    apps.start()
+
+    assert started.wait(2.0), "the refresh thread was never started"
+    assert apps._worker_thread is not None
+
+
+def test_the_worker_refreshes_a_due_app(apps, monkeypatch):
+    apps.create_app({"name": "Tile", "kind": "openrouter_free",
+                     "schedule": "every 1m"})
+    spec = apps.get_app("tile")["spec"]
+    spec["next_refresh"] = time.time() - 1
+    apps._write_json(apps._spec_path("tile"), spec)
+
+    refreshed = []
+    monkeypatch.setattr(apps, "refresh_app",
+                        lambda app_id: refreshed.append(app_id))
+    ticks = iter([False, True])
+    monkeypatch.setattr(apps._stop, "wait", lambda timeout: next(ticks))
+
+    apps._worker_loop()
+
+    assert refreshed == ["tile"]

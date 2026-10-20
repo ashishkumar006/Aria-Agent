@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { GitBranch, Square } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, SkipLink } from '../components/ui';
+import { useMainId, useActivePoll, useSectionActive } from '../components/KeepAlive';
 import { classifyStatus, isRunLive, pillForStatus, type RunStatus } from '../components/markdown';
 import DagCanvas from '../components/DagCanvas';
 import Inspector from '../components/Inspector';
@@ -35,8 +36,10 @@ function pillFor(r: RunRow): { label: string; tone: RunStatus } {
 }
 
 export default function Runs() {
+  const mainId = useMainId();
   const loc = useLocation();
 const nav = useNavigate();
+  const active = useSectionActive();
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [totals, setTotals] = useState<{ runs?: number; nodes?: number; dollars?: number }>({});
   const [loaded, setLoaded] = useState(false);
@@ -71,11 +74,7 @@ const nav = useNavigate();
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-    const t = setInterval(refresh, CONF.pollSlowMs);
-    return () => clearInterval(t);
-  }, [refresh]);
+  useActivePoll(refresh, CONF.pollSlowMs);
 
   const open = useCallback(async (id: string) => {
     const req = ++reqRef.current;
@@ -88,26 +87,22 @@ const nav = useNavigate();
        the Inspector header and "Rerun in Research". */
     setQuery(r ? displayTopic(r) : '');
     setNote('');
-    /* Only poll when the run looks live. Previously liveSid was set
-       unconditionally, so the poll effect immediately re-fetched the graph
-       open() had just loaded — two identical requests for every run,
-       including years-old terminal ones. */
-    /* Same rule as the poll below, for the same reason: `status_counts` from
-       the rollup contains a stranded `pending` on many finished runs, so
-       "some status is not terminal" is not evidence that a run is going. A
-       pending alongside anything settled means it is not live. */
-    const counts = Object.entries(r?.status_counts || {})
-      .map(([k, v]) => ({ status: k, n: (v as number) || 0 }));
-    const looksLive = !r || !r.status_counts
-      ? true
-      : isRunLive(counts);
-    setLiveSid(looksLive ? id : '');
+    setLiveSid('');
     try {
       const g = await api.graph(id);
-      if (reqRef.current === req && seq === gSeq.current) setGraph(g);
+      if (reqRef.current === req && seq === gSeq.current) {
+        setGraph(g);
+        /* Liveness comes from the freshly fetched graph, not the rollup:
+           `status_counts` can carry a stranded `pending` for a run that
+           finished hours ago, which offered Stop and then answered
+           `found:false`. No graph nodes yet is not enough evidence either. */
+        const nodes = g?.nodes || [];
+        if (nodes.length && isRunLive(nodes)) setLiveSid(id);
+      }
     } catch (e) {
       if (reqRef.current !== req || seq !== gSeq.current) return;
       setGraph(null);
+      setLiveSid('');
       setNote(`could not load this run's graph: ${e instanceof Error ? e.message : String(e)}`);
     }
   }, [runs]);
@@ -122,7 +117,7 @@ const nav = useNavigate();
   // Poll the selected graph ONLY while the run is still live: stop as soon
   // as every node reaches a terminal status (or the selection changes).
   useEffect(() => {
-    if (!liveSid) return;
+    if (!liveSid || !active) return;
     let dead = false;
     /* The server answers 200 with an EMPTY node list for an unknown
        or deleted session, so "every node terminal" (which needs at
@@ -151,7 +146,7 @@ const nav = useNavigate();
     tick();
     const t = setInterval(tick, CONF.pollFastMs);
     return () => { dead = true; clearInterval(t); };
-  }, [liveSid]);
+  }, [active, liveSid]);
 
   const vis = runs.filter((s) => {
     /* Search the topic first, then fall back to the raw prompt so a run is
@@ -235,7 +230,7 @@ const nav = useNavigate();
           })}
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Runs">
           {/* Kept mounted and hidden rather than conditionally rendered:
               swapping the button out on run start/end destroyed keyboard

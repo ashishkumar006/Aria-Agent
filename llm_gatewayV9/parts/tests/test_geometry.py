@@ -82,6 +82,23 @@ def test_open_cube_reports_exactly_its_missing_top(open_mesh):
     assert geo.signed_volume < 1.0
 
 
+def test_signed_volume_does_not_depend_on_distance_from_origin(open_mesh):
+    """Area moments are translation-invariant; the old world-origin formula
+    was not, so an open part placed far from (0,0,0) reported a fake volume."""
+    base = compute(open_mesh).signed_volume
+    shifted = Mesh.create(open_mesh.vertices + np.array([1e6, -2e6, 3e6]),
+                          open_mesh.faces)
+    assert compute(shifted).signed_volume == pytest.approx(base, abs=1e-6)
+
+
+def test_one_triangle_far_from_the_origin_encloses_nothing():
+    v = np.array([[1e6, 1e6, 1e6], [1e6 + 1, 1e6, 1e6],
+                  [1e6, 1e6 + 1, 1e6]], dtype=np.float64)
+    f = np.array([[0, 1, 2]], dtype=np.int64)
+    geo = compute(Mesh.create(v, f))
+    assert geo.signed_volume == pytest.approx(0.0, abs=1e-9)
+
+
 def test_scaling_is_linear():
     v, f = prim.cube(scale=2.5)
     geo = compute(Mesh.create(v, f))
@@ -269,9 +286,11 @@ def test_drop_unreferenced_compacts_and_remaps(broken_mesh):
     assert int(compacted.faces.max()) == 7
     geo = compute(compacted)
     assert geo.unreferenced_vertex_count == 0
-    # Removing an unused corner must not move the solid. The volume is 2/3, not
-    # 1: the fixture's inverted face contributes -1/6 in place of its +1/6.
-    assert geo.signed_volume == pytest.approx(2.0 / 3.0, abs=1e-12)
+    # Removing an unused corner must not move the solid or change its volume.
+    # The absolute value is less than 1 because the fixture has an inverted
+    # face; the invariant under test is that compaction changes nothing.
+    assert geo.signed_volume == pytest.approx(
+        compute(broken_mesh).signed_volume, abs=1e-12)
 
 
 def test_drop_faces_leaves_the_rest_untouched(cube_mesh):
@@ -289,17 +308,20 @@ def test_flip_faces_reverses_winding_only_for_the_masked_faces(cube_mesh):
     assert list(flipped.faces[2]) == [4, 6, 5]
     assert list(flipped.faces[0]) == list(cube_mesh.faces[0])
     # Flipping a triangle negates its contribution, so the total drops by
-    # exactly twice that contribution: 1 - 2*(1/6) = 2/3.
-    assert compute(flipped).signed_volume == pytest.approx(2.0 / 3.0, abs=1e-12)
+    # exactly twice that triangle's tetrahedron from the centroid: 5/6.
+    assert compute(flipped).signed_volume == pytest.approx(5.0 / 6.0, abs=1e-12)
     assert compute(flipped).surface_area == pytest.approx(6.0, abs=1e-12)
 
 
-def test_flipping_a_face_touching_the_origin_leaves_the_volume_alone(cube_mesh):
-    """Face 0 is (0, 3, 2) and v0 is the origin, so its contribution is zero.
+def test_flipping_a_face_touching_the_old_origin_still_changes_the_volume(cube_mesh):
+    """Face 0 is (0, 3, 2) and v0 is the origin.
 
-    Worth pinning down because it is the reason `signed_volume` cannot be used
-    to detect a single inverted face on a mesh whose origin sits on it.
+    This used to leave the total unchanged, because the world-origin formula
+    gave that face a zero contribution regardless of winding: a single
+    inverted face touching (0,0,0) was invisible to the volume check. The
+    centroid reference gives every closed face a real contribution.
     """
     mask = np.zeros(cube_mesh.face_count, dtype=bool)
     mask[0] = True
-    assert compute(flip_faces(cube_mesh, mask)).signed_volume == pytest.approx(1.0, abs=1e-12)
+    assert compute(flip_faces(cube_mesh, mask)).signed_volume == pytest.approx(
+        5.0 / 6.0, abs=1e-12)

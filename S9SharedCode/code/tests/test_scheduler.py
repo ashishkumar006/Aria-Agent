@@ -115,6 +115,67 @@ class TestNextFireFromCron:
         assert spec["recurring"] == "every 30m"
 
 
+class TestClockTimes:
+    """Named clock times ('9am', 'today 14:30', '2:30pm') — added after a
+    live incident: "remind me at 9am today" was answered by scheduling
+    'in 1h' (10:09), because the past time was refused with a generic
+    error whose first suggestion was a relative delay."""
+
+    def _at(self, hh: int, mm: int) -> float:
+        import datetime as dt
+        return dt.datetime(2026, 5, 4, hh, mm, 0).timestamp()
+
+    def test_today_clock_in_the_future_is_accepted(self, tmp_path, monkeypatch):
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = self._at(8, 0)
+        with mock.patch("scheduler.time.time", return_value=base):
+            sid = sched.schedule("ping", "today 9am")
+        spec = sched._SCHEDULES[sid]
+        assert spec["next_fire"] == pytest.approx(self._at(9, 0), rel=1e-6)
+        assert spec["recurring"] is None
+
+    def test_bare_ampm_and_24h_forms(self, tmp_path, monkeypatch):
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = self._at(8, 0)
+        for when, want in [("9am", (9, 0)), ("2:30pm", (14, 30)),
+                           ("14:45", (14, 45)), ("at 10:15", (10, 15))]:
+            with mock.patch("scheduler.time.time", return_value=base):
+                sid = sched.schedule(f"ping {when}", when)
+            got = sched._SCHEDULES[sid]["next_fire"]
+            assert got == pytest.approx(self._at(*want), rel=1e-6), when
+
+    def test_passed_clock_refuses_with_its_own_message(
+            self, tmp_path, monkeypatch):
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = self._at(9, 9)  # 09:09 — "9am" is nine minutes past
+        with mock.patch("scheduler.time.time", return_value=base):
+            with pytest.raises(ValueError) as ei:
+                sched.schedule("meeting", "9am")
+        msg = str(ei.value)
+        assert "already passed today" in msg
+        assert "tomorrow 9am" in msg
+        assert "must not be turned into a relative delay" in msg
+        assert "in 1h" not in msg
+        assert sched._SCHEDULES == {}
+
+    def test_passed_today_prefixed_clock_also_refuses(
+            self, tmp_path, monkeypatch):
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = self._at(9, 9)
+        with mock.patch("scheduler.time.time", return_value=base):
+            with pytest.raises(ValueError) as ei:
+                sched.schedule("meeting", "today 9am")
+        assert "already passed today" in str(ei.value)
+
+    def test_bare_digits_are_still_epoch_seconds(self, tmp_path, monkeypatch):
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = self._at(8, 0)
+        target = int(self._at(9, 0))
+        with mock.patch("scheduler.time.time", return_value=base):
+            sid = sched.schedule("ping", str(target))
+        assert sched._SCHEDULES[sid]["next_fire"] == float(target)
+
+
 class TestScheduleCRUD:
     """schedule / list_schedules / cancel round-trip correctly."""
 

@@ -98,17 +98,27 @@ def test_register_model_routes_unit():
     import providers as P
 
     P.MODEL_ROUTES.clear()
+    P.CODE_MODEL_ROUTES.clear()
     try:
         P.register_model_routes({})
         assert P.MODEL_ROUTES == {}
         P.register_model_routes(
             {"kilo": type("K", (), {"model": "custom:free"})(),
              "gemini35lite": type("G", (), {"model": "m"})()})
-        assert P.MODEL_ROUTES["custom:free"] == "kilo"
-        assert P.MODEL_ROUTES["tencent/hy3:free"] == "kilo"
+        # Kilo ids are coding-agent-only. They must NOT appear in the global
+        # table, or a document-pipeline or chat request that happened to pass
+        # one would silently reroute onto a free coding model.
+        assert P.MODEL_ROUTES.get("custom:free") is None
         assert P.MODEL_ROUTES["gemini-3.5-flash-lite"] == "gemini35lite"
+        assert P.CODE_MODEL_ROUTES["custom:free"] == "kilo"
+        assert P.CODE_MODEL_ROUTES["kilo-auto/free"] == "kilo"
+        assert P.route_for_model("custom:free") is None
+        assert P.route_for_model("custom:free", "code") == "kilo"
+        # A global route still wins for a coding request.
+        assert P.route_for_model("gemini-3.5-flash-lite", "code") == "gemini35lite"
     finally:
         P.MODEL_ROUTES.clear()
+        P.CODE_MODEL_ROUTES.clear()
 
 
 def test_integration_inventory_marks_fallback():

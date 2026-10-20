@@ -55,7 +55,16 @@ class ToolRegistration(unittest.TestCase):
         import asyncio
         import mcp_server
         tools = asyncio.run(mcp_server.mcp.list_tools())
-        self.assertEqual(len(tools), 49)
+        # 54 = 49 + 5 code-intelligence tools: document_symbols,
+        # find_references, blast_radius, preview_edit, apply_symbol_edit.
+        # find_symbol regex-matched names and could not tell a definition
+        # from a call site, so "update every caller of X" was never safe.
+        # preview_edit renders a diff and writes nothing; apply_symbol_edit
+        # is the separate, explicit write.
+        # 56 = 54 + make_dir + run_command. make_dir completes the file-tool
+        # set; run_command is the PowerShell escape hatch, bounded by
+        # sandbox.py and guarded/audited in mcp_server.
+        self.assertEqual(len(tools), 56)
 
     def test_redundant_tools_are_gone(self):
         """They must not linger in the catalog or in the tool payload, or the

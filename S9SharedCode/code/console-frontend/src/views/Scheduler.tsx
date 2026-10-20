@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { CalendarClock, Play, Trash2, X } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, Stat, SkipLink } from '../components/ui';
+import { useMainId, useActivePoll } from '../components/KeepAlive';
 import { api, ago, fmtFire, CONF, type ScheduleJob } from '../api';
 
 function asList(s: ScheduleJob[] | Record<string, ScheduleJob> | undefined): (ScheduleJob & { key: string })[] {
@@ -52,6 +53,7 @@ export function orderJobs(jobs: Job[]): Job[] {
 }
 
 export default function Scheduler() {
+  const mainId = useMainId();
   const [jobs, setJobs] = useState<(ScheduleJob & { key: string })[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [q, setQ] = useState('');
@@ -78,17 +80,12 @@ export default function Scheduler() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
-
   // The list only mutates when a job fires (minutes/hours away), so a flat
-  // 2s poll while armed is 7.5× the documented list cadence for static
+  // 2s poll while armed is 7.5A- the documented list cadence for static
   // data. Go fast only when a firing is actually imminent (<60s out).
   const nowS = Date.now() / 1000;
   const imminent = jobs.some((j) => j.enabled && (j.next_fire || 0) > 0 && (j.next_fire || 0) - nowS < 60);
-  useEffect(() => {
-    const t = setInterval(load, imminent ? CONF.pollFastMs : CONF.pollSlowMs);
-    return () => clearInterval(t);
-  }, [load, imminent]);
+  useActivePoll(load, imminent ? CONF.pollFastMs : CONF.pollSlowMs);
 
   const create = async () => {
     /* POST /api/schedule has no idempotency key, so a double-click created
@@ -190,7 +187,7 @@ export default function Scheduler() {
           ))}
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb="Scheduler" />
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">

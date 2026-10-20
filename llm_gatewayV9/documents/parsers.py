@@ -111,6 +111,21 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+def _verbatim(text: str) -> str:
+    """Normalise line endings without touching code indentation.
+
+    `_clean` is right for prose but destroys fenced code and <pre> blocks: it
+    collapses every run of spaces or tabs, so a Python function loses its
+    body indentation and a Makefile becomes a sentence. Keep the characters
+    and only remove the transport damage (soft hyphens, zero-width marks,
+    CRLF), trimming blank lines at the edges.
+    """
+    text = text.replace("\u00ad", "")
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip("\n")
+
+
 # ── PDF table recovery ──────────────────────────────────────────────────────
 # Why this exists, concretely: a weekly menu PDF arrived as one flattened
 # paragraph. The day names ("Monday Tuesday ... Sunday") appeared once, in the
@@ -754,7 +769,9 @@ def parse_markdown(data: bytes) -> ParseResult:
     """Honour the markdown grammar the file actually uses: ATX headings,
     fenced code (kept whole, never split), lists, tables, paragraphs."""
     res = ParseResult()
-    lines = _clean(_dec(data)).splitlines()
+    # `split("\n")` rather than `splitlines()` so a lone `\r` inside code is
+    # already normalised by _verbatim and nothing else is treated as a break.
+    lines = _verbatim(_dec(data)).split("\n")
     i, n = 0, len(lines)
     para: list[str] = []
     lst: list[str] = []
@@ -898,7 +915,7 @@ def parse_html(data: bytes) -> ParseResult:
         elif el.name == "pre":
             t = el.get_text()
             if t.strip():
-                res.blocks.append(Block(kind="code", text=_clean(t)))
+                res.blocks.append(Block(kind="code", text=_verbatim(t)))
         else:
             t = _clean(el.get_text(" ", strip=True))
             if t:

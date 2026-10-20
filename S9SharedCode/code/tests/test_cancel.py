@@ -124,6 +124,7 @@ def test_cancel_endpoint_reports_and_fires():
     r = client.post("/api/chat/cancel", json={"session_id": "s8-not-a-run"})
     assert r.status_code == 200
     assert r.json()["found"] is False
+    assert r.json()["status"] == "missing"
 
     # Register a live run (as _stream_run does) and cancel it by session id.
     ev = ag.threading.Event()
@@ -132,6 +133,7 @@ def test_cancel_endpoint_reports_and_fires():
         r = client.post("/api/chat/cancel", json={"session_id": "t-cancel-sid"})
         assert r.status_code == 200
         assert r.json()["found"] is True
+        assert r.json()["status"] == "cancelled"
         assert ev.is_set()
 
         # …and by conversation id, with a fresh event.
@@ -147,6 +149,41 @@ def test_cancel_endpoint_reports_and_fires():
     # After unregistering, the run is no longer findable.
     r = client.post("/api/chat/cancel", json={"session_id": "t-cancel-sid"})
     assert r.json()["found"] is False
+    assert r.json()["status"] == "missing"
+
+
+def test_stop_landing_before_the_worker_is_remembered():
+    """C8: a Stop between submit and `_register_run` must still stop the run.
+
+    The endpoint used to answer found=false and forget it; the run then
+    proceeded and billed. It must report `pending` and set the event the
+    moment registration happens.
+    """
+    import agent_server as ag
+    from fastapi.testclient import TestClient
+
+    client = TestClient(ag.app)
+    cid = "c-pending-stop"
+    key = "idem-pending-stop"
+    ag._PENDING_CANCELS.pop(cid, None)
+    assert ag._inflight_run_claim(key, cid) == ""
+    try:
+        r = client.post("/api/chat/cancel",
+                        json={"conversation_id": cid})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "pending", body
+        assert body["found"] is True
+        assert body["cancelled"] == 0
+        assert body["session_id"]
+
+        ev = ag.threading.Event()
+        ag._register_run(ev, "s8-pending-stop", cid)
+        assert ev.is_set(), "pending Stop did not survive registration"
+        ag._unregister_run("s8-pending-stop", cid, cancel_ev=ev)
+    finally:
+        ag._inflight_run_release(key)
+        ag._PENDING_CANCELS.pop(cid, None)
 
 
 def test_concurrent_runs_on_one_key_stay_independently_cancellable():
@@ -194,10 +231,14 @@ class TestCancelWiring:
             "_stream_run must pass cancel_ev.is_set (a bool-returning "
             "predicate), not cancel_ev.set (returns None => never cancels)"
         )
-        # Every use of the event must read state, never mutate it: `.set()`
-        # returns None (falsy) so the executor never cancels, the notify gate
-        # always fires, and `done.cancelled` is always null.
-        bare = src.replace("cancel_ev.is_set", "cancel_ev.__ok__")
-        assert "cancel_ev.set" not in bare, (
-            "cancel_ev.set returns None; replace it with cancel_ev.is_set"
+        # `Event.set()` is legitimate in `_register_run` (honouring a Stop
+        # that arrived before the worker). Inside `_stream_run` every use of
+        # the event must READ state: `.set()` returns None (falsy) so the
+        # executor never cancels, the notify gate always fires, and
+        # `done.cancelled` is always null.
+        start = src.index("def _stream_run")
+        end = src.index("\n@app.", start + 1)
+        stream = src[start:end]
+        assert "cancel_ev.set()" not in stream, (
+            "cancel_ev.set returns None; pass cancel_ev.is_set to the executor"
         )

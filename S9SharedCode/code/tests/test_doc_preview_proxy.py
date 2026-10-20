@@ -46,6 +46,28 @@ def tmp_session_root():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_a_stored_document_preview_is_proxied_to_the_gateway(
+        client, monkeypatch):
+    """The Documents modal asks the agent, never the gateway directly."""
+    c, hdr = client
+    import agent_server
+
+    seen = {}
+
+    async def _fake(path, **kw):
+        seen["path"] = path
+        seen["timeout"] = kw.get("timeout")
+        return {"mode": "pages", "format": "pdf", "pages": [],
+                "page_count": 0}
+
+    monkeypatch.setattr(agent_server, "_gw_json", _fake)
+    r = c.get("/api/documents/doc-80c02d11c0/preview", headers=hdr)
+    assert r.status_code == 200, r.text[:200]
+    assert seen["path"] == "/v1/documents/doc-80c02d11c0/preview"
+    assert seen["timeout"] == 120.0
+    assert r.json()["format"] == "pdf"
+
+
 def test_a_spec_preview_is_proxied_to_the_gateway(client, monkeypatch):
     c, hdr = client
     seen = {}

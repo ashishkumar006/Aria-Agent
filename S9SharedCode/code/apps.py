@@ -1,4 +1,4 @@
-"""Config-driven tracker apps for the Apps page.
+﻿"""Config-driven tracker apps for the Apps page.
 
 An app is a JSON spec (no code): what to watch, where to fetch it, how
 often to refresh, and what to show. The runner executes specs on schedule,
@@ -13,7 +13,7 @@ Kinds (v1):
 
 Schedules reuse the scheduler's cron mini-language ("daily@HH:MM",
 "every Nm/Nh") plus "manual". A tiny worker thread (30s tick) fires due
-refreshes — deliberately separate from the LLM scheduler, which fires
+refreshes â€” deliberately separate from the LLM scheduler, which fires
 agent queries, not code.
 
 Conventions match agent_server: S9_STATE_DIR overrides the state dir so
@@ -37,10 +37,10 @@ _OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 _lock = threading.Lock()
 _stop = threading.Event()
-_worker: threading.Thread | None = None
+_worker_thread: threading.Thread | None = None
 
 
-# ── specs ─────────────────────────────────────────────────────────────────
+# â”€â”€ specs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _slug(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
@@ -49,7 +49,7 @@ def _slug(name: str) -> str:
 
 def validate_spec(raw: dict) -> dict:
     """Validate a posted app spec, returning a normalised spec dict.
-    Raises ValueError with a human message on any problem (→ HTTP 400)."""
+    Raises ValueError with a human message on any problem (â†’ HTTP 400)."""
     if not isinstance(raw, dict):
         raise ValueError("spec must be a JSON object")
     kind = (raw.get("kind") or "").strip()
@@ -96,8 +96,8 @@ def validate_spec(raw: dict) -> dict:
     if not 1 <= spec["history"] <= 200:
         raise ValueError("history must be 1..200")
     # Mini-UI block: per-app view config (table/cards, columns, sort).
-    # Pure data — the frontend renders it, so a bad value can never crash
-    # the console; validation still rejects junk loudly (→ HTTP 400).
+    # Pure data â€” the frontend renders it, so a bad value can never crash
+    # the console; validation still rejects junk loudly (â†’ HTTP 400).
     ui = raw.get("ui") or {}
     if not isinstance(ui, dict):
         raise ValueError("ui must be an object")
@@ -131,7 +131,7 @@ def validate_spec(raw: dict) -> dict:
         # The SSRF guard used to run only at fetch time, so a
         # loopback / link-private / metadata URL was accepted at
         # CREATE, persisted into the spec and echoed by every
-        # read — the refusal only surfaced (as a 200 error body)
+        # read â€” the refusal only surfaced (as a 200 error body)
         # on refresh. Refuse it where the spec is written.
         _guard_feed_url(url)
         spec["url"] = url
@@ -154,7 +154,7 @@ def _next_fire(schedule: str, base: float) -> float | None:
     return _sched._next_fire_from_cron(schedule, base)
 
 
-# ── storage ───────────────────────────────────────────────────────────────
+# â”€â”€ storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _spec_path(app_id: str) -> Path:
     return APPS_DIR / f"{app_id}.json"
@@ -239,10 +239,10 @@ def delete_app(app_id: str) -> bool:
         return True
 
 
-# ── runner ────────────────────────────────────────────────────────────────
+# â”€â”€ runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # A spec's URL is operator-supplied, but specs are also
-# created through POST /api/apps — so the fetch must not
+# created through POST /api/apps â€” so the fetch must not
 # reach loopback / link-local / private targets: the agent
 # process can reach the gateway, cloud metadata endpoints
 # and other internal hosts a browser never could. Refuse
@@ -271,7 +271,7 @@ def _refuse_nonpublic_host(host: str) -> None:
                 f"feed URL host {h!r} is not a public address")
         return
     # A hostname: resolve it and check every address it
-    # maps to. Unresolvable here is not a refusal — the
+    # maps to. Unresolvable here is not a refusal â€” the
     # fetch itself fails on it, with the real error.
     try:
         infos = socket.getaddrinfo(h, None)
@@ -309,7 +309,7 @@ def _http_get_json(url: str) -> dict:
     r = httpx.get(url, timeout=25.0, follow_redirects=True,
                   headers={"User-Agent": "Aria-apps/1.0",
                            "Accept": "application/json"})
-    # A public host can redirect to an internal one —
+    # A public host can redirect to an internal one â€”
     # re-check the URL the request actually landed on.
     _guard_feed_url(str(r.url))
     if len(r.content) > _MAX_FEED_BYTES:
@@ -440,9 +440,9 @@ def get_app(app_id: str) -> dict | None:
             "history": data.get("history", [])}
 
 
-# ── worker ────────────────────────────────────────────────────────────────
+# â”€â”€ worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def _worker() -> None:
+def _worker_loop() -> None:
     while not _stop.wait(timeout=30.0):
         try:
             now = time.time()
@@ -455,10 +455,11 @@ def _worker() -> None:
                 if now >= float(nxt):
                     try:
                         refresh_app(spec["id"])
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:      # noqa: BLE001
+                        print(f"[apps] scheduled refresh of "
+                              f"{spec.get('id')!r} failed: {e!r}", flush=True)
+        except Exception as e:                  # noqa: BLE001
+            print(f"[apps] scheduled-refresh tick failed: {e!r}", flush=True)
 
 
 def _seed() -> None:
@@ -484,11 +485,13 @@ def _seed_refresh() -> None:
 def start() -> None:
     """Seed the default tracker + start the refresh worker. Safe to call
     twice; never raises."""
-    global _worker
+    global _worker_thread
     try:
         _seed()
-        if _worker is None or not _worker.is_alive():
-            _worker = threading.Thread(target=_worker, daemon=True)
-            _worker.start()
-    except Exception:
-        pass
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
+            _worker_thread.start()
+    except Exception as e:                 # noqa: BLE001
+        print(f"[apps] scheduled-refresh worker failed to start: {e!r}",
+              flush=True)
+

@@ -170,20 +170,29 @@ class MemoryService:
             self._reconcile_index()
 
     def _reconcile_index(self) -> None:
-        """Heal index drift: the pre-migration writer never pruned vectors
-        for deleted items, so the on-disk index can reference ids that no
-        longer exist (they are silently skipped at read time, which
-        degrades recall without a word). If any orphan ids are found,
-        rebuild the index from the currently-embedded items — loudly."""
+        """Heal index drift against the authoritative ``memory.json``.
+
+        Two failures matter: the pre-migration writer never pruned vectors
+        for deleted items, and a crash during an index write can leave a
+        missing, truncated or zero-filled pair. In both cases recall silently
+        degrades (or vector search is disabled) until someone deletes the
+        files by hand. Rebuild whenever the index ids do not exactly match
+        the live embedded records - loudly.
+        """
         assert self.index is not None
         with self._write_lock:
-            live_ids = {i.id for i in self.store.load() if i.embedding}
-            orphans = [i for i in self.index._ids if i not in live_ids]
-            if not orphans:
+            records = [i for i in self.store.load()
+                       if i.embedding and i.kind in EMBEDDABLE_KINDS]
+            live_ids = {i.id for i in records}
+            current_ids = set(self.index._ids)
+            if (len(self.index._ids) == len(records)
+                    and current_ids == live_ids):
                 return
-            print(f"[memory] index holds {len(orphans)} orphan vector(s) for "
-                  f"deleted items — rebuilding from {len(live_ids)} live "
-                  f"embedded items")
+            orphans = current_ids - live_ids
+            missing = live_ids - current_ids
+            print(f"[memory] index drift: {len(orphans)} orphan and "
+                  f"{len(missing)} missing vector(s); rebuilding from "
+                  f"{len(records)} live embedded items")
             self._rebuild_locked()
             print(f"[memory] index rebuilt: size={self.index.size}")
 

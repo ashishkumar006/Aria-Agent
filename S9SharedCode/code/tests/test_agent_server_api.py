@@ -122,6 +122,67 @@ def test_chat_stream_emits_started_deltas_done(monkeypatch):
     assert str(done["conversation_id"]).startswith("ct-")
 
 
+def test_chat_stream_delivers_live_deltas_and_does_not_replay(monkeypatch):
+    """The lightweight turn must forward gateway deltas as they arrive.
+
+    The old fallback called the blocking `chat`, so every delta was emitted
+    only after the model had finished - the pause was real but the progress
+    was theatre. A streamed answer must also not be sent a second time in the
+    batched tail.
+    """
+    monkeypatch.setattr(flags, "is_enabled", lambda *a, **k: False)
+
+    class _StreamingLLM:
+        def chat(self, **kw):
+            raise AssertionError("a streamable turn must not use chat()")
+
+        async def stream_chat(self, **kw):
+            import asyncio
+            yield {"type": "text", "text": "live "}
+            await asyncio.sleep(0.05)
+            yield {"type": "text", "text": "answer"}
+            yield {"type": "done", "provider": "fake", "model": "fake-1"}
+
+    monkeypatch.setattr(gateway, "LLM", _StreamingLLM)
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+
+    with TestClient(app) as client:
+        frames = _frames(client.post("/api/chat/simple/stream",
+                                     json={"query": "hi"}).text)
+    deltas = [f["text"] for f in frames if f["type"] == "delta"]
+    assert deltas == ["live ", "answer"], deltas
+    assert frames[-1]["type"] == "done"
+    assert frames[-1]["answer"] == "live answer"
+    assert frames[-1]["model"] == "fake-1"
+
+
+def test_chat_stream_forwards_tool_loop_text_live(monkeypatch):
+    """With tools on, the tool loop must be asked to stream (`stream=True`)
+    and its text events must become deltas before the run finishes."""
+    monkeypatch.setattr(flags, "is_enabled", lambda *a, **k: True)
+    seen: dict = {}
+
+    async def _run_with_tools(**kw):
+        seen.update(kw)
+        kw["on_event"]("text", {"delta": "tool "})
+        kw["on_event"]("text", {"delta": "answer"})
+        return {"text": "tool answer", "provider": "fake"}
+
+    import mcp_runner
+    monkeypatch.setattr(mcp_runner, "run_with_tools", _run_with_tools)
+    monkeypatch.setattr(agent_server, "_chat_tool_payload",
+                        lambda: [{"type": "function", "function": {"name": "x"}}])
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+
+    with TestClient(app) as client:
+        frames = _frames(client.post("/api/chat/simple/stream",
+                                     json={"query": "hi"}).text)
+    assert seen.get("stream") is True
+    assert [f["text"] for f in frames if f["type"] == "delta"] == [
+        "tool ", "answer"]
+    assert frames[-1]["answer"] == "tool answer"
+
+
 def test_chat_stream_persists_thread_and_reuses_id(monkeypatch):
     """Streaming must persist to the same thread store as /api/chat/simple,
     and a second turn on the same conversation_id must keep that history."""
@@ -146,6 +207,42 @@ def test_chat_stream_persists_thread_and_reuses_id(monkeypatch):
     roles = [m["role"] for m in thread["messages"]]
     assert roles == ["user", "assistant", "user", "assistant"], roles
     assert thread["messages"][-1]["content"] == "ok"
+
+
+def test_chat_threads_are_scoped_by_engine(monkeypatch):
+    """The Lightweight/DAG toggle must not show the same threads in both.
+
+    A lightweight turn is stored under `light`; a DAG turn recorded through the
+    `/turn` endpoint is stored under `dag`; `?mode=` scopes the listing to one
+    engine. Before this, both engines shared one untagged list, so the sidebar
+    looked identical whichever way the toggle was set.
+    """
+    monkeypatch.setattr(flags, "is_enabled", lambda *a, **k: False)
+
+    class _LLM:
+        def chat(self, **kw):
+            return {"text": "ok", "provider": "fake"}
+
+    monkeypatch.setattr(gateway, "LLM", _LLM)
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+
+    with TestClient(app) as client:
+        light = _frames(client.post("/api/chat/simple/stream",
+                                    json={"query": "light one"}).text)
+        lcid = light[-1]["conversation_id"]
+        assert client.post("/api/chat/threads/c-dagtest/turn",
+                           json={"query": "dag one", "answer": "dag answer",
+                                 "mode": "dag"}).status_code == 200
+        light_list = client.get("/api/chat/threads?mode=light").json()["threads"]
+        dag_list = client.get("/api/chat/threads?mode=dag").json()["threads"]
+
+    light_ids = {t["conversation_id"] for t in light_list}
+    dag_ids = {t["conversation_id"] for t in dag_list}
+    assert lcid in light_ids and lcid not in dag_ids
+    assert "c-dagtest" in dag_ids and "c-dagtest" not in light_ids
+    # The engine tag travels with the row, so the UI can label it.
+    assert all(t["mode"] == "light" for t in light_list)
+    assert all(t["mode"] == "dag" for t in dag_list)
 
 
 def test_chat_stream_rejects_empty_query():

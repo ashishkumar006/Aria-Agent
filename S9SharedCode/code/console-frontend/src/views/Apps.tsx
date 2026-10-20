@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { LayoutGrid, Flag, Plus, ArrowLeft, RefreshCw, Trash2 } from 'lucide-react';
 import { Rail, TopBar, Empty, Stat, Pill, SkipLink } from '../components/ui';
 import { A2ui } from '../components/A2ui';
+import { useMainId, useActivePoll } from '../components/KeepAlive';
 import { api, CONF, type A2uiSurface, type FeedEvent, type FlagRow, type TrackerApp, type TrackerAppDetail, type FeedbackRollup, type McpStats } from '../api';
 
 const fmtTs = (ts: number | null | undefined) =>
@@ -29,6 +30,7 @@ function uiConf(detail: TrackerAppDetail | null) {
 }
 
 export default function Apps() {
+  const mainId = useMainId();
   const [tiles, setTiles] = useState({ gw: false, sess: 0, jobs: 0, tools: '—', spend: '—' });
   const [spend, setSpend] = useState<{ skill: string; dollars: number }[]>([]);
   const [feed, setFeed] = useState<FeedEvent[]>([]);
@@ -334,11 +336,7 @@ export default function Apps() {
     }
   };
 
-  useEffect(() => {
-    load();
-    const t = setInterval(load, CONF.pollSlowMs);
-    return () => clearInterval(t);
-  }, [load]);
+  useActivePoll(load, CONF.pollSlowMs);
 
   const max = Math.max(1e-9, ...spend.map((r) => r.dollars));
 
@@ -371,7 +369,11 @@ export default function Apps() {
           Boards
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{1 + trackers.length}</span>
         </div>
-        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-2.5 pb-3">
+        {/* min-h: the board list starts as the single "System overview" card and
+            grows to one card per tracker once /api/apps lands, which pushed the
+            whole main column down - 0.17 CLS on tablet, the last shift over
+            0.1 anywhere. Three cards is a realistic floor for a real install. */}
+        <div className="min-h-[220px] flex-1 space-y-2 overflow-y-auto px-2.5 pb-3 lg:min-h-0">
           <button
             onClick={() => { setOpenId(null); setDetail(null); }}
             className={`block w-full rounded-[10px] border p-2.5 text-left ${openId === null ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
@@ -409,7 +411,7 @@ export default function Apps() {
           </button>
         </div>
       </div>
-      <main id="main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
+      <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <TopBar crumb={openId && detail ? `Apps / ${detail.name}` : 'Apps'}>
           {openId ? (
             <>
@@ -655,7 +657,11 @@ export default function Apps() {
               {prefab.live ? 'prefab cloud live' : prefab.configured ? 'prefab cloud configured (offline)' : 'local only'}
             </span>
           </div>
-          <section className="mx-3.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
+          {/* Reserved: the flag list is the tallest thing on the page and it
+              arrives after first paint. Growing from a one-line empty state to
+              seven multi-line flag rows pushed the spend section and everything
+              under it down - 0.34 CLS on tablet, the worst on the site. */}
+          <section className="mx-3.5 min-h-[420px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
             {!flags.length && <Empty icon={<Flag size={30} />} title="No flags defined" />}
             {flags.map((f) => (
               <div key={f.name} className="flex items-center gap-3 border-b border-white/5 py-2.5 text-xs last:border-0">
@@ -694,7 +700,12 @@ export default function Apps() {
             ))}
           </section>
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">SPEND BY SKILL</div>
-          <section className="mx-3.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
+          {/* Reserved height: this section went from the "No spend yet" empty
+              state to eight bar rows once the cost fetch landed, and the shift
+              was 0.34 CLS on tablet. `spend` is capped at 8 rows, so eight rows
+              is its real size - reserving exactly that costs nothing and holds
+              the page still. */}
+          <section className="mx-3.5 min-h-[190px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
             {!spend.length && <Empty icon={<LayoutGrid size={30} />} title="No spend yet" />}
             {spend.map((r, i) => (
               <div key={`${r.skill || 'unknown'}-${i}`} className="my-1.5 flex items-center gap-2.5 text-xs">

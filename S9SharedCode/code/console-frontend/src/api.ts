@@ -1,5 +1,7 @@
 /* Typed client over the agent's existing REST + SSE surface. */
 
+import { cachedGet, invalidate } from './lib/getCache';
+
 /** Single source of truth for environment knobs (ports, poll cadence).
     Views must import these instead of hardcoding numbers/URLs. */
 export const CONF = {
@@ -70,6 +72,11 @@ export interface NodeDetail {
     agent_name?: string;
     cost?: number | string;
     provider?: string;
+    /** Per-node token spend/produce, shown in the Inspector stats tab.
+     *  For a tool-using node this is the loop's accumulated total across all
+     *  its turns, not just the final reply's usage. */
+    input_tokens?: number;
+    output_tokens?: number;
     /** Failed nodes carry the reason here (see Inspector's ERROR panel). */
     error?: string;
     elapsed_s?: number;
@@ -90,7 +97,7 @@ export interface SessionSummary {
          tell its own history from the other's.
          Named `run_kind`, not `kind`: in the Authoring sidebar `kind` already
          means the FILE FORMAT (pdf/pptx/docx/xlsx). */
-     run_kind?: 'authoring' | 'research';
+     run_kind?: 'authoring' | 'research' | 'chat';
      /* Did this run actually write a file? Named `has_files` because the
         authoring sidebar already uses `files` for the file LIST. */
      has_files?: boolean;
@@ -249,6 +256,15 @@ export interface CodeEntry {
   size?: number;
 }
 
+/** The active Code workspace: the base path the explorer browses. Defaults
+ *  to the project's two service trees; "Open Folder" points it elsewhere. */
+export interface CodeWorkspace {
+  root: string;
+  name: string;
+  roots?: string[];
+  is_default?: boolean;
+}
+
 /** One file from `/api/code/file`. Served read-only by the agent. */
 export interface CodeFile {
   path: string;
@@ -260,6 +276,9 @@ export interface CodeFile {
   language: string;
   /** Cheap freshness token (mtime+size) so a reload can detect drift. */
   version: string;
+  /** Exact mtime: what a save echoes back so the server can refuse a stale
+   *  write instead of clobbering newer work. */
+  mtime?: number;
 }
 
 /** One diagnostic from `/api/code/check`. Lines and columns are 1-based,
@@ -301,6 +320,51 @@ export interface CodeCheckResult {
 }
 
 /** `/api/code/checks` — the project's own lint/typecheck/tests, run for real. */
+/** Result of one `/api/code/intel` op. Only the fields that op returns are
+ *  populated, so callers must not assume all of them are present. */
+export interface CodeIntelResult {
+  ok?: boolean;
+  error?: string;
+  // symbols
+  file?: string;
+  language?: string;
+  symbols?: Array<{
+    name: string; kind: string; line: number; end_line: number;
+    col: number; doc: string; parent: string;
+  }>;
+  // references / blast
+  symbol?: string;
+  definitions?: Array<{ file: string; line: number; col: number; text: string; kind: string }>;
+  references?: Array<{ file: string; line: number; col: number; text: string; kind: string }>;
+  definition_count?: number;
+  reference_count?: number;
+  files_touched?: number;
+  blast?: Array<{ file: string; count: number; lines: number[] }>;
+  risk?: 'low' | 'medium' | 'high';
+  exact?: boolean;
+  // preview / apply
+  diff?: string;
+  detail?: string;
+  applied?: boolean;
+  written?: boolean;
+  path?: string;
+  // definition / hover (go-to-definition and tooltips)
+  found?: boolean;
+  line?: number;
+  kind?: string;
+  parent?: string;
+  local?: boolean;
+  signature?: string;
+  doc?: string;
+  // rename
+  sites?: Array<{ file: string; line: number; col: number; text: string;
+                  kind: string }>;
+  site_count?: number;
+  new_name?: string;
+  changed?: string[];
+  files_changed?: number;
+}
+
 export interface CodeChecks {
   ok: boolean;
   checks_run: number;
@@ -317,7 +381,93 @@ export interface CodeAskFrame {
   answer?: string;
   path?: string;
   provider?: string;
+  model?: string;
+  /** The model's reasoning. A separate frame type precisely so it is never
+   *  concatenated into the answer. */
+  thinking?: string;
+  input_tokens?: number;
+  output_tokens?: number;
   context_files?: string[];
+}
+
+/** A frame from `/api/code/agent` — the tool-using agentic loop.
+ *
+ *  Superset of CodeAskFrame: it adds the live tool trace (`tool_call` /
+ *  `tool_result`), which is the whole difference between a Q&A box and an
+ *  agent that reads the repo. `delta` frames now arrive token by token from
+ *  the model as it writes, so the answer appears while it is being generated. */
+export interface CodeAgentFrame extends CodeAskFrame {
+  /** Present on tool_call / tool_result: the tool's name. */
+  name?: string;
+  /** tool_call: the identifying argument. tool_result: a bounded result. */
+  detail?: string;
+  /** tool_result only: did the tool succeed? */
+  ok?: boolean;
+  /** Pairs a tool_result with the tool_call it belongs to, so the panel
+   *  updates one activity row instead of appending a duplicate. */
+  id?: string;
+  /** done only: the reasoning was the answer repeated, so any live `thinking`
+   *  frames must be withdrawn. */
+  thinking_dropped?: boolean;
+  /** done only: why the loop stopped early (hop cap, context budget, a stale
+   *  repeat). Empty on a normal completion. */
+  stopped?: string;
+  tool_calls?: number;
+  /** permission only: the agent wants to write and is parked until this id is
+   *  decided through `codePermission`. `diff` is the exact patch.
+   *  write (auto) only: the same payload, but the write is already dispatched
+   *  - no decision is expected; the user reviews afterwards through
+   *  Keep / Revert (`codeKeep` / `codeRevert`). */
+  tool?: string;
+  summary?: string;
+  diff?: string;
+  args?: Record<string, unknown>;
+  /** permission / write: the CLIENT-visible path of the file the write touches
+   *  ("<root>/dir/file"), safe to hand straight to `codeFile`/`open`. */
+  path?: string;
+  /** write only: the write was auto-approved and is being applied now. */
+  auto?: boolean;
+}
+
+/** One unreviewed agent write, as listed by `codeChanges`. */
+export interface CodeAgentChange {
+  path: string;
+  tool?: string;
+  summary?: string;
+  diff?: string;
+  when?: number;
+  /** true when the agent created the file (before-content: nothing). */
+  created?: boolean;
+}
+
+/** One entry of the gateway's Kilo catalogue, normalized upstream. */
+export interface KiloModel {
+  id: string;
+  name: string;
+  vendor: string;
+  owned_by: string;
+  context_length: number;
+  max_completion_tokens: number;
+  price_in: number;
+  price_out: number;
+  is_free: boolean;
+  supports_tools: boolean;
+  supports_vision: boolean;
+  supports_reasoning: boolean;
+  description: string;
+}
+
+/** Response of `/api/models` — the picker roster, or an explanation. */
+export interface ModelRoster {
+  models: KiloModel[];
+  count: number;
+  free_count: number;
+  stale: boolean;
+  /** The pool's current model; what the picker pre-selects. */
+  default?: string;
+  /** Whether a KILO_API_KEY is set (the roster is readable without one). */
+  configured?: boolean;
+  error?: string | null;
 }
 
 export interface SkillRow {
@@ -390,7 +540,10 @@ export type SimpleStreamEvent =
   /* `elapsed_ms` is measured server-side from the moment the turn starts, not
      from when the client rendered: time spent opening the SSE connection is
      the user's wait too, and hiding it would flatter the answer. */
-  | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number }
+  /* `kind: "report"` + `title` mark an answer that IS a research report shown
+     in full (delegated from chat). The console renders those as a preview
+     card that opens in a dialog, instead of inlining several thousand words. */
+  | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number; model?: string; provider?: string; kind?: string; title?: string }
   | { type: 'error'; text?: string }
   | { type: string; [k: string]: unknown };
 
@@ -429,6 +582,20 @@ const LAUNCH_TOKEN: string = (() => {
 
 export function hasLaunchToken(): boolean { return LAUNCH_TOKEN !== ''; }
 
+/** The per-launch token as a value, for the terminal's WebSocket handshake.
+ *  A browser cannot set a custom header on a WebSocket, so the token has to
+ *  travel in the URL — the same unforgeable-per-launch secret, just carried
+ *  where the transport allows. */
+export function launchToken(): string {
+  // Re-read the shell's meta tag rather than pinning the module-load value:
+  // a reconnect after the agent restarted must use the NEW per-launch token
+  // if the shell refreshed it (H12).
+  try {
+    return document.querySelector('meta[name="aria-token"]')
+      ?.getAttribute('content') || LAUNCH_TOKEN;
+  } catch { return LAUNCH_TOKEN; }
+}
+
 /* ── AG-UI ────────────────────────────────────────────────────────────────
    The subset this client consumes. Deliberately not the full 31-event
    vocabulary: these are the frames the Apps refresh emits, and a type that
@@ -456,7 +623,8 @@ export function headers(extra?: Record<string, string>): Record<string, string> 
   // The per-launch token travels as its own header, not as the bearer. It is
   // required on every /api/* call when the agent has one, and a cross-origin
   // page cannot set it.
-  if (LAUNCH_TOKEN) h['X-Aria-Token'] = LAUNCH_TOKEN;
+  const launch = launchToken();
+  if (launch) h['X-Aria-Token'] = launch;
   return h;
 }
 
@@ -488,6 +656,7 @@ async function reason(r: Response): Promise<string> {
  *  it — which is the only way to recover without persisting the secret. */
 export const STALE_TOKEN_EVENT = 'aria:stale-token';
 let staleNotified = false;
+
 function notifyStaleToken(): void {
   if (staleNotified) return;
   staleNotified = true;
@@ -497,9 +666,34 @@ function notifyStaleToken(): void {
 }
 
 async function j<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, { ...init, headers: headers(init?.headers as Record<string, string>) });
-  if (!r.ok) throw new Error(await reason(r));
-  return (await r.json()) as T;
+  const method = (init?.method || 'GET').toUpperCase();
+  /* Read-through cache on GET only. This is the single funnel every view
+     goes through, so caching here covers all of them without touching a call
+     site. A section switch was refetching everything the user had just
+     looked at; the keep-alive host stops the component remount and this stops
+     the network round-trip. Writes bypass it entirely. */
+  const load = async (): Promise<T> => {
+    const r = await fetch(url, { ...init, headers: headers(init?.headers as Record<string, string>) });
+    if (!r.ok) throw new Error(await reason(r));
+    return (await r.json()) as T;
+  };
+  if (method !== 'GET' || !url.startsWith('/api/')) {
+    /* A write makes every cached read of the affected data stale — whatever its
+       verb. This used to live only in `pj` (POST), so the DELETE routes
+       (scheduling, chat threads, memory, documents) went through here with no
+       invalidation at all: `scheduleDelete` reported "deleted", then the
+       view's re-read was served from the 30s read-through cache and the row
+       stayed on screen until the TTL expired or the page was reloaded.
+       Invalidate before the request so a component that re-reads on the
+       success path never sees the pre-write value. */
+    if (method !== 'GET') invalidate();
+    return load();
+  }
+  /* `cache: 'no-store'` opts a GET out of the read-through cache. Liveness
+     probes need it: a 30s-cached /api/health made the gateway-down banner's
+     Retry replay the very failure the user was trying to clear. */
+  if (init?.cache === 'no-store') return load();
+  return cachedGet<T>(url, load);
 }
 
 /** POST a JSON body through the same pipeline as `j` (auth header + server
@@ -508,6 +702,8 @@ async function j<T>(url: string, init?: RequestInit): Promise<T> {
     stringified differently — and each drift was a latent auth or
     contract bug. */
 function pj<T>(url: string, body: unknown, init?: RequestInit): Promise<T> {
+  /* `j` invalidates the read-through cache for every non-GET verb, so a POST
+     through here needs no invalidation of its own. */
   return j<T>(url, {
     ...init,
     method: 'POST',
@@ -529,6 +725,8 @@ export interface ChatThread {
   title?: string;
   updated?: number;
   turns?: number;
+  /** Which engine owns this thread. The sidebar lists only the current mode's. */
+  mode?: 'light' | 'dag';
 }
 
 export interface FlagRow {
@@ -617,7 +815,7 @@ async function* sseFrames(r: Response, signal?: AbortSignal): AsyncGenerator<Rec
 }
 
 export const api = {
-  health: () => j<{ agent: string; gateway_up: boolean }>('/api/health'),
+  health: () => j<{ agent: string; gateway_up: boolean }>('/api/health', { cache: 'no-store' }),
   /* ── document authoring (PDF / PPTX / DOCX / XLSX) ──
      The gateway owns the generators; these two routes proxy them so the
      console never holds the gateway token. `docgen` returns the BLOB (it
@@ -642,32 +840,45 @@ export const api = {
     const m = /filename="?([^";]+)"?/i.exec(cd);
     return { blob: await r.blob(), filename: m ? m[1] : `document.${format}` };
   },
-  chatThreads: (limit = 50, offset = 0) =>
+  /* `mode` scopes the list to one engine ("light" | "dag") so the
+     Lightweight/DAG toggle does not show the same conversations in both. */
+  chatThreads: (limit = 50, offset = 0, mode?: 'light' | 'dag') =>
     j<{ threads: ChatThread[]; total: number; has_more: boolean }>(
-      `/api/chat/threads?limit=${limit}&offset=${offset}`,
+      `/api/chat/threads?limit=${limit}&offset=${offset}${mode ? `&mode=${mode}` : ''}`,
     ),
   chatThread: (cid: string) =>
-    j<{ conversation_id: string; title: string; messages: { role: string; content: string }[] }>(
+    j<{ conversation_id: string; title: string;
+        messages: { role: string; content: string; kind?: string; title?: string }[] }>(
       `/api/chat/threads/${encodeURIComponent(cid)}`,
     ),
+  /* Persist a DAG turn into the sidebar store so a DAG conversation is listed
+     under `dag` and can be reopened (the DAG engine keeps its own transcript;
+     the sidebar store is otherwise lightweight-only). */
+  chatThreadTurn: (cid: string, query: string, answer: string, mode: 'light' | 'dag') =>
+    pj<{ status: string }>(`/api/chat/threads/${encodeURIComponent(cid)}/turn`,
+      { query, answer, mode }),
   chatThreadDelete: (cid: string) =>
     j<{ status: string }>(`/api/chat/threads/${encodeURIComponent(cid)}`, { method: 'DELETE' }),
-  chatSimple: (query: string, conversationId?: string) =>
-    pj<{ answer: string; conversation_id: string; error?: string }>(`/api/chat/simple`, {
+  chatSimple: (query: string, conversationId?: string, model?: string) =>
+    pj<{ answer: string; conversation_id: string; error?: string; kind?: string; title?: string }>(`/api/chat/simple`, {
       query, conversation_id: conversationId || undefined,
+      ...(model ? { model } : {}),
     }),
   sessions: (limit = 50) =>
-    j<{ sessions: SessionSummary[] }>(`/api/sessions?limit=${limit}`),
+    j<{ sessions: SessionSummary[] }>(
+      `/api/sessions?limit=${limit}`, { cache: 'no-store' }),
   runsSummary: (limit = 200) =>
     j<{ runs: RunRow[]; totals?: { runs?: number; nodes?: number; dollars?: number } }>(
-      `/api/runs/summary?limit=${limit}`,
+      `/api/runs/summary?limit=${limit}`, { cache: 'no-store' },
     ),
   /** The graph is always requested `light`: `light=false` makes the server
       serialise every NodeState (untrimmed, "some nodes are megabytes") into
       a `node_states` array this client never reads. Node detail is fetched
       on demand via `api.node()`, which *is* trimmed. */
   graph: (sid: string) =>
-    j<GraphPayload>(`/api/sessions/${encodeURIComponent(sid)}/graph?light=true`),
+    j<GraphPayload>(
+      `/api/sessions/${encodeURIComponent(sid)}/graph?light=true`,
+      { cache: 'no-store' }),
   node: (sid: string, nid: string) =>
     j<NodeDetail>(`/api/sessions/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}`),
   cost: (conversationId?: string) =>
@@ -688,7 +899,8 @@ export const api = {
     }>(
       `/api/nodes/health?limit=200${conversationId ? `&conversation_id=${encodeURIComponent(conversationId)}` : ''}`,
     ),
-  scheduleList: () => j<{ schedules?: ScheduleJob[] | Record<string, ScheduleJob> }>('/api/schedule'),
+  scheduleList: () => j<{ schedules?: ScheduleJob[] | Record<string, ScheduleJob> }>(
+    '/api/schedule', { cache: 'no-store' }),
   scheduleCreate: (query: string, when: string) =>
     pj<{ status: string; id?: string; message?: string }>('/api/schedule', { query, when }),
   scheduleCancel: (id: string) =>
@@ -701,7 +913,7 @@ export const api = {
   scheduleToggle: (id: string, enabled: boolean) =>
     pj<{ ok: boolean; schedule_id?: string; enabled?: boolean; error?: string; hint?: string }>(
       `/api/schedule/${encodeURIComponent(id)}/enabled`, { enabled }),
-  tools: () => j<{ tools: ToolSpec[] }>('/api/tools'),
+  tools: () => j<{ tools: ToolSpec[] }>('/api/tools', { cache: 'no-store' }),
   toolsGuard: () =>
     j<{ disabled: string[] | null; error?: string }>('/api/config/tools'),
   setTool: (tool: string, enabled: boolean) =>
@@ -712,9 +924,10 @@ export const api = {
     pj<{ name?: string; value?: unknown; cleared?: boolean; flags?: FlagRow[]; error?: string }>(
       '/api/apps/flags', { name, value },
     ),
-  trackerApps: () => j<{ apps: TrackerApp[] }>('/api/apps'),
+  trackerApps: () => j<{ apps: TrackerApp[] }>('/api/apps', { cache: 'no-store' }),
   trackerApp: (id: string) =>
-    j<TrackerAppDetail>(`/api/apps/${encodeURIComponent(id)}`),
+    j<TrackerAppDetail>(
+      `/api/apps/${encodeURIComponent(id)}`, { cache: 'no-store' }),
   trackerCreate: (spec: Record<string, unknown>) =>
     pj<{ spec?: Record<string, unknown>; apps?: TrackerApp[]; error?: string }>('/api/apps', spec),
   trackerRefresh: (id: string) =>
@@ -796,7 +1009,7 @@ export const api = {
   /* The behavioural profile. Separate from `memory` because the evidence is
      the point: each row carries the user's own words, so a wrong observation
      is visibly a guess and can be deleted knowing what it rested on. */
-  profile: (signal?: AbortSignal) =>
+  profile: (limit = 200, signal?: AbortSignal) =>
     j<{
       enabled: boolean;
       note?: string;
@@ -810,7 +1023,7 @@ export const api = {
         seen_count?: number;
         created_at?: string;
       }[];
-    }>('/api/profile', { signal }),
+    }>(`/api/profile?limit=${Math.min(Math.max(limit, 1), 200)}`, { signal }),
   /* Write the whole profile - observations AND standing preferences - into the
      Documents section as markdown. */
   saveProfileDocument: () =>
@@ -836,14 +1049,15 @@ export const api = {
       { use_documents: useDocuments }),
   deleteMemory: (id: string) =>
     j<Record<string, unknown>>(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  events: (limit = 200) => j<{ events?: FeedEvent[]; count?: number }>(`/api/events?limit=${limit}`),
+  events: (limit = 200) => j<{ events?: FeedEvent[]; count?: number }>(
+    `/api/events?limit=${limit}`, { cache: 'no-store' }),
   config: () => j<{ raw?: string; error?: string }>('/api/config'),
   templates: () => j<{ templates?: unknown[] }>('/api/templates'),
   /* Documents. Upload returns as soon as the bytes are stored; indexing
      continues in the background, so the caller polls the list. */
   documents: (signal?: AbortSignal) =>
     j<{ documents?: DocItem[]; error?: string }>(
-      '/api/documents', signal ? { signal } : undefined),
+      '/api/documents', { cache: 'no-store', ...(signal ? { signal } : {}) }),
   documentDetail: (id: string) =>
     j<{ document?: DocItem; error?: string }>(
       `/api/documents/${encodeURIComponent(id)}`),
@@ -880,12 +1094,26 @@ export const api = {
     pj<{ hits?: DocHit[]; error?: string }>('/api/documents/search',
       { query, top_k: topK }),
 
-  /* Code workspace — READ ONLY. The agent serves a fixed pair of source trees
-     through a path-confined endpoint; there is no write, move or delete verb.
-     Edits made in the console stay in the browser (see views/Code.tsx). */
+  /* Code workspace. The editor starts on an empty scratch folder; Open Folder
+     or New Playground re-roots it, path-confined, at a local directory. The
+     console pays a human confirm for the one write path (save), and the
+     coding agent's writes pause for approval in the panel (see views/Code.tsx). */
   codeRoots: () =>
     j<{ root?: string; roots?: { name: string; exists: boolean }[]; max_bytes?: number }>(
       '/api/code/roots'),
+  /** The workspace the explorer is browsing right now. */
+  codeWorkspace: () => j<CodeWorkspace>('/api/code/workspace'),
+  /** Open a folder on this machine as the Code workspace. Single-operator,
+   *  loopback, token-gated: the same trust level as the user's own shell.
+   *  Re-roots only `/api/code/*`; the agent's tool sandbox is separate. */
+  openCodeWorkspace: (path: string) =>
+    pj<CodeWorkspace>('/api/code/workspace', { path }),
+  /** Create an empty scratch workspace and switch to it. */
+  newCodePlayground: () =>
+    pj<CodeWorkspace>('/api/code/workspace', { playground: true }),
+  /** Return to the shipped default: the empty scratch workspace. */
+  resetCodeWorkspace: () =>
+    pj<CodeWorkspace>('/api/code/workspace/reset', {}),
   codeTree: (path: string, signal?: AbortSignal) =>
     j<{ path?: string; parent?: string; entries?: CodeEntry[]; error?: string }>(
       `/api/code/tree?path=${encodeURIComponent(path)}`,
@@ -918,6 +1146,38 @@ export const api = {
   codeChecks: (path?: string, signal?: AbortSignal) =>
     pj<CodeChecks>(`/api/code/checks`, { path: path || '' },
       signal ? { signal } : undefined),
+
+  /** Code intelligence for the agent panel.
+   *
+   *  One endpoint over the gateway's `code_intel`: symbols, references, blast
+   *  radius, preview and apply. `preview` writes nothing, so the panel can call
+   *  it freely to show a diff; only `apply` touches disk. */
+  codeIntel: (
+    op: 'symbols' | 'references' | 'blast' | 'preview' | 'apply'
+      | 'definition' | 'hover' | 'rename',
+    args: { path?: string; name?: string; text?: string; mode?: string;
+            confirm?: boolean; line?: number; col?: number;
+            new_name?: string } = {},
+    signal?: AbortSignal,
+  ) => pj<CodeIntelResult>(`/api/code/intel`, { op, ...args },
+      signal ? { signal } : undefined),
+  /** Roster for the Code panel's model picker, proxied from the gateway.
+   *
+   *  Goes through the agent rather than the gateway directly: the gateway has
+   *  no CORS middleware and the page never receives the gateway token, so a
+   *  direct fetch would be blocked twice over.
+   *
+   *  `all` asks for the whole catalogue rather than only the free tier - the
+   *  picker groups free first but must still offer everything, or half the
+   *  models Kilo serves would be unreachable from the UI.
+   *
+   *  `refresh` bypasses both caches (the gateway TTL and the 30s GET cache)
+   *  so the user can pick up a newly added model without a restart. */
+  models: (refresh = false, all = false, signal?: AbortSignal) => {
+    const q = [refresh && 'refresh=true', all && 'all=true'].filter(Boolean);
+    return j<ModelRoster>(`/api/models${q.length ? `?${q.join('&')}` : ''}`, { signal });
+  },
+
   /** Ask the agent about the code in the editor.
    *
    *  Read-only by design: it answers, it does not edit. A question typed into a
@@ -926,11 +1186,19 @@ export const api = {
    *  should. fetch + ReadableStream, not EventSource: EventSource cannot send
    *  X-Aria-Token, so every frame would 401. */
   async *codeAskStream(question: string, path: string, text: string,
-                        signal?: AbortSignal): AsyncGenerator<CodeAskFrame> {
+                        history?: { role: 'user' | 'assistant'; content: string }[],
+                        signal?: AbortSignal,
+                        model?: string): AsyncGenerator<CodeAskFrame> {
     const r = await fetch('/api/code/ask', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ question, path, text }),
+      // `history` makes this a conversation rather than a series of unrelated
+      // questions. The server keeps a bounded tail of the recent turns, so
+      // "and what calls it?" still refers to the previous answer.
+      // `model` is the picker's choice, sent as a bare `vendor/name` id: the
+      // gateway resolves it to a provider itself, so the panel never has to
+      // know or hardcode which provider serves it. Omitted when unset.
+      body: JSON.stringify({ question, path, text, history: history ?? [], ...(model ? { model } : {}) }),
       signal,
     });
     if (!r.ok) throw new Error(await reason(r));
@@ -939,6 +1207,87 @@ export const api = {
       yield f as unknown as CodeAskFrame;
     }
   },
+  /** The agentic counterpart to `codeAskStream`: the coding agent that can
+   *  actually USE tools.
+   *
+   *  `/api/code/ask` is one model call over a pre-baked context slice — the
+   *  model never gets to choose what to look at, so when it wants a tool it has
+   *  nowhere to go and simply stops. This endpoint runs the tool loop: the
+   *  model calls read_file / search_files / find_symbol …, each call and its
+   *  result streams back as `tool_call` / `tool_result` frames, and the answer
+   *  streams token by token as `delta`.
+   *
+   *  `model` is sent as a bare `vendor/name` id (the picker's choice); the
+   *  gateway resolves it, and a Kilo id is what routes the request to Kilo
+   *  rather than the general ladder. Omitting it lets the server default. */
+  async *codeAgentStream(question: string, path: string, text: string,
+                         history?: { role: 'user' | 'assistant'; content: string }[],
+                         signal?: AbortSignal,
+                         model?: string,
+                         maxHops?: number,
+                         paths?: string[],
+                         autoApprove = false): AsyncGenerator<CodeAgentFrame> {
+    const r = await fetch('/api/code/agent', {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        question, path, text, history: history ?? [],
+        ...(model ? { model } : {}),
+        ...(maxHops ? { max_hops: maxHops } : {}),
+        ...(paths && paths.length ? { paths } : {}),
+        ...(autoApprove ? { auto_approve: true } : {}),
+      }),
+      signal,
+    });
+    if (!r.ok) throw new Error(await reason(r));
+    if (!r.body) throw new Error('empty response body');
+    for await (const f of sseFrames(r, signal)) {
+      yield f as unknown as CodeAgentFrame;
+    }
+  },
+  /** Accept or refuse one proposed agent write.
+   *
+   *  The coding agent CAN edit, but never unattended: each write parks the run
+   *  and emits a `permission` frame carrying the exact diff. This call is what
+   *  releases it. A refusal is a real outcome - the model is told the change was
+   *  declined and continues - so the panel can always say "Decline" and let the
+   *  agent adapt rather than hang. */
+  codePermission: (id: string, approve: boolean) =>
+    pj<{ status?: string; id?: string; approve?: boolean; error?: string }>(
+      `/api/code/permission/${encodeURIComponent(id)}`, { approve }),
+  /** Files the agent changed whose change is still unreviewed.
+   *
+   *  With auto-approve the writes land immediately and the user keeps or
+   *  reverts each file afterwards; this lists what is still pending so a page
+   *  reload does not lose the review. `created` marks a file the agent brought
+   *  into existence (Revert deletes it). */
+  codeChanges: (signal?: AbortSignal) =>
+    j<{ changes?: CodeAgentChange[] }>('/api/code/agent/changes',
+      signal ? { signal } : undefined),
+  /** Accept the agent's change to a path: it stays on disk, marks come off. */
+  codeKeep: (path: string) =>
+    pj<{ ok?: boolean; path?: string; error?: string }>(
+      '/api/code/agent/keep', { path }),
+  /** Put a path back the way it was before the agent touched it. A file the
+   *  agent created is removed. */
+  codeRevert: (path: string) =>
+    pj<{ ok?: boolean; path?: string; restored?: boolean; deleted?: boolean;
+         error?: string }>('/api/code/agent/revert', { path }),
+  /** Save a buffer to disk. The only human write route, and gated: the payload
+   *  must carry confirm:true (the user pressed save) plus the mtime the caller
+   *  read, so a stale tab cannot silently clobber newer work. */
+  codeWrite: (path: string, text: string, opts: { confirm: boolean; mtime?: number }) =>
+    pj<{ ok?: boolean; path?: string; written?: boolean; unchanged?: boolean;
+         backup?: string; bytes?: number; error?: string }>(
+      '/api/code/write', { path, text, ...opts }),
+  /** Create one empty file in the workspace, for the explorer's "New file".
+   *
+   *  `/api/code/write` only saves a buffer that was already open, so nothing in
+   *  the console could bring a file into existence. This can only add an empty
+   *  file (never truncates), and needs confirm:true like every write here. */
+  codeNewFile: (name: string, dir?: string) =>
+    pj<{ ok?: boolean; path?: string; created?: boolean; bytes?: number; error?: string }>(
+      '/api/code/newfile', { name, dir: dir || '', confirm: true }),
   /** Review what is on disk: status, diff, or recent log.
    *
    *  Read-only by construction — the server offers no write verb, so this
@@ -981,7 +1330,8 @@ export const api = {
       at its next node boundary and remaining nodes are saved as `skipped`).
       `found:false` simply means nothing was running for that id. */
   cancelRun: (ids: { conversation_id?: string; session_id?: string }) =>
-    pj<{ status: string; found: boolean; cancelled: number }>('/api/chat/cancel', ids),
+    pj<{ status: 'cancelled' | 'pending' | 'missing'; found: boolean;
+         cancelled: number; session_id?: string }>('/api/chat/cancel', ids),
   /** Structured contents of a rendered document: slide cards for a deck,
    *  page cards for a PDF, a grid for a workbook, paragraphs for a .docx.
    *  Read from the artifact that was ACTUALLY produced - the run's own
@@ -1015,7 +1365,9 @@ export const api = {
       reader and stops — callers must also stop their graph polling). */
 async *chat(query: string, conversationId?: string, signal?: AbortSignal,
                opts?: { research?: boolean; idempotencyKey?: string;
-                        docSetup?: Record<string, unknown> }): AsyncGenerator<ChatEvent> {
+                        docSetup?: Record<string, unknown>;
+                        depth?: 'quick' | 'standard' | 'deep';
+                        runKind?: 'research' | 'authoring' | 'chat' }): AsyncGenerator<ChatEvent> {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
@@ -1027,6 +1379,13 @@ async *chat(query: string, conversationId?: string, signal?: AbortSignal,
         // instead of paying for a second identical one.
         research: opts?.research || undefined,
         idempotency_key: opts?.idempotencyKey,
+        /* What kind of run this is, declared rather than inferred later from
+           the skills it emits. Persisted at run start, so a new research
+           topic is listed in the sidebar immediately. */
+        run_kind: opts?.runKind,
+        /* Planner-only. `query` is the TOPIC itself; depth never rides inside
+           it, or every worker reads it as its own instruction. */
+        depth: opts?.depth,
         /* The setup panel is applied to the render server-side, not merely
            described in the prompt - see _clean_doc_setup. */
         doc_setup: opts?.docSetup,
@@ -1046,11 +1405,15 @@ async *chat(query: string, conversationId?: string, signal?: AbortSignal,
   },
   /** POST /api/chat/simple/stream as an async generator of SSE events
       (started/status/delta/done/error). Same abort contract as chat(). */
-  async *chatSimpleStream(query: string, conversationId?: string, signal?: AbortSignal): AsyncGenerator<SimpleStreamEvent> {
+  async *chatSimpleStream(query: string, conversationId?: string, signal?: AbortSignal,
+                          model?: string): AsyncGenerator<SimpleStreamEvent> {
     const r = await fetch('/api/chat/simple/stream', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ query, conversation_id: conversationId || undefined }),
+      // Conditional spread: an empty pick must leave the request identical
+      // to the pre-picker shape so the gateway default still applies.
+      body: JSON.stringify({ query, conversation_id: conversationId || undefined,
+                              ...(model ? { model } : {}) }),
       signal,
     });
     if (!r.ok) throw new Error(await reason(r));
@@ -1065,52 +1428,6 @@ async *chat(query: string, conversationId?: string, signal?: AbortSignal,
     }
   },
 };
-
-/** Build the research brief for a depth.
- *
- * The depth used to be a polite sentence inside the query ("Keep it
- * tight…", "Be thorough…"), which the Planner simply overrode: measured
- * over three runs of the same topic, quick/standard/deep ALL produced
- * `research_plan.depth = "deep"`, and "quick" produced the LONGEST answer
- * (7,071 words) because it fanned out to 4 researchers. The button was
- * decorative.
- *
- * Depth is now a HARD budget the Planner is told to respect, with the
- * worker count spelled out, because that is the only lever that
- * actually changed the output.
- */
-const DEPTH_SPEC: Record<string, { workers: number; shape: string }> = {
-  quick: {
-    workers: 1,
-    shape: 'QUICK — this is a single lookup. Emit EXACTLY ONE researcher node '
-      + '(no facets beyond one) and one formatter. One search, one fetch. The '
-      + 'answer must stay a short paragraph plus sources — under ~400 words.',
-  },
-  standard: {
-    workers: 3,
-    shape: 'STANDARD — emit AT MOST 3 researcher nodes (one per facet) and one '
-      + 'formatter. A structured report: Executive Summary, Key Findings, '
-      + 'Sources. Roughly 1,500-2,500 words.',
-  },
-  deep: {
-    workers: 6,
-    shape: 'DEEP — emit as many researcher nodes as the question genuinely needs '
-      + '(up to 6), each scoped to its own facet, and one formatter. Cover '
-      + 'competing views, risks and unknowns, not just the headline. '
-      + 'Several pages is correct here.',
-  },
-};
-
-export function briefFor(topic: string, depth: string): string {
-  const spec = DEPTH_SPEC[depth] || DEPTH_SPEC.standard;
-  return `You are a research agent. Research this topic and deliver a final report as Markdown.\n\n`
-    + `Topic: ${topic}\n\n`
-    + `RESEARCH DEPTH: ${depth.toUpperCase()}\n`
-    + `${spec.shape}\n\n`
-    + `The depth is a hard budget, not a hint: set research_plan.depth to "${depth}" `
-    + `and do not exceed ${spec.workers} researcher node(s). Use web search, memory `
-    + `and any files available. The final message must be the complete report.`;
-}
 
 export function displayTopic(s: SessionSummary): string {
   if (s.topic) return s.topic.trim();

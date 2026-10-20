@@ -56,6 +56,11 @@
 /* === BASE === */
 html, body, #root {
   height: 100%;
+  /* The shell owns the viewport. Without this a view that is one pixel taller
+     than the window gives the whole document a second scrollbar, and zooming
+     in makes the page drift sideways away from the fixed rail. Views scroll
+     their own panes instead. */
+  overflow: hidden;
   background: var(--color-void);
   color: #ededed;
   font-family: var(--font-sans);
@@ -265,6 +270,38 @@ html, body, #root {
   font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
   color: #d4d4d8; white-space: pre;
 }
+/* A fenced block is one surface: language on the left, copy on the right,
+   code below. Keeping the header inside the same border is what makes the
+   button obviously belong to its block when a message has several. */
+.prose-chat .code-block {
+  margin: 0.55rem 0; overflow: hidden;
+  background: rgba(0, 0, 0, 0.55); border: 1px solid var(--color-edge);
+  border-radius: 8px;
+}
+.prose-chat .code-block pre {
+  margin: 0; border: 0; border-radius: 0; background: transparent;
+}
+.code-block-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 0.75rem; padding: 0.25rem 0.55rem;
+  border-bottom: 1px solid var(--color-edge);
+  background: rgba(255, 255, 255, 0.025);
+}
+.code-lang {
+  font-family: var(--font-mono); font-size: 10.5px; color: #8b8b95;
+  text-transform: lowercase; letter-spacing: 0.04em;
+}
+.code-copy {
+  border: 1px solid transparent; border-radius: 4px;
+  background: transparent; padding: 0.1rem 0.4rem;
+  font-size: 10.5px; font-weight: 600; color: #a9a9b6; cursor: pointer;
+}
+.code-copy:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.14); color: #e6e6ec;
+}
+.code-copy:disabled { cursor: default; }
+.code-copy[data-state="ok"] { color: #7ee2a8; }
+.code-copy[data-state="fail"] { color: #ff8f8f; }
 .table-scroll { overflow-x: auto; margin: 0.55rem 0; }
 .prose-chat table {
   width: 100%; border-collapse: collapse; font-size: 12px;
@@ -424,6 +461,17 @@ html, body, #root {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
   border-radius: 6px;
+}
+/* The Code agent panel draws its own focus affordances (the composer border
+   lights up, the model select and inputs carry their own border). The global
+   accent ring above fired on every click in there — text fields and selects
+   match :focus-visible even for a pointer, and several browsers ring a clicked
+   button too — so clicking a suggestion or the composer left an outline around
+   it. Scoped here rather than globally so the rest of the console keeps its
+   keyboard ring. */
+.agent-panel :focus,
+.agent-panel :focus-visible {
+  outline: none;
 }
 
 /* === REDUCED MOTION === */
@@ -618,4 +666,201 @@ html, body, #root {
 .aria-dragbar select {
   -webkit-app-region: no-drag;
   app-region: no-drag;
+}
+
+/* ── Toasts (sonner) ──────────────────────────────────────────────────────
+   sonner ships its own layout/stacking/animation CSS; these rules only re-skin
+   it onto the console's surfaces and type scale. The colours are set through
+   sonner's own custom properties rather than by overriding its rules, so a
+   sonner upgrade does not silently drop the theme. */
+[data-sonner-toast] {
+  --normal-bg: var(--color-surface-2);
+  --normal-text: #ededed;
+  --normal-border: var(--color-glass-border);
+  --success-bg: var(--color-surface-2);
+  --success-text: #d9f7e6;
+  --success-border: rgba(126, 226, 168, 0.35);
+  --error-bg: var(--color-surface-2);
+  --error-text: #ffd9d9;
+  --error-border: rgba(255, 107, 107, 0.35);
+  font-family: var(--font-sans);
+  border-radius: 10px;
+  backdrop-filter: blur(16px) saturate(1.2);
+  -webkit-backdrop-filter: blur(16px) saturate(1.2);
+}
+[data-sonner-toast] [data-title] { font-size: 12.5px; font-weight: 600; }
+[data-sonner-toast] [data-description] { font-size: 11.5px; color: var(--color-zinc-muted); }
+[data-sonner-toast] [data-button] {
+  font-size: 11.5px; font-weight: 700; border-radius: 6px;
+}
+
+/* ── IDE scope ────────────────────────────────────────────────────────────────
+   The rest of the console is a violet glass dashboard; an editor is not, and
+   the mismatch is why Code never read as "a real IDE". So the editor gets its
+   own neutral graphite palette, scoped to `.ide`, and the surrounding app keeps
+   its identity. Values follow the reference dark theme: near-black chrome, a
+   hair lighter editor surface, one border weight, and 13px text on ~19px rows.
+
+   Re-pointing the TOKENS rather than hardcoding hex on every element is the
+   point: the hundreds of `bg-surface-*` / `border-glass-border` classes across
+   Code.tsx, AgentPanel and Monaco all follow automatically, so there is one
+   palette to change instead of one per component. */
+.ide {
+  /* Chrome (activity bar, tabs, explorer) is darker than the editor surface -
+     that relationship is what makes the editor look like the "front" pane.
+     The surfaces themselves are the app's own tokens: the editor is part of
+     the same window, not a near-black slab bolted onto it. They are not
+     re-declared here on purpose, so a palette change reaches the Code view
+     automatically. */
+  /* Editor-blue, not dashboard-violet. Violet on graphite is the single loudest
+     signal that a panel was not designed as an editor. */
+  --color-accent: #3794ff;
+  --color-zinc-muted: #9d9d9d;
+  --color-ok: #89d185;
+  --color-warn: #cca700;
+  --color-danger: #f14c4c;
+  --color-info: #3794ff;
+  /* The -dim tints are hard-coded rgba in the base palette, so overriding the
+     six colours above alone left pills and badges on the dashboard's amber /
+     violet - which is how a warning pill ended up glaring in a graphite
+     editor. Re-tint them from the same values. */
+  --color-ok-dim: rgba(137, 209, 133, 0.14);
+  --color-warn-dim: rgba(204, 167, 0, 0.14);
+  --color-danger-dim: rgba(241, 76, 76, 0.14);
+  --color-info-dim: rgba(55, 148, 255, 0.14);
+  color: #cccccc;
+  /* Density. The dashboard runs 12.5px on generous padding; an editor runs 13px
+     on 19px lines, and the difference is most of what "feels dense" means. */
+  font-size: 13px;
+  line-height: 1.46;
+}
+/* Square off the chrome. The dashboard's soft radii are right for cards and
+   wrong for a file tree: rounded rows read as a list, not a tree. */
+.ide :where(aside, [role="tablist"], [role="tree"]) button,
+.ide :where(aside, [role="tablist"], [role="tree"]) a {
+  border-radius: 0;
+}
+/* Hairline dividers between panes, so the layout reads as panels rather than
+   as floating cards. */
+.ide aside,
+.ide [role="tablist"],
+.ide [role="tree"] {
+  border-color: var(--color-glass-border);
+}
+/* Monaco fades the minimap canvas to 90% (`.minimap canvas { opacity: .9 }`)
+   and expects the container to paint the editor surface, the way VS Code's
+   own background layer does. Ours was transparent, so 10% of the TEXT of a
+   long line extending under the minimap showed through the empty area below
+   the thumbnails - faint ghost words floating in the minimap column. */
+.ide .monaco-editor .minimap {
+  background-color: var(--color-surface-1);
+}
+
+
+/* ── VS Code Dark Modern, as a scope ──────────────────────────────────────────
+   The base palette is a violet glass dashboard, and its accent appears as
+   LITERAL `violet-400` Tailwind classes in AgentPanel, the model picker and the
+   send button. Re-pointing a custom property cannot reach those, which is why
+   violet survived the token swap and made the editor look like a web page with
+   a dark mode class.
+
+   So the literals are re-pointed here instead, scoped to `.ide`. Same trick as
+   the token block above and for the same reason: one place to change, and no
+   component ends up half violet because someone forgot it. Values are the
+   reference dark theme's own blues and greys. */
+.ide :where(.text-violet-100, .text-violet-200, .text-violet-300) { color: #9cdcfe; }
+.ide :where(.text-violet-50) { color: #eaf3ff; }
+.ide :where(.text-violet-200\/60) { color: rgba(156, 220, 254, 0.6); }
+.ide :where(.text-violet-200\/70) { color: rgba(156, 220, 254, 0.7); }
+.ide :where(.bg-violet-400\/10, .bg-violet-400\/15, .bg-violet-400\/20,
+            .bg-violet-500\/10, .bg-violet-500\/15) { background-color: rgba(55, 148, 255, 0.16); }
+.ide :where(.bg-violet-500\/25) { background-color: rgba(55, 148, 255, 0.22); }
+.ide :where(.bg-violet-300) { background-color: #9cdcfe; }
+.ide :where(.bg-violet-400\/70) { background-color: rgba(55, 148, 255, 0.7); }
+.ide :where(.bg-violet-400, .bg-violet-500) { background-color: #0078d4; }
+.ide :where(.bg-violet-500\/90) { background-color: #0078d4; }
+.ide :where(.hover\:bg-violet-500:hover) { background-color: #026ec1; }
+.ide :where(.border-violet-400\/30) { border-color: rgba(55, 148, 255, 0.3); }
+.ide :where(.border-violet-400\/40) { border-color: rgba(55, 148, 255, 0.4); }
+.ide :where(.hover\:border-violet-400\/50:hover,
+            .focus-within\:border-violet-400\/60:focus-within) {
+  border-color: rgba(55, 148, 255, 0.5);
+}
+.ide :where(.hover\:border-violet-400:hover, .focus\:border-violet-400:focus) {
+  border-color: #3794ff;
+}
+.ide :where(.text-sky-300) { color: #9cdcfe; }
+.ide :where(.text-emerald-300) { color: #89d185; }
+.ide :where(.text-rose-300) { color: #f14c4c; }
+.ide :where(.text-amber-300) { color: #cca700; }
+.ide :where(.bg-amber-400\/15) { background-color: rgba(204, 167, 0, 0.16); }
+
+/* The agent's change marks in the editor (Monaco decorations). Green for
+   added lines, yellow for edited (replaced) lines, red for a deletion point
+   - the same reading as Cursor's inline diff gutter, drawn through Monaco's
+   decoration API so the marks track the lines as the user keeps editing. */
+.aria-agent-add { background: rgba(63, 185, 80, 0.10); }
+.aria-agent-add-gutter { border-left: 3px solid #3fb950; margin-left: 2px; }
+.aria-agent-mod { background: rgba(210, 153, 34, 0.13); }
+.aria-agent-mod-gutter { border-left: 3px solid #d29922; margin-left: 2px; }
+.aria-agent-del-gutter { border-left: 3px solid #f85149; margin-left: 2px; }
+
+/* Inputs. The dashboard's translucent inputs read as glass; an editor's read
+   as recessed wells with a visible edge. */
+.ide :where(input, textarea, select) {
+  background-color: var(--color-surface-2);
+  border-color: #2b3448;
+  border-radius: 2px;
+  color: #cccccc;
+}
+.ide :where(input, textarea, select):focus {
+  border-color: var(--color-accent);
+  outline-color: var(--color-accent);
+}
+/* Buttons, as flat rects - no glow, no gradient. */
+.ide button {
+  border-radius: 2px;
+}
+.ide :where(button):hover {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+/* The chat log reads as a transcript, not a stack of cards: in an editor the
+   agent pane is a panel, so its content sits on the panel surface. */
+.ide :where(aside, [role="tablist"], [role="tree"], .ide-status) {
+  background-color: var(--color-surface-0);
+}
+
+/* The agent panel is the most violet thing in the editor - it carries ~14
+   literal `violet-*` classes, from the send button to the message bubble. A
+   handful of overrides left it looking bolted onto a graphite window, so the
+   rest are mapped here too. Same reference blues. */
+.ide :where(.text-violet-50) { color: #d4d4d4; }
+.ide :where(.bg-violet-500\/5) { background-color: rgba(55, 148, 255, 0.05); }
+.ide :where(.bg-violet-500\/10) { background-color: rgba(55, 148, 255, 0.12); }
+.ide :where(.bg-violet-500\/15) { background-color: rgba(55, 148, 255, 0.16); }
+.ide :where(.bg-violet-500\/25) { background-color: rgba(55, 148, 255, 0.26); }
+.ide :where(.bg-violet-300) { background-color: #9cdcfe; }
+.ide :where(.border-violet-400\/40) { border-color: rgba(55, 148, 255, 0.4); }
+.ide :where(.border-violet-400\/50) { border-color: rgba(55, 148, 255, 0.5); }
+.ide :where(.border-violet-400\/60) { border-color: rgba(55, 148, 255, 0.65); }
+.ide :where(.focus-within\:border-violet-400\/60:focus-within) { border-color: #0078d4; }
+.ide :where(.hover\:border-violet-400\/50:hover) { border-color: rgba(55, 148, 255, 0.6); }
+/* Message bubbles: a chat in an editor is a transcript, so the accent is a
+   left marker rather than a filled violet card. */
+.ide :where(.rounded-2xl) {
+  border-radius: 4px;
+}
+
+/* The send button and other primary actions read from --color-accent rather
+   than a literal violet, so ONE token restyles every accent control in the
+   editor. Mapping each shade individually was a losing game: this is the 8th
+   distinct violet the agent panel carried. */
+.ide :where(.bg-accent) { background-color: var(--color-accent); }
+
+/* The blanket `button:hover` grey above outranks the accent repoints (it
+   carries an extra :hover in its specificity), so the send button lost its
+   blue the moment the pointer touched it. Pin the primary's hover. */
+.ide button.bg-accent:hover {
+  background-color: var(--color-accent);
+  filter: brightness(1.1);
 }

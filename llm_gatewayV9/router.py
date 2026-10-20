@@ -7,27 +7,32 @@ from collections import deque, defaultdict
 
 LIMITS = {
     "ollama":     {"rpm": 9999, "rpd": 9999999, "tpm": 99999999, "cooldown": 0,   "max_ctx": 32000},
-    "cerebras":   {"rpm": 30,   "rpd": 9999,    "tpm": 60000,    "cooldown": 2,   "max_ctx": 8000,    "tokens_per_day": 1_000_000},
-    "groq":       {"rpm": 30,   "rpd": 1000,    "tpm": 6000,     "cooldown": 2,   "max_ctx": 100000},
-    "nvidia":     {"rpm": 40,   "rpd": 9999,    "tpm": 100000,   "cooldown": 2,   "max_ctx": 100000},
     "gemini":     {"rpm": 15,   "rpd": 1000,    "tpm": 250000,   "cooldown": 4,   "max_ctx": 1000000},
     "gemini35lite": {"rpm": 15, "rpd": 1000,    "tpm": 250000,   "cooldown": 4,   "max_ctx": 1000000},
-    "openrouter": {"rpm": 20,   "rpd": 50,      "tpm": 99999999, "cooldown": 3,   "max_ctx": 100000},
-    "github":     {"rpm": 10,   "rpd": 50,      "tpm": 99999999, "cooldown": 6,   "max_ctx": 8000},
     "kilo":       {"rpm": 60,   "rpd": 9999,    "tpm": 99999999, "cooldown": 1,   "max_ctx": 262144},
 }
+# cerebras / groq / nvidia / openrouter / github were removed at the operator's
+# request (providers.DISABLED_PROVIDERS). Their entries are gone from LIMITS
+# too, not merely filtered downstream: this table is served verbatim in
+# /v1/status and rendered in Settings, so a surviving row would advertise a
+# budget for a provider that can no longer be constructed.
 
 SHORTCUTS = {
     "g": "gemini", "gem": "gemini", "gemini": "gemini",
     "g35l": "gemini35lite", "gem35l": "gemini35lite", "gemini35lite": "gemini35lite",
-    "n": "nvidia", "nv": "nvidia", "nvidia": "nvidia",
     "o": "ollama", "oll": "ollama", "ollama": "ollama",
-    "gr": "groq", "groq": "groq",
-    "c": "cerebras", "cer": "cerebras", "cerebras": "cerebras",
-    "or": "openrouter", "opr": "openrouter", "openrouter": "openrouter",
-    "gh": "github", "ghb": "github", "github": "github",
     "k": "kilo", "kilo": "kilo",
 }
+# Aliases for the removed providers are gone WITH them. Leaving "n" or "gr"
+# resolving to a provider that can no longer be constructed turns a typo into a
+# 400 that looks like a gateway fault rather than an unknown shortcut.
+for _dead_alias, _dead in (("n", "nvidia"), ("nv", "nvidia"), ("nvidia", "nvidia"),
+                           ("gr", "groq"), ("groq", "groq"),
+                           ("c", "cerebras"), ("cer", "cerebras"), ("cerebras", "cerebras"),
+                           ("or", "openrouter"), ("opr", "openrouter"),
+                           ("openrouter", "openrouter"),
+                           ("gh", "github"), ("ghb", "github"), ("github", "github")):
+    SHORTCUTS.pop(_dead_alias, None)
 
 
 def resolve(name):
@@ -207,10 +212,12 @@ class Router:
 # with worker quotas (provider keys are shared but providers meter per-model).
 # -----------------------------------------------------------------------------
 
-# NOTE: "kilo" intentionally absent — build_router_providers() wires only
-# cerebras/groq/nvidia/github (per-model metered keys), so any name here
-# without a builder is silently filtered by the Router constructor.
-DEFAULT_ROUTER_ORDER = ["cerebras", "groq", "nvidia", "github"]
+# The router pool now has exactly one member. cerebras/groq/nvidia/github were
+# the per-model-metered routers and all four are in DISABLED_PROVIDERS, so
+# leaving them here would advertise a ring that can never be constructed.
+# Kilo joins the pool, so a tier classification falls back to the token-count
+# rule only if Kilo itself is unavailable.
+DEFAULT_ROUTER_ORDER = ["kilo"]
 
 
 class RouterPool:

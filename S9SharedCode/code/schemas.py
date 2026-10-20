@@ -141,6 +141,15 @@ class AgentResult(BaseModel):
     cost: float = 0.0
     elapsed_s: float = 0.0
     provider: str = ""
+    # Per-node token accounting, for the Runs node stats: what this node
+    # consumed and what it produced, alongside agent/provider/duration.
+    #
+    # `cost` predates these and is populated from the SAME reply's usage, but
+    # it stores a token TOTAL in a field named `cost`, so anything reading it
+    # as money showed $0.00 while the node was spending heavily. These are the
+    # honest pair, straight off the gateway's usage block.
+    input_tokens: int = 0
+    output_tokens: int = 0
     error: str | None = None
     # Session 9: structured failure code for the Browser skill (other skills
     # leave it None and fall through to recovery's text heuristics).

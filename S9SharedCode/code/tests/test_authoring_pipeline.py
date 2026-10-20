@@ -280,6 +280,35 @@ def test_run_skill_fails_loudly_on_unparseable_reply():
     assert "no usable JSON" in (result.error or "")
 
 
+def test_a_no_tools_skill_with_prose_fails_cleanly_not_with_unbound_local():
+    """`render_errors` was initialised only inside `if tools:`, then read on
+    the unparseable-reply path for EVERY skill. A planner/formatter reply that
+    was not JSON raised `UnboundLocalError: render_errors` - masking the real
+    failure (found while writing the recovery-splice tests)."""
+    import asyncio
+
+    skill = skills.SkillRegistry().get("planner")
+    assert skill is not None
+
+    class _FakeLLM:
+        def chat(self, **_kw):
+            return {"text": "prose, not JSON", "provider": "test"}
+
+    original = skills.LLM
+    skills.LLM = _FakeLLM
+    graph_nodes = {"n:1": {"skill": "planner", "inputs": {},
+                           "status": "running"}}
+    try:
+        result, _rendered = asyncio.run(
+            skills.run_skill(skill, "n:1", graph_nodes, "s8-test",
+                             "plan it", None))
+    finally:
+        skills.LLM = original
+
+    assert result.success is False
+    assert "no usable JSON" in (result.error or "")
+
+
 def test_failed_nodes_are_noted_but_do_not_veto_a_recovered_answer():
     """The orchestrator recovers by retrying, then skipping a transient
     branch - and those runs have a real answer. An earlier version replaced

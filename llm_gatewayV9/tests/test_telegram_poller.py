@@ -73,6 +73,100 @@ def _update(uid, text="hello"):
                         "chat": {"id": 555}}}
 
 
+def test_a_real_attachment_model_is_stored_not_crashed(monkeypatch, tmp_path):
+    """The poller read attachments as dicts (`att.get(...)`), but the envelope
+    holds pydantic `Attachment` models. The download thread died with
+    AttributeError before storing anything, so no Telegram file ever reached
+    the Documents store - which is why the agent kept answering as if nothing
+    had been sent."""
+    from adaptors.envelope import Attachment
+
+    ingested = []
+
+    class _Inst:
+        def download(self, file_id, timeout=60.0):
+            assert file_id == "FILEID1"
+            return b"%PDF-1.4 data", str(tmp_path / "x.pdf")
+
+    import memory_api
+    monkeypatch.setattr(
+        memory_api, "ingest_document",
+        lambda name, data: ingested.append((name, data)) or {"id": "doc-x"})
+    msg = type("M", (), {"msg_id": 7, "attachments": [
+        Attachment(kind="file", name="contract.pdf", mime="application/pdf",
+                   size=13, file_id="FILEID1")]})()
+
+    T._absorb_files(_Inst(), msg)
+
+    assert ingested == [("contract.pdf", b"%PDF-1.4 data")]
+
+
+def test_a_stored_attachment_is_indexed_not_left_pending(monkeypatch, tmp_path):
+    """`ingest_document` only writes the record. Outside an upload request
+    nothing started the indexer, so a Telegram file sat in `pending` forever:
+    never READY, so it could not be enabled and search never saw a chunk."""
+    from adaptors.envelope import Attachment
+
+    indexed = []
+
+    class _Inst:
+        def download(self, file_id, timeout=60.0):
+            return b"%PDF-1.4 data", str(tmp_path / "x.pdf")
+
+    import memory_api
+    monkeypatch.setattr(memory_api, "ingest_document",
+                        lambda name, data: {"id": "doc-y"})
+    monkeypatch.setattr(memory_api, "index_document",
+                        lambda doc_id, app: indexed.append((doc_id, app)))
+    msg = type("M", (), {"msg_id": 8, "attachments": [
+        Attachment(kind="file", name="a.pdf", mime="application/pdf",
+                   size=13, file_id="FILEID2")]})()
+    app = object()
+
+    T._absorb_files(_Inst(), msg, app)
+
+    assert indexed == [("doc-y", app)]
+
+
+def test_forward_sends_attachment_metadata_not_a_crash(monkeypatch, tmp_path):
+    """`_forward_to_agent` did `a.get(...)` on `Attachment` objects; the
+    AttributeError aborted the forward before any HTTP call, so the ledger
+    showed two agent-forward errors exactly when two files were sent."""
+    import httpx
+
+    import channels_api
+    from adaptors.envelope import Attachment, ChannelMessage, TrustLevel
+
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+    def _post(url, headers=None, json=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        return _Resp()
+
+    tok = tmp_path / "agent.token"
+    tok.write_text("test-token", encoding="utf-8")
+    monkeypatch.setattr(channels_api, "_agent_token_path", lambda: tok)
+    monkeypatch.setattr(httpx, "post", _post)
+    msg = ChannelMessage(
+        channel="telegram", sender_id="555", chat_id="555", text="",
+        attachments=[Attachment(kind="file", name="contract.pdf",
+                                mime="application/pdf", size=13,
+                                file_id="FILEID1")],
+        trust_level=TrustLevel.paired)
+
+    out = channels_api._forward_to_agent("telegram", msg, "555")
+
+    assert out["status"] == 200, out
+    assert seen["json"]["attachments"] == [
+        {"kind": "file", "name": "contract.pdf", "mime": "application/pdf",
+         "size": 13, "file_id": "FILEID1"}]
+
+
 def test_updates_are_delivered_to_the_webhook_path(monkeypatch):
     """The poller must not invent a second delivery path — an inbound message
     is worth exactly what the webhook does with it."""

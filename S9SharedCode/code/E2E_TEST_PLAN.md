@@ -279,7 +279,13 @@ to its GPU compute advantage here.
 
 ## 12. Open issues (not yet fixed)
 
-1. ~~**`flow.py` parallel sibling execution crashes (§8.2 BUG).**~~ **FIXED** — `flow.py` now uses `asyncio.gather(..., return_exceptions=True)` with per-node error marking (see §11 + `BUGS.md` BUG-001: 3 parallel researchers complete, 0 recovery nodes). Struck through rather than deleted so the history stays readable.
+1. **`flow.py` parallel sibling execution crashes (§8.2 BUG).** When the
+   planner fans out N parallel nodes, `asyncio.gather` over `_run_one` lets a
+   `TaskGroup` `ExceptionGroup` from one sibling abort the batch; 2 of 3
+   researchers died with `ExceptionGroup: unhandled errors in a TaskGroup`.
+   Fix: wrap each `_run_one` so one sibling's failure is isolated (try/except
+   per task, or `asyncio.gather(return_exceptions=True)` + per-node error
+   marking) instead of propagating. **Needs a bug file.**
 2. **Local Qwen2.5-1.5B a11y is unreliable multi-turn.** Drifts to prose
    (`thinking: ...`) with no JSON; needs hardened prompt + JSON normalizer +
    no-op-retry before it can back the browser skill. Not wired in yet.

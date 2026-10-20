@@ -63,10 +63,36 @@ _LOCK = threading.Lock()
 _INFLIGHT: dict[str, float] = {}
 _INFLIGHT_TTL_S = 600.0
 
-# How much of an answer goes back over the channel, and how long to wait for
-# one. Chat platforms have hard message-size limits far below the console's, so
-# the reply is truncated here rather than failing at the adaptor.
+# How much of an answer goes in one channel message, and how long to wait for
+# one. Chat platforms have hard message-size limits far below the console's;
+# longer answers are split, never truncated (see `_chunks`).
 _MAX_REPLY = 3500
+
+
+def _chunks(text: str) -> list[str]:
+    """Split a reply on paragraph/sentence boundaries at the channel limit.
+
+    `answer[:_MAX_REPLY]` is what a Telegram-initiated research request used to
+    get: one message containing the first 3500 characters of a 17k-character
+    report, with no indication that the rest existed. The console's send tool
+    already chunked (Telegram's hard cap is 4096); this path never did.
+    """
+    t = (text or "").strip()
+    out: list[str] = []
+    while len(t) > _MAX_REPLY:
+        cut = -1
+        for sep in ("\n\n", "\n", ". ", " "):
+            pos = t.rfind(sep, 0, _MAX_REPLY)
+            if pos >= _MAX_REPLY // 2:
+                cut = pos + (1 if sep == ". " else 0)
+                break
+        if cut <= 0:
+            cut = _MAX_REPLY
+        out.append(t[:cut].rstrip())
+        t = t[cut:].lstrip()
+    if t:
+        out.append(t)
+    return out or [""]
 
 
 def _self_base() -> str:
@@ -232,11 +258,20 @@ def _run_turn(channel: str, sender: str, text: str,
             answer = (answer + "\n\n"
                       + " ".join(f"Attached: {m['filename']}"
                                  for m in media))
-        res = send_channel_message(
-            channel, answer[:_MAX_REPLY], to=sender, agent="channel-chat",
-            session_id=conversation_id, media=media or None)
-        if not res.get("delivered"):
-            out["error"] = str(res.get("error") or "not delivered")[:300]
+        pieces = _chunks(answer)
+        sent = 0
+        for idx, piece in enumerate(pieces):
+            res = send_channel_message(
+                channel, piece, to=sender, agent="channel-chat",
+                session_id=conversation_id,
+                media=(media if idx == 0 else None) or None)
+            if not res.get("delivered"):
+                out["error"] = (str(res.get("error") or "not delivered")
+                                + (f" (after {sent} of {len(pieces)} messages)"
+                                   if sent else ""))[:300]
+                break
+            sent += 1
+        out["chunks"] = sent
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"[:300]
     return out

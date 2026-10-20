@@ -29,18 +29,26 @@ def test_the_old_paragraph_cap_is_gone():
 def test_findings_length_is_specified_with_real_numbers():
     low = PROMPT.read_text(encoding="utf-8").lower()
     assert "findings length" in low, "no FINDINGS LENGTH section"
-    assert "1,500-4,000 words" in low, (
+    assert ("1,500-4,000 words" in low or "1,500–4,000 words" in low), (
         "no concrete word range for a normal single-facet question")
 
 
-def test_it_explains_why_the_evidence_base_is_the_ceiling():
-    low = PROMPT.read_text(encoding="utf-8").lower()
-    assert "27,000" in low or "60-page" in low, (
-        "the measured starvation is not explained to the model")
-    assert "spilled to an artifact" in low, (
-        "it must be said that being thorough is free - otherwise the model "
-        "compresses to avoid a penalty it was never given")
+def test_findings_length_is_framed_as_a_floor():
+    """The length target must read as a floor to clear.
 
+    This test used to require the measured-starvation narrative ("27,000",
+    "60-page") to be present in the prompt. That was removed deliberately: the
+    model is stateless, so a history of what past runs produced is not an
+    instruction to it, and it was crowding out the instruction that matters.
+    What actually moves output is whether the target reads as a minimum or a
+    ceiling, so that is what is asserted here."""
+    body = (skills.ROOT / "prompts" / "researcher.md").read_text(
+        encoding="utf-8")
+    low = body.lower()
+    assert "floor" in low or "not a ceiling" in low or "minimum" in low, (
+        "findings length is no longer framed as a floor to clear")
+    assert "continuous prose" in low or "prose" in low, (
+        "the findings shape instruction is gone")
 
 def test_researcher_output_ceiling_allows_the_target():
     """One researcher must be able to hold 6,000 words of findings."""

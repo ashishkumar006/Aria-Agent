@@ -7,6 +7,8 @@ from the prompt while the payload carried a different set - and it could list
 reminders but had no tool to create one, so "remind me at six" could not work
 no matter how the user phrased it.
 """
+import json
+
 import agent_server
 from skills import tool_payload
 
@@ -113,15 +115,120 @@ def test_chat_can_actually_schedule():
         "the prompt must tell the model how to handle a reminder request")
 
 
-def test_chat_can_write_files_and_render_documents():
-    """Asking chat for a document used to return pasted markdown. Reading
-    before editing matters: edit_file on a path the model invented destroys
-    whatever was there."""
-    for name in ("read_file", "create_file", "update_file", "edit_file",
-                 "render_document"):
-        assert name in agent_server._CHAT_TOOLS, name
+def test_chat_hands_documents_and_files_to_the_authoring_agent():
+    """Asking chat for a document used to return pasted markdown, and the fix
+    was to give chat render_document - so chat started doing the authoring
+    agent's job, one chat-side tool call at a time. That is what made chat
+    heavy: a request for a document could burn the hop cap and answer
+    "(empty answer)". One delegate_authoring call now does the whole job and
+    returns a real downloadable file, so the specialist tools must be GONE
+    from chat's surface - that is the property this asserts."""
+    for gone in ("render_document", "save_as_document", "read_artifact",
+                 "create_file", "update_file", "edit_file"):
+        assert gone not in agent_server._CHAT_TOOLS, (
+            f"chat still carries {gone}; it should hand off instead")
     assert "delete_file" not in agent_server._CHAT_TOOLS, (
         "chat must not delete; there is no undo and no confirmation")
+    # read-only file access stays: peeking at the workspace is cheap.
+    for keep in ("read_file", "list_dir", "search_files"):
+        assert keep in agent_server._CHAT_TOOLS, keep
+
+
+def test_the_handoff_tools_reach_the_chat_payload():
+    """A tool that is in the list but not in the schema the model actually
+    receives is a tool it can never call."""
+    names = [t["name"] for t in agent_server._chat_tool_payload() or []]
+    assert "delegate_research" in names
+    assert "delegate_authoring" in names
+
+
+def test_chat_keeps_the_conversational_tools():
+    """Handing off the big jobs must not take the conversational ones too: the
+    user's own accounts, reminders and memory are what chat is FOR."""
+    names = {t["name"] for t in agent_server._chat_tool_payload() or []}
+    for keep in ("calendar_query", "gmail_query", "slack_history",
+                 "notion_query", "github_query", "schedule_task",
+                 "cancel_scheduled", "remember_preference", "web_search"):
+        assert keep in names, f"chat lost {keep}"
+
+
+def test_the_handoff_is_described_in_the_prompt():
+    """A tool the model has never heard of is a tool it will not call."""
+    assert "delegate_authoring" in agent_server._CHAT_SYSTEM
+    assert "delegate_research" in agent_server._CHAT_SYSTEM
+
+
+class _FakeStream:
+    """The minimum `_run_handoff` consumes: a body_iterator of SSE bytes."""
+
+    def __init__(self, frames):
+        self._frames = frames
+
+    @property
+    def body_iterator(self):
+        async def _it():
+            for f in self._frames:
+                yield ("data: " + json.dumps(f) + "\n\n").encode("utf-8")
+        return _it()
+
+
+_FILE_FRAME = {"type": "done", "answer": "The report body.",
+               "files": [{"artifact": "art:" + "a" * 16,
+                          "filename": "report.pdf", "format": "pdf",
+                          "skill": "author"}]}
+
+
+def test_a_delegated_run_reports_its_files_and_forbids_invented_links(monkeypatch):
+    """Observed live: a delegated authoring run finished, and chat told the
+    user the file was at `sandbox:/mnt/data/report.pdf` - a path that does not
+    exist here, and a dead link in the console. The tool result now names the
+    file and says not to write any URL, and the `done` frame carries the real
+    artifact so the transcript can offer the download."""
+    import asyncio
+
+    monkeypatch.setattr(agent_server, "_stream_run",
+                        lambda *a, **k: _FakeStream([_FILE_FRAME]))
+    got = asyncio.run(agent_server._run_handoff("a topic", "cid", "key"))
+    assert got["ok"] is True and got["status"] == "done"
+    assert got["files"][0]["filename"] == "report.pdf"
+    assert "report.pdf" in got["say"]
+    assert "Do NOT write any URL" in got["say"]
+
+
+def test_the_dispatcher_collects_handoff_files_for_the_done_frame(monkeypatch):
+    """Chat's `done` frame used to scrape `art:` handles out of the answer,
+    which only works if the model volunteers the handle. The delegated file has
+    to reach the frame regardless."""
+    import asyncio
+
+    monkeypatch.setattr(agent_server, "_stream_run",
+                        lambda *a, **k: _FakeStream([_FILE_FRAME]))
+    sink: list = []
+    d = agent_server._chat_handoff_dispatch("cid", sink)
+    out = asyncio.run(d("delegate_research", {"topic": "x"}))
+    assert json.loads(out)["ok"] is True
+    assert sink and sink[0]["filename"] == "report.pdf"
+
+
+def test_chat_is_told_tools_run_in_parallel():
+    """It kept answering "I can only call one tool at a time" - a falsehood it
+    invented because the prompt never said otherwise, while the runner had
+    always dispatched a batch with asyncio.gather."""
+    assert "PARALLEL" in agent_server._CHAT_SYSTEM.upper()
+
+
+def test_the_handoff_dispatcher_ignores_every_other_tool():
+    """It must return None for anything that is not its own, so every other
+    tool still goes down the unchanged MCP path."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        d = agent_server._chat_handoff_dispatch("ct-test")
+        for name in ("web_search", "gmail_query", "schedule_task", "read_file"):
+            assert loop.run_until_complete(d(name, {})) is None, (
+                f"{name} must not be intercepted by the hand-off")
+    finally:
+        loop.close()
 
 
 def test_every_chat_entry_point_uses_the_same_list():

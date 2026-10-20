@@ -113,6 +113,31 @@ export async function previewDocument(
   return (await r.json()) as DocPreviewResult;
 }
 
+/** Preview a document that lives in the upload registry.
+ *
+ * Unlike `previewDocument`, the bytes never enter the browser: the gateway
+ * reads the stored source and returns pages. That is what makes this work in
+ * Electron builds where the built-in PDF plugin draws a blank frame.
+ */
+export async function previewStoredDocument(
+  docId: string,
+  signal?: AbortSignal,
+): Promise<DocPreviewResult> {
+  const r = await fetch(
+    `/api/documents/${encodeURIComponent(docId)}/preview`,
+    { headers: headers(), signal },
+  );
+  if (!r.ok) {
+    let msg = `preview failed (${r.status})`;
+    try {
+      const j = await r.json();
+      if (j?.error) msg = j.error;
+    } catch { /* keep the status message */ }
+    throw new Error(msg);
+  }
+  return (await r.json()) as DocPreviewResult;
+}
+
 export const PAGE_SIZES: { id: string; label: string; mm: string }[] = [
   { id: 'a4', label: 'A4', mm: '210 × 297' },
   { id: 'letter', label: 'US Letter', mm: '216 × 279' },

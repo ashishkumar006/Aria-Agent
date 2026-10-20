@@ -338,9 +338,12 @@ def test_the_no_match_turn_is_inserted_before_the_question(monkeypatch):
 
 
 def test_system_prompt_tells_the_model_what_the_block_is():
-    """Without this the block is an unexplained wall of text and gets ignored
-    in favour of a confident answer from the model's own weights."""
+    """Without this the model can be handed a wall of text and gets ignored
+    in favour of a confident answer from its own weights. Documents are no
+    longer pre-injected: the prompt now points at the search_knowledge tool
+    instead of explaining a REFERENCE MATERIAL block that never arrives."""
     s = agent_server._CHAT_SYSTEM
-    assert "REFERENCE MATERIAL" in s
+    assert "REFERENCE MATERIAL" not in s
+    assert "THE USER'S DOCUMENTS" in s
     assert "search_knowledge" in s
-    assert "do NOT claim the user has no documents" in s
+    assert "never claim" in s and "no documents" in s
