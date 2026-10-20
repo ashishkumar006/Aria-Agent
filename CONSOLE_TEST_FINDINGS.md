@@ -954,4 +954,108 @@ BUG-036â€¦BUG-041 in `S9SharedCode/code/BUGS.md`; this is the session log.
 - H4/H5 ledger/pricing, H7/H8 scheduler/app edge cases, H11-H14 frontend,
   H21/H22 state, and H26 KeepAlive remain unscheduled without the audit text.
 
+## Round 11 - the rest of the dynamic audit (2026-10-21)
 
+The audit's Critical and High findings were worked in order. This round
+records what was fixed, what was reviewed and deliberately left alone, and
+what is still open.
+
+### Fixed
+
+- **C5 - an authoring run could die with the tab.** The worker now starts
+  BEFORE the `started` frame and owns the idempotency claim, the cost
+  record and the cancel-registry cleanup in its own `finally`. The stream
+  generator releases the claim only when no worker ever started; the
+  disconnect branch must not release it, because the worker is still running
+  and a second identical run would start and bill.
+- **C6 - a part's volume was measured from the world origin.** The mesh
+  centroid is now computed area-weighted, and an inverted or empty solid is
+  penalised by 1e12 so it can never out-score a valid mesh, whatever the
+  triangle budget.
+- **C7 - a second identical submit could start a duplicate run.** The
+  in-flight claim is atomic (claim, or join the run that already holds it)
+  and the dedup stream no longer releases a claim it did not take. In
+  `flow.py` a cancelled node is re-raised instead of being recorded as a
+  failed node, so a cancelled run stops dispatching.
+- **C8 - Stop did nothing before the worker was registered.** A Stop that
+  arrives in that window is remembered (`_PENDING_CANCELS`) and honoured
+  when the worker registers. The cancel endpoint now returns `status`
+  (`cancelled` | `pending` | `missing`), `found`, `cancelled` and the
+  resolved `session_id`; Research mints the conversation id before the
+  request and sends both ids.
+- **H4/H5 - turns on one session could interleave, and a cancelled turn
+  lost its cost.** A per-session turn lock serialises turns and is released
+  in a `finally` on every path; cost is recorded on success, failure and
+  cancellation, with a synchronous fallback when a disconnect tears down
+  the async path.
+- **H6 - "two paragraphs" was not a limit.** Explicit unit counts
+  (one-ten, or a number) with `sentence`/`paragraph`/`bullet` are ceilings
+  now, and they scale: two paragraphs = 240 words, three sentences = 90,
+  five bullets = 100.
+- **H7 - go-to-definition returned a path the console could not open.** The
+  definition call measures against the requested root, and the endpoint maps
+  the result to a client-visible path.
+- **H8 - undo in the code editor left the old buffer in place.** The
+  restore callback updates the body snapshot as well as the editor, so the
+  next save no longer writes the pre-undo text.
+- **H11 - a skills-guard error left the page with no way back.** The
+  guard-error state offers "Enable" as a recovery and reads the pack counts
+  as "counts unknown" instead of inventing a number.
+- **H12 - the terminal could not be restarted and the launch token was
+  captured once.** The bare dock has a "Restart shell" button, and
+  `launchToken()` re-reads the meta tag for every request.
+- **H13 - the command palette swallowed Tab.** The handler always prevents
+  the default and moves focus explicitly.
+- **H14 - every visited view owned `id="main"`.** `useMainId()` gives the id
+  to the visible keep-alive section only, and the skip link focuses it.
+- **H21/H22 - memory observations were clipped and only 50 were fetched.**
+  The list wraps and clips; the client asks for 200 and the server default
+  is 200.
+- **H26 - hidden views kept polling the server.** `KeepAlive` exposes
+  `useSectionActive`/`useActivePoll`, and every converted view pauses while
+  hidden and refreshes on return.
+- **M60 - "a deck" and "slides on X" did not pin the format.** The
+  request-shape families in `_format_requested_in()` now capture the format
+  token in every case, so "a short deck" resolves to `pptx` while a passing
+  mention still pins nothing.
+
+### Reviewed and deliberately not changed
+
+- The prefab HMAC scope bypass, the ReportCard XSS, the SSE `\r\n`, the
+  Research stale-state writes, the cancel wiring itself, `AgentResult.cost`,
+  the memory classifier and the percent-encoded path traversal were
+  re-checked against the code: each is either already handled or is inert
+  as written. The Documents sandbox XSS is inert only because
+  `allow-scripts` is absent - that is the thing to keep absent.
+- The tool catalogue is **56**, not the number the audit quoted.
+- The ModelPicker defect is the inverse of M73: "Auto" cannot be selected
+  once a model is stored.
+
+### Verification
+
+- Agent full suite: **1698 passed, 40 skipped** (one outdated assertion in
+  `test_api_validation.py` was updated: the claim is now released by the
+  worker, so the disconnect branch must NOT release it).
+- Gateway full suite: **1189 passed, 18 skipped**.
+- Frontend unit tests: **59 passed** (`vitest run src`); `tsc --noEmit` and
+  the production build are clean.
+- New/updated regression tests: `test_cancel.py` (stop-before-worker,
+  status contract), `test_idempotency_release.py` (worker-before-frame,
+  turn-lock release), `test_api_validation.py` (claim ownership),
+  `test_brief_format_is_binding.py` (deck/slides capture groups),
+  `test_length_contract.py` (unit ceilings), `parts/tests/test_optimise.py`
+  (invalid-solid dominance), `test_code_workspace_api.py` (definition path).
+
+### Still open
+
+- Authoring first-page latency is still ~11 s; the pypdf gate is gone and
+  the root cause is still not found.
+- A page left open across an agent restart still needs a reload to learn a
+  new per-launch token.
+- True filesystem/network isolation, the `auto_approve: true` bypass of the
+  permission gate, `run_checks` output not reaching the agent, the missing
+  tool results in history, the dead external credentials and the
+  Coding/Workspace pack overlap are unchanged.
+- The remaining Medium and Low audit findings (scheduler, ledger, memory,
+  research, runs, mission, shell/a11y, code, authoring, parts, settings,
+  model picker, skills, misc, L1-L12) have not been worked yet.

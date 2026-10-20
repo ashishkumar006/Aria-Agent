@@ -130,19 +130,33 @@ def test_dedup_stream_ends_in_a_terminal_frame():
 
 
 def test_inflight_key_is_released_on_disconnect():
-    """The disconnect path returns before the release below it.
+    """A disconnect must not strand the idempotency claim.
 
-    A key left claimed for the full 600s TTL meant a later submit with the
-    same key was swallowed as a duplicate of an already-finished run.
+    The claim used to be released by the stream generator AFTER the done
+    frame, so a client that left early (closed tab, navigated away) never
+    reached the release and the key stayed claimed for the full 600s TTL: a
+    later submit with the same key was swallowed as a duplicate of a run
+    that had already finished.
+
+    The release now belongs to the WORKER, whose finally runs whatever the
+    client does. So the disconnect branch must NOT release it - that would
+    free the key while the run is still going and let a second, identical
+    run start and bill (C5).
     """
     src = inspect.getsource(agent_server._stream_run)
-    # Every exit from the generator must release the key.
     assert "_inflight_run_release(idem_key)" in src
+    # The worker's finally releases the claim: it sits BEFORE the disconnect
+    # branch in the source, inside the worker's own try/finally.
+    worker_release = src.find("_inflight_run_release(idem_key)")
     disconnect_at = src.find("if disconnected:")
     assert disconnect_at != -1, "disconnect branch missing"
-    tail = src[disconnect_at:disconnect_at + 1400]
-    assert "_inflight_run_release(idem_key)" in tail, \
-        "the disconnect branch must release the key before returning"
+    assert worker_release < disconnect_at, (
+        "the claim must be released by the worker, before the disconnect "
+        "branch can return")
+    branch = src[disconnect_at:disconnect_at + 1400]
+    assert "_inflight_run_release(idem_key)" not in branch, (
+        "the disconnect branch must not release the claim: the worker is "
+        "still running and a second identical run would start and bill")
 
 
 def test_chat_stream_sends_an_idempotency_key():

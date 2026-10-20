@@ -970,6 +970,194 @@ Tracked from E2E testing (see `E2E_TEST_PLAN.md` §12).
   prefix-does-not-add-a-floor and no-floor-plus-ceiling assertions.
 - **Status:** **FIXED.**
 
+## BUG-060: An authoring run could die with the browser tab
+- **Severity:** High (a paid run could be lost and its spend unrecorded)
+- **Symptom:** closing the tab or pressing Stop right after Submit left the
+  run unstarted or uncosted, and the idempotency key stayed claimed for the
+  full 600s TTL - so a resubmit of the same brief was swallowed as a
+  duplicate of a run that had never really run.
+- **Root cause:** `_stream_run` started the worker only AFTER the first frame
+  was yielded, and the claim was released by the generator after the `done`
+  frame - a path a disconnect never reaches. The cost snapshot and delta were
+  also taken in the generator, so a client that left at `started` was never
+  billed.
+- **Fix (2026-10-21):** the worker thread starts BEFORE the `started` frame.
+  It owns the claim, the cost record and the cancel-registry cleanup in its
+  own `finally`; the generator releases the claim only when no worker ever
+  started. The disconnect branch deliberately does NOT release it: the worker
+  is still running, and freeing the key there would let a second identical
+  run start and bill.
+- **Verified:** `tests/test_idempotency_release.py` (worker-before-frame,
+  release on completion) and
+  `tests/test_api_validation.py::test_inflight_key_is_released_on_disconnect`;
+  agent suite **1698 passed, 40 skipped**.
+- **Status:** **FIXED.**
+
+## BUG-061: A second identical submit could start a duplicate run
+- **Severity:** High (double billing)
+- **Root cause:** the in-flight claim was a check-then-set (not atomic), and
+  the dedup stream released the ORIGINAL run's claim when it finished.
+- **Fix (2026-10-21):** `_inflight_run_claim()` either claims the key or
+  joins the run that already holds it; `_dedup_stream` no longer releases a
+  claim it did not take. Authoring derives its key from the brief through
+  `briefKey()` (stable FNV-1a), so a retry joins the in-flight run while a
+  deliberate re-run after `done` still starts fresh.
+- **Verified:** `tests/test_hardening_round.py`,
+  `tests/test_research_run_contract.py`.
+- **Status:** **FIXED.**
+
+## BUG-062: Stop did nothing when it arrived before the run was registered
+- **Severity:** High (the button reported a stop that stopped nothing)
+- **Root cause:** the cancel endpoint only knew about runs already in the
+  run registry. Authoring and Research register their worker a moment later,
+  so a Stop inside that window found nothing and was discarded.
+- **Fix (2026-10-21):** `_PENDING_CANCELS` remembers a Stop for a session
+  that has no worker yet and `_register_run()` honours it. The endpoint
+  returns `status` (`cancelled` | `pending` | `missing`), `found`,
+  `cancelled` and the resolved `session_id`; Research mints the conversation
+  id before the request and sends both ids.
+- **Verified:** `tests/test_cancel.py` (6 passed), including
+  `test_stop_landing_before_the_worker_is_remembered`.
+- **Status:** **FIXED.**
+
+## BUG-063: Two turns on one session interleaved, and a cancelled turn lost its cost
+- **Severity:** High (mixed-up output, unaccounted spend)
+- **Root cause:** `chat_simple`, `chat_simple_stream` and the DAG worker each
+  ran turns on the same session concurrently, and the cancel path returned
+  before the turn's cost was recorded.
+- **Fix (2026-10-21):** a per-session turn lock (`_turn_lock`) serialises
+  turns; every exit path releases it in a `finally`. Cost is recorded on
+  success, failure and cancellation, with a synchronous fallback when a
+  disconnect tears down the async path before the record is written.
+- **Verified:** `tests/test_idempotency_release.py::test_a_completed_run_releases_its_session_turn_lock`
+  and the cancel/chat suites.
+- **Status:** **FIXED.**
+
+## BUG-064: "Two paragraphs" was not a limit
+- **Severity:** High (a two-paragraph request produced ten pages)
+- **Root cause:** the ceiling parser only knew `one paragraph` and numbers
+  with `at most`, so "two paragraphs on X" fell through to no ceiling at all.
+- **Fix (2026-10-21):** `_explicit_unit_cap()` recognises a number or word
+  count (one-ten) with `sentence`/`paragraph`/`bullet`, and `ceiling_for()`
+  uses it. Unit counts scale: two paragraphs = 240 words, three sentences =
+  90, five bullets = 100.
+- **Verified:** `tests/test_length_contract.py`, `tests/test_length_genre_floor.py`
+  (**40 passed**).
+- **Status:** **FIXED.**
+
+## BUG-065: "A deck" did not pin the deck format
+- **Severity:** Medium (the user asked for a deck and got a PDF)
+- **Root cause:** the request-shape patterns in `_format_requested_in()` had
+  no capture group, so the canonical lookup key was the whole matched phrase
+  ("ashortdeck", "slideson") and never matched the format table. Only the
+  families that happened to capture a token worked.
+- **Fix (2026-10-21):** every family captures the format token; "a short
+  deck" and "slides on pricing" now resolve to `pptx`, while a passing
+  mention ("compare PDF and DOCX export", "compare deck and PDF export")
+  still pins nothing.
+- **Verified:** `tests/test_brief_format_is_binding.py` (4 passed).
+- **Status:** **FIXED.**
+
+## BUG-066: Go-to-definition returned a path the console could not open
+- **Severity:** Medium (the feature was dead)
+- **Root cause:** the intel endpoint returned the SERVER's path, while the
+  console only opens files under its own workspace root.
+- **Fix (2026-10-21):** `code_intel.definition(..., root=...)` measures
+  against the requested root; the endpoint maps a local result to the
+  client-visible path and a remote result through `_code_client_path`.
+- **Verified:** `tests/test_code_workspace_api.py::test_go_to_definition_returns_a_path_the_console_can_open`.
+- **Status:** **FIXED.**
+
+## BUG-067: Undo in the code editor left the old buffer in place
+- **Severity:** Medium (the next save rewrote the pre-undo text)
+- **Root cause:** the history restore callback updated the editor but not the
+  body snapshot, so the next save sent the text as it was before the undo.
+- **Fix (2026-10-21):** the restore callback sets the body snapshot and
+  applies the restored text through the same edit path as any other change.
+- **Verified:** `src/views/Code.diff.test.ts` (4 passed) plus the editor flow.
+- **Status:** **FIXED.**
+
+## BUG-068: A skills-guard error left the page with no way back
+- **Severity:** Medium (the view was unusable)
+- **Root cause:** in the guard-error state the pack and tool controls stayed
+  disabled, and the counts were rendered as if they were known.
+- **Fix (2026-10-21):** the guard-error state turns those controls into an
+  explicit "Enable" recovery, and the pack counts read "counts unknown"
+  instead of inventing a number.
+- **Status:** **FIXED.** (no unit test; the state is exercised in the view)
+
+## BUG-069: The terminal could not be restarted, and the launch token was captured once
+- **Severity:** Medium (a dead shell, and a dead token after a restart)
+- **Root cause:** the bare terminal dock had no restart affordance, and the
+  request headers were built from the meta tag once at module load - so a
+  page left open across an agent restart kept sending the old token.
+- **Fix (2026-10-21):** the bare dock has a "Restart shell" button, and
+  `launchToken()` re-reads the meta tag on every call with the headers using
+  it. A page that was open across a restart still needs a reload to learn a
+  NEW token - the old one is gone with the old process.
+- **Status:** **FIXED** (the reload limitation is inherent to per-launch tokens).
+
+## BUG-070: The command palette swallowed Tab
+- **Severity:** Medium (a keyboard trap)
+- **Root cause:** the palette's key handler only moved focus when the active
+  element was inside the palette, so Tab from the input was swallowed and
+  the user could not leave.
+- **Fix (2026-10-21):** the handler always prevents the default and moves
+  focus explicitly through the palette's focusable nodes.
+- **Verified:** `src/components/ui.rail.test.ts` (4 passed).
+- **Status:** **FIXED.**
+
+## BUG-071: Every visited view owned `id="main"`
+- **Severity:** Medium (invalid HTML; the skip link focused a hidden view)
+- **Root cause:** `KeepAlive` leaves every visited view mounted, so each one
+  rendered `<main id="main">` - several elements with the same id, and
+  `getElementById` returned whichever came first (usually a hidden one).
+- **Fix (2026-10-21):** `useMainId()` gives the id to the visible section
+  only, and `SkipLink` focuses it directly.
+- **Verified:** `tsc` clean, frontend unit tests **59 passed**.
+- **Status:** **FIXED.**
+
+## BUG-072: Memory observations were clipped, and half the list was unreachable
+- **Severity:** Medium (long text broke the layout; only 50 were fetched)
+- **Root cause:** the observation list had no width constraint, and
+  `/api/profile` defaulted to 50 observations while the client asked for
+  neither a limit nor a larger one.
+- **Fix (2026-10-21):** the list wraps and clips (`overflow-x-hidden`,
+  `break-words`, `min-w-0 flex-1`); the client requests 200 observations and
+  the server default is 200.
+- **Status:** **FIXED.**
+
+## BUG-073: Hidden views kept polling the server
+- **Severity:** Medium (wasted requests, stale data on return)
+- **Root cause:** kept-alive views stayed mounted, so their intervals kept
+  firing while another section was on screen.
+- **Fix (2026-10-21):** `KeepAlive` exposes `useSectionActive` and
+  `useActivePoll`; Apps, Settings, Skills, Scheduler, Ledger, Runs, Research,
+  Documents, Mission, Chat, Code and Authoring pause while hidden and
+  refresh when they become visible again.
+- **Verified:** `tsc` clean, frontend unit tests **59 passed**.
+- **Status:** **FIXED.**
+
+## BUG-074: A cancelled node was recorded as a failed node
+- **Severity:** Medium (a cancelled run looked like a broken one)
+- **Root cause:** `flow.py` coerced every `BaseException` from the fan-out
+  batch into a failed `AgentResult`, including `asyncio.CancelledError`, so
+  the loop kept dispatching nodes after the run was cancelled.
+- **Fix (2026-10-21):** cancellation is re-raised, not coerced; other
+  exceptions still fail their own node without taking the batch down.
+- **Status:** **FIXED.**
+
+## BUG-075: An invalid solid could out-score a valid one
+- **Severity:** Medium (the optimiser could "improve" an inside-out part)
+- **Root cause:** the inverted/empty-solid penalty was a flat 1000, which a
+  large `target_faces` miss could swamp - the invalid mesh then looked like
+  the better candidate.
+- **Fix (2026-10-21):** the hard-failure penalty is 1e12, so an inverted or
+  empty mesh always loses to a valid one, whatever the triangle budget.
+- **Verified:** `llm_gatewayV9/parts/tests/test_optimise.py` (13 passed),
+  including `test_an_invalid_solid_loses_even_to_a_wildly_missed_target`.
+- **Status:** **FIXED.**
+
 ## Skipped / unexercised
 - §3 LIVE actions (Telegram/email/calendar/weather/GitHub) — no credentials.
 - §8.3 (malformed skill JSON), §8.4 (MAX_NODES cap) — not exercised.
