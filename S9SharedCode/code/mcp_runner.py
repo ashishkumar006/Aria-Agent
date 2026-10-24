@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import threading
 import time
@@ -161,6 +162,51 @@ def _call_key(name: str, args: dict) -> str:
         return name + ":" + str(args)
 
 
+_TEXT_TOOL_MARK = "[tool call] "
+_TEXT_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
+
+
+def _text_tool_calls(text: str) -> list[dict]:
+    """Recover calls that a provider replayed as prose instead of a call.
+
+    Gemini 3 requires a thoughtSignature on a replayed `functionCall`, and the
+    gateway substitutes `[tool call] name({...})` prose when it has none to
+    send. Smaller Gemini models then copy that prose back as their own answer
+    instead of calling the tool, so the loop ended with a literal
+    "[tool call] computer_action(...)" string. A real answer never consists
+    solely of these marker lines: require every non-empty line to be one, and
+    parse the whole line, so ordinary prose that merely mentions the marker is
+    left alone.
+    """
+    s = (text or "").strip()
+    if not s.startswith(_TEXT_TOOL_MARK):
+        return []
+    calls: list[dict] = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith(_TEXT_TOOL_MARK):
+            return []
+        rest = line[len(_TEXT_TOOL_MARK):].lstrip()
+        op = rest.find("(")
+        if op <= 0:
+            return []
+        name = rest[:op].strip()
+        if not _TEXT_TOOL_NAME.match(name):
+            return []
+        payload = rest[op + 1:].lstrip()
+        try:
+            args, end = json.JSONDecoder().raw_decode(payload)
+        except ValueError:
+            return []
+        if payload[end:].strip() != ")" or not isinstance(args, dict):
+            return []
+        calls.append({"id": f"txt_{len(calls) + 1}", "name": name,
+                      "arguments": args})
+    return calls
+
+
 def _brief_args(args: dict) -> str:
     """One short identifying string for a tool call, for the progress ledger
     that rides back into the model's context (PROGRESS_LEDGER_CALLS)."""
@@ -269,7 +315,8 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                          approve_fn=None,
                          prepare_fn=None,
                          allowed_tools: set[str] | None = None,
-                         max_context_chars: int = 0) -> dict:
+                         max_context_chars: int = 0,
+                         max_tool_result_chars: int | None = None) -> dict:
     """The tool-use loop, factored for testability: `chat_fn(messages)`
     returns a gateway reply dict; `dispatch_fn(name, args)` returns result
     text. Returns the FINAL reply dict. Stops early with an explicit error
@@ -308,7 +355,10 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     outside it is answered with an error and never reaches `dispatch_fn` or
     the gate. `max_context_chars` bounds the accumulating prompt: the oldest
     tool outputs are elided first, and a prompt still over budget stops the
-    loop with a stated reason rather than a gateway rejection."""
+    loop with a stated reason rather than a gateway rejection.
+    `max_tool_result_chars` overrides how much of a single tool result is fed
+    back to the model; None uses the 32k default, and 0 or less means no
+    harness clip (the tool's own guard still applies)."""
     def _emit(kind: str, payload: dict) -> None:
         if on_event is None:
             return
@@ -316,6 +366,9 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             on_event(kind, payload)
         except Exception:
             pass
+    result_cap = (MAX_TOOL_RESULT_MESSAGE_CHARS
+                  if max_tool_result_chars is None
+                  else int(max_tool_result_chars))
     last_reply: dict = {}
     repeats: dict[str, int] = {}
     succeeded: set[str] = set()
@@ -346,6 +399,7 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     # does too. Callers that want a ceiling pass a positive number, which now
     # means exactly that many model calls (the old check allowed one extra).
     no_progress = 0
+    empty_retries = 0
     hop = 0
     while True:
         if max_hops > 0 and hop >= max_hops:
@@ -384,6 +438,33 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
         last_reply = reply
         _absorb(reply)
         tool_calls = reply.get("tool_calls") or []
+        if not tool_calls:
+            _from_text = _text_tool_calls(reply.get("text") or "")
+            if _from_text:
+                # The call is real even though the provider could only replay
+                # it as prose. Treat it as the tool call it is, and do not also
+                # keep the marker line as the model's answer.
+                tool_calls = _from_text
+                reply = dict(reply)
+                reply["text"] = ""
+                last_reply = reply
+        if not tool_calls and not str(reply.get("text") or "").strip():
+            # An empty reply is not an answer. On the streaming path the
+            # upstream occasionally completes with zero text and zero calls
+            # (observed with Gemini: 55s, output_tokens=0), which surfaced as
+            # "ran out of steps" even though no tool had run. Retry once on the
+            # batched path, which is also what happens if the stream raises.
+            if empty_retries < 1:
+                empty_retries += 1
+                hop -= 1
+                chat_stream_fn = None
+                continue
+            return {"text": "", "tool_calls": [],
+                    "provider": reply.get("provider", ""),
+                    "input_tokens": usage_in,
+                    "output_tokens": usage_out,
+                    "error": "the model returned an empty reply twice "
+                             "(no text and no tool call)"}
         if not tool_calls:
             # No tool calls = the run is over. Replace the single turn's
             # usage with the loop's accumulated total so the node reports
@@ -541,13 +622,13 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 except Exception:
                     pass
             body = result_text
-            if len(body) > MAX_TOOL_RESULT_MESSAGE_CHARS:
+            if result_cap > 0 and len(body) > result_cap:
                 # Never clip silently. A model handed a cut-off result with no
                 # marker assumes it received everything, then burns its budget
                 # trying to find the part that was withheld. Name the loss and
                 # the way to a smaller request instead.
-                dropped = len(body) - MAX_TOOL_RESULT_MESSAGE_CHARS
-                body = (body[:MAX_TOOL_RESULT_MESSAGE_CHARS]
+                dropped = len(body) - result_cap
+                body = (body[:result_cap]
                         + f"\n\n[...truncated {dropped} more characters. "
                         "Ask for less: search_files for the exact text, or "
                         "read_file(path, offset, limit) for a line range. Do "
@@ -605,6 +686,7 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          sandbox_root: str | None = None,
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
+                         max_tool_result_chars: int | None = None,
                          stream: bool = False) -> dict:
     """Multi-turn chat: dispatch tool_calls via MCP, keep going until the
     model returns text. Returns the FINAL gateway reply dict (so callers
@@ -629,8 +711,9 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
     the set is answered with an error instead of reaching the MCP child. The
     tool schemas the model is shown are not a security boundary - a model can
     emit any name - so the Code agent passes its allowlist here. `None` keeps
-    the old behaviour for callers that rely on the full server surface.
-    `max_context_chars` bounds the accumulating prompt; see run_tool_loop."""
+    the     old behaviour for callers that rely on the full server surface.
+    `max_context_chars` bounds the accumulating prompt; see run_tool_loop.
+    `max_tool_result_chars` overrides the per-result clip; 0 disables it."""
     _messages: list[dict] = messages if messages is not None else [{"role": "user", "content": prompt}]
     # `_os` was first imported sixteen lines below its use, so Python bound it as
     # a local and every entry raised `UnboundLocalError: cannot access local
@@ -763,7 +846,8 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                     approve_fn=approve_fn,
                     prepare_fn=prepare_fn,
                     allowed_tools=allowed_tools,
-                    max_context_chars=max_context_chars)
+                    max_context_chars=max_context_chars,
+                    max_tool_result_chars=max_tool_result_chars)
     except McpUnavailable:
         raise
     except BaseException as e:

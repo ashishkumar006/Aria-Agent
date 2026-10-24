@@ -55,9 +55,24 @@ def _data_url(img: bytes, mt: str = "image/png") -> str:
     return f"data:{mt};base64,{base64.b64encode(img).decode()}"
 
 
+def _headers() -> dict:
+    """The gateway token.
+
+    `/v1/*` is behind the gateway token. This script never sent one, so
+    every case came back 401 and the script could not tell an auth problem
+    from a vision problem.
+    """
+    p = Path(__file__).resolve().parent.parent / "state" / "gateway.token"
+    try:
+        tok = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        tok = ""
+    return {"x-gateway-token": tok} if tok else {}
+
+
 def _post(body: dict) -> dict:
     with httpx.Client(timeout=120) as c:
-        r = c.post(f"{GW}/v1/chat", json=body)
+        r = c.post(f"{GW}/v1/chat", json=body, headers=_headers())
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError:

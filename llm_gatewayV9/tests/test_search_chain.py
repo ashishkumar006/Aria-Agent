@@ -1,13 +1,28 @@
 """Tests for the web-search provider chain (Tavily -> Brave -> DDG ->
 Marginalia). All providers mocked: asserts ORDER, skip-when-unset, monthly
-caps, usage accounting, and the fail-soft tail (empty list, never raises)."""
+caps, usage accounting, and the fail-soft tail (empty list, never raises).
+
+The chain's health and usage files are redirected to a tmp dir for every
+test: the previous version wrote to the LIVE `state/` files, so the suite
+depended on (and mutated) whatever the running gateway had recorded, and a
+source that had recently errored could be skipped by the cooldown and fail
+a test that had nothing to do with it.
+"""
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from integrations import websearch as ws
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(ws, "HEALTH_PATH", tmp_path / "health.json")
+    monkeypatch.setattr(ws, "USAGE_PATH", tmp_path / "usage.json")
 
 
 def _hits(tag):
@@ -75,6 +90,91 @@ class TestCapsAndUsage:
         data = ws._load_usage()
         assert data["duckduckgo"]["count"] == 1
         assert data["marginalia"]["count"] == 0
+
+
+class TestBudgets:
+    """A search that takes 25 seconds is a broken feature.
+
+    The live ledger showed 93 web-search calls averaging 9.2s, the worst at
+    25.5s: four sources in a chain, each allowed to burn its own timeout
+    before the next was tried, and a source that had just failed being
+    paid for again on the next search.
+    """
+
+    def test_a_source_that_hangs_is_abandoned(self, monkeypatch):
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.setattr(ws, "SOURCE_TIMEOUT_S", 0.3)
+        monkeypatch.setattr(ws, "SEARCH_DEADLINE_S", 5)
+        monkeypatch.setattr(ws, "_ddg_search", lambda q, n: _hits("ddg"))
+        out = ws.search(query="x")
+        assert out and out[0]["url"].startswith("https://ddg")
+
+    def test_a_hanging_source_does_not_eat_the_whole_budget(self, monkeypatch):
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.setattr(ws, "SOURCE_TIMEOUT_S", 0.3)
+        monkeypatch.setattr(ws, "SEARCH_DEADLINE_S", 2)
+        calls = []
+
+        def _hang(q, n):
+            import time
+            time.sleep(5)
+            calls.append("hang")
+            return []
+
+        monkeypatch.setattr(ws, "_ddg_search", _hang)
+        monkeypatch.setattr(ws, "_marginalia_search", lambda q, n: _hits("marg"))
+        out = ws.search(query="x")
+        # The hung source was abandoned and the next one answered.
+        assert out and out[0]["url"].startswith("https://marg")
+
+    def test_the_whole_chain_is_bounded(self, monkeypatch):
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.setattr(ws, "SOURCE_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(ws, "SEARCH_DEADLINE_S", 0.5)
+        monkeypatch.setattr(ws, "_ddg_search", lambda q, n: [])
+        monkeypatch.setattr(ws, "_marginalia_search", lambda q, n: [])
+        import time
+        t0 = time.perf_counter()
+        assert ws.search(query="x") == []
+        assert time.perf_counter() - t0 < 3.0
+
+    def test_a_source_that_just_failed_is_skipped(self, monkeypatch):
+        """A broken backend must not be paid for again on the next search."""
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.setattr(ws, "SOURCE_TIMEOUT_S", 1)
+        monkeypatch.setattr(ws, "SEARCH_DEADLINE_S", 10)
+        # Marginalia first, so it is the one that fails.
+        monkeypatch.setattr(ws, "source_health", lambda: {
+            "scores": {}, "window": 50, "observed": {},
+            "order": {"paid": [], "free": ["marginalia", "duckduckgo"]}})
+        monkeypatch.setattr(ws, "_marginalia_search",
+                            lambda q, n: (_ for _ in ()).throw(
+                                RuntimeError("marginalia is down")))
+        monkeypatch.setattr(ws, "_ddg_search", lambda q, n: _hits("ddg"))
+        # First search: marginalia errors, ddg answers.
+        assert ws.search(query="x")[0]["url"].startswith("https://ddg")
+        assert ws._in_cooldown("marginalia")
+
+        def _must_not_run(q, n):
+            raise AssertionError("a source in cooldown must not be called")
+
+        monkeypatch.setattr(ws, "_marginalia_search", _must_not_run)
+        assert ws.search(query="x")[0]["url"].startswith("https://ddg")
+
+    def test_a_source_that_returned_nothing_is_not_cooled_down(self, monkeypatch):
+        """No hits is a working source answering, not a broken one."""
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+        monkeypatch.setattr(ws, "SOURCE_TIMEOUT_S", 1)
+        monkeypatch.setattr(ws, "SEARCH_DEADLINE_S", 10)
+        monkeypatch.setattr(ws, "_ddg_search", lambda q, n: [])
+        monkeypatch.setattr(ws, "_marginalia_search", lambda q, n: _hits("marg"))
+        assert ws.search(query="x")[0]["url"].startswith("https://marg")
+        assert not ws._in_cooldown("marginalia")
 
 
 class TestProviderShapes:

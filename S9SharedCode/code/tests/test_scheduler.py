@@ -250,6 +250,73 @@ class TestRecurringReArm:
         assert second_fire == pytest.approx(new_base + 30 * 60, rel=1e-3)
 
 
+class TestRecurringPhase:
+    """An interval grid survives restarts; a missed slot does not move it."""
+
+    def _seed(self, sched, monkeypatch, base, when="every 2h"):
+        # No real background worker: it would fire a 2023 epoch instantly.
+        sched._STOP.set()
+        monkeypatch.setattr(sched, "_ensure_worker", lambda: None)
+        monkeypatch.setattr(sched, "_PROCESS_START", base)
+        with mock.patch("scheduler.time.time", return_value=base):
+            sid = sched.schedule("water", when)
+        return sid
+
+    def _capture(self, sched, monkeypatch):
+        fired = []
+        monkeypatch.setattr(
+            sched, "_fire",
+            lambda s, spec=None: fired.append((s, dict(spec))))
+        monkeypatch.setattr(sched, "_log", lambda m: None)
+        return fired
+
+    def test_a_late_tick_keeps_the_original_grid(self, tmp_path, monkeypatch):
+        """A 0.7s tick delay must not accumulate into a 2h drift."""
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = 1_700_000_000.0
+        sid = self._seed(sched, monkeypatch, base)
+        first = sched._SCHEDULES[sid]["next_fire"]
+        fired = self._capture(sched, monkeypatch)
+
+        with mock.patch("scheduler.time.time", return_value=first + 0.7):
+            sched._worker_tick()
+
+        assert [s for s, _ in fired] == [sid]
+        assert sched._SCHEDULES[sid]["next_fire"] == pytest.approx(
+            first + 2 * 3600)
+
+    def test_restart_skips_a_missed_slot_and_keeps_the_phase(
+            self, tmp_path, monkeypatch):
+        """The reported bug: restart re-anchored 02:44/04:44 to 01:03/03:03."""
+        sched = _install_scheduler(tmp_path, monkeypatch)
+        base = 1_700_000_000.0
+        sid = self._seed(sched, monkeypatch, base)
+        first = sched._SCHEDULES[sid]["next_fire"]  # base + 2h
+        # Process comes back at base+5h; the 2h and 4h slots were missed.
+        sched._PROCESS_START = base + 5 * 3600
+        fired = self._capture(sched, monkeypatch)
+
+        with mock.patch("scheduler.time.time",
+                        return_value=base + 5 * 3600 + 10):
+            sched._worker_tick()
+
+        assert not fired, "a slot missed while the agent was down was delivered late"
+        assert sched._SCHEDULES[sid]["next_fire"] == pytest.approx(
+            first + 4 * 3600), "next slot left the 2h grid"
+        assert sched._HEAP and sched._HEAP[0][0] == pytest.approx(
+            first + 4 * 3600), "the corrected slot was not re-heaped"
+
+    def test_advance_recurring_preserves_a_daily_clock_time(self):
+        import datetime as _dt
+        import scheduler as sched
+        base = _dt.datetime(2026, 10, 23, 9, 0, 0).timestamp()
+        # daily@09:00 from a fire at 09:00 is the same clock time tomorrow,
+        # regardless of how late the tick is.
+        assert sched._advance_recurring(
+            "daily@09:00", base, base + 5 * 3600) == pytest.approx(
+                base + 86400)
+
+
 class TestWorkerFire:
     """Drive the REAL _worker loop (regression coverage for the bug where
     the worker disabled a one-shot and then handed the disabled spec to

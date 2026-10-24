@@ -220,6 +220,23 @@ class TestCalendar:
 # ── websearch (backends mocked, usage store mocked) ──────────────────────
 
 class TestWebsearch:
+    """The chain, with the backends mocked.
+
+    The health and usage stores are redirected to a tmp dir for the whole
+    class: the chain reads the LIVE `state/source_health.json` to decide
+    which source to try first and whether a source is in cooldown, so a
+    source that had errored in the last few minutes was skipped and the
+    test saw an empty result - a failure that had nothing to do with the
+    code under test. The class also used to WRITE to the live usage file,
+    so running the suite changed what the running gateway did next.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        import integrations.websearch as w
+        monkeypatch.setattr(w, "HEALTH_PATH", tmp_path / "health.json")
+        monkeypatch.setattr(w, "USAGE_PATH", tmp_path / "usage.json")
+
     def test_tavily_path(self, monkeypatch):
         import integrations.websearch as w
 

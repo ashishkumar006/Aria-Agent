@@ -30,7 +30,32 @@ NOTE: the `computer_action` MCP tool (drive_app / run_command / read_file
 / write_file / open_app with pending/blocked/dry-run statuses) is the
 SAME capability exposed for direct tool calls. On THIS skill path the
 engine runs instead, so you will see `layer` values above rather than
-tool statuses — do not expect {"status": "pending"} here.
+tool statuses - do not expect {"status": "pending"} here.
+
+TWO ROUTES, ONE SKILL:
+
+1. GUI driving (the cascade above) - the node's `metadata.goal`/`app`
+   describe what to do in a window. `metadata.action` is absent.
+
+2. A GATED ACTION - when the node carries
+   `metadata.action` (run_command | read_file | write_file | open_app) and
+   `metadata.args` (the arguments), the gated shell handles it INSTEAD of
+   the cascade. This is the route for a shell command, a file read or
+   write, or opening an app: a command is not a GUI, and clicking into a
+   terminal to type it is both slower and riskier.
+
+   The result is reported as `{"layer": "gated-<action>", "status": ...}`
+   where status is one of:
+   - "pending"  - the action needs the user's approval and is WAITING in
+                  the Computer page. Not a failure. Say so and stop; do not
+                  retry (a retry mints a second approval).
+   - "dry-run"  - the host is in dry-run mode: the action was described,
+                  not executed, and NO approval was created. Report the
+                  description and say the host must restart with live mode.
+   - "done"     - it ran.
+   - "blocked"  - the safety gates refused it (denylisted command or
+                  protected path). Report the reason; do not rephrase it
+                  to get around the gate.
 
 Output (JSON, no markdown):
 {

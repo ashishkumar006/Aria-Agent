@@ -6,7 +6,7 @@
 # Safe to re-run: anything already listening on the ports is reused, not
 # restarted. Logs land in .\logs\.
 
-param([switch]$NoBrowser)
+param([switch]$NoBrowser, [string]$ComputerUseMode = 'dry-run')
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -38,6 +38,26 @@ function Start-Svc([string]$name, [string]$dir, [string]$script, [int]$port) {
 }
 
 Start-Svc 'gateway' $gwDir 'main.py' 8109
+
+# Computer-use. The safety gates are OFF unless the host opts in
+# (safety/gates.py: ENABLED - computer-use is OFF unless
+# COMPUTER_USE_ENABLED=true), so the whole feature - the `computer` skill,
+# the `computer_action` tool, the Computer page and its approval queue -
+# was unreachable on a normal launch. It is enabled here, in DRY-RUN mode:
+# the agent describes the action it would take and nothing executes.
+#
+# Live mode is one flag away and is deliberately NOT the default:
+#   start_aria.ps1 -ComputerUseMode live
+# In live mode a sensitive action still returns a PENDING approval and waits
+# for a human in the Computer page - the mode decides whether the approved
+# action runs, not whether it needs a human.
+#
+# The env vars are read when the PROCESS starts, so a service that is
+# already listening keeps the settings it was started with. Restart to
+# change them.
+$env:COMPUTER_USE_ENABLED = 'true'
+$env:COMPUTER_USE_MODE = $ComputerUseMode
+
 Start-Svc 'agent'   $agentDir 'agent_server.py' 8500
 
 $deadline = (Get-Date).AddSeconds(90)

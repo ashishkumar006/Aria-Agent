@@ -2296,55 +2296,12 @@ def computer_action(action: str, params: dict) -> dict:
     kill_app, start_recording, stop_recording, replay_trajectory, list_apps.
 
     Returns a result dict; if `status` is 'pending' the action is waiting for
-    the user to approve it in the web UI. Computer-use is disabled unless the
-    host opted in via COMPUTER_USE_ENABLED. Example:
+    the user to approve it in the web UI. 'dry-run' means nothing executed and
+    no approval was created. Computer-use is disabled unless the host opted in
+    via COMPUTER_USE_ENABLED. Example:
     computer_action("run_command", {"command": "echo hello"})."""
-    from computer_use import get_computer_use, call as daemon_call, DaemonError
-    from computer_use.safety import shared_gates
-
-    params = params or {}
-    high_level = {"drive_app", "run_command", "read_file", "write_file", "open_app"}
-    if action in high_level:
-        return get_computer_use().request(action, params)
-
-    # Low-level daemon primitives — now gated (previously a safety bypass).
-    # Destructive / sensitive primitives require approval; read-only probes
-    # pass through. Disabled host always blocked.
-    gates = shared_gates()
-    if not gates.enabled:
-        return {"status": "disabled",
-                "message": "Computer-use is disabled. Set COMPUTER_USE_ENABLED=true to opt in."}
-    _SENSITIVE_LOW = {"kill_app", "click", "type_text", "press_key", "hotkey",
-                      "launch_app", "replay_trajectory", "start_recording"}
-    _READONLY_LOW = {"get_accessibility_tree", "get_window_state", "get_desktop_state",
-                     "list_apps", "stop_recording"}
-    if action in _SENSITIVE_LOW:
-        if gates.mode == "dry-run":
-            return {"status": "dry-run", "action": action, "params": params,
-                    "message": f"[dry-run] would {action}"}
-        if gates.needs_approval(action, params):
-            aid = gates.create_approval(action, params)
-            return {"status": "pending", "approval_id": aid,
-                    "message": "Action requires your approval."}
-    elif action not in _READONLY_LOW:
-        # Unknown low-level tool — require approval by default (fail-closed).
-        if gates.mode == "dry-run":
-            return {"status": "dry-run", "action": action, "params": params,
-                    "message": f"[dry-run] would {action}"}
-        aid = gates.create_approval(action, params)
-        return {"status": "pending", "approval_id": aid,
-                "message": "Unknown low-level action requires approval."}
-    # Low-level daemon primitives.
-    try:
-        result = daemon_call(action, params, timeout=60)
-        # Normalise to status dict for UI consistency.
-        if isinstance(result, dict) and "status" not in result:
-            return {"status": "done", "result": result}
-        return result
-    except DaemonError as e:
-        return {"status": "error", "message": f"daemon error: {e}"}
-    except Exception as e:
-        return {"status": "error", "message": f"{type(e).__name__}: {e}"}
+    from computer_use.tool import tool_dispatch
+    return tool_dispatch(action, params)
 
 
 @mcp.tool()

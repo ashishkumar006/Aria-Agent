@@ -99,9 +99,22 @@ def test_researcher_states_the_turn_budget_honestly():
     assert re.search(r"\b6\b|six", RS.lower()), (
         "the tool-turn cap is not stated, so 'write up every page' is "
         "unfalsifiable when only 2.8 pages arrive")
-    assert "8,000" in RS or "8_000" in RS or "first ~8,000" in RS.lower(), (
-        "fetch_url's per-page truncation is not stated; the model believes it "
-        "has the whole page")
+    assert "8,000" not in RS and "8_000" not in RS, (
+        "the prompt still claims the old 8k per-page clip")
+    assert "complete" in RS.lower() or "whole" in RS.lower(), (
+        "the prompt does not say fetch_url returns the whole page")
+    assert "300,000" in RS, (
+        "the real runaway guard is not stated, so a TRUNCATED body would be "
+        "treated as the whole page")
+    assert "TRUNCATED" in RS, (
+        "the page-body truncation marker is not explained")
+
+
+def test_researcher_disables_the_tool_result_clip():
+    """The yaml, not a code default, is what lets a researcher read pages
+    whole. 32k in mcp_runner used to cut long articles mid-sentence."""
+    skill = skills.SkillRegistry().get("researcher")
+    assert skill.max_tool_result_chars == 0
 
 
 def test_the_word_floor_is_falsifiable():

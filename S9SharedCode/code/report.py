@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 import httpx
-from gateway import GATEWAY_URL
+from gateway import GATEWAY_URL, _client
 from persistence import SessionStore
 
 ROOT = Path(__file__).parent
@@ -88,8 +88,11 @@ def _dag_lines(graph: dict | None) -> list[str]:
 
 def _cost_summary(sid: str) -> dict:
     try:
-        r = httpx.get(f"{GATEWAY_URL}/v1/cost/by_agent",
-                      params={"session": sid}, timeout=20)
+        # The pooled client carries X-Gateway-Token. A bare httpx.get did
+        # not, so this read 401'd and the report showed a gateway error
+        # instead of the run's cost.
+        r = _client().get(f"{GATEWAY_URL}/v1/cost/by_agent",
+                          params={"session": sid}, timeout=20)
         r.raise_for_status()
         return r.json()
     except Exception as e:

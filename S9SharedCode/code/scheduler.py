@@ -35,6 +35,14 @@ _SCHEDULES: dict[str, dict] = {}
 _STOP = threading.Event()
 _WORKER: "threading.Thread | None" = None
 
+# When this process came up. An interval slot that fell due meaningfully
+# before this point was missed while the agent was off: it must not be
+# delivered at startup, and it must not move the schedule's phase.
+_PROCESS_START = time.time()
+_RECUR_INTERVAL = _re.compile(r"every\s+(\d+)\s*([smh]?)\s*$",
+                              _re.IGNORECASE)
+_RECUR_START_GRACE_S = 60.0
+
 
 def _load() -> None:
     global _SCHEDULES, _HEAP
@@ -141,6 +149,42 @@ def _next_fire_from_cron(cron: str, base: float) -> float:
         pass
     # bare epoch
     return float(cron)
+
+
+def _interval_seconds(cron: str) -> int | None:
+    """The step for an `every N[s|m|h]` spec, or None for a clock spec."""
+    m = _RECUR_INTERVAL.fullmatch((cron or "").strip())
+    if not m:
+        return None
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[
+        (m.group(2) or "m").lower()]
+
+
+def _advance_recurring(cron: str, scheduled: float, now: float) -> float:
+    """The next occurrence after `now`, on the schedule's ORIGINAL grid.
+
+    `every N` is an interval grid anchored at the first fire, not a delay
+    measured from whenever the worker last woke. Re-arming from
+    `time.time()` turned a 2h reminder created at 00:43 (02:44, 04:44,
+    ...) into 03:02, 05:02 after one restart, because the missed slot was
+    re-anchored to the restart time. Advancing from the scheduled epoch
+    keeps both the interval and the phase.
+    """
+    step = _interval_seconds(cron)
+    if step is not None:
+        if step < 1:
+            raise ValueError(f"recurring interval must be >= 1: {cron!r}")
+        if scheduled > now:
+            return scheduled
+        # Jump over every slot the process missed in one calculation; a
+        # loop would crawl for a long downtime with "every 45s".
+        return scheduled + ((int((now - scheduled) // step) + 1) * step)
+    nxt = _next_fire_from_cron(cron, scheduled)
+    for _ in range(10000):
+        if nxt > now:
+            return nxt
+        nxt = _next_fire_from_cron(cron, nxt)
+    return _next_fire_from_cron(cron, now)
 
 
 class _BadWhen(ValueError):
@@ -904,11 +948,13 @@ def _worker() -> None:
 
 
 def _worker_tick() -> None:
+    now = time.time()
+    skip_missed = False
     with _SCHED_LOCK:
         if not _HEAP:
             return
         fire, sid = _HEAP[0]
-        if time.time() < fire:
+        if now < fire:
             return
         heapq.heappop(_HEAP)
         spec = _SCHEDULES.get(sid)
@@ -924,8 +970,8 @@ def _worker_tick() -> None:
         # Re-arm recurring schedules before firing.
         if spec.get("recurring"):
             try:
-                spec["next_fire"] = _next_fire_from_cron(
-                    spec["recurring"], time.time())
+                spec["next_fire"] = _advance_recurring(
+                    spec["recurring"], float(fire), now)
             except (ValueError, OSError) as e:
                 # A corrupt `recurring` value used to raise HERE â€”
                 # inside the loop with no guard â€” killing the worker
@@ -940,6 +986,17 @@ def _worker_tick() -> None:
                 return
             heapq.heappush(_HEAP, (spec["next_fire"], sid))
             _save()
+            # The most recent slot on the grid is `next_fire - step`.
+            # If it fell due well before this process started, it was
+            # missed while the agent was down: skip it rather than firing
+            # immediately and re-anchoring (that is what turned 02:44 /
+            # 04:44 into 03:02 / 05:02). A slot that was merely late
+            # because the worker was busy still fires.
+            step = _interval_seconds(spec["recurring"])
+            if step:
+                last_slot = spec["next_fire"] - step
+                skip_missed = (
+                    last_slot < _PROCESS_START - _RECUR_START_GRACE_S)
         else:
             # RELIABILITY FIX (one-shot re-fire): fired one-shot items
             # used to stay enabled=True with a stale past next_fire, so
@@ -948,6 +1005,11 @@ def _worker_tick() -> None:
             # (or any reload) can never resurrect the schedule.
             spec["enabled"] = False
             _save()
+    if skip_missed:
+        _log(f"[{sid}] skipped a missed {spec['recurring']!r} slot "
+             f"({int(now - fire)}s before startup); next "
+             f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(spec['next_fire']))}")
+        return
     # A cancel() that landed between the snapshot and here must not
     # still fire â€” the snapshot predates the cancel and is still
     # enabled (see cancel()).

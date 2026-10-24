@@ -73,7 +73,7 @@ researcher:
   tools_allowed: [web_search, fetch_url, arxiv_search, wikipedia_search,
                   openalex_search, news_search, fetch_pdf, extract_tables,
                   wayback_fetch, remember_preference, recall_preferences,
-                  read_artifact]
+                  read_artifact, computer_action]
   temperature: 0.7         # exploratory; let the model choose phrasings
   # `findings` is what every downstream node reads, and this was the single
   # tightest constraint in the whole DAG: 6000 tokens had to cover the
@@ -88,6 +88,10 @@ researcher:
   # model writes until it is done rather than until a local constant runs out.
   # Cost scales with what is actually written, not with the ceiling.
   max_tokens: 65536
+  # A fetched page is evidence, and the generic 32k harness clip cut long
+  # articles mid-sentence. 0 = no harness clip; fetch_url's own 300k runaway
+  # guard still applies and marks any page it had to cut.
+  max_tool_result_chars: 0
   description: Performs multi-step web research and produces normalised text outputs.
 
 distiller:

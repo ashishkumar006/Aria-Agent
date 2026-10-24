@@ -389,6 +389,86 @@ def test_the_profile_block_marks_a_single_sighting_as_an_anecdote(monkeypatch):
         "a single incident is being presented as a pattern to the model")
     assert "not a standing preference" in blk
 
+
+def test_a_repeat_sighting_reinforces_the_newest_entry(monkeypatch, posted):
+    """The newest matching row is the live one.
+
+    The reinforce path used to take the FIRST match in the list, and the
+    list is newest-first - so it took the newest. But when the oldest
+    matching row was a legacy record that could never be linked (the
+    gateway refused the link and, worse, kept the orphan), every repeat
+    sighting reinforced THAT row and left a fresh duplicate behind. The
+    live profile drawer ended up with 80 copies of one claim.
+    """
+    monkeypatch.setattr(mem, "list_observations", lambda k=200: [
+        {"id": "mem:old", "observation": "prefers concise answers",
+         "evidence": "no preamble", "keywords": ["concise"],
+         "confidence": 0.5, "seen_count": 1,
+         "created_at": "2026-10-16T23:29:15.308338"},
+        {"id": "mem:new", "observation": "prefers concise answers",
+         "evidence": "no preamble", "keywords": ["concise"],
+         "confidence": 0.5, "seen_count": 2,
+         "created_at": "2026-10-20T20:29:07.813171"},
+    ])
+    mem._reinforce_observation(
+        [{"id": "mem:old", "observation": "prefers concise answers",
+          "evidence": "no preamble", "keywords": ["concise"],
+          "confidence": 0.5, "seen_count": 1,
+          "created_at": "2026-10-16T23:29:15.308338"},
+         {"id": "mem:new", "observation": "prefers concise answers",
+          "evidence": "no preamble", "keywords": ["concise"],
+          "confidence": 0.5, "seen_count": 2,
+          "created_at": "2026-10-20T20:29:07.813171"}],
+        "prefers concise answers", "no preamble", 0.8, ["concise"])
+    assert posted, "the repeat sighting was not written at all"
+    assert posted[0][1]["supersedes"] == "mem:new", (
+        "the live entry was not the one reinforced")
+
+
+def test_a_repeat_sighting_survives_a_vanished_target(monkeypatch, posted):
+    """If the row we meant to supersede is gone, keep the claim anyway.
+
+    The gateway used to persist the record and THEN fail the link, so the
+    client saw an error and believed nothing was written while the drawer
+    kept the orphan. The gateway now refuses the write outright, and the
+    client must fall back to storing the claim as a new row instead of
+    dropping it.
+    """
+    class _Resp:
+        status_code = 404
+
+    class _Err(Exception):
+        response = _Resp()
+
+    calls = []
+
+    def fake_post(path, body, timeout=60.0):
+        calls.append((path, body))
+        if body.get("supersedes"):
+            raise _Err("gone")
+        return {"item": {"id": "mem:fresh", "kind": "observation",
+                         "descriptor": body.get("descriptor", ""),
+                         "keywords": body.get("keywords", []),
+                         "value": body.get("value", {}),
+                         "source": "chat", "run_id": "chat",
+                         "confidence": body.get("confidence", 1.0)}}
+
+    monkeypatch.setattr(mem, "_post", fake_post)
+    mem._reinforce_observation(
+        [{"id": "mem:vanished", "observation": "prefers concise answers",
+          "evidence": "no preamble", "keywords": ["concise"],
+          "confidence": 0.5, "seen_count": 1}],
+        "prefers concise answers", "no preamble", 0.8, ["concise"])
+    assert len(calls) == 2, calls
+    assert "supersedes" not in calls[-1][1], (
+        "the fallback write still tried to link to the vanished row")
+    assert calls[-1][1]["value"]["observation"] == "prefers concise answers"
+
+
+def test_the_profile_block_counts_repeated_sightings(monkeypatch):
+    import agent_server
+    import memory as _m
+    monkeypatch.setattr(_m, "observations_enabled", lambda: True)
     monkeypatch.setattr(
         agent_server, "_read_profile_for_block", lambda: [
             {"observation": "prefers concise answers",
@@ -396,6 +476,7 @@ def test_the_profile_block_marks_a_single_sighting_as_an_anecdote(monkeypatch):
              "seen_count": 4}])
     blk = agent_server._chat_profile_block()
     assert "seen 4 times" in blk
+
 
 
 def test_identical_descriptors_dedupe_even_when_one_side_has_no_keywords():

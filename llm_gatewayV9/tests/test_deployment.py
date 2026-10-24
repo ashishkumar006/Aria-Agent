@@ -18,6 +18,7 @@ import zlib
 
 import httpx
 import pytest
+from pathlib import Path
 
 BASE = os.getenv("LLM_GATEWAY_V9_URL", "http://localhost:8109")
 AGENT = "deploy-probe"
@@ -30,9 +31,46 @@ def note(area, name, status, detail=""):
     RESULTS.append((area, name, status, str(detail)[:160]))
 
 
+# ?? authentication ???????????????????????????????????????????????????????
+# `/v1/*` has been behind the gateway token since the auth work. This probe
+# never sent one, so every request 401'd, the presence check failed, and
+# the whole file skipped on every run: 18 tests that look like a passing
+# deployment check while testing nothing at all.
+#
+# The token comes from the LIVE token file the gateway writes at start-up
+# (state/gateway.token) - not from the environment, because the test
+# process sets GATEWAY_V9_TOKEN to a fixture value that the running
+# gateway does not share.
+TOKEN_FILE = Path(__file__).resolve().parent.parent / "state" / "gateway.token"
+
+
+def _live_token() -> str:
+    try:
+        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _hdr() -> dict:
+    tok = _live_token()
+    return {"x-gateway-token": tok} if tok else {}
+
+
+def _get(url: str, **kw):
+    return httpx.get(url, headers=_hdr(), **kw)
+
+
+def _post(url: str, **kw):
+    return httpx.post(url, headers=_hdr(), **kw)
+
+
+def _delete(url: str, **kw):
+    return httpx.delete(url, headers=_hdr(), **kw)
+
+
 def _gateway_up():
     try:
-        r = httpx.get(f"{BASE}/v1/control/presence", timeout=5)
+        r = _get(f"{BASE}/v1/control/presence", timeout=5)
         return r.status_code == 200
     except Exception:
         return False
@@ -97,7 +135,7 @@ def red_dot_url():
 # ── core ────────────────────────────────────────────────────────────────
 def test_presence():
     need_live()
-    r = httpx.get(f"{BASE}/v1/control/presence", timeout=10)
+    r = _get(f"{BASE}/v1/control/presence", timeout=10)
     assert r.status_code == 200
     d = r.json()
     assert d.get("up") is True
@@ -106,7 +144,7 @@ def test_presence():
 
 def test_status_shape():
     need_live()
-    r = httpx.get(f"{BASE}/v1/status", timeout=15)
+    r = _get(f"{BASE}/v1/status", timeout=15)
     assert r.status_code == 200
     d = r.json()
     for k in ("order", "live", "today", "limits", "gemini_only"):
@@ -117,12 +155,12 @@ def test_status_shape():
 # ── workers ─────────────────────────────────────────────────────────────
 def test_worker_chat_each_live_provider():
     need_live()
-    live = httpx.get(f"{BASE}/v1/status", timeout=15).json()["live"]
+    live = _get(f"{BASE}/v1/status", timeout=15).json()["live"]
     assert live, "no workers wired"
     failures = []
     for name in sorted(live):
         try:
-            r = httpx.post(f"{BASE}/v1/chat", json={
+            r = _post(f"{BASE}/v1/chat", json={
                 "prompt": "Reply with the single word: ok",
                 "provider": name, "max_tokens": 5,
                 "agent": AGENT, "session": SESSION}, timeout=150)
@@ -140,7 +178,7 @@ def test_worker_chat_each_live_provider():
 
 def test_chat_auto_ladder():
     need_live()
-    r = httpx.post(f"{BASE}/v1/chat", json={
+    r = _post(f"{BASE}/v1/chat", json={
         "prompt": "Reply with the single word: ok",
         "max_tokens": 5, "agent": AGENT, "session": SESSION}, timeout=150)
     assert r.status_code == 200, r.text[:200]
@@ -150,7 +188,7 @@ def test_chat_auto_ladder():
 
 def test_chat_batch():
     need_live()
-    r = httpx.post(f"{BASE}/v1/chat/batch", json={
+    r = _post(f"{BASE}/v1/chat/batch", json={
         "calls": [{"prompt": "Reply: ok", "max_tokens": 3, "agent": AGENT, "session": SESSION},
                   {"prompt": "Reply: ok", "max_tokens": 3, "agent": AGENT, "session": SESSION}],
         "max_concurrency": 2}, timeout=180)
@@ -162,7 +200,7 @@ def test_chat_batch():
 
 def test_vision():
     need_live()
-    r = httpx.post(f"{BASE}/v1/vision", json={
+    r = _post(f"{BASE}/v1/vision", json={
         "image": red_dot_url(), "prompt": "What color is this single pixel? Answer one word.",
         "max_tokens": 10, "agent": AGENT, "session": SESSION}, timeout=180)
     assert r.status_code == 200, r.text[:200]
@@ -173,7 +211,7 @@ def test_vision():
 
 def test_embed():
     need_live()
-    r = httpx.post(f"{BASE}/v1/embed", json={
+    r = _post(f"{BASE}/v1/embed", json={
         "text": "deployment probe", "task_type": "retrieval_query",
         "agent": AGENT, "session": SESSION}, timeout=90)
     assert r.status_code == 200, r.text[:200]
@@ -185,7 +223,7 @@ def test_embed():
 # ── channels ────────────────────────────────────────────────────────────
 def test_channels_inventory():
     need_live()
-    chans = httpx.get(f"{BASE}/v1/channels", timeout=15).json()["channels"]
+    chans = _get(f"{BASE}/v1/channels", timeout=15).json()["channels"]
     assert len(chans) == 16, f"got {len(chans)}"
     for c in chans:
         note("channels", c["name"], "LIVE" if c.get("configured") else "UNKEYED",
@@ -196,7 +234,7 @@ def test_channels_inventory():
 
 def test_telegram_probe():
     need_live()
-    r = httpx.post(f"{BASE}/v1/channels/telegram/send",
+    r = _post(f"{BASE}/v1/channels/telegram/send",
                    json={"to": "0", "text": "deploy probe"}, timeout=60)
     assert r.status_code == 200, r.text[:200]
     d = r.json()
@@ -207,7 +245,7 @@ def test_telegram_probe():
 
 # ── integrations (read-only) ────────────────────────────────────────────
 def _integration(service, op, args):
-    r = httpx.post(f"{BASE}/v1/integrations/{service}/{op}",
+    r = _post(f"{BASE}/v1/integrations/{service}/{op}",
                    json={"args": args, "agent": AGENT, "session": SESSION}, timeout=90)
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:150]}"
     return r.json()
@@ -252,21 +290,21 @@ def test_integration_writes_skipped():
 def test_memory_roundtrip():
     need_live()
     marker = f"deploy-probe marker {int(time.time())}"
-    r = httpx.post(f"{BASE}/v1/memory/remember", json={
+    r = _post(f"{BASE}/v1/memory/remember", json={
         "kind": "fact", "descriptor": marker, "keywords": ["deploy", "probe"],
         "value": {}, "source": "deploy-probe", "run_id": "deploy-probe",
         "session_id": SESSION}, timeout=120)
     assert r.status_code == 200, r.text[:200]
     try:
-        r = httpx.post(f"{BASE}/v1/memory/search", json={
+        r = _post(f"{BASE}/v1/memory/search", json={
             "query": "deploy-probe marker", "top_k": 5, "session_id": SESSION}, timeout=120)
         assert r.status_code == 200, r.text[:200]
         hits = r.json().get("items", [])
         assert any(marker in str(h) for h in hits), "written fact not recalled"
         note("memory", "remember+search", "WORKING", "self-recall ok")
     finally:
-        httpx.delete(f"{BASE}/v1/memory", params={"session_id": SESSION}, timeout=30)
-    r = httpx.post(f"{BASE}/v1/memory/search", json={
+        _delete(f"{BASE}/v1/memory", params={"session_id": SESSION}, timeout=30)
+    r = _post(f"{BASE}/v1/memory/search", json={
         "query": "deploy-probe marker", "top_k": 5, "session_id": SESSION}, timeout=120)
     assert not any(marker in str(h) for h in r.json().get("items", [])), "wipe failed"
     note("memory", "session wipe", "WORKING", "probe data removed")
@@ -274,7 +312,7 @@ def test_memory_roundtrip():
 
 def test_memory_stats():
     need_live()
-    r = httpx.get(f"{BASE}/v1/memory/stats", timeout=15)
+    r = _get(f"{BASE}/v1/memory/stats", timeout=15)
     assert r.status_code == 200
     note("memory", "stats", "WORKING", "drawers reporting")
 
@@ -282,9 +320,9 @@ def test_memory_stats():
 # ── voice / policy / observability ──────────────────────────────────────
 def test_voice():
     need_live()
-    r = httpx.get(f"{BASE}/v1/tts/voices", timeout=15)
+    r = _get(f"{BASE}/v1/tts/voices", timeout=15)
     assert r.status_code == 200 and r.json().get("voices"), r.text[:150]
-    r = httpx.post(f"{BASE}/v1/tts", json={"text": "deployment probe"}, timeout=180)
+    r = _post(f"{BASE}/v1/tts", json={"text": "deployment probe"}, timeout=180)
     assert r.status_code == 200, r.text[:200]
     assert len(r.content) > 1000, f"suspiciously small: {len(r.content)}"
     note("voice", "tts", "WORKING", f"{len(r.content)} wav bytes")
@@ -292,7 +330,7 @@ def test_voice():
 
 def test_policy_evaluate():
     need_live()
-    r = httpx.post(f"{BASE}/v1/policy/evaluate", json={
+    r = _post(f"{BASE}/v1/policy/evaluate", json={
         "trust": "untrusted", "tool": "send_telegram"}, timeout=15)
     assert r.status_code == 200
     assert "action" in r.json(), str(r.json())[:150]
@@ -302,7 +340,7 @@ def test_policy_evaluate():
 def test_observability():
     need_live()
     for u in ("/v1/spend", "/v1/cost/by_agent", "/v1/calls?limit=1"):
-        r = httpx.get(f"{BASE}{u}", timeout=15)
+        r = _get(f"{BASE}{u}", timeout=15)
         assert r.status_code == 200, u
     note("system", "spend/cost/calls", "WORKING", "ledger readable")
 

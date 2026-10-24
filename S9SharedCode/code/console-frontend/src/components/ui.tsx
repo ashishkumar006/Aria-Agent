@@ -8,7 +8,7 @@ import { motion } from 'motion/react';
 import {
   Zap, MessageSquare, Play, Database, Search, CalendarDays, Package,
   LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2, FileOutput,
-  TriangleAlert, Boxes,
+  TriangleAlert, Boxes, Monitor,
 } from 'lucide-react';
 import { api, CONF } from '../api';
 import { openCommandPalette } from '../lib/palette';
@@ -103,6 +103,7 @@ export const RAIL: { group: string; items: { to: string; label: string; icon: Re
        this same list, so Ctrl+K could not find it either. A section nobody can
        navigate to is not shipped. */
     { to: '/parts', label: 'Parts', icon: <Boxes size={16} /> },
+    { to: '/computer', label: 'Computer', icon: <Monitor size={16} /> },
   ]},
   { group: 'System', items: [
     { to: '/settings', label: 'Settings', icon: <Settings size={16} /> },

@@ -1898,14 +1898,22 @@ async def cost_by_skill(conversation_id: str | None = None):
                        "calls": sum(r["calls"] for r in rows),
                        "skills": len(rows)}}
 @app.get("/api/audit")
-async def audit_export(redact: bool = True):
+async def audit_export(redact: bool = True, limit: int = 0):
     """Export the computer-use audit log with secrets redacted by default.
     Returns the redacted log lines so the dashboard / compliance tooling can
     show a safe, shareable record of every gated action.
+
+    `limit` returns only the newest N lines. The log is append-only and
+    uncapped, so a page that rendered all of it put thousands of DOM nodes
+    on screen and pushed the one line the user came to read (an approval)
+    out of sight. 0 keeps the whole log for compliance exports.
     """
     from computer_use import safety
     lines = safety.SafetyGates.export_audit(redact=redact)
-    return {"lines": lines, "count": len(lines)}
+    total = len(lines)
+    if limit and limit > 0:
+        lines = lines[-limit:]
+    return {"lines": lines, "count": len(lines), "total": total}
 # ── sessions browser (UI panel) ────────────────────────────────────────────
 # A node keeps its "running" status in graph.json until the executor marks it
 # terminal. If the process dies mid-run (kill -9, crash, power loss) nothing
@@ -6669,9 +6677,23 @@ def _chat_tool_payload() -> list[dict] | None:
     blocked = _CHAT_WRITE_METHODS
     if not blocked:
         return specs
+    import copy
     out = []
     for spec in specs:
         name = str(spec.get("name") or "")
+        if name == "computer_action":
+            # Chat drives apps by GOAL. The low-level daemon primitives are for
+            # the Computer page and skills; handed to a small chat model they
+            # turn "play a song" into a long sequence of press_key/replace_text
+            # calls against whatever window happens to be focused (observed
+            # live: LWin, a URL typed into a page, then a click). Keep chat on
+            # the tools that own their own accessibility/vision cascade.
+            spec = copy.deepcopy(spec)
+            props = ((spec.get("input_schema") or {}).get("properties") or {})
+            action = props.get("action") or {}
+            if action.get("enum"):
+                action["enum"] = [a for a in action["enum"]
+                                  if a in _CHAT_COMPUTER_ACTIONS]
         deny = blocked.get(name)
         if not deny:
             out.append(spec)
@@ -7558,12 +7580,19 @@ async def list_approvals():
     """List pending computer-use approvals + daemon capabilities for the UI."""
     from computer_use import get_computer_use
     import os as _os
+    cu = get_computer_use()
     return {
-        "approvals": get_computer_use().list_approvals(),
+        "approvals": cu.list_approvals(),
         "capabilities": await _cached_capabilities(),
         # P2.2: surface the current mode so the approval panel can show
         # dry-run vs live and warn the user nothing will execute in dry-run.
         "mode": _os.getenv("COMPUTER_USE_MODE", "dry-run").lower(),
+        # Whether the feature is switched on AT ALL. The mode alone is not
+        # enough: with the gates off, every request is refused with
+        # "computer-use is disabled" and the panel would show an empty
+        # queue that looks like "nothing was asked" rather than "the whole
+        # feature is off".
+        "enabled": bool(getattr(cu.safety, "enabled", False)),
     }
 # ── lightweight chat (no DAG) ────────────────────────────────────────────
 # The Chat page is a minimal chatbot: one direct gateway LLM call per turn,
@@ -7625,6 +7654,11 @@ _CHAT_TOOLS = [
     # the behavioural profile is READ-only for chat; see the note on the
     # prompt paragraph below for why recording is not offered here.
     "recall_observations",
+    # Gated desktop control. This is ONE tool with an action selector, not the
+    # raw daemon surface: sensitive actions land in the approval queue and the
+    # host has to opt in with COMPUTER_USE_ENABLED. Chat may ASK for a click;
+    # only the user's approval makes it happen.
+    "computer_action",
 ]
 # Tools chat deliberately does NOT get, with the reason, so the next person does
 # not "fix" the gap by adding them.
@@ -7641,11 +7675,17 @@ _CHAT_TOOLS_REFUSED = {
     "send_email", "send_telegram", "slack_message", "discord_message",
     "github_create_issue", "notion_create_page", "notion_append",
     "create_calendar_event",
-    "delete_file", "computer_action", "index_document",
+    "delete_file", "index_document",
 }
 # (tool, api_method) pairs chat must never call, checked where the payload is
 # built rather than by name. A refused capability that is reachable through a
 # general-purpose wrapper is not refused.
+# Chat gets the goal-level computer actions only. Each of these owns its own
+# a11y/vision cascade; the low-level primitives (click, press_key, replace_text,
+# get_window_state...) are deliberately not offered to chat.
+_CHAT_COMPUTER_ACTIONS = frozenset({
+    "drive_app", "open_app", "run_command", "read_file", "write_file",
+})
 _CHAT_WRITE_METHODS: dict[str, frozenset] = {
     "github_query": frozenset({"create_issue"}),
     "notion_query": frozenset({"create_page", "append_text"}),
@@ -7671,7 +7711,7 @@ _CHAT_SYSTEM = (
     "calendar_query, gmail_query, github_query, slack_history, notion_query, "
     "recall_preferences, remember_preference, list_scheduled, "
     "schedule_task, cancel_scheduled, read_file, list_dir, search_files, "
-    "enable_scheduled, recall_observations, "
+    "enable_scheduled, recall_observations, computer_action, "
     "delegate_research, delegate_authoring) "
     # Parallelism is REAL, and the model kept denying it. Asked "can you call
     # tools in parallel?" it answered "I can only call one tool at a time - the
@@ -7734,6 +7774,28 @@ _CHAT_SYSTEM = (
     "reports it is still running, say so and point at Research or Runs rather "
     "than waiting or retrying. Keep web_search for a single quick lookup - it "
     "is fast and does not need a whole run. "
+    # Gated desktop access. The tool is in the payload, but a model that is not
+    # told what `pending` means will report a click it never made, and one that
+    # is not told the host gate exists will offer to "open Notepad" on a build
+    # where computer use is off.
+    "ON THE USER'S MACHINE: computer_action is gated desktop control - open an "
+    "app, run a command, read or write a file, or drive an app towards a goal. "
+    "open_app ONLY launches the app; it does not play, pause, click or type. "
+    "When the user asks for an action INSIDE an app ('play a song', 'pause', "
+    "'next track', 'send this'), call drive_app with that goal in the same turn "
+    "- do not open the app and stop there, and do not tell the user to do it "
+    "themselves. drive_app ALWAYS needs params.app set to the application name "
+    "(for example 'Spotify') beside params.goal; without it the driver has no "
+    "safe target. Use it only when the user explicitly asks you to do something "
+    "on their computer, not for a question you can answer from knowledge or the "
+    "web. "
+    "It is OFF unless the host enabled it: if it returns disabled, say so "
+    "plainly and do not pretend otherwise. A result of pending means the "
+    "action has NOT run - tell the user to approve it in the Computer page and "
+    "never claim it happened. A result of dry-run means nothing ran and NO "
+    "approval exists: do not tell the user to approve it; say the host is in "
+    "dry-run and must be restarted with -ComputerUseMode live. Never claim an "
+    "action happened unless the result says done. "
     # When a delegated job comes back. The report is displayed to the user in
     # FULL by the interface, so anything the model writes about it is
     # decoration at best and a competing summary at worst.
@@ -8162,6 +8224,11 @@ def _chat_history_for_model(history: list[dict]) -> list[dict]:
     for m in history or []:
         if not isinstance(m, dict):
             continue
+        # A pending row is this run's own placeholder; an error/stopped row
+        # is UI state, not something the model said. Feeding either back
+        # would make the next turn answer a message that never existed.
+        if m.get("pending") or m.get("kind") in ("error", "stopped"):
+            continue
         role = m.get("role") or "user"
         content = str(m.get("content") or "")
         notes: list[str] = []
@@ -8473,7 +8540,9 @@ def _chat_handoff_dispatch(conversation_id: str | None,
 
     Handles the two BIG hand-off tools (`delegate_research`,
     `delegate_authoring`) plus the two small ones chat needs to act on what a
-    delegated run produced (`send_channel_message`, `save_to_documents`).
+    delegated run produced (`send_channel_message`, `save_to_documents`), and
+    `computer_action` - which must run in THIS process so an approval it mints
+    is the same one `/api/computer/approvals` lists for the console.
     Returns None for every other name, which leaves it on the unchanged MCP
     path.
 
@@ -8493,9 +8562,31 @@ def _chat_handoff_dispatch(conversation_id: str | None,
     async def _dispatch(name: str, args: dict):
         if name not in ("delegate_research", "delegate_authoring",
                         "send_channel_message", "save_to_documents",
-                        "read_report"):
+                        "read_report", "computer_action"):
             return None
         try:
+            if name == "computer_action":
+                # Run in the agent process, not the MCP child: SafetyGates
+                # keeps approvals in memory, and the child's copy is invisible
+                # to the Computer page (and to the retry after approval).
+                from computer_use.tool import tool_dispatch
+                a = args if isinstance(args, dict) else {}
+                _action = str(a.get("action") or "")
+                _params = a.get("params") or {}
+                if (_action == "drive_app"
+                        and not str(_params.get("app") or "").strip()):
+                    # Without an app the driver takes the FOREGROUND window.
+                    # Observed live: "play a song" clicked a Chrome page while
+                    # the model reported it had played Spotify. Refuse rather
+                    # than act on a window the user did not name.
+                    return json.dumps({
+                        "ok": False, "status": "bad_request",
+                        "message": ("drive_app needs params.app (the application "
+                                    "name) as well as params.goal; nothing ran."),
+                    })
+                return json.dumps(
+                    tool_dispatch(_action, _params),
+                    default=str)
             if name == "read_report":
                 return _chat_read_report_tool(args or {}, conversation_id)
             if name == "send_channel_message":
@@ -8665,6 +8756,166 @@ def _chat_threads_save(data: dict) -> None:
         _write_json_atomic(_CHAT_THREADS_PATH, data)
     except Exception:
         pass
+
+
+# Server-owned lightweight runs and their lightweight/ DAG cancellation.
+# The old stream did the model call inside the SSE generator, so a refresh
+# or navigation closed the request and cancelled the turn before it could
+# persist an answer. Runs now live in this registry, independent of whoever
+# is watching; /api/chat/cancel is the only thing that stops one.
+_CHAT_RUNS: dict[str, dict] = {}
+_CHAT_RUNS_LOCK = threading.Lock()
+_CHAT_PENDING_GRACE_S = 5.0
+
+
+def _chat_run_register(conversation_id: str, task, turn_id: str) -> None:
+    with _CHAT_RUNS_LOCK:
+        _CHAT_RUNS[conversation_id] = {"task": task, "turn_id": turn_id}
+
+
+def _chat_run_unregister(conversation_id: str, task) -> None:
+    with _CHAT_RUNS_LOCK:
+        rec = _CHAT_RUNS.get(conversation_id)
+        if rec is not None and rec.get("task") is task:
+            _CHAT_RUNS.pop(conversation_id, None)
+
+
+def _chat_conversation_active(conversation_id: str) -> bool:
+    """True while either engine still owns work for this conversation."""
+    if not conversation_id:
+        return False
+    with _CHAT_RUNS_LOCK:
+        rec = _CHAT_RUNS.get(conversation_id)
+        if rec is not None:
+            task = rec.get("task")
+            if task is not None and not task.done():
+                return True
+    # DAG runs register their threading.Event under the conversation id.
+    # Defined later in the module; read at call time, after startup.
+    with _ACTIVE_RUNS_LOCK:
+        return bool(_ACTIVE_RUNS.get(conversation_id))
+
+
+def _chat_thread_evict(data: dict) -> None:
+    if len(data) <= _CHAT_MAX_THREADS:
+        return
+    for _cid in sorted(data, key=lambda c: data[c].get("updated", 0)
+                       )[:len(data) - _CHAT_MAX_THREADS]:
+        print(f"[chat.threads] EVICTED {_cid} - over the "
+              f"{_CHAT_MAX_THREADS}-thread safety valve")
+        del data[_cid]
+
+
+def _chat_pending_append(conversation_id: str, query: str,
+                         mode: str) -> str:
+    """Persist the question and an in-flight answer placeholder.
+
+    Written before the run starts, so a reload during generation shows the
+    question and a working row instead of a thread that looks empty. The
+    placeholder is replaced by `_chat_pending_finish`; a stale one is
+    reconciled on read if no run owns the conversation.
+    """
+    import uuid as _uuid
+    turn_id = f"turn-{_uuid.uuid4().hex[:12]}"
+    started = _time.time()
+    with _CHAT_THREADS_LOCK:
+        data = _chat_threads_load()
+        thread = data.get(conversation_id)
+        if not isinstance(thread, dict):
+            thread = {"title": query[:60], "updated": 0, "messages": []}
+        hist = thread.get("messages") or []
+        thread["messages"] = (hist + [
+            {"role": "user", "content": query, "turn_id": turn_id},
+            {"role": "assistant", "content": "", "pending": True,
+             "turn_id": turn_id, "started": started},
+        ])[-(_CHAT_MAX_TURNS * 2):]
+        thread["updated"] = started
+        thread["mode"] = mode
+        if not thread.get("title"):
+            thread["title"] = query[:60]
+        data[conversation_id] = thread
+        _chat_thread_evict(data)
+        _chat_threads_save(data)
+    return turn_id
+
+
+def _chat_pending_finish(conversation_id: str, turn_id: str, *,
+                         answer: str = "", error: str = "",
+                         stopped: bool = False,
+                         files: list | None = None,
+                         kind: str = "", title: str = "") -> None:
+    """Replace the pending placeholder with the settled assistant message."""
+    with _CHAT_THREADS_LOCK:
+        data = _chat_threads_load()
+        thread = data.get(conversation_id)
+        if not isinstance(thread, dict):
+            return
+        msgs = thread.get("messages") or []
+        if stopped:
+            msg = {"role": "assistant",
+                   "content": (answer or "").strip() or "Stopped.",
+                   "kind": "stopped"}
+        elif error:
+            _partial = (answer or "").strip()
+            msg = {"role": "assistant",
+                   "content": ((_partial + "\n\n") if _partial else "")
+                              + f"The run failed: {error}",
+                   "kind": "error"}
+        else:
+            msg = {"role": "assistant", "content": answer}
+            if kind:
+                msg["kind"] = kind
+            if title:
+                msg["title"] = title
+            if files:
+                msg["files"] = files
+        msg["turn_id"] = turn_id
+        replaced = False
+        for i, m in enumerate(msgs):
+            if (isinstance(m, dict) and m.get("turn_id") == turn_id
+                    and m.get("role") == "assistant"):
+                msgs[i] = msg
+                replaced = True
+                break
+        if not replaced:
+            msgs.append(msg)
+        thread["messages"] = msgs[-(_CHAT_MAX_TURNS * 2):]
+        thread["updated"] = _time.time()
+        data[conversation_id] = thread
+        _chat_thread_evict(data)
+        _chat_threads_save(data)
+
+
+def _chat_reconcile_pending(conversation_id: str, thread: dict) -> bool:
+    """Mark a pending row interrupted only when no run owns it.
+
+    A server restart leaves the placeholder in the thread store. Without
+    this, the Chat view would poll forever for an answer that can never
+    arrive, so say what happened and let the user send it again.
+    """
+    if _chat_conversation_active(conversation_id):
+        return False
+    msgs = thread.get("messages") or []
+    changed = False
+    now = _time.time()
+    for m in msgs:
+        if not isinstance(m, dict) or not m.get("pending"):
+            continue
+        started = float(m.get("started") or 0)
+        if started and now - started < _CHAT_PENDING_GRACE_S:
+            continue
+        m["content"] = ("This run was interrupted before it finished. "
+                        "Send the message again.")
+        m["kind"] = "error"
+        m.pop("pending", None)
+        changed = True
+    if changed:
+        thread["updated"] = now
+        with _CHAT_THREADS_LOCK:
+            data = _chat_threads_load()
+            data[conversation_id] = thread
+            _chat_threads_save(data)
+    return changed
 _ART_HANDLE = re.compile(r"art:[0-9a-fA-F]{16}")
 def _chat_produced_files(conversation_id: str, answer: str) -> list[dict]:
     """Artifacts the model rendered during a chat turn.
@@ -8726,6 +8977,7 @@ async def list_chat_threads(limit: int = 50, offset: int = 0,
          "title": (t.get("title") or "(untitled)")[:90],
          "mode": t.get("mode") or "light",
          "updated": t.get("updated") or 0,
+         "active": _chat_conversation_active(cid),
          "turns": len(t.get("messages", [])) // 2}
         for cid, t in data.items() if isinstance(t, dict)
     ]
@@ -8745,8 +8997,13 @@ async def get_chat_thread(conversation_id: str):
         t = _chat_threads_load().get(conversation_id)
     if not isinstance(t, dict):
         return JSONResponse(status_code=404, content={"error": "unknown thread"})
+    active = _chat_conversation_active(conversation_id)
+    if not active:
+        _chat_reconcile_pending(conversation_id, t)
+        active = _chat_conversation_active(conversation_id)
     return {"conversation_id": conversation_id,
             "title": t.get("title") or "(untitled)",
+            "active": active,
             "messages": t.get("messages") or []}
 @app.delete("/api/chat/threads/{conversation_id}")
 async def delete_chat_thread(conversation_id: str):
@@ -8937,8 +9194,11 @@ async def chat_simple(req: Request):
         try:
             # Read-only tools so chat can answer current/external facts
             # (web_search, fetch_url, get_time, search_knowledge,
-            # currency_convert) instead of guessing. Messaging, calendar,
-            # file-write and computer tools stay on the Research path.
+            # currency_convert) instead of guessing. Messaging, calendar and
+            # file-write tools stay on the DAG path. Computer use is the one
+            # side-effecting capability chat does get, because it is gated:
+            # off unless the host opts in, dry-run by default, and every
+            # sensitive action waits in the approval queue.
             # Tool failures fall back to a plain text call — chat never
             # 502s on tool infrastructure.
             from skills import tool_payload as _tool_payload
@@ -9193,10 +9453,13 @@ async def _dedup_stream(session_id: str, key: str = ""):
 @app.post("/api/chat/simple/stream")
 async def chat_simple_stream(req: Request):
     """SSE twin of /api/chat/simple. Frames: `started{conversation_id}`,
-    `status{text}` (thinking… + live tool progress), `delta{text}`
+    `status{text}` (thinking... + live tool progress), `delta{text}`
     (answer chunks), `done{answer, conversation_id}`, `error{text}`.
-    Thread persistence + cost accounting are identical to chat_simple.
-    `media_type` must stay `text/event-stream` or gzip buffers the stream.
+
+    The turn runs in a server-owned task, not in this response generator.
+    A refresh, navigation, or closed tab only detaches a viewer: the task
+    finishes and persists the answer. `/api/chat/cancel` is the only thing
+    that stops it. The generator is just the live view of the run's queue.
     """
     # Bound here, not where it was first needed: `await _aio...` with no
     # binding in scope is a NameError, and it took the whole route down.
@@ -9230,12 +9493,8 @@ async def chat_simple_stream(req: Request):
         return JSONResponse(status_code=400,
                             content={"error": "model must be a string"})
     model = model[:200] or None
-    # Idempotency for research submits. "Research this topic" has no client
-    # guard, so a double-click (or a retry after a slow response that looked
-    # like a failure) starts a SECOND paid run of the same question and the
-    # sidebar then shows two identical topics. A caller-supplied key wins;
-    # otherwise an identical query inside the window collapses onto the run
-    # already in flight, and the UI is told which one it joined.
+    # Idempotency for research submits. A caller-supplied key wins;
+    # otherwise an identical query inside the window joins the run in flight.
     idem_key = str(body.get("idempotency_key") or "").strip()[:120]
     if not idem_key and body.get("research"):
         idem_key = "research:" + _req_digest(query)
@@ -9253,17 +9512,16 @@ async def chat_simple_stream(req: Request):
             # No id supplied: mint one.
             import uuid as _uuid
             conversation_id = f"ct-{_uuid.uuid4().hex[:8]}"
-            _pre[conversation_id] = {"title": query[:60], "updated": 0, "mode": "light",
-                                     "messages": []}
+            _pre[conversation_id] = {"title": query[:60], "updated": 0,
+                                     "mode": "light", "messages": []}
             _chat_threads_save(_pre)
         elif conversation_id not in _pre:
             # Bound, not replaced - see the note in `chat_simple`.
-            _pre[conversation_id] = {"title": query[:60], "updated": 0, "mode": "light",
-                                     "messages": []}
+            _pre[conversation_id] = {"title": query[:60], "updated": 0,
+                                     "mode": "light", "messages": []}
             _chat_threads_save(_pre)
     # Claim the idempotency key only after the id exists, so a duplicate that
     # arrives while this one is still being set up joins rather than races.
-    # The claim is atomic: two simultaneous submits cannot both win.
     existing_id = _inflight_run_claim(idem_key, conversation_id)
     if existing_id:
         # `**_SSE_HEADERS`, not `headers=`: that name is a kwargs bundle
@@ -9271,147 +9529,170 @@ async def chat_simple_stream(req: Request):
         # made StreamingResponse try to encode the nested dict as a latin-1
         # header and 500 on every duplicate submit.
         return StreamingResponse(_dedup_stream(existing_id), **_SSE_HEADERS)
+    # Build the model's history BEFORE inserting this turn's rows, then write
+    # the question and a pending answer placeholder. That write happens before
+    # the response exists, so even a refresh at frame one keeps the question.
+    with _CHAT_THREADS_LOCK:
+        _data = _chat_threads_load()
+        _thread = _data.get(conversation_id)
+        if not isinstance(_thread, dict):
+            _thread = {"title": query[:60], "updated": 0, "mode": "light",
+                       "messages": []}
+        _history = _thread.get("messages") or []
+        messages = ([{"role": "system", "content": _chat_system_now()}]
+                    + _chat_history_for_model(_history[-(_CHAT_MAX_TURNS * 2):])
+                    + [{"role": "user", "content": query}])
+    try:
+        turn_id = _chat_pending_append(conversation_id, query, "light")
+    except Exception:
+        # The thread store being unavailable must not take the turn down;
+        # the answer is still worth returning. `_finish` will report that it
+        # could not be saved.
+        turn_id = ""
     # Same deterministic preference capture as chat_simple (see
     # _capture_preference_bg for why it does not rely on the model).
     _capture_preference_bg(query, conversation_id)
     _capture_observation_bg(query, conversation_id)
-    async def gen():
-        import time as _t
-        _t0 = _t.monotonic()
-        pending: list[str] = []
-        # What to say while a LONG hand-off tool runs. The periodic
-        # "still working… 245s elapsed" heartbeat told the user nothing about
-        # WHAT was running; for the two delegation tools the wait is minutes,
-        # so the line must say what is being waited on and that it arrives by
-        # itself. Set on tool_call, cleared on tool_result.
-        busy: dict = {}
-        # Set once any answer text has gone out live, so the tail below does
-        # not replay the whole answer as fake deltas after the model finished.
-        streamed = {"any": False}
-        def _emit(kind: str, payload: dict) -> None:
-            if kind == "text":
-                chunk = str(payload.get("delta") or "")
-                if chunk:
-                    streamed["any"] = True
-                    pending.append(_sse("delta", text=chunk))
-                return
-            if kind == "tool_call":
-                _name = str(payload.get("name", "tool"))
-                if _name == "delegate_research":
-                    busy["note"] = ("research is ongoing - the report will "
-                                    "appear here as soon as it is ready")
-                    pending.append(_sse("status", text=(
-                        "starting the research - this can take a few "
-                        "minutes…")))
-                elif _name == "delegate_authoring":
-                    busy["note"] = ("the document is being prepared - it will "
-                                    "appear here as soon as it is rendered")
-                    pending.append(_sse("status", text=(
-                        "preparing the document (research, then rendering) - "
-                        "this can take a few minutes…")))
-                else:
-                    pending.append(_sse("status",
-                                        text=f"using {_name}…"))
-            elif kind == "tool_result":
-                busy.pop("note", None)
-                if not payload.get("ok", True):
-                    pending.append(_sse("status",
-                                        text=(f"{payload.get('name', 'tool')} "
-                                              f"failed, continuing…")))
-        yield _sse("started", conversation_id=conversation_id)
-        # Wall-clock for the whole turn, reported on `done`. Measured here
-        # rather than in the UI: the client cannot know when the request
-        # actually reached the model, and a number computed from
-        # render-start would flatter the server by however long the SSE
-        # connection took to open.
-        _turn_t0 = _time.perf_counter()
-        with _CHAT_THREADS_LOCK:
-            data = _chat_threads_load()
-            if conversation_id not in data:
-                data[conversation_id] = {"title": query[:60], "updated": 0, "mode": "light",
-                                         "messages": []}
-            thread = data[conversation_id]
-            history = thread.get("messages") or []
-            messages = ([{"role": "system", "content": _chat_system_now()}]
-                        + _chat_history_for_model(history[-(_CHAT_MAX_TURNS * 2):])
-                        + [{"role": "user", "content": query}])
-        # No up-front document retrieval here either - same reason as the
-        # non-streaming twin: `search_knowledge` is the access, and injecting a
-        # search's chunks into every turn was the opposite of lightweight.
-        # Same recall as the non-streaming path; a streamed answer must not be
-        # less informed about the user than a buffered one.
-        messages = await _with_chat_memory(messages, query, conversation_id)
-        messages = _with_channel_persona(messages, conversation_id)
-        # Write the question to the thread NOW, not after the answer. The save
-        # that records a completed turn runs at the very end of the stream, so
-        # a client that walked away - "Start new chat", a closed tab, a dropped
-        # connection - lost BOTH halves: the user had paid for the tokens and
-        # came back to an empty thread, with nothing in the UI saying the turn
-        # had existed. The assistant half is appended at the end (and simply
-        # never arrives if the run was cut short), so an abandoned turn leaves
-        # the question on screen instead of vanishing.
+
+    # The run's live view. Bounded so a detached run cannot grow memory with
+    # a slow/absent reader; text is also accumulated in `acc`, so a dropped
+    # delta only loses painting, never the answer.
+    q = _aio.Queue(maxsize=4000)
+    acc = {"text": ""}
+    streamed = {"any": False}
+    busy: dict = {}
+    run_started = _time.monotonic()
+    started_box = {"v": False}
+
+    def _put(kind: str, payload: dict) -> None:
         try:
-            with _CHAT_THREADS_LOCK:
-                _data = _chat_threads_load()
-                _th = _data.get(conversation_id)
-                if _th is None:
-                    _th = {"title": query[:60], "updated": 0, "mode": "light",
-                           "messages": []}
-                _hist = _th.get("messages") or []
-                _th["messages"] = ((_hist + [{"role": "user", "content": query}])
-                                   [-(_CHAT_MAX_TURNS * 2):])
-                _th["updated"] = _t.time()
-                if not _th.get("title"):
-                    _th["title"] = query[:60]
-                _data[conversation_id] = _th
-                _chat_threads_save(_data)
-        except Exception:
-            # A thread store that refuses the write must not take the turn down
-            # with it - the answer is still worth returning to the user.
+            q.put_nowait((kind, payload))
+        except _aio.QueueFull:
             pass
-        # Hold one turn per conversation for the whole model call and the cost
-        # record, so concurrent sends cannot include each other's tokens in
-        # their snapshot delta (H5).
-        turn_lock = _turn_lock(conversation_id)
-        await _aio.to_thread(turn_lock.acquire)
+
+    def _put_final(kind: str, payload: dict) -> None:
+        # A terminal frame must never be the item the full queue drops.
+        while True:
+            try:
+                q.put_nowait((kind, payload))
+                return
+            except _aio.QueueFull:
+                try:
+                    q.get_nowait()
+                except _aio.QueueEmpty:
+                    pass
+
+    def _emit(kind: str, payload: dict) -> None:
+        if kind == "text":
+            chunk = str(payload.get("delta") or "")
+            if chunk:
+                streamed["any"] = True
+                acc["text"] += chunk
+                _put("delta", {"text": chunk})
+            return
+        if kind == "tool_call":
+            _name = str(payload.get("name", "tool"))
+            if _name == "delegate_research":
+                busy["note"] = ("research is ongoing - the report will "
+                                "appear here as soon as it is ready")
+                _put("status", {"text": (
+                    "starting the research - this can take a few minutes...")})
+            elif _name == "delegate_authoring":
+                busy["note"] = ("the document is being prepared - it will "
+                                "appear here as soon as it is rendered")
+                _put("status", {"text": (
+                    "preparing the document (research, then rendering) - "
+                    "this can take a few minutes...")})
+            else:
+                _put("status", {"text": f"using {_name}..."})
+        elif kind == "tool_result":
+            busy.pop("note", None)
+            if not payload.get("ok", True):
+                _put("status", {"text": (
+                    f"{payload.get('name', 'tool')} failed, continuing...")})
+
+    async def _run_turn() -> None:
+        started_box["v"] = True
+        turn_lock = None
+        locked = False
         cost_before = None
+        model_name = ""
+        provider = ""
+
+        def _finish(*, answer: str = "", error: str = "", stopped: bool = False,
+                    files: list | None = None, kind: str = "",
+                    title: str = "", save_error: str = "") -> None:
+            try:
+                _chat_pending_finish(conversation_id, turn_id, answer=answer,
+                                     error=error, stopped=stopped, files=files,
+                                     kind=kind, title=title)
+            except Exception as e:
+                # The answer is still worth showing; the client gets the same
+                # "answer delivered but could not be saved" contract as before.
+                save_error = save_error or f"{type(e).__name__}: {e}"
+            final_answer = answer or ("Stopped." if stopped else "")
+            if save_error:
+                _put_final("__error__", {"text": (
+                    f"answer delivered but could not be saved: {save_error}"
+                    if final_answer else
+                    f"could not save this turn: {save_error}")})
+            elif error:
+                _put_final("__error__", {"text": f"chat failed: {error}"})
+            else:
+                payload = {
+                    "answer": final_answer,
+                    "conversation_id": conversation_id,
+                    "elapsed_ms": int((_time.perf_counter() - started_box["t0"])
+                                      * 1000),
+                    "model": model_name,
+                    "provider": provider,
+                    "kind": kind,
+                    "title": title,
+                    "files": files or [],
+                }
+                if stopped:
+                    payload["stopped"] = True
+                _put_final("__done__", payload)
+
+        started_box["t0"] = _time.perf_counter()
         try:
-            cost_before = await _aio.to_thread(_session_cost_breakdown,
-                                               conversation_id)
-            from skills import tool_payload as _tool_payload
+            # Recall first: it is three gateway round-trips and needs no
+            # conversation lock. Same recall as /api/chat/simple.
+            _messages = await _with_chat_memory(messages, query, conversation_id)
+            _messages = _with_channel_persona(_messages, conversation_id)
+            turn_lock = _turn_lock(conversation_id)
+            await _aio.to_thread(turn_lock.acquire)
+            locked = True
+            try:
+                cost_before = await _aio.to_thread(_session_cost_breakdown,
+                                                   conversation_id)
+            except Exception:
+                cost_before = None
+            from skills import tool_payload as _tool_payload  # noqa: F401
             try:
                 from flags import is_enabled as _flag_on
                 _chat_tools_on = _flag_on("chat.tools", True)
             except Exception:
                 _chat_tools_on = True
-            # Must match chat_simple's list exactly — the streaming twin and
-            # the one-shot endpoint otherwise give the model different
-            # capabilities, which is its own kind of lie.
             _tools = _chat_tool_payload() if _chat_tools_on else None
-            # Filled by a delegated run (see `_chat_handoff_dispatch`), then
-            # reported on `done` so the transcript can offer the download.
             handoff_files: list = []
-            # Receives the FULL text of a delegated research report (see
-            # `_chat_handoff_dispatch`); it becomes the answer verbatim.
             handoff_report: dict = {}
+
             async def _work() -> dict:
-                """The whole model turn: tool loop if tools are on, else a
-                plain call. Runs as one task so the stream can keep emitting
-                progress while the gateway call is still in flight."""
+                nonlocal model_name, provider
                 if _tools:
                     try:
                         from mcp_runner import run_with_tools as _run_with_tools
                         import outcomes as _outcomes
                         return await _run_with_tools(
-                            messages=messages, tools_payload=_tools,
+                            messages=_messages, tools_payload=_tools,
                             agent="chat", session_id=conversation_id, model=model,
                             max_tokens=2048, temperature=0.7,
                             doc_ids=_conversation_doc_ids(conversation_id, body),
                             stream=True,
                             on_event=_emit,
-                            extra_dispatch=_chat_handoff_dispatch(conversation_id,
-                                                                  handoff_files,
-                                                                  handoff_report),
+                            extra_dispatch=_chat_handoff_dispatch(
+                                conversation_id, handoff_files, handoff_report),
                             on_outcome=lambda n, a, ok, t, lat: _outcomes.on_tool_outcome(
                                 name=n, arguments=a, ok=ok, result_text=t,
                                 latency_s=lat, session_id=conversation_id,
@@ -9419,21 +9700,15 @@ async def chat_simple_stream(req: Request):
                     except Exception as _te:
                         print(f"[chat] tool loop failed, plain-text fallback: "
                               f"{type(_te).__name__}: {_te}")
-                # No tools: stream the gateway directly. `LLM.chat` is
-                # synchronous and returns only after the last token, so the
-                # old code had no answer to send until the model had finished
-                # and then replayed it in 240-char chunks - a progress bar
-                # pretending to be a stream.
+                # No tools: stream the gateway directly.
                 try:
                     llm = LLM()
                     stream_fn = getattr(llm, "stream_chat", None)
                     if stream_fn is not None:
                         parts: list[str] = []
-                        provider = ""
-                        answered = ""
                         try:
                             async for ev in stream_fn(
-                                    messages=messages, agent="chat",
+                                    messages=_messages, agent="chat",
                                     session=conversation_id, model=model,
                                     max_tokens=2048, temperature=0.7):
                                 kind = ev.get("type")
@@ -9444,17 +9719,13 @@ async def chat_simple_stream(req: Request):
                                         _emit("text", {"delta": chunk})
                                 elif kind == "done":
                                     provider = str(ev.get("provider") or provider)
-                                    answered = str(ev.get("model") or answered)
+                                    model_name = str(ev.get("model") or model_name)
                             text = "".join(parts)
                             return {"text": text, "provider": provider,
-                                    "model": answered,
+                                    "model": model_name,
                                     "input_tokens": 0,
                                     "output_tokens": len(text) // 4}
                         except Exception as _se:
-                            # Partial text already reached the client: raising
-                            # preserves it (the UI keeps a stopped/partial
-                            # answer) instead of replacing it with a second,
-                            # billed non-streaming call.
                             if parts:
                                 raise
                             print(f"[chat] stream failed, batched fallback: "
@@ -9465,141 +9736,120 @@ async def chat_simple_stream(req: Request):
                     print(f"[chat] no stream available: "
                           f"{type(_se).__name__}: {_se}")
                 return await _aio.to_thread(
-                    LLM().chat, messages=messages, agent="chat",
+                    LLM().chat, messages=_messages, agent="chat",
                     session=conversation_id, model=model,
                     max_tokens=2048, temperature=0.7)
-            yield _sse("status", text="thinking…")
-            _task = _aio.create_task(_work())
-            try:
-                # Poll so tool progress AND a heartbeat reach the client while
-                # the gateway call is in flight. A slow provider (or a 503ing
-                # key the router is failing over) can take minutes; without a
-                # heartbeat the UI would sit on a stale "thinking…" with no
-                # idea if it was alive.
-                _last_beat = _t.monotonic()
-                while not _task.done():
-                    await _aio.sleep(0.15)
-                    while pending:
-                        yield pending.pop(0)
-                    _now = _t.monotonic()
-                    if _now - _last_beat >= _CHAT_STREAM_HEARTBEAT_S:
-                        _last_beat = _now
-                        # Keep the idempotency claim alive for
-                        # runs longer than the registry TTL (see
-                        # _inflight_run_touch).
-                        _inflight_run_touch(idem_key)
-                        yield _sse("status", text=(
-                            (busy.get("note") or "still working")
-                            + f" · {int(_now - _t0)}s elapsed"))
-                reply = await _task
-            finally:
-                # If the client hit stop (or navigated away), Starlette closes
-                # the generator here — cancel the in-flight turn so it stops
-                # burning a gateway call instead of running on orphaned.
-                if not _task.done():
-                    _task.cancel()
-            while pending:
-                yield pending.pop(0)
-            answer = (reply.get("text") or "").strip() or _chat_empty_answer(reply)
-            # A delegated research report IS the answer - verbatim, the same
-            # text the Research page shows. The model's paraphrase of it was
-            # the difference the user saw between the two surfaces, so the
-            # report replaces the paraphrase rather than following it.
+
+            reply = await _work()
+            reply = reply if isinstance(reply, dict) else {}
+            model_name = str(reply.get("model") or model_name)
+            provider = str(reply.get("provider") or provider)
+            answer = ((reply.get("text") or "").strip()
+                      or _chat_empty_answer(reply))
             report_title = str(handoff_report.get("topic") or "").strip()
             report_text = str(handoff_report.get("text") or "").strip()
             if report_text:
                 answer = report_text
-        except Exception as e:
-            yield _sse("error", text=f"chat failed: {e}")
-            return
-        finally:
-            # Always reconcile, not only when an answer was produced: a failed
-            # or cancelled turn can still have been billed by the gateway.
-            # If cancellation makes the await impossible, fall back to the
-            # blocking read so the spend is not lost (H4).
-            try:
-                delta = await _aio.to_thread(_session_cost_delta,
-                                             conversation_id, cost_before)
-                if delta:
-                    _record_turn_cost(conversation_id, query, delta)
-            except BaseException:
-                try:
-                    delta = _session_cost_delta(conversation_id, cost_before)
-                    if delta:
-                        _record_turn_cost(conversation_id, query, delta)
-                except Exception:
-                    pass
-                raise
-            finally:
-                turn_lock.release()
-        # A report is not dribbled word by word: at 12ms a chunk a 20,000-char
-        # report would spend a minute painting after it was already written,
-        # for no benefit - the console renders it as a card from `done`. Its
-        # own status line says what is arriving instead.
-        if report_text:
-            yield _sse("status", text="report ready - showing it in full…")
-        elif not streamed["any"]:
-            # Batched fallback only. Live deltas already painted the answer;
-            # replaying it here sent every character twice.
-            for _chunk in _chat_chunks(answer):
-                yield _sse("delta", text=_chunk)
-                # Light pacing so a long answer paints in progressively rather
-                # than arriving as one burst. Bounded: 12ms per chunk, so even a
-                # 20k-char answer adds well under a second before `done`.
-                await _aio.sleep(_CHAT_STREAM_PACE_S)
-        # Persistence is inside the try on purpose. If the thread store is
-        # corrupt or the disk is full, the exception used to escape the async
-        # generator and truncate the response — so the client saw deltas and
-        # NO terminal frame, rendered a partial answer as a finished one, and
-        # the turn was never stored. Now it is a clean `error` frame.
-        try:
             files_out = (_chat_produced_files(conversation_id, answer)
                          or handoff_files)
-            with _CHAT_THREADS_LOCK:
-                data = _chat_threads_load()
-                if conversation_id not in data:
-                    data[conversation_id] = {"title": query[:60], "updated": 0, "mode": "light",
-                                             "messages": []}
-                thread = data[conversation_id]
-                history = thread.get("messages") or []
-                # Only the answer is added here: the question was written
-                # before the stream started, so appending it again would
-                # repeat the user half in every reopened transcript.
-                _assistant = {"role": "assistant", "content": answer}
-                # kind/title mark a report that is displayed in full: later
-                # turns get a name-and-description stub for it (see
-                # `_chat_history_for_model`) and the UI renders the card.
-                if report_text:
-                    _assistant["kind"] = "report"
-                    _assistant["title"] = report_title or query[:80]
-                if files_out:
-                    _assistant["files"] = files_out
-                thread["messages"] = (history + [_assistant]
-                                      )[-(_CHAT_MAX_TURNS * 2):]
-                thread["updated"] = _t.time()
-                if not thread.get("title"):
-                    thread["title"] = query[:60]
-                if len(data) > _CHAT_MAX_THREADS:
-                    for _cid in sorted(data, key=lambda c: data[c].get("updated", 0)
-                                       )[:len(data) - _CHAT_MAX_THREADS]:
-                        print(f"[chat.threads] EVICTED {_cid} - over the "
-                              f"{_CHAT_MAX_THREADS}-thread safety valve")
-                        del data[_cid]
-                _chat_threads_save(data)
+            if report_text:
+                _put("status", {"text": "report ready - showing it in full..."})
+            elif not streamed["any"]:
+                # Batched fallback only. Live deltas already painted it.
+                for _chunk in _chat_chunks(answer):
+                    _put("delta", {"text": _chunk})
+                    await _aio.sleep(_CHAT_STREAM_PACE_S)
+                acc["text"] = answer
+            _finish(answer=answer,
+                    files=files_out,
+                    kind=("report" if report_text else ""),
+                    title=((report_title or query[:80]) if report_text else ""))
+        except _aio.CancelledError:
+            # Stop. Keep the partial answer the user already paid for, and
+            # persist it so reopening the thread shows the same thing.
+            _finish(answer=acc["text"].strip(), stopped=True)
         except Exception as e:
-            yield _sse("error", text=f"answer delivered but could not be saved: {e}")
+            _finish(answer=acc["text"].strip(),
+                    error=f"{type(e).__name__}: {e}")
+        finally:
+            # Record spend whatever happened, including cancellation. The
+            # fallback is synchronous because awaiting inside a cancelled
+            # task can raise again before the ledger write happens.
+            try:
+                if cost_before is not None:
+                    try:
+                        delta = await _aio.to_thread(_session_cost_delta,
+                                                     conversation_id, cost_before)
+                    except BaseException:
+                        delta = _session_cost_delta(conversation_id, cost_before)
+                    if delta:
+                        _record_turn_cost(conversation_id, query, delta)
+            except Exception:
+                pass
+            if locked and turn_lock is not None:
+                turn_lock.release()
+            _put_final("__end__", {})
+
+    _put("status", {"text": "thinking..."})
+    runner = _aio.create_task(_run_turn())
+
+    def _runner_done(task) -> None:
+        _chat_run_unregister(conversation_id, task)
+        if task.cancelled():
+            # A task cancelled before its body ran never reached _finish, so
+            # the placeholder would otherwise stay pending until reconcile.
+            if not started_box["v"]:
+                try:
+                    _chat_pending_finish(conversation_id, turn_id, stopped=True)
+                except Exception:
+                    pass
+                _put_final("__done__", {
+                    "answer": "Stopped.", "conversation_id": conversation_id,
+                    "elapsed_ms": int((_time.perf_counter() - run_started) * 1000),
+                    "model": "", "provider": "", "kind": "", "title": "",
+                    "files": [], "stopped": True})
             return
-        # Echo the model that ACTUALLY answered (the gateway reports it), so a
-        # pinned pick can be confirmed rather than assumed.
-        yield _sse("done", answer=answer, conversation_id=conversation_id,
-                   elapsed_ms=int((_time.perf_counter() - _turn_t0) * 1000),
-                   model=(reply.get("model") or "") if isinstance(reply, dict) else "",
-                   provider=(reply.get("provider") or "") if isinstance(reply, dict) else "",
-                   kind=("report" if report_text else ""),
-                   title=(report_title if report_text else ""),
-                   files=files_out)
+        try:
+            exc = task.exception()
+        except Exception:
+            exc = None
+        if exc is not None:
+            print(f"[chat] background turn ended with {type(exc).__name__}: {exc}")
+
+    runner.add_done_callback(_runner_done)
+    _chat_run_register(conversation_id, runner, turn_id)
+
+    async def gen():
+        yield _sse("started", conversation_id=conversation_id)
+        _last_beat = _time.monotonic()
+        terminal: tuple[str, dict] | None = None
+        while True:
+            try:
+                item = await _aio.wait_for(q.get(), timeout=0.5)
+            except _aio.TimeoutError:
+                _now = _time.monotonic()
+                if _now - _last_beat >= _CHAT_STREAM_HEARTBEAT_S:
+                    _last_beat = _now
+                    _inflight_run_touch(idem_key)
+                    yield _sse("status", text=(
+                        (busy.get("note") or "still working")
+                        + f" - {int(_now - run_started)}s elapsed"))
+                continue
+            if item is None:
+                break
+            kind, payload = item
+            if kind == "__end__":
+                break
+            if kind in ("__done__", "__error__"):
+                terminal = (kind, payload)
+                break
+            yield _sse(kind, **payload)
+        if terminal is not None:
+            kind, payload = terminal
+            yield _sse("done" if kind == "__done__" else "error", **payload)
+
     return StreamingResponse(gen(), **_SSE_HEADERS)
-# ── chat (streaming) ────────────────────────────────────────────────────────
+
 def _sse(event_type: str, **payload) -> str:
     """One SSE-style frame: `data: {json}\\n\\n`."""
     frame = {"type": event_type, **payload}
@@ -9757,8 +10007,13 @@ def _unregister_run(*keys: str | None,
                 del _ACTIVE_RUNS[k]
 def _active_run_count() -> int:
     with _ACTIVE_RUNS_LOCK:
-        return len({id(ev) for evs in _ACTIVE_RUNS.values()
-                    for ev in evs})
+        dag = len({id(ev) for evs in _ACTIVE_RUNS.values()
+                   for ev in evs})
+    with _CHAT_RUNS_LOCK:
+        light = sum(1 for rec in _CHAT_RUNS.values()
+                    if rec.get("task") is not None
+                    and not rec["task"].done())
+    return dag + light
 @app.post("/api/chat/cancel")
 async def cancel_chat(req: Request):
     """Stop a live run: `{"conversation_id": ...}` or `{"session_id": ...}`.
@@ -9785,7 +10040,19 @@ async def cancel_chat(req: Request):
     with _ACTIVE_RUNS_LOCK:
         pairs = [(k, ev) for k in keys
                  for ev in _ACTIVE_RUNS.get(k, ())]
-    if pairs:
+    # Lightweight runs are asyncio tasks in their own registry, not DAG
+    # threading.Events. Stop must cancel those too, or the "only Stop can
+    # stop a run" contract is false for the default chat engine.
+    with _CHAT_RUNS_LOCK:
+        chat_tasks = []
+        for _k in keys:
+            _rec = _CHAT_RUNS.get(_k)
+            _task = _rec.get("task") if isinstance(_rec, dict) else None
+            if _task is not None and not _task.done():
+                chat_tasks.append(_task)
+    for _task in chat_tasks:
+        _task.cancel()
+    if pairs or chat_tasks:
         for _k, ev in pairs:
             ev.set()
         status = "cancelled"
@@ -9812,7 +10079,8 @@ async def cancel_chat(req: Request):
             except Exception:
                 session_id = ""
     return {"status": status, "found": status != "missing",
-            "cancelled": len(pairs),
+            "cancelled": len(pairs) + len(chat_tasks),
+            "lightweight_cancelled": len(chat_tasks),
             "flagged": any(ev.is_set() for _k, ev in pairs),
             "session_id": session_id,
             "active_runs": _active_run_count()}
@@ -10004,6 +10272,26 @@ def _stream_run(query: str, conversation_id: str | None,
                 fail_box["error"] = str(e)
                 _push(f"AGENT ERROR: {e}")
             finally:
+                # Settle the DAG chat turn here, in the worker. The drain
+                # generator may already be gone (refresh/navigation), so
+                # persisting next to the `done` frame loses the answer.
+                if dag_turn_id:
+                    try:
+                        if fail_box["error"]:
+                            _chat_pending_finish(
+                                conversation_id, dag_turn_id,
+                                error=fail_box["error"])
+                        elif cancel_ev.is_set():
+                            _chat_pending_finish(
+                                conversation_id, dag_turn_id,
+                                answer=str(answer_box.get("answer") or ""),
+                                stopped=True)
+                        else:
+                            _chat_pending_finish(
+                                conversation_id, dag_turn_id,
+                                answer=str(answer_box.get("answer") or ""))
+                    except Exception as _e:
+                        print(f"[chat.dag] answer write skipped: {_e!r}")
                 # Always release the cancel registry, whatever way we left.
                 # Only OUR event: a concurrent run sharing this session or
                 # conversation key must stay cancellable.
@@ -10028,6 +10316,17 @@ def _stream_run(query: str, conversation_id: str | None,
                 # and its cost record are complete.
                 _inflight_run_release(idem_key)
                 _push(None)  # sentinel
+        # DAG chat turns are persisted by the WORKER, not by the SSE
+        # generator. A refresh closes the generator, but the worker keeps
+        # running; without this row the answer existed only in the tab that
+        # watched it. The placeholder goes in before the thread starts, so a
+        # reload during the gateway warmup still shows the question.
+        dag_turn_id = ""
+        if run_kind == "chat" and conversation_id:
+            try:
+                dag_turn_id = _chat_pending_append(conversation_id, query, "dag")
+            except Exception as _e:
+                print(f"[chat.dag] pending write skipped: {_e!r}")
         thread = threading.Thread(target=_run_and_drain, daemon=True)
         thread.start()
         worker_box["started"] = True

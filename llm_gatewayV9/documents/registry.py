@@ -310,6 +310,56 @@ class EmbedderUnavailable(RuntimeError):
     and resume later, NOT to `failed` and not to `ready`."""
 
 
+class ParseTimeout(RuntimeError):
+    """The parser did not finish inside the deadline.
+
+    A pathological file (a 7.9 MB PDF with a broken xref, a zip bomb, a
+    document with a million pages) can make a parser spin forever. The
+    symptom was a document parked on `parsing` with zero chunks, no error
+    and no retry - and because the indexer serialises documents, it also
+    blocked every other upload behind it.
+    """
+
+
+# How long a single parse may take before the document is failed with a
+# clear reason. Parsing is CPU-bound and normally takes seconds; 5 minutes
+# is far past anything healthy.
+PARSE_TIMEOUT_S = float(os.getenv("DOCUMENT_PARSE_TIMEOUT_S", "300") or 300)
+
+
+def _parse_with_timeout(filename: str, data: bytes,
+                        timeout_s: float | None = None):
+    """Parse `data`, giving up after `timeout_s`.
+
+    The parse runs on its own daemon thread so a parser that never returns
+    cannot hold the document hostage: the caller gets a `ParseTimeout`, the
+    document is marked failed with a reason, and the indexer moves on. The
+    abandoned thread is a daemon, so it cannot keep the process alive.
+    """
+    from documents import parsers as P
+
+    limit = PARSE_TIMEOUT_S if timeout_s is None else timeout_s
+    box: dict = {}
+
+    def _run():
+        try:
+            box["parsed"] = P.parse(filename, data)
+        except BaseException as e:          # noqa: BLE001 - re-raised below
+            box["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True, name="doc-parse")
+    t.start()
+    t.join(timeout=limit if limit > 0 else None)
+    if t.is_alive():
+        raise ParseTimeout(
+            f"parsing {filename} took longer than {int(limit)}s and was "
+            f"abandoned")
+    if "error" in box:
+        raise box["error"]
+    return box.get("parsed")
+
+
+
 class Indexer:
     """Parses, chunks and embeds one document at a time."""
 
@@ -356,9 +406,11 @@ class Indexer:
             from documents import parsers as P
             from documents.chunker import chunk_blocks
             try:
-                parsed = P.parse(doc.filename, data)
+                parsed = _parse_with_timeout(doc.filename, data)
             except P.UnsupportedDocument as e:
                 return reg.set_status(doc_id, FAILED, str(e))
+            except ParseTimeout as e:
+                return reg.set_status(doc_id, FAILED, str(e)[:200])
             except Exception as e:
                 return reg.set_status(doc_id, FAILED,
                                       f"could not parse the file: {e}")

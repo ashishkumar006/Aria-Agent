@@ -54,6 +54,92 @@ MAX_L3_CALLS = 6  # max vision escalations per run
 MAX_TURNS_HARD = 12
 
 
+def _driver_refusal(res: dict | None) -> str:
+    """A cua-driver refusal is an HTTP success with a refusal body.
+
+    Treating it as success is how `replace_text` reported `ok` while the
+    document stayed empty: the driver had refused the call with
+    `snapshot_id_required`, the cascade ignored it, and the judge retried the
+    identical action until the loop-guard aborted.
+    """
+    if not isinstance(res, dict):
+        return ""
+    if str(res.get("status") or "").lower() == "refused":
+        return str((res.get("refusal") or {}).get("message")
+                   or res.get("message") or "refused by cua-driver")
+    if res.get("refusal"):
+        return str((res.get("refusal") or {}).get("message") or "refused")
+    return ""
+
+
+def _wants_foreground(res: dict | None) -> bool:
+    esc = (res or {}).get("escalation") or {}
+    return str(esc.get("target") or "").lower() == "foreground"
+
+
+def _pick_editable(elements: list[dict] | None,
+                   element_index: int | None = None) -> dict | None:
+    """The element a text action should target.
+
+    Modern Notepad, Calculator and Settings are XAML hosts: WM_CHAR is
+    dropped (the driver answers `effect: unverifiable` plus an escalation),
+    and only an element-targeted call routed through UIA lands. The judge
+    names the role ("Document", "Edit") but often omits the index, so resolve
+    it from the snapshot instead of typing into the void.
+    """
+    els = elements or []
+    if element_index is not None:
+        for e in els:
+            if e.get("element_index") == element_index:
+                return e
+    for e in els:
+        if str(e.get("role") or "").lower() in ("document", "edit"):
+            return e
+    return None
+
+
+def _call_checked(tool: str, args: dict, *, timeout: float = 15.0) -> dict:
+    """daemon.call + refusal -> exception, so the dispatcher cannot report ok."""
+    res = daemon.call(tool, args, timeout=timeout)
+    msg = _driver_refusal(res)
+    if msg:
+        raise DaemonError(f"{tool}: {msg}")
+    return res
+
+
+def _call_type(args: dict) -> dict:
+    """type_text, honouring the driver's explicit foreground escalation.
+
+    Returns only a delivered result. When the target drops background input
+    and the foreground retry is also unverified, raise instead of leaving the
+    judge to repeat the same action until the loop-guard aborts.
+    """
+    res = _call_checked("type_text", args)
+    if _wants_foreground(res):
+        retry = dict(args)
+        retry["delivery_mode"] = "foreground"
+        res = _call_checked("type_text", retry)
+        if _wants_foreground(res) or str(res.get("effect")) == "unverifiable":
+            raise DaemonError(
+                "type_text: target drops background input and foreground "
+                "delivery was unverified")
+    return res
+
+
+def _call_key(tool: str, args: dict, *, timeout: float = 15.0) -> dict:
+    """press_key/hotkey with the same one-shot foreground escalation."""
+    res = _call_checked(tool, args, timeout=timeout)
+    if _wants_foreground(res):
+        retry = dict(args)
+        retry["delivery_mode"] = "foreground"
+        res = _call_checked(tool, retry, timeout=timeout)
+        if str(res.get("effect")) == "unverifiable":
+            raise DaemonError(
+                f"{tool}: target drops background keys and foreground "
+                "delivery was unverified")
+    return res
+
+
 @dataclass
 class ComputerResult:
     success: bool
@@ -467,6 +553,17 @@ class ComputerUseSkill:
         """
         try:
             if os.name == "nt":
+                # Launch on the PRIVATE desktop when isolation is on, so the
+                # app the agent opens never lands on the user's desktop.
+                try:
+                    from . import private_desktop as _pd
+                    if _pd.enabled():
+                        pid = _pd.launch_on_private_desktop(
+                            "cmd.exe", f'/c start "" "{app_hint}"')
+                        if pid:
+                            return True
+                except Exception:
+                    pass
                 subprocess.Popen(["cmd", "/c", "start", "", app_hint],
                                  shell=False, creationflags=subprocess.DETACHED_PROCESS)
             else:
@@ -781,9 +878,11 @@ class ComputerUseSkill:
                 args = {"pid": pid, "x": act["x"], "y": act["y"]}
                 if window_id is not None:
                     args["window_id"] = window_id
-                if state.get("snapshot_id"):
-                    args["snapshot_id"] = state["snapshot_id"]
-                daemon.call("click", args, timeout=15)
+                # A coordinate click must NOT carry snapshot_id: the driver
+                # reads a snapshot as an element-handle claim and refuses it
+                # with "snapshot_id requires element_index". That turned every
+                # successful L3 vision target into a failed click.
+                _call_checked("click", args)
                 self.safety.record_action("click", args, "done")
                 return ComputerResult(True, "L3", output=verdict)
             except Exception as e:
@@ -849,75 +948,119 @@ class ComputerUseSkill:
                                 args["element_index"] = new_idx
                     except Exception:
                         pass
-                daemon.call("click", args, timeout=15)
+                _call_checked("click", args)
             elif t == "replace_text":
-                # cua-driver rejects "replace_text" as an unclassified action.
-                # Translate it to the supported sequence: focus (click) the
-                # element, select-all, then type the new value. This keeps
-                # the L2b judge's "overwrite" intent working even if it emits
-                # replace_text.
-                eidx = act.get("element_index")
+                # Overwrite the editable element's value. cua-driver has no
+                # replace_text tool, and modern Notepad/Calculator/Settings
+                # are XAML hosts: WM_CHAR is dropped there, so the old
+                # focus/select-all/type emulation silently did nothing (and
+                # the ignored `snapshot_id_required` refusal made it look
+                # successful). ValuePattern.SetValue is the atomic write both
+                # native and XAML controls accept; it needs a FRESH
+                # element_token because the next snapshot invalidates it.
+                text = act.get("value", "")
+                fresh = _call_checked(
+                    "get_window_state",
+                    {"pid": pid, "window_id": window_id,
+                     "include_screenshot": True}, timeout=20)
+                els = fresh.get("elements") or []
+                el = _pick_editable(els, act.get("element_index"))
+                if act.get("match") and els:
+                    new_idx = layers.resolve_index(els, act)
+                    if new_idx is not None:
+                        el = _pick_editable(els, new_idx) or el
+                token = (el or {}).get("element_token")
+                if token:
+                    # A token carries its window/snapshot, so drop any stale
+                    # snapshot_id from the turn's opening scan: the driver
+                    # refuses handles that disagree.
+                    tok_args = {k: v for k, v in base.items()
+                                if k != "snapshot_id"}
+                    res = daemon.call("set_value",
+                                      {**tok_args, "element_token": token,
+                                       "value": text}, timeout=15)
+                    # set_value answers `effect: unverifiable` even when the
+                    # next scan's value readback proves it landed, so only a
+                    # refusal counts as failure here.
+                    if not _driver_refusal(res):
+                        self._last_dispatch_error = ""
+                        self.safety.record_action(t, dict(act), "done")
+                        return True
+                # Fallback for controls without a token: focus, select-all,
+                # delete, then type - all against the SAME fresh snapshot.
+                eidx = (el or {}).get("element_index")
+                snap = fresh.get("snapshot_id")
                 if eidx is not None:
-                    try:
-                        fresh = daemon.call("get_window_state",
-                                            {"pid": pid, "window_id": window_id,
-                                             "include_screenshot": True}, timeout=20)
-                        snap = fresh.get("snapshot_id")
-                        # Re-resolve a stale index from the fresh tree (see the
-                        # click handler above for why index/snapshot must match).
-                        if act.get("match") and fresh.get("elements"):
-                            new_idx = layers.resolve_index(fresh["elements"], act)
-                            if new_idx is not None:
-                                eidx = new_idx
-                        daemon.call("click", {"pid": pid, "window_id": window_id,
-                                             "element_index": eidx,
-                                             **({"snapshot_id": snap} if snap else {})},
-                                    timeout=15)
-                        daemon.call("press_key", {"pid": pid, "window_id": window_id,
-                                                 "key": "a", "modifiers": ["ctrl"],
-                                                 **({"snapshot_id": snap} if snap else {})},
-                                    timeout=15)
-                        # Delete the selection so stale text can't survive when
-                        # the subsequent type lands without clearing (contract).
-                        daemon.call("press_key", {"pid": pid, "window_id": window_id,
-                                                 "key": "Delete",
-                                                 **({"snapshot_id": snap} if snap else {})},
-                                    timeout=15)
-                    except Exception:
-                        pass
-                daemon.call("type_text",
-                            {"pid": pid, "window_id": window_id,
-                             "element_index": eidx,
-                             "text": act.get("value", ""),
-                             "clear": False}, timeout=15)
+                    _call_checked("click",
+                                  {**base, "element_index": eidx,
+                                   **({"snapshot_id": snap} if snap else {})})
+                    _call_key("press_key",
+                              {**base, "key": "a", "modifiers": ["ctrl"],
+                               **({"snapshot_id": snap} if snap else {})})
+                    _call_key("press_key",
+                              {**base, "key": "Delete",
+                               **({"snapshot_id": snap} if snap else {})})
+                targs = ({k: v for k, v in base.items() if k != "snapshot_id"}
+                         if token else dict(base))
+                if token:
+                    targs["element_token"] = token
+                targs["text"] = text
+                _call_type(targs)
             elif t == "type":
+                # Text entry. XAML hosts accept text only when the call
+                # targets the editable element (their CoreInput drops posted
+                # WM_CHAR), so resolve a token when the judge named only a
+                # role. Native controls keep the plain path.
                 args = dict(base)
-                if act.get("element_index") is not None:
-                    args["element_index"] = act["element_index"]
-                    # Element-targeted type needs a fresh snapshot too.
-                    # Re-resolve a stale index from that fresh tree so the
-                    # index and snapshot_id are from the same scan.
-                    try:
-                        fresh = daemon.call("get_window_state",
-                                            {"pid": pid, "window_id": window_id,
-                                             "include_screenshot": True}, timeout=20)
+                eidx = act.get("element_index")
+                fresh = None
+                if eidx is not None:
+                    fresh = _call_checked(
+                        "get_window_state",
+                        {"pid": pid, "window_id": window_id,
+                         "include_screenshot": True}, timeout=20)
+                    els = fresh.get("elements") or []
+                    if act.get("match") and els:
+                        new_idx = layers.resolve_index(els, act)
+                        if new_idx is not None:
+                            eidx = new_idx
+                    el = _pick_editable(els, eidx)
+                    token = (el or {}).get("element_token")
+                    if token:
+                        args = {k: v for k, v in args.items()
+                                if k != "snapshot_id"}
+                        args["element_token"] = token
+                    else:
+                        args["element_index"] = eidx
                         if fresh.get("snapshot_id"):
                             args["snapshot_id"] = fresh["snapshot_id"]
-                        if act.get("match") and fresh.get("elements"):
-                            new_idx = layers.resolve_index(fresh["elements"], act)
-                            if new_idx is not None:
-                                args["element_index"] = new_idx
-                    except Exception:
-                        pass
                 else:
-                    # No element_index: type into the foreground window.
+                    # No element_index: type into the focused window.
                     # Omit snapshot_id — the driver refuses type_text when a
-                    # snapshot is present without element_index, and typing
-                    # into the focused window needs no snapshot at all.
+                    # snapshot is present without element_index.
                     args.pop("snapshot_id", None)
                 args["text"] = act.get("value", "")
                 args["clear"] = act.get("clear", False)
-                daemon.call("type_text", args, timeout=15)
+                try:
+                    _call_type(args)
+                except DaemonError:
+                    # The target dropped plain input (XAML host). Retry once
+                    # against the editable element from a fresh snapshot.
+                    if eidx is not None:
+                        raise
+                    fresh = _call_checked(
+                        "get_window_state",
+                        {"pid": pid, "window_id": window_id,
+                         "include_screenshot": True}, timeout=20)
+                    el = _pick_editable(fresh.get("elements"))
+                    token = (el or {}).get("element_token")
+                    if not token:
+                        raise
+                    retry = {k: v for k, v in base.items()
+                             if k != "snapshot_id"}
+                    retry["element_token"] = token
+                    retry["text"] = args["text"]
+                    _call_type(retry)
             elif t == "press_key":
                 # Re-fetch a fresh snapshot for key presses too — a stale
                 # snapshot_id from the turn's initial scan can cause the
@@ -939,9 +1082,9 @@ class ComputerUseSkill:
                 pargs["key"] = _key
                 if act.get("modifiers"):
                     pargs["modifiers"] = act["modifiers"]
-                daemon.call("press_key", pargs, timeout=15)
+                _call_key("press_key", pargs)
             elif t == "hotkey":
-                daemon.call("hotkey", {**base, "keys": act.get("keys")}, timeout=15)
+                _call_key("hotkey", {**base, "keys": act.get("keys")})
             elif t == "scroll":
                 # Pass element_index through when the judge supplied one —
                 # the driver refuses snapshot-less element scrolls, and
@@ -962,7 +1105,7 @@ class ComputerUseSkill:
                     except Exception:
                         if snapshot_id:
                             _sargs["snapshot_id"] = snapshot_id
-                daemon.call("scroll", _sargs, timeout=15)
+                _call_checked("scroll", _sargs)
             elif t == "wait":
                 # Clamp LLM-controlled sleep (same 5s cap as the browser
                 # driver) so a runaway "wait 1000" can't stall the cascade.

@@ -1,6 +1,7 @@
 import os, time, json
 import sys
 import asyncio
+import re
 from pathlib import Path
 from typing import Any, Optional
 from contextlib import asynccontextmanager
@@ -112,15 +113,29 @@ TIER_TO_ORDER = {
 # routing decisions never burn through router quota on big prompts.
 ROUTER_SAMPLE_HEAD = 400
 ROUTER_SAMPLE_TAIL = 400
+# Below this estimate the deterministic answer is already known and the LLM
+# router can only ever agree with it. The router exists to catch the
+# "small but dense" case (code, base64) - and the band where that matters
+# starts well above this. Asking the router anyway was pure waste: the only
+# wired router model (kilo-auto/free) does not follow the instruction, so
+# every small request paid 1.5-4s for a reply that was discarded and the
+# deterministic rule was used instead (217 failed router calls in 24h, all
+# of them `router_memory` on the memory subsystem's small prompts).
+ROUTER_MIN_TOKENS = int(os.getenv("GATEWAY_ROUTER_MIN_TOKENS", "512") or 512)
+# How many replies a router may mangle before it is benched for a while.
+ROUTER_PARSE_STRIKES = 3
+ROUTER_BENCH_S = 300
 ROUTER_PROMPT = (
-    "You are a routing classifier. Given a token_count and a content sample, "
-    "output exactly one of: TINY, LARGE, or HUGE.\n\n"
+    "Classify the size of a request.\n"
+    "Reply with ONE word from this list and nothing else: TINY, LARGE, HUGE\n"
+    "Do not repeat these instructions. Do not explain. Do not ask a question.\n"
+    "Example reply: TINY\n\n"
     "Rules:\n"
     "- TINY: token_count below 1000 with simple factual content.\n"
     "- LARGE: token_count between 1000 and 8000, OR token_count below 1000 "
     "but content is dense (code, base64, multilingual, technical).\n"
     "- HUGE: token_count above 8000.\n\n"
-    "Output the single word and nothing else."
+    "Your answer:"
 )
 
 
@@ -147,10 +162,19 @@ def _tier_from_count(tokens: int) -> str:
 
 
 def _parse_tier(text: str) -> Optional[str]:
+    """The tier word in a router reply, or None.
+
+    Exactly one tier word must be present. A reply that names more than one
+    ("TINY, LARGE, or HUGE" - the echo the free router model produced) is
+    ambiguous, and answering "HUGE" for it was wrong: the old code took the
+    first match in a fixed order, so an echoed list was read as HUGE and
+    then clamped to LARGE, sending a small request to a big model.
+    """
     up = (text or "").upper()
-    for tier in ("HUGE", "LARGE", "TINY"):
-        if tier in up:
-            return tier
+    found = [t for t in ("TINY", "LARGE", "HUGE")
+             if re.search(rf"\b{t}\b", up)]
+    if len(found) == 1:
+        return found[0]
     return None
 
 
@@ -170,6 +194,28 @@ def _explicit_provider_for(model: str, agent, providers) -> str | None:
     return routed if routed in providers else None
 
 
+def _bench_router(router_pool, name: str) -> None:
+    """Bench a router that answered with something unparseable.
+
+    The strike counter lives on the pool so it survives across calls. After
+    `ROUTER_PARSE_STRIKES` mangled replies the provider is marked
+    unavailable for `ROUTER_BENCH_S` seconds, and the deterministic
+    token-count rule answers in the meantime. Without this a router that
+    cannot follow the instruction was retried first on EVERY request.
+    """
+    strikes = getattr(router_pool, "parse_strikes", None)
+    if strikes is None:
+        return
+    strikes[name] = int(strikes.get(name, 0)) + 1
+    if strikes[name] >= ROUTER_PARSE_STRIKES:
+        strikes[name] = 0
+        try:
+            router_pool.state[name].mark_unavailable(
+                ROUTER_BENCH_S, "router reply was not parseable")
+        except Exception:  # noqa: BLE001 - a bench must never break a call
+            pass
+
+
 async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, prompt_text: str):
     """Run a router-LLM classification. Returns a RouterDecision (without
     chosen_worker_* fields, which are filled in by the caller after worker pick).
@@ -179,11 +225,22 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
     """
     estimated = _estimate_tokens(prompt_text)
 
-    # Short-circuit HUGE — no need to spend a router call.
+    # Short-circuit HUGE - no need to spend a router call.
     if estimated > 8000:
         return RouterDecision(
             role=role, tier="HUGE", estimated_tokens=estimated,
             router_provider="(skipped)", router_model="(skipped)",
+            router_latency_ms=0, fallback_used=True,
+        )
+
+    # Small enough that the deterministic rule already answers it. Spending a
+    # router call here bought nothing: the reply was discarded and the
+    # token-count rule decided anyway, at the cost of 1.5-4s per call.
+    if estimated < ROUTER_MIN_TOKENS:
+        return RouterDecision(
+            role=role, tier=_tier_from_count(estimated),
+            estimated_tokens=estimated,
+            router_provider="(skipped: small)", router_model="(skipped: small)",
             router_latency_ms=0, fallback_used=True,
         )
 
@@ -238,6 +295,13 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
                             prompt_chars=len(envelope),
                             call_role=call_role, router_decision="unparseable",
                             agent=req.agent, session=req.session)
+                # A router that cannot follow the instruction must not be
+                # asked again on the NEXT request: it was tried first (and
+                # answered wrongly) on every single memory operation - 217
+                # wasted calls in 24h, 1.5-4s each. After a few mangled
+                # replies it is benched, and the deterministic rule answers
+                # until the bench expires.
+                _bench_router(router_pool, name)
                 continue
             db.log_call(provider=name, model=result.get("model", provider.model),
                         input_tokens=result.get("input_tokens", 0),

@@ -228,8 +228,12 @@ class RouterPool:
     """
     def __init__(self, providers: dict, order: list[str]):
         self.providers = providers
-        self.order = [p for p in order if p in providers]
+        self.order = [o for o in order if o in providers]
         self.state = defaultdict(RateState)
+        # Consecutive unparseable replies per router. A router that cannot
+        # follow the tier instruction is benched instead of being asked
+        # again on every request (see main._bench_router).
+        self.parse_strikes: dict[str, int] = defaultdict(int)
 
     def candidates(self):
         return list(self.order)

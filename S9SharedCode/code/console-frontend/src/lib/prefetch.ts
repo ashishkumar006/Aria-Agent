@@ -24,6 +24,7 @@ const LOADERS: Record<string, () => Promise<unknown>> = {
   '/code': () => import('../views/Code'),
   '/authoring': () => import('../views/Authoring'),
   '/parts': () => import('../views/Parts'),
+  '/computer': () => import('../views/Computer'),
 };
 
 /** Warm one section's chunk. A miss (unknown id) is not an error. */

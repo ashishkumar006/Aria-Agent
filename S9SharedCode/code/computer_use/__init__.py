@@ -63,7 +63,10 @@ class ComputerUse:
             except Exception as e:
                 return {"status": "error",
                         "message": f"{type(e).__name__}: {e}"}
-            return {"status": "done" if res.success else "error",
+            _layer = str(res.layer or "")
+            _status = ("dry-run" if "dry-run" in _layer
+                       else ("done" if res.success else "error"))
+            return {"status": _status,
                     "layer": res.layer,
                     "output": res.output,
                     "trace": res.trace[-20:],

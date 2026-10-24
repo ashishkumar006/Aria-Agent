@@ -883,12 +883,24 @@ def _reinforce_observation(existing: list[dict], obs: str, quote: str,
     repeated agreement is evidence, but "certain about a person" is not a
     thing this store should ever assert. Keeps the FIRST observation text
     (it was the one that described the pattern) and the LATEST quote.
+
+    The row that gets reinforced is the NEWEST match, by creation time. The
+    old code took the first match in the list, and the list is not purely
+    ordered by age: a legacy record sorts to the front, it can never be
+    linked (the gateway refuses the supersede), and every repeat sighting
+    therefore reinforced THAT row and left a fresh duplicate behind. The
+    live profile drawer held 80 copies of a single claim because of it.
     """
     a = _content_words(obs)
     if not a:
         return
     kws = {str(k).lower().strip() for k in (keywords or []) if str(k).strip()}
-    for row in existing:
+    # Newest first: a repeat sighting must land on the live row.
+    ordered = sorted(
+        existing,
+        key=lambda r: str(r.get("created_at") or ""),
+        reverse=True)
+    for row in ordered:
         rk = {str(k).lower().strip() for k in (row.get("keywords") or [])
               if str(k).strip()}
         same = False
@@ -927,7 +939,23 @@ def _reinforce_observation(existing: list[dict], obs: str, quote: str,
                 "confidence": _confidence_for(
                     max(float(row.get("confidence") or 0.0), conf), repeats),
             }
-            _post("/v1/memory/remember", body)
+            try:
+                _post("/v1/memory/remember", body)
+            except Exception as e:
+                # 404: the row we meant to supersede is gone (a purge, a
+                # drawer rebuild, a legacy record that was never linkable).
+                # The claim is still true and still worth keeping, so store
+                # it as a new row instead of dropping it on the floor.
+                if getattr(getattr(e, "response", None), "status_code", None) == 404:
+                    fresh = dict(body)
+                    fresh.pop("supersedes", None)
+                    fresh["value"] = dict(body["value"])
+                    fresh["value"]["seen_count"] = 1
+                    _post("/v1/memory/remember", fresh)
+                    print("[memory.observations] the previous entry was "
+                          "gone; stored the claim as a new row")
+                    return
+                raise
             print(f"[memory.observations] reinforced an existing entry "
                   f"({seen + 1} sightings)")
         except Exception as e:

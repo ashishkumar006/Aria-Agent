@@ -1158,6 +1158,350 @@ Tracked from E2E testing (see `E2E_TEST_PLAN.md` §12).
   including `test_an_invalid_solid_loses_even_to_a_wildly_missed_target`.
 - **Status:** **FIXED.**
 
+## BUG-076: The tier router spent 1.5-4s per call on a reply it always discarded
+- **Severity:** High (every memory operation paid for it; 217 wasted calls in 24h)
+- **Symptom:** the gateway's ledger showed 217 `router_memory` calls in a day,
+  every one of them an error, averaging 6.4s: `unparseable tier reply: We need
+  answer routing classifier`. Each was a small prompt (830 chars) that the
+  deterministic token-count rule could have answered instantly.
+- **Root cause:** the router pool has exactly one member - the free
+  `kilo-auto/free` model - and it does not follow the tier instruction. The
+  reply was discarded and the deterministic rule decided anyway, but only
+  AFTER the round trip. The parse also took the FIRST tier word in a fixed
+  order, so an echoed option list ("TINY, LARGE, or HUGE") read as HUGE.
+- **Fix (2026-10-21):** prompts under 512 estimated tokens skip the router
+  (the deterministic rule already answers that band); a router that mangles
+  three replies is benched for five minutes; the reply must contain exactly
+  ONE tier word; the prompt now asks for a single word and gives an example.
+- **Verified:** `tests/test_router_backoff.py` - 7 passed, including
+  "a small prompt never asks the router" and "a router that cannot follow
+  the instruction is benched".
+- **Status:** **FIXED.**
+
+## BUG-077: A web search could take 25 seconds
+- **Severity:** High (the user's request waited on it)
+- **Symptom:** the live ledger showed 93 `integration:websearch` calls
+  averaging 9.2s, the worst at 25.5s. The chain walked four sources in
+  order, each allowed to burn its own timeout before the next was tried:
+  Tavily's own default is 60s, DDG's backend fan-out is unbounded, and
+  Marginalia was set to 20s. A source that had just failed was paid for
+  again on the very next search.
+- **Root cause:** no per-source budget, no whole-chain budget, and the
+  `HEALTH_COOLDOWN_S` constant was defined but never used.
+- **Fix (2026-10-21):** each source gets 6s (Tavily 60s -> 6s, Brave and
+  Marginalia 20s -> 6s, DDG 3 backends -> 2), the whole chain gets 15s, and
+  a source that just ERRORED is skipped for 5 minutes - but only until
+  every other source has also failed, because a cooldown that can return
+  nothing is worse than a slow search. "No hits" is no longer counted as an
+  error, so a working source is not cooled down for answering.
+- **Verified:** `tests/test_search_chain.py` (14 passed) and
+  `integrations/test_integrations.py` (22 passed, now hermetic - the class
+  used to read and WRITE the live health and usage files, so a source that
+  had errored minutes earlier made the tests fail for no reason). Live
+  search: 8 results in 6.5s.
+- **Status:** **FIXED.**
+
+## BUG-078: A memory write whose supersede target was missing left an orphan
+- **Severity:** High (the store filled with duplicates, and the duplicates
+  broke search)
+- **Symptom:** the profile drawer held 111 rows for SIX distinct
+  observations - 80 copies of "prefers publication dates on every claim",
+  every one of them superseding the same vanished record `mem:1`. Worse,
+  those duplicates crowded every search out of the results: a nonsense
+  query returned five copies of one observation and an EXACT keyword match
+  (the deployment probe's written fact) did not come back at all.
+- **Root cause:** the gateway linked a superseding record to its target
+  AFTER the new record was written. A missing target therefore persisted
+  the record and then raised: the client saw a 404 and believed nothing was
+  stored, while the drawer kept the orphan. Every repeat sighting wrote
+  another one.
+- **Fix (2026-10-21):** the target is checked BEFORE the write, so a
+  missing one leaves the drawer exactly as it was. The agent's reinforce
+  path falls back to storing the claim as a NEW row when the target has
+  vanished, instead of dropping it.
+- **Verified:** `tests/test_memory.py` (34 passed) including "a missing
+  supersede target leaves no orphan" and "a superseding write hides the old
+  record". Live repair: the profile drawer is back to 7 distinct
+  observations and an exact match comes back first.
+- **Status:** **FIXED.**
+
+## BUG-079: A repeat sighting reinforced the wrong observation row
+- **Severity:** High (it is what made the duplicates in BUG-078)
+- **Symptom:** every repeat sighting of a claim reinforced the same
+  unlinkable legacy row instead of the live one, so the claim never
+  converged on a single row.
+- **Root cause:** the reinforce path took the FIRST match in the list. The
+  list is sorted by age, but a legacy record sorts to the front, and a
+  legacy record can never be linked - so the gate could never succeed and
+  the duplicates multiplied.
+- **Fix (2026-10-21):** the newest matching row (by creation time) is the
+  one that is reinforced.
+- **Verified:** `tests/test_user_observations.py` (58 passed) including
+  "a repeat sighting reinforces the newest entry" and "a repeat sighting
+  survives a vanished target".
+- **Status:** **FIXED.**
+
+## BUG-080: A document that never parses parked on "parsing - 0 chunks"
+- **Severity:** Medium (the document was unreachable, and it blocked every
+  other upload behind it)
+- **Symptom:** a 7.9 MB PDF sat on `parsing - 0 chunks` with no error, no
+  timeout and no retry. The indexer serialises documents, so it also
+  blocked every other upload.
+- **Root cause:** the parse ran with no deadline. A pathological file (a
+  broken xref, a zip bomb) can make a parser spin forever, and the worker
+  thread stays alive, so the reconcile that resumes an interrupted document
+  sees a "live" worker and does nothing.
+- **Fix (2026-10-21):** the parse runs on its own daemon thread under a
+  5-minute deadline (configurable). On timeout the document is marked
+  failed with a reason instead of parking forever.
+- **Verified:** `tests/test_documents_registry.py` (32 passed) including
+  "a parser that never returns fails the document".
+- **Status:** **FIXED.**
+
+## BUG-081: The vision call sent no gateway token, so the whole L3 layer was dead
+- **Severity:** High (a third of the computer-use engine never ran)
+- **Symptom:** the computer-use skill failed with "vision returned
+  unexpected type: NoneType" on every turn that escalated to vision. The
+  chat path worked, so it looked like a model problem.
+- **Root cause:** `LLM().vision()` posted to the gateway's `/v1/vision` with
+  a bare `httpx.post` and NO headers. Every `/v1/*` route has been behind
+  `X-Gateway-Token` since the auth work, so the call answered 401 - and
+  the engine, which swallows the error and escalates, reported a NoneType
+  instead. The same class of bug made `report.py`'s cost summary 401.
+- **Fix (2026-10-21):** both calls use the pooled, token-carrying client.
+- **Verified:** a live vision call now answers ("Red" for a red pixel).
+- **Status:** **FIXED.**
+
+## BUG-082: The vision judge never asked for JSON
+- **Severity:** High (the L3 layer failed even with a working vision call)
+- **Symptom:** with the token fixed, the vision call still ended in
+  "vision returned unexpected type: NoneType" - the model had answered
+  perfectly well, in prose.
+- **Root cause:** the L2b a11y judge passes the action schema as a strict
+  JSON schema; the L3 vision judge passed nothing, so the model answered
+  "the click target is the blue button" and `_extract_json` found no JSON.
+- **Fix (2026-10-21):** the vision judge sends the same action schema
+  (`ACTION_SCHEMA_JSON`), and the gateway's `/v1/vision` returns the parsed
+  object.
+- **Verified:** a live schema-constrained vision call returns
+  `{"verdict": "act", "action": {"type": "click", "x": 100, "y": 100}}`.
+- **Status:** **FIXED.**
+
+## BUG-083: Computer-use could not reach its own approval queue
+- **Severity:** High ("gated" meant "stuck")
+- **Symptom:** the safety gates say a sensitive action "returns a pending
+  token; the web UI resolves it (approve/reject) before execution"
+  (safety/gates.py). The agent server had the endpoints; the console had
+  nothing that could call them, and the agent could not even MINT a pending
+  approval: the computer skill runs the desktop cascade, and a GUI click is
+  not approval-worthy. A request for a command drove a terminal window
+  instead of asking the user.
+- **Root cause:** the gated shell - the only path that can mint an
+  approval - was reachable only through the `computer_action` MCP tool, and
+  no skill route reached it. The "web UI" the gates name did not exist.
+- **Fix (2026-10-21):**
+  - The `computer` skill takes a GATED ACTION when the node carries
+    `metadata.action` (run_command | read_file | write_file | open_app) and
+    `metadata.args`; the planner prompt and the skill prompt both describe
+    it, and a `pending` status is reported as "waiting for approval", not
+    as a failure (a failure would be retried, and every retry mints another
+    approval).
+  - The console has a **Computer** page: the mode, the pending approvals
+    with their exact arguments, approve/reject buttons, the redacted audit
+    trail and the recorded trajectories.
+- **Verified:** `tests/test_computer_gated_route.py` (5 passed);
+  `e2e/computer.spec.ts` (2 passed) in a real browser; live end-to-end:
+  the agent asked, the gate minted `cu-...`, the page showed the command
+  and its arguments, one click resolved it, and the audit recorded
+  `pending-approval` then `approved`. In live mode the approved command
+  executed (`returncode 0`, `Python 3.8.2`).
+- **Status:** **FIXED.**
+
+## BUG-084: Computer-use was off on every normal launch
+- **Severity:** Medium (the feature was unreachable)
+- **Symptom:** every computer-use request answered "computer-use is
+  disabled. Set COMPUTER_USE_ENABLED=true to opt in" - on a machine where
+  the cua-driver daemon was running and the feature was fully built.
+- **Root cause:** the gates are OFF unless the host opts in, and the
+  launcher never set the flag.
+- **Fix (2026-10-21):** `start_aria.ps1` sets `COMPUTER_USE_ENABLED=true`
+  and `COMPUTER_USE_MODE=dry-run` (nothing executes; a sensitive action
+  still waits for a human). Live mode is one flag away and is deliberately
+  not the default: `start_aria.ps1 -ComputerUseMode live`.
+- **Status:** **FIXED.**
+
+## BUG-085: The deployment probe never authenticated, so it tested nothing
+- **Severity:** Medium (18 tests that looked like a passing check)
+- **Symptom:** every probe in `tests/test_deployment.py` skipped with
+  "gateway down at http://localhost:8109" - while the gateway was up.
+  The presence check itself got a 401 and read as "down".
+- **Root cause:** `/v1/*` has required `X-Gateway-Token` since the auth
+  work, and the probe sent no header.
+- **Fix (2026-10-21):** the probe reads the live token file and sends it
+  on every request. The suite now runs 16 of the 18 probes for real; the
+  two that skip are Gmail and GitHub, whose credentials are dead (correctly
+  skipped, not passed).
+- **Bonus:** with the probe live, it found a REAL failure - the memory
+  round-trip, where a written fact was not recalled - which turned out to
+  be the duplicate observations (BUG-078). It passes now.
+- **Status:** **FIXED.**
+
+## BUG-086: The console told a healthy host "AX no tree - shots none"
+- **Severity:** High (the page that exists to explain computer-use said it was blind)
+- **Symptom:** on a machine where the cua-driver was running, 309 apps were
+  listed and the engine could see 16 windows, the Computer page's DRIVER card
+  read `AX no tree - shots none` - the exact message for "this host cannot
+  see the screen", so the feature looked broken.
+- **Root cause:** `daemon.capabilities()` read `windows` off
+  `get_desktop_state`, which the current Windows driver answers with display
+  metadata plus a screenshot and no window list. `ax_ok` was therefore
+  always False, and the screenshot sample was only attempted per-window, so
+  it was skipped too. `safety/permissions.py` had always asked the right
+  question (`get_accessibility_tree`); the capability probe did not.
+- **Fix (2026-10-21):** the probe asks `get_accessibility_tree` for the
+  window list, and accepts a desktop screenshot as proof of capture before
+  falling back to sampling a window.
+- **Verified:** live probe now reports `ax_ok True, screenshot_ok True, 309
+  apps, 16 windows`; page shows `AX ok - shots ok`. Tests
+  `test_capability_probe_reads_the_ax_tree` and
+  `test_capability_probe_still_says_no_tree_when_there_is_none`.
+- **Status:** **FIXED.**
+
+## BUG-087: The audit tab rendered the entire, uncapped log
+- **Severity:** Medium (6,900 DOM nodes, and the one line worth reading was
+  buried)
+- **Symptom:** opening "Audit trail" rendered every entry ever written -
+  6,897 lines and growing - dominated by desktop clicks, with the approvals
+  the user actually came to see scrolled far out of view.
+- **Root cause:** `/api/audit` returned `export_audit()` whole (the log is
+  append-only by design), and the view mapped all of it.
+- **Fix (2026-10-21):** `/api/audit` takes `limit` and returns the newest N
+  plus `total`; the page asks for 400 and labels it "newest 400 of N".
+  Compliance exports still get the whole log with no limit.
+- **Verified:** `tests/test_audit_log.py::TestAuditEndpointLimit` (2 tests);
+  browser shows "newest 400 of 6904".
+- **Status:** **FIXED.**
+
+## BUG-088: The approval the agent quoted could not be found on the page
+- **Severity:** Low (but it is the id the user needs to act on)
+- **Symptom:** the agent answered "requires your approval (Approval ID:
+  cu-1792545714-1)"; the page listed the action and its arguments but never
+  the id, so there was nothing to match the message against.
+- **Fix (2026-10-21):** the row shows the id in mono next to the action.
+- **Status:** **FIXED.**
+
+## BUG-089: "replay" was offered in dry-run, where it can only fail
+- **Severity:** Low (a button whose only outcome is an error)
+- **Symptom:** every replay click in dry-run answered 400 "replay executes
+  real desktop actions; it requires COMPUTER_USE_MODE=live" - correct on the
+  server, but the page kept offering the button.
+- **Fix (2026-10-21):** disabled unless the feature is enabled AND the mode
+  is live, with the reason in the tooltip.
+- **Status:** **FIXED.**
+
+## BUG-090: A recording could be replayed but not read
+- **Severity:** Low (the tab was a list of ids)
+- **Symptom:** "Recordings" showed `run-... N turns` and a replay button;
+  the recorded tool calls - the reason to keep a recording - were
+  unreachable, though `GET /api/computer/runs/{id}` existed and the client
+  already had `computerRun`.
+- **Fix (2026-10-21):** the run id expands to its turns and their calls;
+  a recording with none says "This recording holds no tool calls."
+- **Verified:** browser - expanding the live run lists its turns.
+- **Status:** **FIXED.**
+
+## BUG-091: GUI typing reported success but wrote nothing
+- **Severity:** High (the feature's core action silently did nothing)
+- **Symptom:** live `drive_app` on Notepad traced `replace_text -> ok` three
+  times, then `aborted: loop-guard: repeated action replace_text 3x`; the
+  document stayed empty.
+- **Cause:** the driver had answered
+  `{"status":"refused","refusal":{"code":"snapshot_id_required"}}` and, on
+  the plain path, `{"effect":"unverifiable","escalation":{"target":
+  "foreground"}}`. The engine treated both as success because
+  `daemon.call` returns refusals as ordinary bodies. `replace_text` also
+  passed a bare `element_index` with no snapshot, which this driver build
+  refuses, and modern Notepad (a XAML host) drops posted WM_CHAR, so only an
+  element-targeted UIA write lands.
+- **Fix (2026-10-21):** refusals raise (`_call_checked`); `replace_text`
+  resolves the editable element (`Document`/`Edit`) and overwrites via UIA
+  `set_value` with a fresh `element_token`; `type` retries once with
+  `delivery_mode:"foreground"`, then against the editable token;
+  `press_key`/`hotkey` honour the same escalation.
+- **Verified:** live Notepad run - `success=True`, layer L2b, document value
+  `aria computer use ok`; `replace_text -> ok` on turn 0, `goal met` on turn 1.
+- **Residual:** Ctrl+S to modern Notepad is still undeliverable by the driver
+  (posted keys ignored, foreground unverified). Typing is confirmed; saving
+  needs a UIA click on the app's Save control.
+- **Status:** **FIXED.**
+
+## BUG-092: A recurring reminder's clock time moves after a restart
+- **Severity:** Medium (a 2h reminder silently changes its phase)
+- **Symptom:** the water reminder (`sch-14effc0f`, `every 2h`, created
+  2026-10-18 00:43:57) fired at 03:02, 05:02, 07:02 after an agent restart
+  instead of staying on the original 02:44 / 04:44 grid.
+- **Cause:** `_worker_tick` re-armed an interval with
+  `_next_fire_from_cron(..., time.time())`. When the agent was down over a
+  slot, the overdue fire was re-anchored to the restart time, moving every
+  later reminder. Ordinary tick latency accumulated too.
+- **Fix (2026-10-23):** `_advance_recurring` advances from the scheduled
+  epoch by whole intervals, so the phase is preserved. An interval slot
+  that fell due before this process started is skipped rather than delivered
+  late. `daily@HH:MM` jobs still fire late because their phase is the clock.
+- **Verified:** targeted scheduler suites 84 passed; the live water row was
+  re-anchored from 09:02:51 to 08:43:57 (the creation grid).
+- **Status:** **FIXED.**
+
+## BUG-093: The researcher was told 8k and silently cut at 32k
+- **Severity:** High (a long article arrived mid-sentence; findings were
+  written from a partial page without knowing it)
+- **Symptom:** `fetch_url` itself returned up to 300k chars, but
+  `mcp_runner` clipped every tool message at 32,000 chars. The researcher
+  prompt claimed `fetch_url` returned "the first ~8,000 characters", which
+  contradicted both layers.
+- **Cause:** the 32k clip was a global harness default with no per-skill
+  override, and the prompt was pinned to an older 8k fetch cap.
+- **Fix (2026-10-23):** `run_tool_loop`/`run_with_tools` accept
+  `max_tool_result_chars` (None = 32k default, 0 = no harness clip);
+  `Skill` reads it from `agent_config.yaml`; the researcher sets it to 0.
+  `fetch_url`'s own 300k runaway guard still applies and marks a cut page
+  with `TRUNCATED` in the body. The prompt now states the whole-page
+  contract and that guard.
+- **Verified:** new `tests/test_tool_result_cap.py` (100k page arrives
+  whole with 0, still clipped at 32k with None); prompt-consistency tests
+  updated; full agent suite 1723 passed, 39 skipped.
+- **Status:** **FIXED.**
+
+## BUG-094: A chat run died whenever its viewer left
+- **Severity:** Critical (refresh, navigation, or switching threads lost the
+  answer; the user could not tell a stopped run from a detached one)
+- **Symptom:** a long lightweight answer vanished if the Chat view unmounted.
+  A DAG answer streamed to completion but a refresh before the final frame
+  left no assistant row, because the browser wrote the turn on `done`.
+  Switching Lightweight/DAG aborted the open stream without telling the
+  server, and Stop only aborted the client request.
+- **Cause:** `chat_simple_stream` ran the model call inside the SSE generator,
+  so Starlette cancellation on disconnect cancelled the turn. DAG persistence
+  was client-side only. `stop()` had no server-side effect for lightweight
+  runs. `switchMode()` cleared the transcript while the old stream was still
+  writing into it.
+- **Fix (2026-10-23):** the lightweight turn now runs in a server-owned
+  `asyncio.Task` (`_CHAT_RUNS`), with the SSE response as a bounded queue
+  viewer. The user row + pending assistant row are written before the
+  response starts; the worker settles them itself. `/api/chat/cancel` cancels
+  the task. DAG workers settle their own pending row. The console remembers
+  one thread per engine, polls a reattached pending run, and treats unmount /
+  thread switch / mode switch / New chat as detach, not Stop; Stop calls
+  `/api/chat/cancel` and then reloads the settled row.
+- **Verified:** disconnect/closed-stream persistence and lightweight cancel
+  tests added; DAG closed-stream persistence test added; full agent suite
+  **1733 passed, 39 skipped**; frontend **68 passed**; `tsc --noEmit` clean.
+  Live probes confirmed: closing the SSE socket still stored the answer;
+  `/api/chat/cancel` cancelled and stored `stopped`; a DAG stream closed at
+  frame one still settled; browser probes passed refresh, mode-switch and
+  Stop without console errors.
+- **Status:** **FIXED.**
+
 ## Skipped / unexercised
 - §3 LIVE actions (Telegram/email/calendar/weather/GitHub) — no credentials.
 - §8.3 (malformed skill JSON), §8.4 (MAX_NODES cap) — not exercised.

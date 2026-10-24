@@ -60,6 +60,9 @@ interface Msg {
   kind?: string;
   /** The report's name (the research topic). */
   title?: string;
+  /** A server-owned turn that has not settled yet. The placeholder survives
+   *  a refresh, so the transcript can show work instead of an empty thread. */
+  pending?: boolean;
 }
 
 /** Stored thread messages → transcript bubbles. One mapper for both load
@@ -68,14 +71,27 @@ interface Msg {
  *  comes back as the preview card it rendered as live - not as a wall of
  *  markdown - and keeps its title. */
 function toMsgs(
-  list: Array<{ role: string; content: string; kind?: string; title?: string }>,
+  list: Array<{ role: string; content: string; kind?: string; title?: string;
+               pending?: boolean }>,
   nextId: () => number,
 ): Msg[] {
   return (list || []).map((m) => {
     if (m.role === 'user') return { id: nextId(), who: 'you' as const, text: m.content };
+    if (m.pending) {
+      return { id: nextId(), who: 'aria' as const,
+        html: renderMarkdown('…'), meta: 'working on the server…', pending: true };
+    }
     if (m.kind === 'report') {
       return { id: nextId(), who: 'aria' as const, text: m.content,
         kind: 'report', title: m.title || '', arts: artRefs(m.content) };
+    }
+    if (m.kind === 'error') {
+      return { id: nextId(), who: 'aria' as const, text: m.content,
+        meta: 'failed', arts: artRefs(m.content) };
+    }
+    if (m.kind === 'stopped') {
+      return { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content),
+        meta: 'stopped', arts: artRefs(m.content) };
     }
     return { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content), arts: artRefs(m.content) };
   });
@@ -376,14 +392,32 @@ export default function Chat() {
      localStorage survives reload and navigation; the URL does not survive the
      router's own state, and a deep link is not the point here. */
   const LAST_CID_KEY = 'aria_chat_last_cid';
+  const lastCidKey = (m: ChatMode) => `aria_chat_last_cid_${m}`;
   const [cid, setCid] = useState(() => {
-    try { return localStorage.getItem(LAST_CID_KEY) || ''; } catch { return ''; }
+
+    try {
+      // One remembered thread PER ENGINE. A single key made the Lightweight
+      // and DAG panes erase each other's place: switching tabs replaced the
+      // open id, and switching back found nothing to restore.
+      const m = localStorage.getItem('aria.chat.mode') === 'dag' ? 'dag' : 'light';
+      return localStorage.getItem(lastCidKey(m))
+        || (m === 'light' ? localStorage.getItem(LAST_CID_KEY) : '')
+        || '';
+    } catch { return ''; }
   });
-  const rememberCid = (next: string) => {
+  const cidRef = useRef(cid);
+  const rememberCid = (next: string, forMode: ChatMode = modeRef.current) => {
+    cidRef.current = next;
     setCid(next);
     try {
-      if (next) localStorage.setItem(LAST_CID_KEY, next);
-      else localStorage.removeItem(LAST_CID_KEY);
+      if (next) localStorage.setItem(lastCidKey(forMode), next);
+      else localStorage.removeItem(lastCidKey(forMode));
+      // Keep writing the old key for lightweight so an existing install
+      // still reopens its last conversation after this upgrade.
+      if (forMode === 'light') {
+        if (next) localStorage.setItem(LAST_CID_KEY, next);
+        else localStorage.removeItem(LAST_CID_KEY);
+      }
     } catch { /* private mode: the thread still lives server-side */ }
   };
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -391,6 +425,12 @@ export default function Chat() {
   const nearLimit = input.length > CHAT_MAX_QUERY * 0.9;
   const overLimit = input.length > CHAT_MAX_QUERY;
   const [sending, setSending] = useState(false);
+  /* A turn can still be running server-side after a refresh or a thread
+     switch. `sending` only describes THIS component's stream; this describes
+     the server's run, so the Stop control remains available when we reattach. */
+  const [remoteActive, setRemoteActive] = useState(false);
+  const remoteActiveRef = useRef(false);
+  useEffect(() => { remoteActiveRef.current = remoteActive; }, [remoteActive]);
   // Thread id currently being deleted, so the control can disable itself and
   // a rapid second click cannot fire a second DELETE.
   const [dropping, setDropping] = useState('');
@@ -524,20 +564,57 @@ export default function Chat() {
       if (mountedRef.current) setMoreLoading(false);
     }
   }, [moreLoading]);
+  /* Load one thread into the transcript. The request counter is the same one
+     `select` and `send` use, so a stale fetch cannot paint over a newer one. */
+  const loadThread = async (id: string, req: number, fallback = 'Chat',
+                             forget = false) => {
+    try {
+      const d = await api.chatThread(id);
+      if (!mountedRef.current || reqRef.current !== req) return;
+      setCrumb((d.title || fallback).slice(0, 40));
+      setMsgs(toMsgs(d.messages || [], nextId));
+      setRemoteActive(!!d.active);
+    } catch {
+      if (!mountedRef.current || reqRef.current !== req) return;
+      if (forget) {
+        try { localStorage.removeItem(lastCidKey(modeRef.current)); } catch { /* ignore */ }
+        if (modeRef.current === 'light') {
+          try { localStorage.removeItem(LAST_CID_KEY); } catch { /* ignore */ }
+        }
+        rememberCid('', modeRef.current);
+        setRemoteActive(false);
+      } else {
+        setMsgs([{ id: nextId(), who: 'err', text: 'could not load this thread.' }]);
+      }
+    }
+  };
   /* Switching engine switches the whole context: a thread belongs to exactly
-     one engine, so the open thread, the transcript and the list are all reset
-     to the target engine's threads. Before this the toggle changed only the
-     NEXT message's engine, so the sidebar showed the same conversations under
-     both — a lightweight thread and a DAG run were listed side by side. */
+     one engine, so the open thread, the transcript and the list are reset to
+     the target engine's threads. Each engine remembers its own open thread;
+     the previous run is only DETACHED, never stopped (only Stop does that). */
   const switchMode = (next: ChatMode) => {
     if (next === mode) return;
+    reqRef.current++;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setQueued([]);
+    sendingRef.current = false;
+    setSending(false);
+    setStatus('');
     setMode(next);
     modeRef.current = next;
-    rememberCid('');
-    setQueued([]);
-    setMsgs([]);
+    let nextCid = '';
+    try { nextCid = localStorage.getItem(lastCidKey(next)) || ''; } catch { /* ignore */ }
+    if (!nextCid && next === 'light') {
+      try { nextCid = localStorage.getItem(LAST_CID_KEY) || ''; } catch { /* ignore */ }
+    }
+    rememberCid(nextCid, next);
     setThreads([]);
     setTotal(0);
+    setRemoteActive(false);
+    setMsgs([]);
+    setCrumb('Chat');
+    if (nextCid) void loadThread(nextCid, reqRef.current, 'Chat', true);
     void refresh();
   };
   /* What the tool pill says, read from the server rather than asserted here.
@@ -619,15 +696,56 @@ export default function Chat() {
         if (cancelled || !mountedRef.current) return;
         setCrumb((d.title || 'Chat').slice(0, 40));
         setMsgs(toMsgs(d.messages || [], nextId));
+        setRemoteActive(!!d.active);
       } catch {
         // Gone for good: forget it, so the next visit starts clean instead of
         // retrying a dead id on every mount.
-        try { localStorage.removeItem(LAST_CID_KEY); } catch { /* ignore */ }
+        try { localStorage.removeItem(lastCidKey(modeRef.current)); } catch { /* ignore */ }
+        if (modeRef.current === 'light') {
+          try { localStorage.removeItem(LAST_CID_KEY); } catch { /* ignore */ }
+        }
         rememberCid('');
       }
     })();
     return () => { cancelled = true; };
   }, [cid]);
+
+  /* Reattach to a server-owned run after a refresh, a navigation, or a thread
+     switch. The answer used to exist only in the stream that was closed, so
+     the transcript looked empty (or question-only) until the user guessed to
+     reload again. */
+  const hasPending = msgs.some((m) => m.pending);
+  useEffect(() => {
+    if (!active || !cid || (!hasPending && !remoteActive)) return;
+    let alive = true;
+    let timer: number | undefined;
+    const tick = async () => {
+      if (!alive || !mountedRef.current) return;
+      if (sendingRef.current) {
+        timer = window.setTimeout(tick, 1200);
+        return;
+      }
+      try {
+        const d = await api.chatThread(cid);
+        if (!alive || !mountedRef.current) return;
+        setCrumb((d.title || 'Chat').slice(0, 40));
+        setMsgs(toMsgs(d.messages || [], nextId));
+        setRemoteActive(!!d.active);
+        if (d.active || (d.messages || []).some((m) => m.pending)) {
+          timer = window.setTimeout(tick, 1500);
+        } else {
+          refresh();
+        }
+      } catch {
+        timer = window.setTimeout(tick, 3000);
+      }
+    };
+    timer = window.setTimeout(tick, 700);
+    return () => {
+      alive = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [active, cid, hasPending, remoteActive, refresh]);
 
   /* Follow the stream only while the user is already at the bottom. The
      unconditional `scrollTop = scrollHeight` on every delta physically
@@ -692,18 +810,24 @@ export default function Chat() {
   }, [active, refresh]);
 
   const select = async (t: ChatThread) => {
-    // Switching threads abandons any in-flight stream. Bumping reqRef makes
-    // its loop bail, and the abort actually stops the request — without it
-    // the abandoned turn kept streaming and holding a gateway call.
+    // Switching threads only DETACHES the current viewer. The server-owned
+    // run keeps going and persists its answer; Stop is the only cancel.
     abortRef.current?.abort();
+    abortRef.current = null;
     const req = ++reqRef.current;
-    rememberCid(t.conversation_id);
     setQueued([]);
+    setHint(null);
+    setRemoteActive(false);
     // Show the engine + model this thread actually ran on, not the default.
     const pref = prefsRef.current[t.conversation_id];
-    if (pref) { setMode(pref.mode); setAiModel(pref.model); }
+    const threadMode = pref?.mode || t.mode || modeRef.current;
+    if (pref) setAiModel(pref.model);
+    if (threadMode !== modeRef.current) {
+      setMode(threadMode);
+      modeRef.current = threadMode;
+    }
+    rememberCid(t.conversation_id, threadMode);
     setCrumb((t.title || 'Chat').slice(0, 40));
-    setHint(null);
     // Load this conversation's document preference so the toggle reflects
     // what the server will actually do, rather than always reading "on".
     try {
@@ -711,17 +835,10 @@ export default function Chat() {
       if (!mountedRef.current || reqRef.current !== req) return;
       setUseDocs(pr.prefs?.use_documents !== false);
     } catch { /* leave the default */ }
-    try {
-      const d = await api.chatThread(t.conversation_id);
-      if (!mountedRef.current || reqRef.current !== req) return; // stale
-      // Hands are scanned on reload too, so a document produced in an earlier
-      // conversation comes back reachable rather than as prose. A report
-      // comes back as its preview card, not as a wall of markdown.
-      setMsgs(toMsgs(d.messages || [], nextId));
-    } catch {
-      if (!mountedRef.current || reqRef.current !== req) return;
-      setMsgs([{ id: nextId(), who: 'err', text: 'could not load this thread.' }]);
-    }
+    // Hands are scanned on reload too, so a document produced in an earlier
+    // conversation comes back reachable rather than as prose. A report comes
+    // back as its preview card, not as a wall of markdown.
+    await loadThread(t.conversation_id, req, t.title || 'Chat');
   };
   const STARTERS = [
     'What can you do?',
@@ -837,10 +954,11 @@ export default function Chat() {
     // reqRef bump made the first stream bail before creating its bubble
     // — two user bubbles, one answer. A ref is synchronous, so the claim
     // is atomic; the state flag still drives the disabled UI.
-    if (sendingRef.current) {
+    if (sendingRef.current || remoteActiveRef.current) {
       // A long run kept the composer live but the Send button disabled and
       // this guard silently dropping the next message. Queue it instead; it
-      // runs, in order, when this turn finishes.
+      // runs, in order, when this turn finishes. A run reattached after a
+      // refresh is just as busy as one this component started.
       setQueued((list) => [...list, q]);
       setInput('');
       return;
@@ -927,7 +1045,7 @@ export default function Chat() {
         if (!mountedRef.current || reqRef.current !== req) return; // superseded
         if (ev.type === 'started' && (ev as { conversation_id?: string }).conversation_id) {
           const nid = (ev as { conversation_id?: string }).conversation_id as string;
-          rememberCid(nid);
+          rememberCid(nid, useMode);
           pinThis(nid);
         } else if (ev.type === 'status' || ev.type === 'log') {
           setStatus((ev as { text?: string }).text || 'working…');
@@ -938,7 +1056,7 @@ export default function Chat() {
           acc = (ev as { answer?: string }).answer ?? acc;
           if ((ev as { conversation_id?: string }).conversation_id) {
             const nid = (ev as { conversation_id?: string }).conversation_id as string;
-            rememberCid(nid);
+            rememberCid(nid, useMode);
             pinThis(nid);
           }
           /* Prefer the server's measurement over the client's. The client
@@ -951,19 +1069,17 @@ export default function Chat() {
             ? serverMs
             : Date.now() - t0;
           const secs = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
-          settle(`done in ${secs} · ${useMode === 'dag' ? 'DAG' : 'lightweight'}`,
+          const stopped = !!(ev as { stopped?: boolean }).stopped;
+          settle(stopped
+            ? `stopped after ${secs}`
+            : `done in ${secs} · ${useMode === 'dag' ? 'DAG' : 'lightweight'}`,
             (ev as { files?: StreamFile[] }).files,
             (ev as { kind?: string }).kind,
             (ev as { title?: string }).title);
-          /* A DAG turn lives in the run's session, which the sidebar store
-             never sees; record it under `dag` so the conversation is listed
-             and can be reopened. Lightweight turns are saved server-side. */
-          if (useMode === 'dag') {
-            const stored = (ev as { conversation_id?: string }).conversation_id || cid;
-            if (stored) {
-              void api.chatThreadTurn(stored, q, acc, 'dag').catch(() => {});
-            }
-          }
+          /* Both engines persist their own turn server-side now. Writing the
+             DAG turn a second time here duplicated it, and was the reason a
+             refresh could show the answer twice. */
+          setRemoteActive(false);
           refresh();
         } else if (ev.type === 'error') {
           // The server can emit `error` AFTER the answer finished streaming
@@ -982,6 +1098,8 @@ export default function Chat() {
               id: nextId(), who: 'err', text: humanError((ev as { text?: string }).text),
             }]);
           }
+          setRemoteActive(false);
+          refresh();
         }
       }
     } catch (e) {
@@ -997,6 +1115,10 @@ export default function Chat() {
            happened, in the normal voice. */
         else setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
           id: nextId(), who: 'aria', text: 'Stopped.' }]);
+        // Stop cancels server-side too; keep the composer busy until the
+        // cancellation has been persisted and the thread is reloaded.
+        setRemoteActive(!!cidRef.current);
+        refresh();
       } else {
         const msg = String((e as Error).message || e);
         /* The composer was emptied when the turn started, so on a length
@@ -1031,8 +1153,25 @@ export default function Chat() {
       }]);
     }
     setQueued([]);
+    // Aborting this viewer only detaches it. The run lives on the server, so
+    // Stop has to tell the server; otherwise the answer appeared later in a
+    // thread the user believed they had stopped. Read the ref, not the render
+    // closure: the id is minted by the `started` frame and may not have been
+    // painted yet when Stop is clicked.
+    const liveCid = cidRef.current;
+    if (liveCid) void api.cancelRun({ conversation_id: liveCid }).catch(() => { });
     abortRef.current?.abort();
-    setStatus('stopping…');
+    setStatus('stopping...');
+    // Give the worker a moment to persist its partial/stopped row, then
+    // reattach so the transcript matches what a reload would show.
+    if (liveCid) {
+      window.setTimeout(() => {
+        if (mountedRef.current) {
+          void loadThread(liveCid, ++reqRef.current, crumb, false);
+          refresh();
+        }
+      }, 900);
+    }
   };
 
   /* `send` is recreated every render, so the drain reads it through a ref and
@@ -1045,31 +1184,31 @@ export default function Chat() {
      here, not inside `send`, keeps exactly one turn in flight and reads the
      CURRENT queue rather than the one captured when the turn started. */
   useEffect(() => {
-    if (sending || queued.length === 0) return;
+    if (sending || remoteActive || queued.length === 0) return;
     const [next, ...rest] = queued;
     setQueued(rest);
     void sendRef.current(next);
-  }, [sending, queued]);
+  }, [sending, remoteActive, queued]);
 
   const fresh = () => {
     reqRef.current++; // invalidate any in-flight select/send
-    abortRef.current?.abort(); // and stop any open stream
-    // Starting a new chat mid-answer used to blank the transcript as if
-    // nothing had happened, while the question was still sitting in the
-    // thread server-side. Say what happened so the user knows the turn was
-    // kept (they can reopen it from the list) rather than silently dropped.
-    const hadTurn = sendingRef.current;
+    abortRef.current?.abort(); // detach this viewer; the server run continues
+    abortRef.current = null;
+    // Starting a new chat is NOT Stop. The previous run keeps going and
+    // persists its answer; this pane simply starts looking at a new thread.
+    const hadTurn = sendingRef.current || remoteActiveRef.current;
     const wasQueued = queued.length;
     rememberCid('');
     setQueued([]);
     setMsgs(hadTurn || wasQueued ? [{
       id: nextId(), who: 'aria' as const,
       text: wasQueued
-        ? `Stopped ${wasQueued} queued message${wasQueued === 1 ? '' : 's'} before they ran — they were not sent.`
-        : 'Stopped before the answer finished. Your question was kept in the conversation, so you can reopen it and continue.',
+        ? `Started a new chat. ${wasQueued} queued message${wasQueued === 1 ? '' : 's'} were not sent. The previous run continues in the sidebar.`
+        : 'Started a new chat. The previous run continues in the sidebar; only Stop cancels a run.',
     }] : []);
     setCrumb('Chat');
     setHint(null);
+    setRemoteActive(false);
     sendingRef.current = false;
     setSending(false);
     setStatus('');
@@ -1115,7 +1254,11 @@ export default function Chat() {
      bubble used to carry aria-live, so a screen reader treated the
      whole transcript as a stack of regions to re-announce whenever
      any of them re-rendered. */
-  const streamingId = sending && msgs.length ? msgs[msgs.length - 1].id : null;
+  const busy = sending || remoteActive;
+  const streamingId = busy && msgs.length
+    ? (sending ? msgs[msgs.length - 1].id
+      : (msgs.find((m) => m.pending)?.id ?? null))
+    : null;
 
   /* Never a fallback number. Unread is "tools unknown", and switched off is
      "no tools" — both honest, both distinguishable from a real count. */
@@ -1155,7 +1298,7 @@ export default function Chat() {
               DAG
             </button>
           </div>
-          <ModelPicker model={aiModel} onChange={setAiModel} busy={sending}
+          <ModelPicker model={aiModel} onChange={setAiModel} busy={busy}
                        label="Model for chat" applyDefault={false} />
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-2.5 pb-3">
@@ -1265,7 +1408,7 @@ export default function Chat() {
                   <button
                     key={s}
                     onClick={() => send(s)}
-                    disabled={sending}
+                    disabled={busy}
                     className="rounded-full border border-violet-400/30 bg-violet-400/[0.07] px-3 py-1.5 text-xs text-violet-200 transition-colors hover:border-violet-400/60 hover:bg-violet-400/[0.14] disabled:opacity-50"
                   >
                     {s}
@@ -1322,11 +1465,12 @@ export default function Chat() {
               </button>
             </div>
           )}
-          {sending && (
+          {busy && (
             <div className="flex items-center gap-2 text-xs text-zinc-muted" role="status" aria-live="polite">
               <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-violet-400" />
-              {status || 'thinking…'}
-              <button onClick={stop} className="rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 hover:border-red-400/60 hover:text-red-200">stop</button>
+              {status || (remoteActive ? 'still running on the server…' : 'thinking…')}
+              <button onClick={stop} title="Stop the server run"
+                className="rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 hover:border-red-400/60 hover:text-red-200">stop</button>
             </div>
           )}
         </div>        <div className="border-t border-white/10 p-3">
@@ -1348,7 +1492,7 @@ export default function Chat() {
             />
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={sending || uploading}
+              disabled={busy || uploading}
               title="Attach a document: PDF, DOCX, MD, TXT, HTML, CSV or XLSX (images cannot be read yet)"
               aria-label="Attach files"
               className="flex flex-none items-center gap-1.5 self-end rounded-md border border-white/15 bg-white/5 px-3 py-2.5 text-xs font-bold text-zinc-300 hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
@@ -1387,11 +1531,11 @@ export default function Chat() {
                 thing. */}
             {/* While a run streams this queues the message rather than being
                 disabled: a dead Send is exactly what lost the text before. */}
-            <button onClick={() => send()} disabled={sending && !input.trim()}
-              aria-label={sending ? 'Queue message' : 'Send message'}
-              title={sending ? 'Queue — runs when this turn finishes' : undefined}
+            <button onClick={() => send()} disabled={busy && !input.trim()}
+              aria-label={busy ? 'Queue message' : 'Send message'}
+              title={busy ? 'Queue — runs when this turn finishes' : undefined}
               className="flex items-center gap-1.5 self-end rounded-md bg-violet-400 px-4 py-2.5 text-xs font-bold text-[#0b0b0e] shadow-[0_0_16px_rgba(139,124,246,0.35)] hover:brightness-110 disabled:opacity-50">
-              {sending ? <Clock size={13} /> : <Send size={13} />} {sending ? 'Queue' : 'Send'}
+              {busy ? <Clock size={13} /> : <Send size={13} />} {busy ? 'Queue' : 'Send'}
             </button>
           </div>
           <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">

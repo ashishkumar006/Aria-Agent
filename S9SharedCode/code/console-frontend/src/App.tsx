@@ -27,6 +27,7 @@ const Settings = lazy(() => import('./views/Settings'));
 const Code = lazy(() => import('./views/Code'));
 const Authoring = lazy(() => import('./views/Authoring'));
 const Parts = lazy(() => import('./views/Parts'));
+const Computer = lazy(() => import('./views/Computer'));
 
 /* Warm the split chunks shortly after first paint so that only the very
    first section can suspend; afterwards every hop is served from the module
@@ -132,7 +133,7 @@ function StaleTokenNotice() {
 /* Every section, in one registry. Order is only for stable DOM ordering; the
    `id` is the route path and is what the keep-alive host keys on. Kept beside
    the CHUNKS preloader list above so the two cannot drift. */
-const SECTIONS = [
+export const SECTIONS = [
   { id: '/research', render: () => <Research /> },
   { id: '/console', render: () => <Chat /> },
   { id: '/runs', render: () => <Runs /> },
@@ -147,6 +148,7 @@ const SECTIONS = [
   { id: '/code', render: () => <Code /> },
   { id: '/authoring', render: () => <Authoring /> },
   { id: '/parts', render: () => <Parts /> },
+  { id: '/computer', render: () => <Computer /> },
 ] as const;
 
 /** Map a raw pathname onto a registered section id. */

@@ -1059,3 +1059,124 @@ what is still open.
 - The remaining Medium and Low audit findings (scheduler, ledger, memory,
   research, runs, mission, shell/a11y, code, authoring, parts, settings,
   model picker, skills, misc, L1-L12) have not been worked yet.
+
+## Round 12 - the ledger, the router, the search, and computer-use (2026-10-21)
+
+This round started from a question about the gateway ledger ("why do the
+calls mix cohere north code and gemini, and why did a `hi` send 4k tokens?")
+and ended with computer-use wired to the agent and to the console. Both
+halves are recorded here.
+
+### What the ledger actually showed
+
+- **The mix is two different callers, not one agent.** `cohere/north-mini-code:free`
+  (via Kilo, the free code model) is the CHAT worker; it carries the
+  system prompt, the 25 chat tool schemas and the memory, so it is billed
+  ~3,100 input tokens per turn. The small Gemini calls (~420 tokens) are
+  the MEMORY subsystem's own helper calls - the classifier and the
+  quote-support check in `memory.py` - which run with `auto_route="memory"`.
+- **A third of the ledger was waste.** 217 `router_memory` calls in 24h,
+  100% errors, 1.5-4s each: the free router model does not follow the tier
+  instruction, so its reply was discarded and the deterministic rule
+  decided anyway - after the round trip. That is BUG-076.
+- **"hi" costs 4k tokens because the tools and the system prompt are
+  static.** Measured: 25 tool schemas = 15,370 chars (~3.8k tokens) and
+  the system prompt = 6,192 chars (~1.5k tokens), sent on EVERY turn.
+  The user's own words are two tokens of that. It is inherent to a
+  tool-using chat; the honest fix is prompt caching, not trimming the
+  behaviour rules, and the model in use is free.
+- **The web search was slow because nothing bounded it** (BUG-077): four
+  sources, each allowed its own timeout, the worst call 25.5s.
+
+### Fixed
+
+- **The tier router** no longer spends a call it will throw away (small
+  prompts skip it; a router that mangles its replies is benched; an
+  echoed option list is no longer read as HUGE).
+- **Web search** has a per-source budget (6s), a chain budget (15s) and a
+  working cooldown for a source that just errored - with the cooldown as a
+  last resort, so it can never turn a search into an empty result. Live:
+  8 results in 6.5s (was 9.2s average, 25.5s worst).
+- **Memory writes** no longer orphan a record when the supersede target is
+  gone (BUG-078), and a repeat sighting reinforces the LIVE row
+  (BUG-079). The live profile drawer held 111 rows for 6 observations; it
+  now holds 7, and an exact-match search comes back first.
+- **A document that never parses** now fails with a reason instead of
+  parking on "parsing - 0 chunks" and blocking every other upload.
+- **The deployment probe authenticates** (BUG-085): it had been skipping
+  all 18 tests while the gateway was up, and the moment it ran for real it
+  found the memory round-trip failure - which was the duplicates.
+
+### Computer-use, wired up and tested
+
+- **The L3 layer of the desktop agent was dead**: the vision call sent no
+  gateway token (401) and the vision judge never asked for JSON, so every
+  escalation died with "vision returned unexpected type: NoneType"
+  (BUG-081, BUG-082). Both fixed and verified live.
+- **The approval queue was unreachable** (BUG-083). The gates name a "web
+  UI" that did not exist, and the agent could not even mint a pending
+  approval, because the cascade drives a GUI and a GUI click is not
+  approval-worthy. Now:
+  - a `computer` node with `metadata.action` (run_command / read_file /
+    write_file / open_app) takes the gated shell route, which is the only
+    path that can mint an approval;
+  - the console has a **Computer** page - mode, pending approvals with
+    their exact arguments, approve/reject, the redacted audit trail, the
+    recorded trajectories;
+  - `start_aria.ps1` enables the feature in DRY-RUN mode (nothing
+    executes; a sensitive action still waits for a human). Live mode is
+    `-ComputerUseMode live`, deliberately not the default.
+- **Live end-to-end**: the agent asked for `python --version`, the gate
+  minted `cu-1792538640-1`, the page showed the action and its arguments,
+  one click resolved it, the audit recorded `pending-approval` then
+  `approved`, and in live mode the approved command executed
+  (`returncode 0`, `Python 3.8.2`).
+
+### Verification
+
+- Agent full suite: **1708 passed, 39 skipped**.
+- Gateway full suite: **1216 passed, 2 skipped** - the two skips are Gmail
+  and GitHub, whose credentials are dead (skipped on purpose, not passed).
+- Frontend unit tests: **64 passed**; `tsc` and the production build are
+  clean; `e2e/computer.spec.ts` passes in a real browser.
+
+### Still open
+
+- The chat's static payload (5.4k tokens per turn) is unchanged; only
+  prompt caching would cut it, and the model in use is free.
+- The remaining Medium/Low audit findings are untouched.
+- Authoring first-page latency is still ~11 s.
+
+## Round 13 - checking the Computer page in a real browser (2026-10-21)
+
+The page was verified the way a user meets it: a real browser, a real pending
+approval minted by the agent itself, and every tab opened.
+
+**What already worked.** Rail entry and route, the Control sidebar with the
+pending count, the four stats, the dry-run banner, a pending `run_command`
+with its exact arguments, approve/reject resolving through the gate, the
+empty state, the audit log (redacted), the recordings list, and the replay
+guard on the server (403 when off, 400 when not live). No console errors.
+
+**Four defects the browser check found, all fixed:**
+
+1. **DRIVER said "AX no tree - shots none" on a healthy host** (BUG-086). The
+   probe read `windows` off `get_desktop_state`; the Windows driver answers
+   that with display metadata and no window list. The AX tree is a separate
+   call and returned 16 windows; the desktop screenshot was right there in
+   the same response. The page now reads `AX ok - shots ok`, which is the
+   truth, and two tests pin both directions (tree, and no tree).
+2. **The audit tab rendered every line ever written** (BUG-087) - 6,897 of
+   them, mostly clicks, with the approvals invisible at the bottom.
+   `/api/audit` now takes `limit` and the page shows "newest 400 of 6,904".
+3. **The approval id was not on the page** (BUG-088), although the agent's
+   answer quotes it.
+4. **Replay was offered in dry-run** (BUG-089) where it can only 400, and
+   **a recording could be replayed but not read** (BUG-090) - the id now
+   expands to its turns and calls.
+
+**Verification:** agent suite 1712 passed / 39 skipped; frontend 64 passed;
+`tsc` and the production build clean; `e2e/computer.spec.ts` 2 passed
+(including the new "replay is disabled in dry-run" assertion); the scratch
+tab-by-tab browser pass passed with zero console errors.
+

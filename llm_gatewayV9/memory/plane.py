@@ -181,6 +181,18 @@ class MemoryPlane:
                 minutes=WORKING_TTL_MINUTES)
         svc = self.drawers[routed]
         svc.sweep_expired()  # opportunistic: one cheap load, keeps TTL honest
+        if supersedes:
+            # The target must exist BEFORE the new record is written.
+            #
+            # It used to be linked afterwards, so a write whose target was
+            # missing persisted the new record and then raised: the client
+            # saw a 404 and believed nothing was stored, while the drawer
+            # kept the orphan. Every repeat sighting of one observation
+            # therefore left a duplicate behind - the profile drawer held 80
+            # copies of a single claim, and because they all superseded the
+            # same vanished record, the duplicates crowded every search
+            # (including exact keyword matches) out of the results.
+            self._require_supersede_target(supersedes)
         item = await svc.remember(
             kind=kind, descriptor=descriptor, keywords=keywords,
             value=value, source=source, run_id=run_id, goal_id=goal_id,
@@ -194,6 +206,22 @@ class MemoryPlane:
         if routed == "document" and doc and doc.doc_id:
             self._note_doc_version(doc.doc_id, doc.version)
         return item
+
+    def _require_supersede_target(self, old_id: str) -> None:
+        """Raise if the record a write wants to supersede is not there.
+
+        Checked BEFORE the write, so a missing target cannot leave a
+        persisted orphan behind: the caller gets a 404 and the drawer stays
+        exactly as it was.
+        """
+        for _name, svc in self.drawers.items():
+            for rec in svc.store.load():
+                if rec.id == old_id:
+                    return
+        raise LookupError(
+            f"supersedes target {old_id!r} not found in any drawer "
+            f"(legacy records are frozen - re-add the corrected claim as "
+            f"a new fact instead)")
 
     async def _mark_superseded(self, old_id: str, new_id: str,
                                new_drawer: str) -> None:

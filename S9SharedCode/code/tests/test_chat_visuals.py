@@ -11,7 +11,9 @@ reply.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -259,6 +261,81 @@ def test_the_question_is_stored_before_the_answer_is_known(client, monkeypatch):
     assert any(m.get("role") == "user" and m.get("content") == "will you survive?"
                for m in msgs), (
         f"the interrupted turn lost the user's message; stored={msgs!r}")
+
+
+def test_a_disconnected_stream_still_persists_the_answer(monkeypatch):
+    """Closing the SSE response must detach a viewer, not cancel the turn.
+
+    The old generator owned the model call, so this exact action - refresh,
+    navigate away, close the tab - cancelled it before the answer was stored.
+    The run now lives in a server-owned task; only /api/chat/cancel stops it.
+    """
+    _stub_chat(monkeypatch, "the answer survives the refresh")
+
+    async def _slow_mem(messages, query, *a, **k):
+        await asyncio.sleep(0.4)
+        return messages
+
+    monkeypatch.setattr(agent_server, "_with_chat_memory", _slow_mem)
+    monkeypatch.setattr(agent_server, "_session_cost_breakdown", lambda *a, **k: None)
+    monkeypatch.setattr(agent_server, "_session_cost_delta", lambda *a, **k: None)
+
+    cid = "ct-disconnect-answer"
+    with TestClient(agent_server.app) as tc:
+        with tc.stream("POST", "/api/chat/simple/stream", headers=HDR,
+                       json={"conversation_id": cid,
+                             "query": "keep going after I leave"}) as r:
+            assert r.status_code == 200
+            for line in r.iter_lines():
+                if line:
+                    break
+        # The response is closed. Give the detached run time to finish and
+        # read the store directly, the way a reloaded Chat view would.
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            msgs = _messages(cid)
+            if any(m.get("role") == "assistant" and not m.get("pending")
+                   for m in msgs):
+                break
+            time.sleep(0.1)
+
+    msgs = _messages(cid)
+    answer = [m for m in msgs
+              if m.get("role") == "assistant" and not m.get("pending")]
+    assert answer, f"the detached turn never stored an answer; stored={msgs!r}"
+    assert answer[-1].get("content") == "the answer survives the refresh"
+
+
+def test_cancel_route_reaches_the_lightweight_run_registry():
+    """Stop must cancel the asyncio task, not only the DAG threading.Event."""
+    cancelled = []
+
+    class _Task:
+        def done(self):
+            return False
+
+        def cancel(self):
+            cancelled.append(True)
+
+    cid = "ct-cancel-registry"
+    with agent_server._CHAT_RUNS_LOCK:
+        old = agent_server._CHAT_RUNS.get(cid)
+        agent_server._CHAT_RUNS[cid] = {"task": _Task(), "turn_id": "turn-x"}
+    try:
+        with TestClient(agent_server.app) as tc:
+            r = tc.post("/api/chat/cancel", headers=HDR,
+                        json={"conversation_id": cid})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled", body
+        assert body["lightweight_cancelled"] == 1, body
+        assert cancelled == [True]
+    finally:
+        with agent_server._CHAT_RUNS_LOCK:
+            if old is None:
+                agent_server._CHAT_RUNS.pop(cid, None)
+            else:
+                agent_server._CHAT_RUNS[cid] = old
 
 
 def test_a_completed_turn_stores_the_question_exactly_once(client, monkeypatch):

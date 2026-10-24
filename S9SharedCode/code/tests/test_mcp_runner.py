@@ -461,5 +461,79 @@ class TestRunToolLoop:
         assert "error" in out and "no successful tool result" in out["error"]
 
 
+class TestTextReplayedToolCalls:
+    """Gemini without a thoughtSignature gets its call replayed as prose.
+
+    The gateway substitutes `[tool call] name({...})` for a functionCall it
+    cannot sign, and a small model then copies that line back as its answer.
+    The loop used to return it as the final text and never dispatch anything.
+    """
+
+    def test_prose_call_is_dispatched_and_not_returned_as_the_answer(self):
+        replies = [
+            {"text": '[tool call] computer_action({"action": "open_app", '
+                     '"params": {"app": "Spotify"}})',
+             "provider": "gemini-3", "tool_calls": []},
+            {"text": "Spotify is open.", "provider": "gemini-3"},
+        ]
+        seen: list[tuple[str, dict]] = []
+
+        async def _dispatch(name, args):
+            seen.append((name, args))
+            return '{"ok": true}'
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[{"role": "user", "content": "play a song"}],
+            chat_fn=_Script(replies), dispatch_fn=_dispatch, max_hops=4))
+        assert seen == [("computer_action",
+                         {"action": "open_app",
+                          "params": {"app": "Spotify"}})]
+        assert out["text"] == "Spotify is open."
+
+    def test_empty_stream_is_retried_on_the_batched_path(self):
+        """A stream can complete with zero text and zero calls; that is not an
+        answer. The loop must retry once without streaming."""
+        calls = {"stream": 0, "batched": 0}
+
+        async def _stream(messages, on_text=None):
+            calls["stream"] += 1
+            return {"text": "", "tool_calls": [], "provider": "f"}
+
+        async def _chat(messages):
+            calls["batched"] += 1
+            return {"text": "a real answer", "provider": "f"}
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=lambda n, a: "x",
+            chat_stream_fn=_stream, max_hops=2))
+        assert calls == {"stream": 1, "batched": 1}
+        assert out["text"] == "a real answer"
+
+    def test_empty_reply_twice_is_reported_not_dressed_up(self):
+        async def _chat(messages):
+            return {"text": "", "tool_calls": [], "provider": "f"}
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=lambda n, a: "x",
+            max_hops=2))
+        assert out["text"] == ""
+        assert "empty reply twice" in out["error"]
+
+    def test_marker_inside_ordinary_prose_is_not_a_call(self):
+        text = 'Use [tool call] open_app({"app": "Spotify"}) to open it.'
+        replies = [{"text": text, "provider": "f", "tool_calls": []}]
+        seen: list[str] = []
+
+        async def _dispatch(name, args):
+            seen.append(name)
+            return "{}"
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_Script(replies), dispatch_fn=_dispatch,
+            max_hops=2))
+        assert seen == []
+        assert out["text"] == text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

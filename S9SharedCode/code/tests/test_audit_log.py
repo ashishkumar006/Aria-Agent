@@ -129,3 +129,46 @@ class TestAuditLog:
         # the agent_server layer checks `enabled` before calling it.
         # Here we just verify the gate state.
         assert g.enabled is False
+
+
+# ?? the export endpoint ???????????????????????????????????????????????????????
+
+class TestAuditEndpointLimit:
+    """`/api/audit?limit=` bounds what a page has to render.
+
+    The log is append-only and uncapped. The Computer page rendered every
+    line, so 6,897 entries became 6,897 DOM nodes and the approval the user
+    came to read sat at the bottom of a wall of clicks.
+    """
+
+    def _write(self, path, n):
+        with open(path, "w", encoding="utf-8") as f:
+            for i in range(n):
+                f.write(f"2026-10-21T00:00:{i:02d} click done {{'n': {i}}}\n")
+
+    def test_limit_returns_the_newest_lines(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        p = tmp_path / "computer_use.log"
+        self._write(p, 50)
+        monkeypatch.setattr(gates_mod, "AUDIT_PATH", p)
+        import agent_server
+        with TestClient(agent_server.app) as c:
+            r = c.get("/api/audit?limit=3")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["count"] == 3
+        assert body["total"] == 50
+        assert "'n': 47" in body["lines"][0], "the newest lines, oldest first"
+        assert "'n': 49" in body["lines"][-1]
+
+    def test_no_limit_keeps_the_whole_log(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        p = tmp_path / "computer_use.log"
+        self._write(p, 20)
+        monkeypatch.setattr(gates_mod, "AUDIT_PATH", p)
+        import agent_server
+        with TestClient(agent_server.app) as c:
+            r = c.get("/api/audit")
+        body = r.json()
+        assert body["count"] == 20 and body["total"] == 20
+

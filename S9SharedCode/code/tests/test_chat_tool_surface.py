@@ -7,6 +7,7 @@ from the prompt while the payload carried a different set - and it could list
 reminders but had no tool to create one, so "remind me at six" could not work
 no matter how the user phrased it.
 """
+import asyncio
 import json
 
 import agent_server
@@ -25,8 +26,10 @@ def test_the_whole_chat_toolset_actually_resolves():
 
 
 def test_no_refused_tool_is_reachable_from_chat():
-    """Sending mail, creating events and touching the machine stay on the
-    Research path: they act on other people and are not undoable from chat."""
+    """Sending mail, creating events and deleting files stay off chat's
+    surface: they act on other people or have no undo. Desktop control is
+    NOT in this set - it is offered as the gated `computer_action` instead,
+    where the approval queue decides whether anything runs."""
     got = {t["name"] for t in (tool_payload(agent_server._CHAT_TOOLS) or [])}
     leaked = got & set(agent_server._CHAT_TOOLS_REFUSED)
     assert not leaked, f"refused tools are reachable: {sorted(leaked)}"
@@ -113,6 +116,119 @@ def test_chat_can_actually_schedule():
     assert "list_scheduled" in agent_server._CHAT_TOOLS
     assert "remind" in agent_server._CHAT_SYSTEM.lower(), (
         "the prompt must tell the model how to handle a reminder request")
+
+
+def test_chat_reaches_the_machine_only_through_the_gated_tool():
+    """Desktop access is offered to chat, but as ONE approval-gated tool.
+
+    The model has to be told what `pending` means or it will report a click
+    that never ran, and it has to be told the host gate exists or it will
+    promise to open Notepad on a build where computer use is off.
+    """
+    names = {t["name"] for t in agent_server._chat_tool_payload() or []}
+    assert "computer_action" in names
+    assert "computer_action" not in agent_server._CHAT_TOOLS_REFUSED
+    assert "computer_action" in agent_server._CHAT_SYSTEM
+    assert "pending" in agent_server._CHAT_SYSTEM.lower()
+    assert "dry-run" in agent_server._CHAT_SYSTEM.lower()
+
+
+def test_chat_is_offered_goal_level_computer_actions_only():
+    """A small chat model handed the daemon primitives improvises against the
+    focused window: observed live as press_key LWin, a URL typed into a page and
+    an unrelated click instead of one drive_app call. Low-level control stays
+    on the Computer page and in skills; chat gets goals."""
+    specs = {t["name"]: t for t in agent_server._chat_tool_payload() or []}
+    spec = specs["computer_action"]
+    enum = (((spec.get("input_schema") or {}).get("properties") or {})
+            .get("action", {}).get("enum") or [])
+    assert set(enum) == set(agent_server._CHAT_COMPUTER_ACTIONS)
+    assert "drive_app" in enum
+    for low in ("click", "press_key", "replace_text", "get_window_state"):
+        assert low not in enum
+
+
+def test_chat_drive_app_without_a_named_app_is_refused(monkeypatch):
+    """The driver targets the foreground window when app is missing.
+
+    Live, a chat "play a song" call without params.app clicked a Chrome page
+    and still reported that Spotify was playing. Refuse before dispatch so no
+    unrelated window can be touched.
+    """
+    import computer_use.safety as safety
+    monkeypatch.setenv("COMPUTER_USE_ENABLED", "true")
+    monkeypatch.setenv("COMPUTER_USE_MODE", "live")
+    safety.reset_shared_gates()
+
+    dispatch = agent_server._chat_handoff_dispatch("cu-test")
+    raw = asyncio.run(dispatch("computer_action", {
+        "action": "drive_app", "params": {"goal": "play a song"}}))
+    out = json.loads(raw)
+
+    assert out["status"] == "bad_request"
+    assert "params.app" in out["message"]
+    assert safety.shared_gates().list_approvals() == []
+
+
+def test_chat_computer_action_runs_in_the_agent_process(monkeypatch):
+    """Chat must not dispatch computer_action over MCP: the child's approval
+    store is not the one `/api/computer/approvals` reads, so a pending action
+    there never appears in the Computer page."""
+    import computer_use.safety as safety
+    monkeypatch.setenv("COMPUTER_USE_ENABLED", "true")
+    monkeypatch.setenv("COMPUTER_USE_MODE", "dry-run")
+    safety.reset_shared_gates()
+
+    dispatch = agent_server._chat_handoff_dispatch("cu-test")
+    raw = asyncio.run(dispatch("computer_action", {
+        "action": "open_app", "params": {"app": "Spotify"}}))
+    out = json.loads(raw)
+
+    assert out["status"] == "dry-run"
+    assert safety.shared_gates().list_approvals() == []
+
+
+def test_chat_pending_approval_is_listed_by_the_computer_page(monkeypatch):
+    import computer_use.safety as safety
+    monkeypatch.setenv("COMPUTER_USE_ENABLED", "true")
+    monkeypatch.setenv("COMPUTER_USE_MODE", "live")
+    safety.reset_shared_gates()
+
+    dispatch = agent_server._chat_handoff_dispatch("cu-test")
+    raw = asyncio.run(dispatch("computer_action", {
+        "action": "run_command",
+        "params": {"command": "taskkill /F /PID 1234"}}))
+    out = json.loads(raw)
+
+    assert out["status"] == "pending"
+    assert out["approval_id"] in {
+        a["id"] for a in safety.shared_gates().list_approvals()}
+
+
+def test_the_researcher_gets_the_same_gated_machine_access():
+    """`computer` is a DAG skill; the researcher is a tool-calling node, so
+    the capability has to be granted in `tools_allowed` and explained in its
+    prompt or the model can never call it. The planner already carries the
+    skill itself."""
+    import yaml
+
+    cfg = yaml.safe_load(
+        open(agent_server.__file__.replace("agent_server.py", "agent_config.yaml"),
+             encoding="utf-8")) or {}
+    skills_cfg = cfg.get("skills") or cfg
+    researcher = skills_cfg.get("researcher") or {}
+    assert "computer_action" in (researcher.get("tools_allowed") or [])
+
+    prompt_path = agent_server.__file__.replace(
+        "agent_server.py", "prompts/researcher.md")
+    prompt = open(prompt_path, encoding="utf-8").read()
+    assert "computer_action" in prompt
+    assert "pending" in prompt.lower(), (
+        "the researcher must be told that pending means it did not run")
+
+    planner = open(agent_server.__file__.replace(
+        "agent_server.py", "prompts/planner.md"), encoding="utf-8").read()
+    assert "computer" in planner
 
 
 def test_chat_hands_documents_and_files_to_the_authoring_agent():

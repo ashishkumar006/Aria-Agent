@@ -328,6 +328,31 @@ def test_missing_source_file_fails(reg, monkeypatch):
     assert "missing" in out.error.lower()
 
 
+def test_a_parser_that_never_returns_fails_the_document(reg, monkeypatch):
+    """A pathological file must not park the document on `parsing` forever.
+
+    The symptom was a document stuck at "parsing - 0 chunks" with no error
+    and no retry - and because the indexer serialises documents, it blocked
+    every other upload behind it too.
+    """
+    from documents import parsers as P
+
+    monkeypatch.setattr(R, "PARSE_TIMEOUT_S", 0.25)
+
+    def _hang(*_a, **_kw):
+        time.sleep(30)
+        raise AssertionError("the parse should have been abandoned")
+
+    monkeypatch.setattr(P, "parse", _hang)
+    d = _upload(reg, "hang.pdf", b"%PDF-1.7 broken")
+    out = MemoryIndexer(reg, embed=FakeEmbedder()).run(d.id)
+    assert out.status == R.FAILED
+    assert "longer than" in out.error
+    assert out.chunk_count == 0
+    # The failure is visible, not just a status: the user must be told why.
+    assert out.error.strip()
+
+
 def test_unknown_document_is_none(reg):
     assert MemoryIndexer(reg, embed=FakeEmbedder()).run("doc-nope") is None
 

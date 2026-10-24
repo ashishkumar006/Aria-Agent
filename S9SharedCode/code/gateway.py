@@ -294,9 +294,14 @@ class _RoutedLLM:
             if _rf_schema:
                 body["schema"] = _rf_schema
                 body["schema_name"] = response_format.get("name", "out")
-        import httpx as _httpx
-        r = _httpx.post(f"{self._raw.base_url}/v1/vision", json=body,
-                        timeout=self._raw.timeout)
+        # The gateway requires X-Gateway-Token on every /v1/* route, and this
+        # call used a bare httpx.post with no headers: the vision endpoint
+        # answered 401 and the computer-use engine - which swallows the error
+        # and escalates - reported "vision returned unexpected type: NoneType".
+        # So the whole L3 layer of the desktop agent was dead while the chat
+        # path (which uses the pooled, token-carrying client) worked fine.
+        r = _client().post(f"{self._raw.base_url}/v1/vision", json=body,
+                            timeout=self._raw.timeout)
         r.raise_for_status()
         return r.json()
 

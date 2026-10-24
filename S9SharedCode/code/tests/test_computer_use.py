@@ -163,5 +163,64 @@ def test_shim_exposes_legacy_api():
     assert hasattr(cu, "resolve")
 
 
+# ?? Capability probe: what the console reports as "DRIVER" ??????????????????
+def test_capability_probe_reads_the_ax_tree(monkeypatch):
+    """A healthy host must not be reported as "AX no tree ? shots none".
+
+    The probe used to read `windows` off `get_desktop_state`; the Windows
+    driver answers that call with display metadata only, so the console told
+    the user the agent could not see anything while `get_accessibility_tree`
+    returned real windows and a full-screen PNG came back every time.
+    """
+    import computer_use.core.daemon as D
+
+    png = "iVBORw0KGgoAAAANSUhEUg=="
+    seen: list[str] = []
+
+    def fake_call(name, params=None, timeout=None):
+        seen.append(name)
+        if name == "get_desktop_state":
+            return {"display": "primary", "screenshot_png_b64": png}
+        if name == "get_accessibility_tree":
+            return {"processes": [{"pid": 1}],
+                    "windows": [{"pid": 2, "window_id": 3, "title": "Code"}]}
+        if name == "list_apps":
+            return {"apps": [{"name": "Code", "running": True}]}
+        return {}
+
+    monkeypatch.setattr(D, "_binary", lambda: "cua-driver.exe")
+    monkeypatch.setattr(D, "_is_running", lambda b: True)
+    monkeypatch.setattr(D, "_pipe_responsive", lambda b: True)
+    monkeypatch.setattr(D, "call", fake_call)
+
+    caps = D.capabilities()
+    assert "get_accessibility_tree" in seen, "the probe must ask for the tree"
+    assert caps["daemon_running"] is True
+    assert caps["ax_ok"] is True, "a window list was returned; the tree is readable"
+    assert caps["screenshot_ok"] is True, "the desktop returned a PNG"
+    assert caps["apps"] == [{"name": "Code", "running": True}]
+
+
+def test_capability_probe_still_says_no_tree_when_there_is_none(monkeypatch):
+    """The fix must not become "always true": an empty tree is a no."""
+    import computer_use.core.daemon as D
+
+    def fake_call(name, params=None, timeout=None):
+        if name == "get_accessibility_tree":
+            return {"processes": [], "windows": []}
+        if name == "get_desktop_state":
+            return {"display": "primary"}
+        return {}
+
+    monkeypatch.setattr(D, "_binary", lambda: "cua-driver.exe")
+    monkeypatch.setattr(D, "_is_running", lambda b: True)
+    monkeypatch.setattr(D, "_pipe_responsive", lambda b: True)
+    monkeypatch.setattr(D, "call", fake_call)
+
+    caps = D.capabilities()
+    assert caps["ax_ok"] is False
+    assert caps["screenshot_ok"] is False
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

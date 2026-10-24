@@ -25,6 +25,13 @@ class GatedShell:
             self.safety.record_action("run_command", {"command": command},
                                       f"blocked: {blocked}")
             return {"status": "blocked", "message": blocked}
+        if self.safety.mode == "dry-run":
+            self.safety.record_action("run_command", {"command": command},
+                                      "dry-run")
+            return {"status": "dry-run", "command": command,
+                    "message": f"[dry-run] would run: {command}. No approval "
+                               "was created; restart with -ComputerUseMode "
+                               "live to execute."}
         if (not force and self.safety.needs_approval(
                 "run_command", {"command": command})
                 and not self.safety.already_approved(
@@ -32,11 +39,6 @@ class GatedShell:
             aid = self.safety.create_approval("run_command", {"command": command})
             return {"status": "pending", "approval_id": aid,
                     "message": "Action requires your approval."}
-        if self.safety.mode == "dry-run":
-            self.safety.record_action("run_command", {"command": command},
-                                      "dry-run")
-            return {"status": "dry-run", "command": command,
-                    "message": f"[dry-run] would run: {command}"}
         try:
             proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
@@ -59,15 +61,17 @@ class GatedShell:
             return {"status": "blocked", "message": f"path '{path}' is protected"}
         # Gated like everything else: approval patterns may target sensitive
         # paths, and dry-run describes instead of returning real content.
+        if self.safety.mode == "dry-run":
+            self.safety.record_action("read_file", {"path": path}, "dry-run")
+            return {"status": "dry-run", "path": path,
+                    "message": f"[dry-run] would read: {path}. No approval "
+                               "was created; restart with -ComputerUseMode "
+                               "live to execute."}
         if (not force and self.safety.needs_approval("read_file", {"path": path})
                 and not self.safety.already_approved("read_file", {"path": path})):
             aid = self.safety.create_approval("read_file", {"path": path})
             return {"status": "pending", "approval_id": aid,
                     "message": "Action requires your approval."}
-        if self.safety.mode == "dry-run":
-            self.safety.record_action("read_file", {"path": path}, "dry-run")
-            return {"status": "dry-run", "path": path,
-                    "message": f"[dry-run] would read: {path}"}
         p = Path(os.path.expanduser(path))
         if not p.exists():
             self.safety.record_action("read_file", {"path": path},
@@ -84,15 +88,17 @@ class GatedShell:
             return {"status": "blocked", "message": f"path '{path}' is protected"}
         # A file write is a mutation: it must go through the same approval
         # and dry-run gates as run_command/open_app, not around them.
+        if self.safety.mode == "dry-run":
+            self.safety.record_action("write_file", {"path": path}, "dry-run")
+            return {"status": "dry-run", "path": path,
+                    "message": f"[dry-run] would write {len(content)} bytes: "
+                               f"{path}. No approval was created; restart with "
+                               "-ComputerUseMode live to execute."}
         if (not force and self.safety.needs_approval("write_file", {"path": path})
                 and not self.safety.already_approved("write_file", {"path": path})):
             aid = self.safety.create_approval("write_file", {"path": path})
             return {"status": "pending", "approval_id": aid,
                     "message": "Action requires your approval."}
-        if self.safety.mode == "dry-run":
-            self.safety.record_action("write_file", {"path": path}, "dry-run")
-            return {"status": "dry-run", "path": path,
-                    "message": f"[dry-run] would write {len(content)} bytes: {path}"}
         p = Path(os.path.expanduser(path))
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -106,15 +112,17 @@ class GatedShell:
             self.safety.record_action("open_app", {"app": app},
                                       "blocked: protected path")
             return {"status": "blocked", "message": f"path '{app}' is protected"}
+        if self.safety.mode == "dry-run":
+            self.safety.record_action("open_app", {"app": app}, "dry-run")
+            return {"status": "dry-run", "app": app,
+                    "message": f"[dry-run] would open: {app}. No approval was "
+                               "created; restart with -ComputerUseMode live "
+                               "to execute."}
         if (not force and self.safety.needs_approval("open_app", {"app": app})
                 and not self.safety.already_approved("open_app", {"app": app})):
             aid = self.safety.create_approval("open_app", {"app": app})
             return {"status": "pending", "approval_id": aid,
                     "message": "Action requires your approval."}
-        if self.safety.mode == "dry-run":
-            self.safety.record_action("open_app", {"app": app}, "dry-run")
-            return {"status": "dry-run", "app": app,
-                    "message": f"[dry-run] would open: {app}"}
         try:
             if os.name == "nt":
                 subprocess.Popen(["cmd", "/c", "start", "", app], shell=False)

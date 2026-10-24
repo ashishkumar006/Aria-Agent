@@ -88,11 +88,34 @@ def ensure_daemon(timeout: float = 12.0) -> bool:
         log_path = ROOT / "computer_use" / "daemon.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         logf = open(log_path, "ab")
+        # The daemon is the ONLY thing that touches the desktop: its UIA
+        # reads, screenshots and clicks are the agent's view of the world.
+        # If it runs on the user's `Default` desktop, every computer_action
+        # reads and clicks the user's windows. With ARIA_PRIVATE_DESKTOP
+        # set, the daemon starts on a SECOND, invisible desktop so the user's
+        # session is never disturbed.
+        startupinfo = None
+        try:
+            from .. import private_desktop as _pd
+            if _pd.enabled():
+                name = _pd.ensure_private_desktop()
+                if name:
+                    import atexit as _at
+                    _at.register(_pd.restore_default_desktop)
+                    startupinfo = subprocess.STARTUPINFO()
+                    # STARTF_USEDESKTOP (0x00000100) is not exported by this
+                    # pywin32 build; set the bit directly so the daemon
+                    # starts on the private desktop instead of the user's.
+                    startupinfo.dwFlags |= 0x00000100
+                    startupinfo.lpDesktop = name
+        except Exception:
+            startupinfo = None
         subprocess.Popen(
             [bin_, "serve"],
             stdout=logf,
             stderr=logf,
             stdin=subprocess.DEVNULL,
+            startupinfo=startupinfo,
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
@@ -251,11 +274,24 @@ def capabilities() -> dict:
         out["note"] = "daemon not running — call ensure_daemon()"
         return out
     try:
+        # The accessibility tree is its own call (`get_accessibility_tree`).
+        # This probe used to read `windows` off `get_desktop_state`, which the
+        # current Windows driver answers with display metadata only - so a
+        # perfectly healthy host reported "AX no tree" and the console told the
+        # user the feature could not see anything. `permissions.py` has always
+        # asked the right question; this probe now asks it the same way.
         ds = call("get_desktop_state", {}, timeout=15)
-        wins = ds.get("windows") or []
+        try:
+            tree = call("get_accessibility_tree", {}, timeout=15)
+        except Exception:
+            tree = {}
+        wins = (tree or {}).get("windows") or []
         out["ax_ok"] = len(wins) > 0
-        # Sample one window for a screenshot to confirm capture works.
-        if wins:
+        # A desktop capture is proof enough; only fall back to sampling one
+        # window when the desktop call carried no screenshot.
+        if ds.get("screenshot_png_b64"):
+            out["screenshot_ok"] = True
+        elif wins:
             w = wins[0]
             try:
                 st = call("get_window_state",

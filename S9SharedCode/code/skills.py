@@ -183,9 +183,17 @@ def _v9_judge_vision(image_data_url: str, prompt: str, system: str) -> dict | No
     forces a vision-capable provider and supports a JSON schema for typed
     output), so the image actually reaches the model. No model is pinned so
     the gateway fails over to any available vision-capable provider.
+
+    The SCHEMA is not optional. Without it the model answers in prose ("the
+    click target is the blue button"), `_extract_json` finds no JSON, and
+    the caller sees None - which the engine reports as "vision returned
+    unexpected type: NoneType" and the whole L3 layer looks broken while
+    the model was answering perfectly well. The endpoint supports a JSON
+    schema and returns the parsed object.
     """
     try:
         model_kw = {"model": _COMPUTER_VISION_MODEL} if _COMPUTER_VISION_MODEL else {}
+        from computer_use.prompts import ACTION_SCHEMA_JSON
         reply = LLM().vision(
             image=image_data_url,
             prompt=prompt,
@@ -193,9 +201,15 @@ def _v9_judge_vision(image_data_url: str, prompt: str, system: str) -> dict | No
             agent="computer",
             max_tokens=800,
             temperature=0.0,
+            response_format={"type": "json_schema",
+                             "schema": ACTION_SCHEMA_JSON,
+                             "name": "action"},
             **model_kw,
         )
         _bump_cost(reply, l3=True)
+        parsed = reply.get("parsed")
+        if isinstance(parsed, dict) and parsed:
+            return parsed
         return _extract_json(reply.get("text") or "")
     except Exception:
         return None
@@ -222,6 +236,12 @@ class Skill:
         # (Critic, Distiller) drops it to ~0.
         self.temperature: float = float(cfg.get("temperature", 0.3))
         self.max_tokens: int = int(cfg.get("max_tokens", 2048))
+        # Per-skill clip on one tool result fed back to the model. None keeps
+        # the 32k harness default; 0 disables the clip (the tool's own cap
+        # still applies) and is what researcher uses to read pages whole.
+        _result_chars = cfg.get("max_tool_result_chars")
+        self.max_tool_result_chars: int | None = (
+            None if _result_chars is None else int(_result_chars))
         # Sectioned expansion (see `_sectioned_final_answer`): a skill
         # with `sectioned: true` and more than one upstream result is
         # written one section per result instead of in a single call.
@@ -2348,7 +2368,7 @@ _TOOL_CATALOG = {
     },
     "computer_action": {
         "name": "computer_action",
-        "description": "Gated computer-use on the user's machine. High-level: drive_app (natural-language goal against a desktop app), run_command, read_file, write_file, open_app. Low-level daemon primitives: launch_app, get_accessibility_tree, get_window_state, click, type_text, press_key, hotkey, scroll, get_desktop_state, bring_to_front, kill_app, start_recording, stop_recording, replay_trajectory, list_apps. Returns status; 'pending' means awaiting user approval.",
+        "description": "Gated computer-use on the user's machine. High-level: drive_app (natural-language goal against a NAMED desktop app: params.app + params.goal), run_command, read_file, write_file, open_app. Low-level daemon primitives: launch_app, get_accessibility_tree, get_window_state, click, type_text, press_key, hotkey, scroll, get_desktop_state, bring_to_front, kill_app, start_recording, stop_recording, replay_trajectory, list_apps. Returns status: 'pending' means awaiting approval in the Computer page; 'dry-run' means nothing ran and no approval exists; 'done' means it executed.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2359,7 +2379,13 @@ _TOOL_CATALOG = {
                                     "hotkey", "scroll", "get_desktop_state", "bring_to_front",
                                     "kill_app", "start_recording", "stop_recording",
                                     "replay_trajectory", "list_apps"]},
-                "params": {"type": "object"},
+                "params": {
+                    "type": "object",
+                    "description": ("For drive_app: {app: application name, "
+                                    "goal: what to do}. app is required so the "
+                                    "driver never acts on the foreground window "
+                                    "by accident."),
+                },
             },
             "required": ["action", "params"],
         },
@@ -2953,6 +2979,26 @@ def _disabled_tools() -> "set | None":
         return None
 
 
+async def _computer_tool_dispatch(name: str, args: dict):
+    """Own `computer_action` in the agent process, not the MCP child.
+
+    SafetyGates stores approvals in memory. A pending approval minted inside
+    the MCP child was invisible to the Computer page (and to the retry that
+    follows approval), because the page reads the agent process's store.
+    """
+    if name != "computer_action":
+        return None
+    try:
+        from computer_use.tool import tool_dispatch
+        a = args if isinstance(args, dict) else {}
+        return json.dumps(
+            tool_dispatch(a.get("action"), a.get("params") or {}),
+            default=str)
+    except Exception as e:
+        return json.dumps({"status": "error",
+                           "message": f"{type(e).__name__}: {e}"})
+
+
 def tool_payload(tool_names: list[str]) -> list[dict] | None:
     if not tool_names:
         return None
@@ -3227,6 +3273,47 @@ policy_notes: list | None = None,
         node_meta = node_dict.get("metadata") or {}
         goal = node_meta.get("goal") or node_meta.get("question") or query
         app_hint = node_meta.get("app")
+
+        # A GATED ACTION instead of GUI driving.
+        #
+        #   metadata.action: run_command | read_file | write_file | open_app
+        #   metadata.args:   the arguments for that action
+        #
+        # The cascade drives a GUI; a shell command or a file write is not
+        # a GUI, and the gated shell is the instrument for those. It is also
+        # the ONLY path that can mint a PENDING APPROVAL - the cascade's own
+        # clicks and keystrokes are not approval-worthy - so without this
+        # route the approval queue in the Computer page could never be
+        # reached from the agent, and "gated" meant "stuck".
+        _action = str(node_meta.get("action") or "").strip()
+        if _action in ("run_command", "read_file", "write_file", "open_app"):
+            from computer_use import get_computer_use
+            _args = node_meta.get("args") or node_meta.get("arguments") or {}
+            if not isinstance(_args, dict):
+                _args = {}
+            try:
+                _res = get_computer_use(session_id=session_id).request(
+                    _action, _args)
+            except Exception as _e:
+                _res = {"status": "error", "message": f"{type(_e).__name__}: {_e}"}
+            _status = str(_res.get("status") or "error")
+            # "pending" is not a failure: the action waits for a human in
+            # the Computer page, and the run must say so rather than look
+            # broken.
+            _ok = _status in ("done", "dry-run", "pending")
+            return AgentResult(
+                success=_ok,
+                agent_name=skill.name,
+                output={"layer": f"gated-{_action}", "action": _action,
+                        "goal": goal, "result": _res,
+                        "status": _status,
+                        "message": _res.get("message") or "",
+                        "approval_id": _res.get("approval_id") or "",
+                        "cost": _computer_cost_snapshot()},
+                cost=0.0,
+                elapsed_s=time.time() - started,
+            ), rendered
+
         from computer_use.engine import ComputerUseSkill
         from computer_use import safety
 
@@ -3428,6 +3515,8 @@ policy_notes: list | None = None,
             # critical path in outcomes.py.
             on_outcome=_capture,
             prepare_fn=_prepare,
+            extra_dispatch=_computer_tool_dispatch,
+            max_tool_result_chars=skill.max_tool_result_chars,
         )
         # Whatever the model said about the artifact, the receipt uses this.
         _authoritative = produced

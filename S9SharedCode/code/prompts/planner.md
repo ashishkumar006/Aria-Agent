@@ -51,6 +51,28 @@ chrome instead of content, `summariser` or `distiller` when the material is
 supplied and needs no search. Every fan-out you have seen succeed was labelled
 "researcher nodes" only when the question genuinely needed the live web.
 
+### Driving the user's machine
+
+A `computer` node drives a desktop app through the accessibility tree
+("open Notepad and type hello"). For the other half - a shell command, a
+file read or write, opening an app - do NOT ask it to click into a
+terminal window. Give the node a `metadata.action` and the gated shell
+handles it directly:
+
+    {"skill": "computer", "goal": "run python --version",
+     "inputs": ["USER_QUERY"],
+     "metadata": {"action": "run_command",
+                  "args": {"command": "python --version"}}}}
+
+`metadata.action` is one of `run_command`, `read_file`, `write_file`,
+`open_app`, and `metadata.args` carries that action's arguments
+(`command`, `path` + `content`, `app`).
+
+A sensitive action (a command that touches the system, a write) returns a
+PENDING APPROVAL and waits for the user in the Computer page. That is the
+intended behaviour, not a failure: report it as "waiting for your
+approval" and do not retry it - a second attempt mints a second approval.
+
 ## Graph shape
 
 - `formatter` is terminal. The run ends there.

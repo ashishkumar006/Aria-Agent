@@ -154,6 +154,16 @@ export interface DocPreview {
 
 export interface RunRow extends SessionSummary {}
 
+/** A gated computer-use action waiting for a human decision. */
+export interface ComputerApproval {
+  id: string;
+  action: string;
+  params?: Record<string, unknown>;
+  created?: number;
+  status?: string;
+  reason?: string;
+}
+
 export interface FeedbackRow {
   name: string;
   up: number;
@@ -543,7 +553,7 @@ export type SimpleStreamEvent =
   /* `kind: "report"` + `title` mark an answer that IS a research report shown
      in full (delegated from chat). The console renders those as a preview
      card that opens in a dialog, instead of inlining several thousand words. */
-  | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number; model?: string; provider?: string; kind?: string; title?: string }
+  | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number; model?: string; provider?: string; kind?: string; title?: string; stopped?: boolean }
   | { type: 'error'; text?: string }
   | { type: string; [k: string]: unknown };
 
@@ -727,6 +737,9 @@ export interface ChatThread {
   turns?: number;
   /** Which engine owns this thread. The sidebar lists only the current mode's. */
   mode?: 'light' | 'dag';
+  /** True while the server still owns a run for this thread, even when no
+      browser is watching its stream. */
+  active?: boolean;
 }
 
 export interface FlagRow {
@@ -816,6 +829,42 @@ async function* sseFrames(r: Response, signal?: AbortSignal): AsyncGenerator<Rec
 
 export const api = {
   health: () => j<{ agent: string; gateway_up: boolean }>('/api/health', { cache: 'no-store' }),
+  /* ── computer-use (gated desktop control) ──────────────────────────────
+     The gates live server-side: a sensitive action returns a PENDING
+     approval and waits for a human. This view is where that human is -
+     the agent server had the endpoints, but nothing in the console could
+     approve anything, so a pending action was a dead end. */
+  computerStatus: () => j<{
+    approvals: ComputerApproval[];
+    capabilities: { binary_present?: boolean; daemon_running?: boolean;
+                    ax_ok?: boolean; screenshot_ok?: boolean;
+                    elevated?: boolean; platform?: string;
+                    apps?: { name: string; running: boolean }[]; note?: string };
+    mode: string;
+    /** False when the gates are off entirely (COMPUTER_USE_ENABLED). */
+    enabled: boolean;
+  }>('/api/computer/approvals', { cache: 'no-store' }),
+  /** Approve or reject a pending action. `approve:false` is a rejection -
+   *  the action never runs, which is the point of the gate. */
+  computerDecide: (id: string, approve: boolean) =>
+    pj<{ status: string; action?: string; approve?: boolean }>(
+      `/api/computer/approvals/${encodeURIComponent(id)}`,
+      { approve }),
+  /** The redacted audit trail: every gated request and its outcome.
+   *  `limit` keeps only the newest lines - the log is uncapped and the
+   *  approval the user came to read is at the end. */
+  computerAudit: (redact = true, limit = 400) =>
+    j<{ lines: string[]; count: number; total?: number }>(
+      `/api/audit?redact=${redact ? 'true' : 'false'}&limit=${limit}`, { cache: 'no-store' }),
+  /** Recorded trajectories (start/stop recording, replay). */
+  computerRuns: () => j<{ runs: { id: string; turns?: number; path?: string }[] }>(
+    '/api/computer/runs', { cache: 'no-store' }),
+  computerRun: (id: string) =>
+    j<{ id: string; turns?: { turn: string; calls: unknown[] }[] }>(
+      `/api/computer/runs/${encodeURIComponent(id)}`, { cache: 'no-store' }),
+  computerReplay: (id: string) =>
+    pj<{ status: string; result?: unknown }>(
+      `/api/computer/replay/${encodeURIComponent(id)}`, {}),
   /* ── document authoring (PDF / PPTX / DOCX / XLSX) ──
      The gateway owns the generators; these two routes proxy them so the
      console never holds the gateway token. `docgen` returns the BLOB (it
@@ -847,8 +896,9 @@ export const api = {
       `/api/chat/threads?limit=${limit}&offset=${offset}${mode ? `&mode=${mode}` : ''}`,
     ),
   chatThread: (cid: string) =>
-    j<{ conversation_id: string; title: string;
-        messages: { role: string; content: string; kind?: string; title?: string }[] }>(
+    j<{ conversation_id: string; title: string; active?: boolean;
+        messages: { role: string; content: string; kind?: string; title?: string;
+                    pending?: boolean; started?: number; files?: StreamFile[] }[] }>(
       `/api/chat/threads/${encodeURIComponent(cid)}`,
     ),
   /* Persist a DAG turn into the sidebar store so a DAG conversation is listed
@@ -1331,7 +1381,8 @@ export const api = {
       `found:false` simply means nothing was running for that id. */
   cancelRun: (ids: { conversation_id?: string; session_id?: string }) =>
     pj<{ status: 'cancelled' | 'pending' | 'missing'; found: boolean;
-         cancelled: number; session_id?: string }>('/api/chat/cancel', ids),
+         cancelled: number; lightweight_cancelled?: number;
+         session_id?: string }>('/api/chat/cancel', ids),
   /** Structured contents of a rendered document: slide cards for a deck,
    *  page cards for a PDF, a grid for a workbook, paragraphs for a .docx.
    *  Read from the artifact that was ACTUALLY produced - the run's own

@@ -451,3 +451,65 @@ async def test_api_rejects_bad_kind(api_client):
     r = await api_client.post("/v1/memory/remember", json={
         "kind": "nope", "descriptor": "x", "source": "t", "run_id": "r1"})
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_a_missing_supersede_target_leaves_no_orphan(api_client):
+    """A write whose supersede target is gone must not persist a record.
+
+    The link used to be made AFTER the record was written, so a missing
+    target persisted the record and then raised: the client saw a 404 and
+    believed nothing was stored, while the drawer kept the orphan. Every
+    repeat sighting of one observation therefore left a duplicate behind -
+    the profile drawer ended up holding 80 copies of a single claim, and
+    those duplicates crowded every search (including exact keyword
+    matches) out of the results.
+    """
+    marker = "orphan-check-4711"
+    r = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": marker,
+        "keywords": ["orphancheck"], "value": {"observation": marker},
+        "source": "test", "run_id": "t1",
+        "supersedes": "mem:does-not-exist"})
+    assert r.status_code == 404, r.text
+
+    r = await api_client.get("/v1/memory", params={"limit": 200})
+    assert r.status_code == 200, r.text
+    assert not any(i["descriptor"] == marker for i in r.json()["items"]), \
+        "the failed write left a record behind"
+
+    # And the same claim CAN be stored, without a supersede link.
+    r = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": marker,
+        "keywords": ["orphancheck"], "value": {"observation": marker},
+        "source": "test", "run_id": "t1"})
+    assert r.status_code == 200, r.text
+    r = await api_client.get("/v1/memory", params={"limit": 200})
+    assert sum(1 for i in r.json()["items"]
+               if i["descriptor"] == marker) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_superseding_write_hides_the_old_record(api_client):
+    """The link must work when the target IS there: the old row drops out
+    of the profile list, so a repeated observation converges on one row."""
+    first = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": "converge-check-9931",
+        "keywords": ["converge"], "value": {"observation": "converge-check-9931"},
+        "source": "test", "run_id": "t1"})
+    assert first.status_code == 200, first.text
+    old_id = first.json()["item"]["id"]
+
+    second = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": "converge-check-9931",
+        "keywords": ["converge"], "value": {"observation": "converge-check-9931"},
+        "source": "test", "run_id": "t1", "supersedes": old_id})
+    assert second.status_code == 200, second.text
+
+    r = await api_client.get("/v1/memory", params={
+        "limit": 200, "hide_superseded": "true"})
+    assert r.status_code == 200, r.text
+    visible = [i for i in r.json()["items"]
+               if i["descriptor"] == "converge-check-9931"]
+    assert len(visible) == 1, visible
+    assert visible[0]["id"] != old_id
