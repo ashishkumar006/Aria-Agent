@@ -59,8 +59,9 @@ def test_research_chat_sends_the_topic_and_a_planner_note(monkeypatch):
     seen: dict = {}
 
     def fake_stream(query, conversation_id, request=None, idem_key="",
-                    doc_setup=None, run_note="", run_kind=""):
-        seen.update(query=query, run_note=run_note, run_kind=run_kind)
+                    doc_setup=None, run_note="", run_kind="", body=None):
+        seen.update(query=query, run_note=run_note, run_kind=run_kind,
+                    body=body)
         return StreamingResponse(iter([b"data: {\"type\": \"done\"}\n\n"]),
                                  media_type="text/event-stream")
 
@@ -84,6 +85,11 @@ def test_research_chat_sends_the_topic_and_a_planner_note(monkeypatch):
     assert seen["run_kind"] == "research"
     assert "DEEP" in seen["run_note"].upper()
     assert "you are a research agent" not in seen["run_note"].lower()
+    # The per-turn body must reach `_stream_run` as an argument. Reading it
+    # inside that function used to raise `NameError: body` and kill every
+    # research run before its first node.
+    assert seen["body"]["research"] is True
+    assert seen["body"]["depth"] == "deep"
 
 
 def test_research_true_without_run_kind_still_declares_research(monkeypatch):
@@ -91,7 +97,7 @@ def test_research_true_without_run_kind_still_declares_research(monkeypatch):
     seen: dict = {}
 
     def fake_stream(query, conversation_id, request=None, idem_key="",
-                    doc_setup=None, run_note="", run_kind=""):
+                    doc_setup=None, run_note="", run_kind="", body=None):
         seen.update(run_note=run_note, run_kind=run_kind)
         return StreamingResponse(iter([b"data: {\"type\": \"done\"}\n\n"]),
                                  media_type="text/event-stream")
@@ -116,7 +122,7 @@ def test_chat_dag_run_declares_chat_not_research(monkeypatch):
     seen: dict = {}
 
     def fake_stream(query, conversation_id, request=None, idem_key="",
-                    doc_setup=None, run_note="", run_kind=""):
+                    doc_setup=None, run_note="", run_kind="", body=None):
         seen.update(run_note=run_note, run_kind=run_kind)
         return StreamingResponse(iter([b"data: {\"type\": \"done\"}\n\n"]),
                                  media_type="text/event-stream")

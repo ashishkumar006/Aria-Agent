@@ -23,8 +23,8 @@ const KEY = 'text-sky-300';
 const STR = 'text-emerald-300';
 const NUM = 'text-amber-300';
 const BOOL = 'text-violet-300';
-const COMMENT = 'text-zinc-600';
-const DIM = 'text-zinc-500';
+const COMMENT = 'text-zinc-400';
+const DIM = 'text-zinc-400';
 
 type Span = { text: string; cls: string };
 
@@ -122,6 +122,29 @@ describe('yamlHighlighter', () => {
     h.line('  system: |');
     h.reset();
     expect(find(h.line('    Note: prose'), KEY)?.text).toBe('Note');
+  });
+
+  it('keeps muted tokens readable on the config viewer background', () => {
+    /* The viewer paints #0a0a0d. Comments explain the config's own settings,
+       so they are content, not decoration: they must clear WCAG AA (4.5:1 at
+       11.5px). zinc-600 measured 2.56:1 and failed the whole Settings page. */
+    const lin = (c: number) => {
+      const s = c / 255;
+      return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    };
+    const lum = (hex: string) => {
+      const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+      return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    };
+    const ratio = (a: string, b: string) => {
+      const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+    const ZINC_400 = '#a1a1aa';
+    const VIEWER_BG = '#0a0a0d';
+    expect(ratio(ZINC_400, VIEWER_BG)).toBeGreaterThan(4.5);
+    expect(COMMENT).toBe('text-zinc-400');
+    expect(DIM).toBe('text-zinc-400');
   });
 
   it('preserves indentation as its own run so nesting still reads', () => {

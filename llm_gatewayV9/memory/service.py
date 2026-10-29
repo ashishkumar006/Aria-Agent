@@ -605,8 +605,12 @@ class MemoryService:
     # ── maintenance ────────────────────────────────────────────────────────
 
     def list_recent(self, limit: int = 50,
-                    session_id: str | None = None) -> list[MemoryRecord]:
-        return self.store.list_recent(limit=limit, session_id=session_id)
+                    session_id: str | None = None,
+                    kinds: set[str] | None = None,
+                    hide_superseded: bool = False) -> list[MemoryRecord]:
+        return self.store.list_recent(limit=limit, session_id=session_id,
+                                      kinds=kinds,
+                                      hide_superseded=hide_superseded)
 
     def clear(self, session_id: str | None = None,
               older_than: datetime | None = None) -> int:
@@ -642,10 +646,15 @@ class MemoryService:
     def stats(self) -> dict:
         items = self.store.load()
         by_kind: dict[str, int] = {}
+        live_by_kind: dict[str, int] = {}
         embedded = 0
         sessions: set[str] = set()
+        live = 0
         for i in items:
             by_kind[i.kind] = by_kind.get(i.kind, 0) + 1
+            if i.superseded_by is None:
+                live += 1
+                live_by_kind[i.kind] = live_by_kind.get(i.kind, 0) + 1
             if i.embedding:
                 embedded += 1
             if i.session_id:
@@ -653,6 +662,12 @@ class MemoryService:
         return {
             "items": len(items),
             "by_kind": by_kind,
+            # The Memory page's counts and its default list both hide
+            # corrections, so a total that included them would disagree with
+            # what the user can see. `by_kind` stays for compatibility.
+            "live": live,
+            "superseded": len(items) - live,
+            "live_by_kind": live_by_kind,
             "embedded": embedded,
             "sessions": len(sessions),
             "index_size": self.index.size if self.index is not None else 0,

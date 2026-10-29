@@ -133,6 +133,16 @@ def test_the_terminal_consumer_is_exempt_from_spilling():
     assert entry["findings"][:200] in block
 
 
+def test_the_document_writer_is_exempt_from_spilling():
+    """Across 1,910 recorded author/deck tool uses, `read_artifact` was called
+    zero times — so a spilled findings reached the writer as an 800-char
+    preview and the rest was never read."""
+    entry = {"question": "q", "findings": _big()}
+    block = skills._inputs_block([entry], 400_000, skill_name="author")
+    assert '"artifact"' not in block
+    assert entry["findings"][:200] in block
+
+
 def test_read_artifact_round_trips_and_pages(tmp_path, monkeypatch):
     # Own store: the shared one is repointed by other tests.
     monkeypatch.setattr(arts, "STORE", tmp_path / "artifacts")

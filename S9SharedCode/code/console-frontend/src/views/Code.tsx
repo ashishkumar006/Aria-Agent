@@ -20,9 +20,11 @@
 
 import {
   useCallback, useEffect, useMemo, useRef, useState, type ReactNode,
+  type CSSProperties, type PointerEvent as ReactPointerEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import {
-  ChevronDown, ChevronRight, Circle, CircleCheck, Code2,
+  ChevronDown, ChevronRight, Circle, CircleCheck, Code2, Command,
   Eye, FileCode2, FileText, Folder, FolderPlus, FolderOpen, Globe, Loader2,
   Maximize2,
   PanelLeftClose, PanelLeftOpen, Play, Save, Search, Square, Terminal,
@@ -64,6 +66,21 @@ import {
 } from '../api';
 
 const STORE_KEY = 'aria.code.drafts.v1';
+/* The agent pane is resizable, and its width is remembered. The floor keeps
+   the composer's model select usable; the ceiling keeps the editor the widest
+   thing on screen, which is the point of an editor. `vw - 800` reserves the
+   rail, the explorer and ~360px of Monaco, so the split cannot crush the file
+   it is discussing - that bug is why the pane used to be a fixed 400px. */
+const AGENT_MIN = 264;
+const AGENT_MAX = 560;
+const AGENT_DEFAULT = 360;
+const AGENT_STORE = 'aria.code.agentWidth';
+function agentCap(vw: number) {
+  return Math.max(AGENT_MIN, Math.min(AGENT_MAX, vw - 800));
+}
+function clampAgentW(w: number, vw = window.innerWidth) {
+  return Math.max(AGENT_MIN, Math.min(agentCap(vw), w));
+}
 /* The agent's disk-writing tools (agent_server.py's own list). A successful
    result from any of these means the explorer's cached listings are stale. */
 const WRITE_TOOLS = new Set([
@@ -553,7 +570,7 @@ function DirNode({
         onClick={() => toggle(path)}
         aria-expanded={isOpen}
         title={path}
-        className="flex w-full items-center gap-1.5 rounded py-[3px] pr-2 text-left text-[12px] text-zinc-300 hover:bg-glass-hover"
+        className="flex w-full items-center gap-1.5 rounded py-1 pr-2 text-left text-[12px] text-zinc-300 hover:bg-glass-hover"
         style={{ paddingLeft: 8 + depth * 12 }}
       >
         {isOpen
@@ -581,7 +598,7 @@ function DirNode({
                     ? `${child} — changed by the agent, not yet reviewed`
                     : child}
                   aria-current={activePath === child ? 'true' : undefined}
-                  className={`flex w-full items-center gap-1.5 rounded py-[3px] pr-2 text-left text-[12px] ${
+                  className={`flex w-full items-center gap-1.5 rounded py-1 pr-2 text-left text-[12px] ${
                     activePath === child
                       ? 'bg-white/[0.06] text-zinc-100'
                       : 'text-zinc-400 hover:bg-glass-hover'
@@ -869,8 +886,17 @@ export default function Code() {
   const [explorerOn, setExplorerOn] = useState(true);
   /* The agent is a pane, not a fixture: on a laptop it was taking more width
      than the editor it comments on (252px of editor at 1024 wide). Collapsible
-     from the top bar, open by default only when there is room for both. */
+     from the top bar, open by default only when there is room for both, and
+     never on the stacked layout - below `lg` it used to stack UNDER the editor
+     and, once toggled on, leave Monaco five pixels tall. */
   const [agentOn, setAgentOn] = useState(() => window.innerWidth >= 1280);
+  /* Drag-resizable, remembered across reloads. Stored as a raw number: the
+     clamp is applied on read so a window that shrank since last time cannot
+     restore a width that eats the editor. */
+  const [agentW, setAgentW] = useState(() => {
+    const raw = Number(localStorage.getItem(AGENT_STORE));
+    return Number.isFinite(raw) && raw > 0 ? clampAgentW(raw) : clampAgentW(AGENT_DEFAULT);
+  });
   /* Same reasoning as the agent: a 60px minimap leaves a 250px editor with
      almost no code. It stays available from the status bar. */
   const [minimapOn, setMinimapOn] = useState(() => window.innerWidth >= 1280);
@@ -969,6 +995,44 @@ export default function Code() {
       else localStorage.removeItem('aria.code.model');
     } catch { /* private mode: the picker still works for this session */ }
   }, [aiModel]);
+  /* Remember the agent split, and keep it inside the cap when the window
+     shrinks (a width saved on a 4K monitor must not swallow a laptop editor). */
+  useEffect(() => {
+    try {
+      localStorage.setItem(AGENT_STORE, String(Math.round(agentW)));
+    } catch { /* private mode: the width still holds for this session */ }
+  }, [agentW]);
+  useEffect(() => {
+    const onResize = () => setAgentW((w) => clampAgentW(w));
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const dragAgent = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = agentW;
+    const move = (ev: PointerEvent) => setAgentW(clampAgentW(startW - (ev.clientX - startX)));
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      document.body.style.removeProperty('cursor');
+      document.body.style.removeProperty('user-select');
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }, [agentW]);
+  /* Arrow keys resize from the splitter itself, so the panel is reachable
+     without a precise drag. Left grows the panel (it sits on the right). */
+  const nudgeAgent = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = e.shiftKey ? 48 : 16;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); setAgentW((w) => clampAgentW(w + step)); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); setAgentW((w) => clampAgentW(w - step)); }
+    else if (e.key === 'Home') { e.preventDefault(); setAgentW(clampAgentW(AGENT_MIN)); }
+    else if (e.key === 'End') { e.preventDefault(); setAgentW(clampAgentW(AGENT_MAX)); }
+  }, []);
   const [shortcuts, setShortcuts] = useState(false);
   const [search, setSearch] = useState<{ open: boolean; q: string; hits: CodeMatch[]; busy: boolean }>(
     { open: false, q: '', hits: [], busy: false });
@@ -1849,6 +1913,10 @@ const runProjectChecks = useCallback(async () => {
     return () => { live = false; ac.abort(); };
   }, []);
 
+  /* One switch for both the splitter and the pane. Zen hides the agent with
+     the rest of the chrome - the mode exists to give the file the screen. */
+  const agentOpen = agentOn && !zen;
+
   return (
     /* `.ide` scopes the editor palette (index.css): graphite chrome, a denser
        type scale and square rows. The rest of the console keeps its own look,
@@ -1860,19 +1928,25 @@ const runProjectChecks = useCallback(async () => {
         {!zen && (
           <TopBar crumb="Code">
             {dirty && <Pill tone="info">browser draft</Pill>}
+            {/* Borderless: the top bar is a title bar, not a toolbar of
+                framed buttons. The agent remains a labelled toggle because
+                its state is the one thing here that changes the layout; on
+                the stacked layout it opens the panel over the editor rather
+                than under it. */}
             <button type="button" onClick={() => setAgentOn((v) => !v)}
               aria-pressed={agentOn}
               title={agentOn ? 'Hide the agent panel' : 'Show the agent panel'}
-              className={`flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] transition-colors ${
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
                 agentOn
-                  ? 'border-zinc-600 bg-white/[0.07] text-zinc-200'
-                  : 'border-glass-border text-zinc-400 hover:bg-glass-hover'}`}>
+                  ? 'bg-white/[0.07] text-zinc-200'
+                  : 'text-zinc-400 hover:bg-glass-hover hover:text-zinc-200'}`}>
               <Sparkles size={11} /> Agent
             </button>
             <button type="button" title="Command palette (Ctrl+Shift+P)"
+              aria-label="Command palette"
               onClick={() => setPalette('cmd')}
-              className="rounded border border-glass-border px-2 py-0.5 text-[11px] text-zinc-400 hover:bg-glass-hover">
-              <Play size={11} />
+              className="rounded p-1.5 text-zinc-400 transition-colors hover:bg-glass-hover hover:text-zinc-200">
+              <Command size={12} />
             </button>
           </TopBar>
         )}
@@ -1881,7 +1955,7 @@ const runProjectChecks = useCallback(async () => {
             the explorer is `w-full`, so a row here hands it the whole viewport
             and squeezes the editor column to zero, which then overflows the
             document sideways. */}
-        <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <div className="relative flex min-h-0 flex-1 flex-col lg:flex-row">
           {/* Explorer */}
           {!zen && explorerOn && (
             <aside aria-label="Explorer"
@@ -1900,7 +1974,7 @@ const runProjectChecks = useCallback(async () => {
             {/* Tabs */}
             {!zen && (
               <div role="tablist" aria-label="Open editors"
-                className="flex flex-none items-stretch overflow-x-auto border-b border-glass-border bg-surface-0">
+                className="flex flex-none items-stretch overflow-x-auto bg-surface-0">
                 {panes.map((p, i) => {
                   const isDirty = p.body !== p.base;
                   return (
@@ -1942,50 +2016,59 @@ const runProjectChecks = useCallback(async () => {
               </div>
             )}
 
-            {/* Breadcrumbs */}
+            {/* Breadcrumbs. Quiet on purpose: the path runs along a 22px
+                strip, and the actions only appear when they apply - an
+                always-visible Definition/References/Save triplet sitting at
+                40% opacity was most of the visual noise in this column. */}
             {pane && !zen && (
               <nav aria-label="Breadcrumbs"
-                className="flex flex-none items-center gap-1 overflow-x-auto border-b border-glass-border bg-surface-1 px-3 py-1 text-[11px] text-zinc-muted">
+                className="flex flex-none items-center gap-1 overflow-x-auto border-b border-glass-border bg-surface-1 px-3 py-[3px] text-[11px] text-zinc-500">
                 {pane.path.split('/').map((seg, i, arr) => (
                   <span key={i} className="flex items-center gap-1 whitespace-nowrap">
                     {i > 0 && <ChevronRight size={10} className="text-zinc-muted/60" />}
                     <span className={i === arr.length - 1 ? 'text-zinc-300' : ''}>{seg}</span>
                   </span>
                 ))}
-                <span className="ml-auto flex items-center gap-1">
+                <span className="ml-auto flex items-center gap-0.5 pl-2">
                   {/* Editor actions live on the editor's own toolbar. They used
                       to sit in the agent panel header, which read as if the AI
-                      owned go-to-definition and saving. */}
-                  <button type="button" onClick={() => void goToDefinition()}
-                    title="Go to definition (F12)"
-                    disabled={!caretWord}
-                    className="flex flex-none items-center gap-1 rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40">
-                    <FileCode2 size={11} /> <span className="hidden xl:inline">Definition</span>
-                  </button>
-                  <button type="button"
-                    onClick={() => { if (caretWord) { setIntelWord(caretWord); setIntelOpen(true); } else flash('put the caret on a symbol first'); }}
-                    title="Find references (Shift+F12)"
-                    disabled={!caretWord}
-                    className="flex flex-none items-center gap-1 rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40">
-                    <Globe size={11} /> <span className="hidden xl:inline">References</span>
-                  </button>
-                  <button type="button" onClick={() => setSaveDiff((s) => ({ ...s, open: true }))}
-                    title="Save to disk (Ctrl+S)"
-                    disabled={!pane || !dirty}
-                    className="flex flex-none items-center gap-1 rounded border border-glass-border px-1.5 py-0.5 text-[10.5px] text-zinc-400 hover:text-zinc-200 disabled:opacity-40">
-                    <Save size={11} /> <span className="hidden xl:inline">Save</span>
-                  </button>
+                      owned go-to-definition and saving. Icon-only, and only
+                      when the caret is on a symbol. */}
+                  {caretWord && (
+                    <>
+                      <button type="button" onClick={() => void goToDefinition()}
+                        title={`Go to definition of ${caretWord} (F12)`}
+                        aria-label="Go to definition"
+                        className="flex h-[18px] w-[18px] items-center justify-center rounded text-zinc-500 hover:bg-glass-hover hover:text-zinc-200">
+                        <FileCode2 size={11} />
+                      </button>
+                      <button type="button"
+                        onClick={() => { setIntelWord(caretWord); setIntelOpen(true); }}
+                        title={`Find references to ${caretWord} (Shift+F12)`}
+                        aria-label="Find references"
+                        className="flex h-[18px] w-[18px] items-center justify-center rounded text-zinc-500 hover:bg-glass-hover hover:text-zinc-200">
+                        <Globe size={11} />
+                      </button>
+                    </>
+                  )}
+                  {dirty && (
+                    <button type="button" onClick={() => setSaveDiff((s) => ({ ...s, open: true }))}
+                      title="Save to disk (Ctrl+S)"
+                      aria-label="Save to disk"
+                      className="flex h-[18px] w-[18px] items-center justify-center rounded text-amber-300/90 hover:bg-glass-hover hover:text-amber-200">
+                      <Save size={11} />
+                    </button>
+                  )}
                   {lang === 'markdown' && (
                     <button type="button" onClick={() => setPreviewMd((v) => !v)}
                       aria-pressed={previewMd}
                       title={previewMd
                         ? 'Back to the source'
                         : 'Render this draft as markdown (the file on disk is untouched)'}
-                      className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10.5px] ${
-                        previewMd
-                          ? 'border-sky-400/50 text-sky-300'
-                          : 'border-glass-border text-zinc-400 hover:text-zinc-200'}`}>
-                      <Eye size={11} /> {previewMd ? 'Edit' : 'Preview'}
+                      aria-label={previewMd ? 'Edit markdown source' : 'Preview markdown'}
+                      className={`flex h-[18px] w-[18px] items-center justify-center rounded hover:bg-glass-hover ${
+                        previewMd ? 'text-sky-300' : 'text-zinc-500 hover:text-zinc-200'}`}>
+                      <Eye size={11} />
                     </button>
                   )}
                   {/* The language moved to the status bar; showing it here as
@@ -1993,6 +2076,87 @@ const runProjectChecks = useCallback(async () => {
                 </span>
               </nav>
             )}
+
+            {/* Workspace search */}
+            {search.open && (
+              <div className="flex flex-none flex-col border-b border-glass-border bg-surface-1">
+                <div className="flex items-center gap-2 px-3 py-2">
+                  <Search size={12} className="flex-none text-zinc-muted" />
+                  <input
+                    value={search.q}
+                    onChange={(e) => {
+                      const q = e.target.value;
+                      setSearch((s) => ({ ...s, q }));
+                      if (q.trim().length < 3) { setSearch((s) => ({ ...s, hits: [] })); return; }
+                      setSearch((s) => ({ ...s, busy: true }));
+                      /* Debounce, cancel, and drop out-of-order replies.
+                         This used to fire on every keystroke with no debounce and
+                         no AbortSignal, so typing "DOCUMENT_EMBED" queued ~10 full
+                         workspace scans; the server walked ~2100 files per request,
+                         and because those handlers are `async def` doing blocking
+                         I/O, every keystroke stalled every other /api route too.
+                         Responses also landed out of order, so an older query's
+                         results overwrote a newer one's. */
+                      searchReq.current += 1;
+                      const seq = searchReq.current;
+                      window.clearTimeout(searchTimer.current);
+                      searchAbort.current?.abort();
+                      const ac = new AbortController();
+                      searchAbort.current = ac;
+                      searchTimer.current = window.setTimeout(() => {
+                        api.codeSearch(q, 200, ac.signal)
+                          .then((r) => {
+                            if (seq !== searchReq.current) return;
+                            setSearch((s) => ({ ...s, hits: r?.matches ?? [], busy: false }));
+                          })
+                          .catch(() => {
+                            if (seq !== searchReq.current) return;
+                            if (ac.signal.aborted) return;
+                            setSearch((s) => ({ ...s, hits: [], busy: false }));
+                          });
+                      }, 250);
+                    }}
+                    onKeyDown={(e) => { if (e.key === 'Escape') setSearch((s) => ({ ...s, open: false })); }}
+                    placeholder="Search across the workspace (Ctrl+Shift+F)"
+                    aria-label="Search across the workspace"
+                    className="min-w-0 flex-1 rounded border border-glass-border bg-surface-0 px-2 py-1 text-[12px] text-zinc-100 outline-none focus:border-accent/50"
+                  />
+                  <span className="text-[10.5px] tabular-nums text-zinc-muted">
+                    {search.busy ? 'searching…'
+                      : search.q.trim().length < 3 ? 'type 3+ characters'
+                      : `${search.hits.length} match${search.hits.length === 1 ? '' : 'es'}`}
+                  </span>
+                  <button type="button" onClick={() => setSearch((s) => ({ ...s, open: false }))}
+                    aria-label="Close search"
+                    className="rounded p-0.5 text-zinc-muted hover:bg-glass-hover hover:text-zinc-200">
+                    <X size={13} />
+                  </button>
+                </div>
+                {search.hits.length > 0 && (
+                  <ul className="max-h-[24vh] overflow-y-auto border-t border-glass-border">
+                    {search.hits.map((h, i) => (
+                      <li key={`${h.path}-${h.line}-${i}`}>
+                        <button type="button"
+                          onClick={async () => {
+                            setSearch((s) => ({ ...s, open: false }));
+                            await open(h.path);
+                            /* The buffer for a newly opened file is not in this
+                               closure, so the jump is applied by an effect once the
+                               pane is actually active rather than guessed here. */
+                            setJump({ path: h.path, line: h.line, col: h.col });
+                          }}
+                          className="flex w-full items-baseline gap-2 px-3 py-1 text-left text-[11.5px] hover:bg-glass-hover">
+                          <span className="flex-none truncate text-zinc-muted">{h.path}</span>
+                          <span className="flex-none tabular-nums text-zinc-muted">{h.line}</span>
+                          <span className="min-w-0 flex-1 truncate text-zinc-300">{h.text}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
 
             {/* What the agent changed in this file, and the two ways out.
                 The lines themselves carry the marks (green added, yellow
@@ -2126,10 +2290,14 @@ const runProjectChecks = useCallback(async () => {
                       : 'border-transparent text-zinc-500 hover:bg-surface-2 hover:text-zinc-300'}`}>
                   <CircleDot size={11} />
                   Problems
-                  <span className={`rounded-sm px-1 text-[10px] tabular-nums ${
-                    problems.length ? 'bg-danger-dim text-danger' : 'bg-white/5 text-zinc-500'}`}>
-                    {problems.length}
-                  </span>
+                  {/* No badge at zero. A grey "0" is a chip whose only job is
+                      to take space; the absence of a number IS the empty state,
+                      and the panel body explains syntax-only coverage. */}
+                  {problems.length > 0 && (
+                    <span className="rounded-sm bg-danger-dim px-1 text-[10px] tabular-nums text-danger">
+                      {problems.length}
+                    </span>
+                  )}
                 </button>
                 <button type="button" role="tab"
                   aria-selected={panel === 'terminal'}
@@ -2156,7 +2324,7 @@ const runProjectChecks = useCallback(async () => {
                   onClick={() => { setPanel('problems'); void runProjectChecks(); }}
                   disabled={checksBusy}
                   aria-label="Run the project's lint, typecheck and tests"
-                  className="flex h-[21px] flex-none items-center gap-1 rounded border border-white/10 px-1.5 text-[10.5px] font-semibold text-zinc-400 hover:border-zinc-600 hover:text-zinc-200 disabled:opacity-60">
+                  className="flex h-[21px] flex-none items-center gap-1 rounded px-1.5 text-[10.5px] font-medium text-zinc-500 transition-colors hover:bg-glass-hover hover:text-zinc-200 disabled:opacity-60">
                   {checksBusy ? <Loader2 size={10} className="animate-spin" />
                     : <Play size={10} />}
                   {checksBusy ? 'running…' : 'Run checks'}
@@ -2256,14 +2424,34 @@ const runProjectChecks = useCallback(async () => {
               own instead of being handed a context slice; the trace of what it
               did is part of the answer, not a debug log. It owns its own
               conversation, abort handle and model pick. Hidden with CSS rather
-              than unmounted, so collapsing the pane cannot eat a typed draft. */}
-          <div className={agentOn
-            ? 'flex min-h-0 min-w-0 w-full flex-none lg:w-[340px] xl:w-[400px] 2xl:w-[440px]'
-            : 'hidden'}>
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col border-t border-glass-border bg-surface-0 lg:border-t-0">
+              than unmounted, so collapsing the pane cannot eat a typed draft.
+              `hidden`/`lg:flex` matters: below lg the layout stacks, and an
+              agent pane there left Monaco five pixels tall.
+
+              The splitter is a real separator: pointer drag, arrow keys, and
+              double-click to reset, with the width persisted. */}
+          {agentOpen && (
+            <div role="separator" aria-orientation="vertical"
+              aria-label="Resize the agent panel"
+              tabIndex={0}
+              aria-valuemin={AGENT_MIN} aria-valuemax={AGENT_MAX}
+              aria-valuenow={Math.round(agentW)}
+              title="Drag to resize · double-click to reset"
+              onPointerDown={dragAgent}
+              onKeyDown={nudgeAgent}
+              onDoubleClick={() => setAgentW(clampAgentW(AGENT_DEFAULT))}
+              className="group relative hidden w-[5px] flex-none cursor-col-resize outline-none focus-visible:bg-accent/20 lg:block">
+              <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-glass-border transition-colors group-hover:bg-accent/50" />
+            </div>
+          )}
+          <div className={agentOpen
+            ? 'absolute inset-0 z-30 flex w-full min-h-0 min-w-0 flex-none bg-surface-0 lg:static lg:z-auto lg:w-[var(--agent-w)]'
+            : 'hidden'}
+            style={{ '--agent-w': `${agentW}px` } as CSSProperties}>
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-surface-0">
             {/* No second "AGENT" bar above the panel's own header: the header
-                already carries the sparkle, the conversation title and the
-                file chip, and a title row over a title row is just chrome. */}
+                already carries the sparkle and the conversation title, and a
+                title row over a title row is just chrome. */}
             <AgentPanel
               path={pane?.path ?? ''}
               body={body}
@@ -2396,90 +2584,11 @@ const runProjectChecks = useCallback(async () => {
               gitBusy={gitBusy}
               gitOut={gitOut ? { text: gitOut.text, ok: !!gitOut.ok } : null}
               onGit={(t) => loadGit(t)}
+              onClose={() => setAgentOn(false)}
             />
           </div>
           </div>
         </div>
-
-        {/* Workspace search */}
-        {search.open && (
-          <div className="flex flex-none flex-col border-b border-glass-border bg-surface-1">
-            <div className="flex items-center gap-2 px-3 py-2">
-              <Search size={12} className="flex-none text-zinc-muted" />
-              <input
-                value={search.q}
-                onChange={(e) => {
-                  const q = e.target.value;
-                  setSearch((s) => ({ ...s, q }));
-                  if (q.trim().length < 3) { setSearch((s) => ({ ...s, hits: [] })); return; }
-                  setSearch((s) => ({ ...s, busy: true }));
-                  /* Debounce, cancel, and drop out-of-order replies.
-                     This used to fire on every keystroke with no debounce and
-                     no AbortSignal, so typing "DOCUMENT_EMBED" queued ~10 full
-                     workspace scans; the server walked ~2100 files per request,
-                     and because those handlers are `async def` doing blocking
-                     I/O, every keystroke stalled every other /api route too.
-                     Responses also landed out of order, so an older query's
-                     results overwrote a newer one's. */
-                  searchReq.current += 1;
-                  const seq = searchReq.current;
-                  window.clearTimeout(searchTimer.current);
-                  searchAbort.current?.abort();
-                  const ac = new AbortController();
-                  searchAbort.current = ac;
-                  searchTimer.current = window.setTimeout(() => {
-                    api.codeSearch(q, 200, ac.signal)
-                      .then((r) => {
-                        if (seq !== searchReq.current) return;
-                        setSearch((s) => ({ ...s, hits: r?.matches ?? [], busy: false }));
-                      })
-                      .catch(() => {
-                        if (seq !== searchReq.current) return;
-                        if (ac.signal.aborted) return;
-                        setSearch((s) => ({ ...s, hits: [], busy: false }));
-                      });
-                  }, 250);
-                }}
-                onKeyDown={(e) => { if (e.key === 'Escape') setSearch((s) => ({ ...s, open: false })); }}
-                placeholder="Search across the workspace (Ctrl+Shift+F)"
-                aria-label="Search across the workspace"
-                className="min-w-0 flex-1 rounded border border-glass-border bg-surface-0 px-2 py-1 text-[12px] text-zinc-100 outline-none focus:border-accent/50"
-              />
-              <span className="text-[10.5px] tabular-nums text-zinc-muted">
-                {search.busy ? 'searching…'
-                  : search.q.trim().length < 3 ? 'type 3+ characters'
-                  : `${search.hits.length} match${search.hits.length === 1 ? '' : 'es'}`}
-              </span>
-              <button type="button" onClick={() => setSearch((s) => ({ ...s, open: false }))}
-                aria-label="Close search"
-                className="rounded p-0.5 text-zinc-muted hover:bg-glass-hover hover:text-zinc-200">
-                <X size={13} />
-              </button>
-            </div>
-            {search.hits.length > 0 && (
-              <ul className="max-h-[24vh] overflow-y-auto border-t border-glass-border">
-                {search.hits.map((h, i) => (
-                  <li key={`${h.path}-${h.line}-${i}`}>
-                    <button type="button"
-                      onClick={async () => {
-                        setSearch((s) => ({ ...s, open: false }));
-                        await open(h.path);
-                        /* The buffer for a newly opened file is not in this
-                           closure, so the jump is applied by an effect once the
-                           pane is actually active rather than guessed here. */
-                        setJump({ path: h.path, line: h.line, col: h.col });
-                      }}
-                      className="flex w-full items-baseline gap-2 px-3 py-1 text-left text-[11.5px] hover:bg-glass-hover">
-                      <span className="flex-none truncate text-zinc-muted">{h.path}</span>
-                      <span className="flex-none tabular-nums text-zinc-muted">{h.line}</span>
-                      <span className="min-w-0 flex-1 truncate text-zinc-300">{h.text}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
 
         {/* Stale-source notice */}
         {stale && (
@@ -2496,28 +2605,23 @@ const runProjectChecks = useCallback(async () => {
           </div>
         )}
 
-        {/* Status bar. The agent-writes notice lives HERE, not in the top bar:
-            it is standing context about how this workspace behaves, and the
-            status bar is where an editor keeps that (branch, remote,
-            encoding). In the top bar it competed with the breadcrumb for
-            attention every second. */}
-        <div className="ide-status flex flex-none items-center gap-x-3 overflow-hidden whitespace-nowrap border-t border-glass-border bg-surface-0 px-3 py-1 text-[10.5px] text-zinc-muted">
-          <span className="hidden flex-none items-center gap-1 text-zinc-500 xl:flex" title="The coding agent writes straight to the workspace; every change is marked in the editor and can be kept or reverted per file afterwards.">
-            <ShieldQuestion size={10} /> agent auto-applies · review after
+        {/* Status bar. Left: standing context about this workspace, in the
+            fewest words that stay honest. Right: where the caret is and the
+            toggles that change the editor. Spaces/UTF-8/chars were fixed facts
+            about every file here; printing them cost attention every second
+            and told the user nothing they could act on. The problems count
+            lives on the Problems tab directly above, so it is not repeated. */}
+        <div className="ide-status flex flex-none items-center gap-x-3 overflow-hidden whitespace-nowrap border-t border-glass-border bg-surface-0 px-3 py-0.5 text-[10.5px] text-zinc-muted">
+          <span className="hidden flex-none items-center gap-1 text-zinc-500 xl:flex"
+                title="The coding agent writes straight to the workspace; every change is marked in the editor and can be kept or reverted per file afterwards.">
+            <ShieldQuestion size={10} /> agent writes
           </span>
-          {problems.length > 0 && (
-            <span className="flex-none text-rose-400">{problems.length} error{problems.length === 1 ? '' : 's'}</span>
-          )}
-          {/* Right cluster in VS Code's order: cursor, then text settings, then
-              the toggles. The language used to sit on the far left wearing an
-              icon, in front of Ln/Col, which read like a stray filter chip. */}
+          {/* Right cluster in VS Code's order: cursor, then the language, then
+              the toggles. Selection and folds only appear when they exist. */}
           <span className="ml-auto flex min-w-0 flex-none items-center gap-x-3">
             <span className="flex-none">Ln {cursor.line}, Col {cursor.col}</span>
             {selLen > 0 && <span className="hidden flex-none xl:inline">({selLen} selected)</span>}
             {folded > 0 && <span className="hidden flex-none xl:inline">{folded} folded</span>}
-            <span className="hidden flex-none xl:inline">Spaces: 4</span>
-            <span className="hidden flex-none xl:inline">UTF-8</span>
-            <span className="hidden flex-none 2xl:inline">{body.length} chars</span>
             <span className="flex-none">{pane ? LANG_LABEL[lang] ?? lang : 'no file'}</span>
             <span className="flex flex-none items-center gap-0.5">
               <button type="button" onClick={() => setOutlineOn((v) => !v)}
@@ -2554,10 +2658,11 @@ const runProjectChecks = useCallback(async () => {
               </button>
             </span>
           </span>
+          {/* Transient feedback only. The old static "draft stays in this
+              browser" sentence shared this row with real state and read as
+              more chrome; the dirty pill in the title bar says it when true. */}
           <span className="flex min-w-0 items-center" role="status">
-            {note
-              ? <span className="truncate text-accent/90">{note}</span>
-              : <span className="hidden truncate 2xl:inline">draft stays in this browser until saved</span>}
+            {note && <span className="truncate text-accent/90">{note}</span>}
           </span>
         </div>
 

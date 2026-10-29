@@ -32,6 +32,9 @@ function uiConf(detail: TrackerAppDetail | null) {
 export default function Apps() {
   const mainId = useMainId();
   const [tiles, setTiles] = useState({ gw: false, sess: 0, jobs: 0, tools: '—', spend: '—' });
+  /* First paint. The tiles used to render their defaults as facts: "GATEWAY
+     down" in red and six zeroes while the board was still reading. */
+  const [loaded, setLoaded] = useState(false);
   const [spend, setSpend] = useState<{ skill: string; dollars: number }[]>([]);
   const [feed, setFeed] = useState<FeedEvent[]>([]);
   const [flags, setFlags] = useState<FlagRow[]>([]);
@@ -119,6 +122,7 @@ export default function Apps() {
     if (tr) setTrackers(tr.apps || []);
     setFeedback(fb);
     setMcp(mst);
+    setLoaded(true);
   }, []);
 
   const openApp = useCallback(async (id: string) => {
@@ -644,12 +648,13 @@ export default function Apps() {
         ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
-            <Stat k="AGENT" v="up" s={`:${CONF.agentPort}`} tone="ok" />
-            <Stat k="GATEWAY" v={tiles.gw ? 'up' : 'down'} s={`:${CONF.gatewayPort}`} tone={tiles.gw ? 'ok' : 'bad'} />
-            <Stat k="SESSIONS" v={String(tiles.sess)} s="first 200 listed" />
-            <Stat k="JOBS ARMED" v={String(tiles.jobs)} s="scheduler" />
-            <Stat k="TOOLS LIVE" v={tiles.tools} s="of catalog" />
-            <Stat k="SPEND" v={tiles.spend} s="lifetime USD" />
+            <Stat k="AGENT" v="up" s={`:${CONF.agentPort}`} tone="ok" loading={!loaded} />
+            <Stat k="GATEWAY" v={tiles.gw ? 'up' : 'down'} s={`:${CONF.gatewayPort}`}
+              tone={tiles.gw ? 'ok' : 'bad'} loading={!loaded} />
+            <Stat k="SESSIONS" v={String(tiles.sess)} s="first 200 listed" loading={!loaded} />
+            <Stat k="JOBS ARMED" v={String(tiles.jobs)} s="scheduler" loading={!loaded} />
+            <Stat k="TOOLS LIVE" v={tiles.tools} s="of catalog" loading={!loaded} />
+            <Stat k="SPEND" v={tiles.spend} s="lifetime USD" loading={!loaded} />
           </div>
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">
             FLAGS & CONFIG
@@ -692,7 +697,7 @@ export default function Apps() {
                   <span className="flex-none font-mono text-zinc-300">{String(f.value)}</span>
                 )}
                 {f.source === 'override' && (
-                  <button onClick={() => revert(f)} className="flex-none text-[11px] text-zinc-muted underline hover:text-zinc-300">
+                  <button onClick={() => revert(f)} className="flex-none py-1 text-[11px] leading-4 text-zinc-muted underline hover:text-zinc-300">
                     revert
                   </button>
                 )}

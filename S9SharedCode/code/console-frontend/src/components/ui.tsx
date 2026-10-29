@@ -1,18 +1,19 @@
 /* Shared shell bits: rail, topbar, stats, cards, empty states, hooks. */
 import {
-  createContext, memo, useCallback, useContext, useEffect, useMemo, useState,
-  type ReactNode,
+  createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef,
+  useState, useSyncExternalStore, type ReactNode,
 } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { motion } from 'motion/react';
 import {
   Zap, MessageSquare, Play, Database, Search, CalendarDays, Package,
   LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2, FileOutput,
-  TriangleAlert, Boxes, Monitor,
+  TriangleAlert, Boxes, Monitor, PanelLeftClose, PanelLeftOpen,
 } from 'lucide-react';
 import { api, CONF } from '../api';
 import { openCommandPalette } from '../lib/palette';
 import { prefetchSection } from '../lib/prefetch';
+import { useSectionActive } from './KeepAlive';
 
 /* One health poll for the whole shell.
  *
@@ -21,16 +22,16 @@ import { prefetchSection } from '../lib/prefetch';
  * renders a single banner from it. Before this, the Rail, Chat and Research
  * each ran their own 15 s poll, and no page outside those three said anything
  * at all when the gateway died. */
-type HealthState = { up: boolean; checked: boolean; refresh: () => void };
+type HealthState = { up: boolean; checked: boolean; refresh: (fresh?: boolean) => Promise<void> };
 
 const HealthCtx = createContext<HealthState | null>(null);
 
 export function HealthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<{ up: boolean; checked: boolean }>(
     { up: false, checked: false });
-  const tick = useCallback(async () => {
+  const tick = useCallback(async (fresh = false) => {
     try {
-      const h = await api.health();
+      const h = await api.health(fresh);
       setState({ up: h.gateway_up !== false, checked: true });
     } catch {
       setState({ up: false, checked: true });
@@ -67,10 +68,12 @@ export function GatewayDownBanner() {
         needs a model will fail. The agent is still up.
       </span>
       <button type="button" disabled={busy}
-        onClick={() => {
+        onClick={async () => {
           setBusy(true);
-          h.refresh();
-          window.setTimeout(() => setBusy(false), 900);
+          /* `true` = ask the server to probe NOW. The plain poll may answer
+             from its 8s cache; a Retry that re-read the cached "up" cleared
+             this banner while the gateway was still dead. */
+          try { await h.refresh(true); } finally { setBusy(false); }
         }}
         className="flex-none rounded-md border border-amber-400/50 px-2.5 py-1 text-[11.5px] font-semibold hover:bg-amber-400/20 disabled:opacity-60">
         {busy ? 'Checking…' : 'Retry'}
@@ -110,15 +113,153 @@ export const RAIL: { group: string; items: { to: string; label: string; icon: Re
   ]},
 ];
 
+/* ── rail pinning ───────────────────────────────────────────────────────────
+ * The nav is a fixed 200px every view pays for, on every screen. On a 1440px
+ * laptop that is the difference between a ~580px editor and a ~780px one.
+ *
+ * Pinned by default: the nav stays discoverable, the tab order is unchanged and
+ * existing routes/tests keep working. The brand row carries a collapse button.
+ * Once collapsed the rail leaves the flex flow entirely — the view reclaims the
+ * full width — and an 8px strip on the left edge (or keyboard focus) slides it
+ * back as an overlay. Pinning it again puts it back in flow.
+ *
+ * The state lives at module scope, not in the component: every visited section
+ * keeps its own `<Rail/>` mounted, and per-component state would leave the next
+ * section pinned after the user collapsed it on this one.
+ */
+const RAIL_PIN_KEY = 'aria.rail.pinned';
+const readRailPinned = () => {
+  try { return localStorage.getItem(RAIL_PIN_KEY) !== '0'; } catch { return true; }
+};
+let railPinned = readRailPinned();
+const railListeners = new Set<() => void>();
+function setRailPinned(next: boolean): void {
+  railPinned = next;
+  try { localStorage.setItem(RAIL_PIN_KEY, next ? '1' : '0'); } catch { /* storage off */ }
+  for (const f of railListeners) f();
+}
+const subscribeRail = (f: () => void) => {
+  railListeners.add(f);
+  return () => { railListeners.delete(f); };
+};
+const getRailPinned = () => railPinned;
+
+/* The rail is a top strip below `lg` and a column above it, so a rule that only
+ * applies to the column (out of flow, inert while closed) has to ask the
+ * viewport. matchMedia rather than a resize listener: it fires on the exact
+ * boundary the CSS uses. */
+const WIDE_Q = '(min-width: 1024px)';
+function subscribeWide(f: () => void) {
+  const mq = window.matchMedia(WIDE_Q);
+  mq.addEventListener('change', f);
+  return () => mq.removeEventListener('change', f);
+}
+const useWide = () => useSyncExternalStore(
+  subscribeWide, () => window.matchMedia(WIDE_Q).matches, () => false);
+
 export const Rail = memo(function Rail() {
   const loc = useLocation();
   const up = useHealth();
+  /* Pinned = in flow. Unpinned = out of flow, hidden to the left, revealed on
+     demand. `peek` is the transient hover/focus reveal; it is local because
+     only the visible section's rail can be pointed at. */
+  const pinned = useSyncExternalStore(subscribeRail, getRailPinned, getRailPinned);
+  const [peek, setPeek] = useState(false);
+  const hideTimer = useRef(0);
+  const cancelHide = useCallback(() => {
+    if (hideTimer.current) {
+      window.clearTimeout(hideTimer.current);
+      hideTimer.current = 0;
+    }
+  }, []);
+  const show = useCallback(() => {
+    cancelHide();
+    setPeek(true);
+  }, [cancelHide]);
+  const hideSoon = useCallback(() => {
+    cancelHide();
+    hideTimer.current = window.setTimeout(() => setPeek(false), 180);
+  }, [cancelHide]);
+  useEffect(() => cancelHide, [cancelHide]);
+  /* Escape closes a transient reveal without touching the pin state. */
+  useEffect(() => {
+    if (!peek) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setPeek(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [peek]);
+  /* The aside only receives `pointerenter` when the pointer crosses its edge.
+     A rail that appeared UNDER a stationary pointer (the usual case: the edge
+     strip opened it) never gets one, so its `pointerleave` alone can leave the
+     panel stuck open. Watch the pointer position instead: 208px is the rail
+     plus a small grace band on its border. */
+  useEffect(() => {
+    if (pinned || !peek) return;
+    const onMove = (e: PointerEvent) => {
+      if (e.clientX > 208) hideSoon();
+    };
+    window.addEventListener('pointermove', onMove, { passive: true });
+    return () => window.removeEventListener('pointermove', onMove);
+  }, [pinned, peek, hideSoon]);
+  const open = pinned || peek;
+  const wide = useWide();
+  /* The phone rail is a horizontal strip, and the active item can be off the
+   * right edge: opening /settings or /computer directly (bookmark, the desktop
+   * shell restoring the last route, a deep link from a run) showed the first
+   * seven items and no sign of where you were. Bring the active item into
+   * view BEFORE paint, and only scroll as far as needed so clicking a
+   * partially visible item does not jerk the strip to the centre. */
+  const navRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    const nav = navRef.current;
+    if (!nav || wide) return;
+    if (nav.scrollWidth <= nav.clientWidth + 1) return;
+    const act = nav.querySelector<HTMLElement>('[aria-current="page"]');
+    if (!act) return;
+    const nr = nav.getBoundingClientRect();
+    const ar = act.getBoundingClientRect();
+    if (ar.left < nr.left) nav.scrollLeft += ar.left - nr.left - 8;
+    else if (ar.right > nr.right) nav.scrollLeft += ar.right - nr.right + 8;
+  }, [loc.pathname, wide]);
+  /* A nav slid off-screen must not stay in the tab order. Without this, the
+     first Tab from the address bar focused an invisible link 200px to the
+     left (which then revealed the rail under the user's cursor), and getting
+     to the page meant tabbing through seventeen invisible stops. `inert` is
+     the only way to remove a subtree from both focus order and the a11y tree;
+     it is applied only where the rail is actually out of flow. */
+  const closed = wide && !open;
   return (
-    /* Below lg the rail is a horizontal, scrollable icon strip pinned to the
-       top of the stack. It used to stay a fixed 52px *column* beside a fixed
-       248px list pane, so on a 390px viewport the content column collapsed to
-       ~90px and every page scrolled sideways with one letter per line. */
-    <aside className="flex w-full flex-none flex-row items-center gap-1 overflow-x-auto border-b border-glass-border bg-surface-0 px-2 py-1.5 lg:h-full lg:w-[200px] lg:flex-col lg:items-stretch lg:overflow-x-hidden lg:overflow-y-auto lg:border-b-0 lg:border-r lg:px-0 lg:py-0">
+    <>
+      {/* The edge trigger. Invisible apart from a 2px hairline, so the collapsed
+          state still shows WHERE the nav comes back from. Hidden while pinned
+          (the rail itself is there) and below lg (where the rail is a top
+          strip, not a column). */}
+      {!pinned && wide && (
+        <div
+          aria-hidden
+          onPointerEnter={show}
+          className="group fixed inset-y-0 left-0 z-30 hidden w-2 lg:block"
+        >
+          <span className="absolute inset-y-0 left-0 w-[2px] bg-white/10 transition-colors group-hover:bg-accent/60" />
+        </div>
+      )}
+      <aside
+        id="primary-rail"
+        inert={closed}
+        onPointerEnter={pinned ? undefined : show}
+        onPointerLeave={pinned ? undefined : hideSoon}
+        onFocusCapture={pinned ? undefined : show}
+        onBlurCapture={pinned ? undefined : (e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) hideSoon();
+        }}
+        className={`flex w-full flex-none flex-row items-center gap-1 overflow-x-auto border-b border-glass-border bg-surface-0 px-2 py-1.5 lg:h-full lg:w-[200px] lg:flex-col lg:items-stretch lg:overflow-x-hidden lg:overflow-y-auto lg:border-b-0 lg:border-r lg:px-0 lg:py-0 ${
+          pinned
+            ? 'lg:relative'
+            : `lg:absolute lg:inset-y-0 lg:left-0 lg:z-40 lg:shadow-2xl lg:transition-transform lg:duration-200 lg:ease-out motion-reduce:lg:transition-none ${
+              open ? 'lg:translate-x-0' : 'lg:-translate-x-full'
+            }`
+        }`}
+      >
       {/* Brand — the topbar already names the product, so the strip skips it. */}
       <div className="hidden flex-none items-center gap-2.5 px-4 pb-3 pt-4 lg:flex">
         <div className="flex h-7 w-7 flex-none items-center justify-center rounded-lg bg-accent/15" title="Aria">
@@ -137,6 +278,27 @@ export const Rail = memo(function Rail() {
         >
           <Search size={13} />
         </button>
+        {/* Collapse / pin. Kept in the brand row, not a floating control: it is
+            a property of the nav, and it needs to be visible exactly when the
+            nav is (so it can put it back). */}
+        <button
+          type="button"
+          onClick={(e) => {
+            const next = !pinned;
+            setRailPinned(next);
+            setPeek(false);
+            if (!next) e.currentTarget.blur();
+          }}
+          title={pinned
+            ? 'Hide the navigation — hover the left edge to bring it back'
+            : 'Keep the navigation open'}
+          aria-label={pinned ? 'Hide navigation' : 'Pin navigation'}
+          aria-expanded={open}
+          aria-controls="primary-rail"
+          className="flex h-6 flex-none items-center rounded-md px-1 text-zinc-500 transition-colors hover:bg-glass-hover hover:text-zinc-300"
+        >
+          {pinned ? <PanelLeftClose size={13} /> : <PanelLeftOpen size={13} />}
+        </button>
       </div>
 
       {/* Nav groups (icon-only below lg).
@@ -146,7 +308,12 @@ export const Rail = memo(function Rail() {
           grows the whole document instead of scrolling. That stayed hidden
           while the strip fitted a 390px phone; adding a 12th item pushed it
           over and every page became 594px wide with one icon per line. */}
-      <nav className="flex min-h-0 min-w-0 flex-1 items-center gap-1 overflow-x-auto px-0.5 lg:flex-col lg:items-stretch lg:overflow-x-visible lg:px-2 lg:pb-3" aria-label="Primary">
+      {/* The nav scrolls on its own at desktop. With `overflow-y: visible` a
+          700px-tall window (the desktop shell's own minimum) overflowed by
+          32px and the last item, Settings, painted over the status footer.
+          The rail's own overflow-y-auto never engaged because the flex item
+          clipped the growth instead of contributing scroll height. */}
+      <nav ref={navRef} className="flex min-h-0 min-w-0 flex-1 items-center gap-1 overflow-x-auto px-0.5 lg:flex-col lg:items-stretch lg:overflow-x-hidden lg:overflow-y-auto lg:px-2 lg:pb-3" aria-label="Primary">
         {RAIL.map((g, gi) => (
           <div key={g.group} className={gi > 0 ? 'ml-1 lg:ml-0 lg:mt-3' : ''}>
             <div className="mb-1.5 hidden px-2.5 text-[10px] font-bold tracking-[0.16em] text-zinc-muted uppercase lg:block">
@@ -162,7 +329,7 @@ export const Rail = memo(function Rail() {
                     title={it.label}
                     aria-label={it.label}
                     aria-current={on ? 'page' : undefined}
-                    className={`group relative flex flex-none items-center justify-center gap-2.5 rounded-lg px-3 py-3 text-[13px] transition-all duration-[250ms] ease-out lg:flex-initial lg:justify-start lg:px-2.5 lg:py-[6px] ${
+                    className={`group relative flex flex-none items-center justify-center gap-2.5 rounded-lg px-3 py-3 text-[13px] transition-colors duration-200 ease-out lg:flex-initial lg:justify-start lg:px-2.5 lg:py-[6px] ${
                       on
                         ? 'bg-white/[0.06] font-semibold text-zinc-100'
                         : 'text-zinc-400 hover:bg-glass-hover hover:text-zinc-200'
@@ -205,7 +372,8 @@ export const Rail = memo(function Rail() {
         <span className={`status-dot flex-none ${up ? 'status-dot-ok' : 'status-dot-bad'}`} role="status" aria-label={up ? 'agent and gateway connected' : 'connecting'} />
         <span className="text-[11px] text-zinc-muted">{up ? 'agent + gateway' : 'connecting…'}</span>
       </div>
-    </aside>
+      </aside>
+    </>
   );
 });
 
@@ -213,16 +381,41 @@ export const TopBar = memo(function TopBar({ crumb, children }: { crumb: string;
   /* Every view renders a TopBar, so this is the one place that can give each
      route an identity. `document.title` was the static "Aria · Research" on
      all fifteen routes, so a screen reader, a bookmark and the browser tab
-     history could not tell you where you were. */
+     history could not tell you where you were.
+
+     It must follow VISIBILITY, not just mounting. Keep-alive hides a visited
+     view instead of unmounting it, so going Back to Documents did not remount
+     its TopBar and the tab kept saying "Aria · Runs" while the URL and page
+     were Documents. The effect now runs when the section becomes active
+     again; hidden sections are explicitly skipped so their (still mounted)
+     TopBars cannot fight over the title. */
+  const active = useSectionActive();
   useEffect(() => {
-    document.title = `Aria · ${crumb}`;
-  }, [crumb]);
+    if (active) document.title = `Aria · ${crumb}`;
+  }, [active, crumb]);
+  const pinned = useSyncExternalStore(subscribeRail, getRailPinned, getRailPinned);
+  const wide = useWide();
   return (
     /* The control cluster used to be a bare `flex-1` spacer plus siblings, so
        a wide pill row (status + Download + Copy) pushed the header past the
        viewport and gave the whole page a horizontal scrollbar. It wraps now
        and right-aligns itself. */
     <div className="glass sticky top-0 z-10 flex items-center gap-2 px-4 py-2.5">
+      {/* The way back. A collapsed nav that can only be restored by finding a
+          two-pixel edge is not restorable in practice: the toggle went off
+          screen with the rail, so the top bar carries one too. It reads as
+          "show", not "pin", because one click puts the nav back in flow. */}
+      {wide && !pinned && (
+        <button
+          type="button"
+          onClick={() => setRailPinned(true)}
+          title="Show the navigation"
+          aria-label="Show navigation"
+          className="flex h-6 flex-none items-center rounded-md px-1 text-zinc-500 transition-colors hover:bg-glass-hover hover:text-zinc-300"
+        >
+          <PanelLeftOpen size={13} />
+        </button>
+      )}
       <span className="flex flex-none items-center gap-1.5 text-[13px] font-semibold">
         {/* Below lg the rail's brand row is hidden, so the wordmark rides
             here; on desktop the rail already says "Aria", and a second badge
@@ -237,15 +430,20 @@ export const TopBar = memo(function TopBar({ crumb, children }: { crumb: string;
   );
 });
 
-export const Stat = memo(function Stat({ k, v, s, tone, accent }: {
+export const Stat = memo(function Stat({ k, v, s, tone, accent, loading }: {
   k: string;
   v: string;
   s?: string;
   tone?: 'ok' | 'bad' | 'warn';
   accent?: string;
+  /** First paint: the view has not read its list yet. Rendering the `0` /
+   *  `down` default here asserts a fact nobody has checked — a fresh
+   *  Documents page said "DOCUMENTS 0" for 650ms and an Apps tile said
+   *  "GATEWAY down" (red) until the health read landed. */
+  loading?: boolean;
 }) {
-  const accentColor = tone === 'ok' ? 'var(--color-ok)' : tone === 'bad' ? 'var(--color-danger)' : tone === 'warn' ? 'var(--color-warn)' : accent || 'var(--color-accent)';
-  const valueColor = tone === 'ok' ? 'text-ok' : tone === 'bad' ? 'text-danger' : tone === 'warn' ? 'text-warn' : '';
+  const accentColor = loading ? 'var(--color-muted)' : tone === 'ok' ? 'var(--color-ok)' : tone === 'bad' ? 'var(--color-danger)' : tone === 'warn' ? 'var(--color-warn)' : accent || 'var(--color-accent)';
+  const valueColor = loading ? 'text-zinc-muted' : tone === 'ok' ? 'text-ok' : tone === 'bad' ? 'text-danger' : tone === 'warn' ? 'text-warn' : '';
 
   return (
     <div className="instrument-card min-w-[116px] flex-1 p-3.5" style={{ '--accent-line': accentColor } as React.CSSProperties}>
@@ -256,7 +454,10 @@ export const Stat = memo(function Stat({ k, v, s, tone, accent }: {
           re-derives the whole row's distribution and rewraps it, pushing every
           section below down - 0.17 CLS on Apps, the worst remaining on the
           site. Numbers must not reflow their container. */}
-      <div className={`mt-1 min-w-[3ch] whitespace-nowrap text-xl font-bold tabular-nums ${valueColor}`}>{v}</div>
+      <div
+        className={`mt-1 min-w-[3ch] whitespace-nowrap text-xl font-bold tabular-nums ${valueColor}`}
+        aria-busy={loading || undefined}
+      >{loading ? '—' : v}</div>
       {s && <div className="mt-0.5 truncate text-[11px] text-zinc-muted">{s}</div>}
     </div>
   );

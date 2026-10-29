@@ -114,6 +114,47 @@ def test_toggle_is_scoped_to_its_own_conversation(monkeypatch):
     _reset_prefs("conv-b")
 
 
+def test_memory_block_honours_docs_off(monkeypatch):
+    """The uploaded-document chunk reached MEMORY HITS in a thread with
+    documents switched OFF: `_chat_memory_block` read the GLOBAL enabled set,
+    so the toggle governed retrieval tools but not the one block that is
+    injected into every chat prompt."""
+    import memory as mem
+
+    seen = {}
+
+    def _read(query, **kw):
+        seen.update(kw)
+        return [{"descriptor": "chunk from the uploaded document",
+                 "kind": "document"}]
+
+    monkeypatch.setattr(mem, "read", _read)
+    block = agent_server._chat_memory_block("what does the doc say?", "s1",
+                                            set())
+    # Nothing is read from the document drawer at all - filtering after the
+    # ranking would still spend a slot and a record without doc_id would pass.
+    assert "document" not in (seen.get("drawers") or []), seen
+    assert seen.get("doc_ids") == set(), seen
+    assert "uploaded document" not in block
+
+
+def test_memory_block_passes_the_conversations_own_document_set(monkeypatch):
+    """Docs on: exactly this conversation's documents may answer, not every
+    enabled document in the registry."""
+    import memory as mem
+
+    seen = {}
+
+    def _read(query, **kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr(mem, "read", _read)
+    agent_server._chat_memory_block("q", "s1", {"doc-a"})
+    assert seen.get("doc_ids") == {"doc-a"}, seen
+    assert "document" in (seen.get("drawers") or []), seen
+
+
 def test_preference_round_trips_through_the_http_endpoint():
     from fastapi.testclient import TestClient
 
@@ -128,3 +169,70 @@ def test_preference_round_trips_through_the_http_endpoint():
         bad = client.post(f"/api/chat/threads/{CONV}/prefs", json={"use_documents": "maybe"})
         assert bad.status_code == 400, bad.text
     _reset_prefs(CONV)
+
+
+# ── the toggle must reach the DAG/Research worker, not just the light chat ──
+#
+# `_stream_run` is a SEPARATE function from the /api/chat handler that owns the
+# request body, so reading `body` inside it is a NameError - and it was:
+# every research run died with "name 'body' is not defined" before the first
+# node. The suite missed it because the route-level tests replace `_stream_run`
+# with a fake. These drive the real one with the orchestrator stubbed out.
+
+def _stream_once(monkeypatch, conversation_id: str, body):
+    """Run `_stream_run` to completion, returning (frames, captured kwargs)."""
+    import asyncio
+
+    import gateway
+
+    monkeypatch.setattr(agent_server, "_GATEWAY_WARMUP_THREAD", None)
+    monkeypatch.setattr(agent_server, "_EMBEDDER_WARMUP_THREAD", None)
+    monkeypatch.setattr(gateway, "ensure_gateway", lambda *a, **k: True)
+    monkeypatch.setattr(agent_server, "_session_cost_breakdown",
+                        lambda sid: {})
+    monkeypatch.setattr(agent_server, "_session_cost_delta",
+                        lambda sid, before: {})
+    monkeypatch.setattr(agent_server, "_record_turn_cost",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(agent_server, "resolve_session",
+                        lambda _cid: "s8-docs-stream")
+    seen = {}
+
+    def _run(*_a, **kw):
+        seen.update(kw)
+        return "ok"
+
+    monkeypatch.setattr(agent_server, "_run_orchestrator", _run)
+
+    resp = agent_server._stream_run("what does the doc say?", conversation_id,
+                                    body=body)
+
+    async def _go():
+        return [f async for f in resp.body_iterator]
+
+    return asyncio.run(_go()), seen
+
+
+def test_docs_off_preference_reaches_the_orchestrator(monkeypatch):
+    agent_server._chat_prefs("ct-docs-stream", use_documents=False)
+    try:
+        frames, seen = _stream_once(monkeypatch, "ct-docs-stream", None)
+    finally:
+        _reset_prefs("ct-docs-stream")
+    assert seen.get("doc_ids") == set(), (
+        "the stored docs-off toggle never reached the run: "
+        f"{seen.get('doc_ids')!r}")
+    assert not any('"error"' in str(f) for f in frames), frames
+
+
+def test_per_turn_use_documents_false_reaches_the_orchestrator(monkeypatch):
+    """A body-level OFF wins for THIS turn even when the stored pref is on."""
+    agent_server._chat_prefs("ct-docs-stream-body", use_documents=True)
+    try:
+        frames, seen = _stream_once(monkeypatch, "ct-docs-stream-body",
+                                    {"use_documents": False})
+    finally:
+        _reset_prefs("ct-docs-stream-body")
+    assert seen.get("doc_ids") == set(), seen.get("doc_ids")
+    assert not any('"error"' in str(f) for f in frames), frames
+

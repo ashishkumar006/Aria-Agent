@@ -88,14 +88,25 @@ def _is_up() -> bool:
     token path was right, every probe 401'd, the running gateway was reported
     down, and `ensure_gateway()` tried to launch a second copy on a port already
     in use and then failed with "failed to start within 45s".
+
+    A connection-level failure ends the probe. The three paths share one host,
+    so when nothing is listening the other two cannot answer either - trying
+    them just multiplied the timeout by three. On this box a closed loopback
+    port silently drops the SYN (it does not refuse), so a dead gateway cost
+    3 x 2s before `/api/health` could say so.
     """
     for path in ("/health", "/healthz", "/v1/routers"):
         try:
-            r = _client().get(f"{GATEWAY_URL}{path}", timeout=2.0)
-            if r.status_code < 500:
-                return True
+            r = _client().get(f"{GATEWAY_URL}{path}", timeout=1.0)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            return False
         except Exception:
             continue
+        if r.status_code == 404:
+            # This gateway version does not implement the path; try the next.
+            continue
+        if r.status_code < 500:
+            return True
     return False
 
 

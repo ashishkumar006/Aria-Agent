@@ -86,29 +86,36 @@ document carries one Sources section built from that list.
 ## FINDINGS LENGTH
 
 `findings` is continuous prose — the way a person who read all your pages would
-write it up. Not a list, not a table, not one entry per source.
+write it up.
 
-- Write **1,500–4,000 words** for a normal single-facet question, and up to
-  6,000 when the material carries it.
-- **Every page you fetched gets written up.** Go through the pages one after
-  another and report what each actually says. Five pages fetched is five pages
-  written up; a page you used for two sentences was a wasted fetch. As a rule
-  of thumb: **your findings should be at least 200 words for every page you
-  fetched.** Six pages is at least 1,200 words.
-- **Before you finish, count the words in `findings`.** If it is under 1,200 and
-  you fetched more than two pages, you have not written up the pages yet — go
-  back and continue. This is the single most common failure: writing a tidy
-  digest of three sentences and calling it finished.
-- Organise by subtopic with the specifics attached: every figure with its unit
+**Your job is to ARRANGE the evidence, not to condense it.** You are the only
+node that sees the pages. The formatter below you stitches your evidence (and
+your siblings') into the final answer; it can organise the material, but it
+cannot invent a fact you left out. So: keep every fact you read, and organise
+the write-up by subtopic so the next node can find it. What you may drop is page
+chrome, navigation, adverts, and repeated boilerplate — never content.
+
+- **Every page you fetched gets written up in full.** Go through the pages one
+  after another and report what each actually says. Five pages fetched is five
+  pages written up; a page you used for two sentences was a wasted fetch. As a
+  rule of thumb: **at least 200 words per page you fetched.** Six pages is at
+  least 1,200 words.
+- **Before you finish, count the words in `findings`.** If it is under 200 per
+  page you fetched, you have not written the pages up yet — go back and
+  continue.
+- If a page has ten facts, write up ten facts. If a table has twenty rows, the
+  values that answer the question must appear; do not replace them with "a
+  range of figures".
+- Organise by subtopic, with the specifics attached: every figure with its unit
   and date, every mechanism with the step that makes it work, every table
   reproduced as values rather than described.
 - Attribute in the sentence ("Vitruvius reports…", "the 1979 study found…").
   No reference numbers or bracketed markers in the body.
-- Do not pad — no restatement of your own headings, no closing paragraph that
-  repeats the body. Padding and brevity are different failures; write densely,
-  and keep going while fetched material is left unused. If a subtopic still has
-  material in your pages, it is not finished.
-- If a subtopic still has material left in your pages, it is not finished.
+- Do not pad with your own headings or a closing paragraph that repeats the
+  body. Padding is restating what you already wrote; more evidence from your
+  pages is never padding.
+- There is no upper limit. A long, well-organised write-up is the correct
+  output; the formatter will use all of it.
 
 ## Conflicts
 

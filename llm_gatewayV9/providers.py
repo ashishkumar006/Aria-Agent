@@ -189,6 +189,44 @@ def _inline_system_turns(messages) -> list[str]:
     return out
 
 
+def drop_empty_turns(messages) -> list[dict]:
+    """Remove conversational turns that carry nothing at all.
+
+    A transcript can contain an assistant row with `content: ""` (Aria stores
+    a surface-only answer that way). Strict OpenAI-compatible backends reject
+    the WHOLE request when that row is replayed - kilo/Cohere: "invalid
+    message provided at index N: must have non-empty content or tool calls" -
+    and `/v1/chat` reported the provider's 400 as a 502, so every later turn
+    of the thread failed identically. Such a row says nothing, so dropping it
+    keeps the conversation valid and loses no information.
+
+    `system`/`developer`/`tool` turns are never dropped: instructions must
+    reach the model, and tool results are paired with their `tool_call` (the
+    adapters already replace an empty result with "(no output)").
+    """
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = (m.get("role") or "").lower()
+        if role in ("system", "developer", "tool"):
+            out.append(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            has_content = any(
+                isinstance(b, dict) and (
+                    str(b.get("text") or "").strip()
+                    or b.get("image_url") or b.get("inline_data"))
+                for b in content)
+        else:
+            has_content = bool(str(content or "").strip())
+        if not has_content and not (m.get("tool_calls") or []):
+            continue
+        out.append(m)
+    return out
+
+
 def _empty_result(model: str) -> dict:
     return {
         "text": "", "tool_calls": [],

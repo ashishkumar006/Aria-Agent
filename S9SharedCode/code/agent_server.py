@@ -1471,44 +1471,79 @@ async def preview_artifact(artifact_id: str):
     import docpreview as _dp
     return _dp.preview(data, ctype)
 # ── health ──────────────────────────────────────────────────────────────────
-_GW_UP = {"up": False, "at": 0.0, "busy": False}
-def _gateway_up_cached(ttl: float = 30.0) -> bool:
-    """Gateway liveness without stalling the UI.
-    A synchronous probe costs up to ~2s (gateway cold hit), and every
-    console page polls /api/health on load — that was the "slow
-    navigation" feel. So: serve the last-known value instantly and
-    refresh it in a background thread at most once per `ttl` seconds.
+_GW_UP = {"up": False, "at": 0.0}
+_GW_PROBE_TTL = 8.0          # cache lifetime for a value we will report
+_GW_PROBE_LOCK = __import__("threading").Lock()
+
+
+def _gateway_up_now() -> bool:
+    """Probe the gateway once and publish the result.
+
+    Every caller that arrives while a probe is running waits for that same
+    probe instead of launching its own, so a console page loading eight panels
+    at once costs one probe, not eight. Bounded by `_is_up`'s 1s timeout.
     """
     import time as _t
-    import threading as _th
-    now = _t.time()
-    if now - _GW_UP["at"] > ttl and not _GW_UP["busy"]:
-        _GW_UP["busy"] = True
-        def _probe():
-            try:
-                from gateway import _is_up
-                _GW_UP["up"] = bool(_is_up())
-            except Exception:
-                _GW_UP["up"] = False
-            finally:
-                _GW_UP["at"] = _t.time()
-                _GW_UP["busy"] = False
-        _th.Thread(target=_probe, daemon=True).start()
+    with _GW_PROBE_LOCK:
+        # Another request may have refreshed it while we waited for the lock.
+        if _t.time() - _GW_UP["at"] <= 0.5:
+            return _GW_UP["up"]
+        try:
+            from gateway import _is_up
+            _GW_UP["up"] = bool(_is_up())
+        except Exception:
+            _GW_UP["up"] = False
+        _GW_UP["at"] = _t.time()
+        return _GW_UP["up"]
+
+
+def _gateway_up_cached(ttl: float = _GW_PROBE_TTL) -> bool:
+    """Last known gateway state, without blocking.
+
+    A non-blocking variant for callers that only render a hint. `/api/health`
+    deliberately does NOT use it: `Retry` asked for the current state and got
+    the previous one, so a dead gateway's banner was cleared by the very button
+    meant to re-check it. See the endpoint.
+    """
+    import time as _t
+    if _t.time() - _GW_UP["at"] > ttl:
+        # Refresh in the background; the next poll will see the new value.
+        __import__("threading").Thread(
+            target=_gateway_up_now, daemon=True).start()
     return _GW_UP["up"]
-_gateway_up_cached()  # warm the cache in background while the server boots
+
+
+# Warm the cache while the server boots, so the first page load can usually be
+# answered without paying for a probe on the request path.
+__import__("threading").Thread(target=_gateway_up_now, daemon=True).start()
+
+
 @app.get("/api/health")
-async def health():
+async def health(req: Request):
     """Liveness probe for the UI status dot.
-    Reports the agent as 'ready' unconditionally (the agent process is up
-    and able to serve requests). `gateway_up` is checked best-effort: if the
+
+    Reports the agent as 'ready' unconditionally (the agent process is up and
+    able to serve requests). `gateway_up` is checked best-effort: if the
     gateway client import fails (e.g. Python 3.8 syntax in llm_gatewayV9/
     client.py), we report `gateway_up: false` instead of 500-ing the whole
     endpoint — the UI just shows "ready (gateway starting)" and the first
     /api/chat call will trigger the warmup.
+
+    Unlike a list read, this value is only useful if it is CURRENT: the banner
+    that depends on it tells the user every paid action will fail. So a stale
+    cache is refreshed before answering (in a thread, off the event loop), and
+    `?fresh=1` — the banner's Retry — always probes. The probe is ~10ms when
+    the gateway is up and ~1s when it is not.
     """
+    import asyncio as _aio
+    import time as _t
+    fresh = (req.query_params.get("fresh") or "").lower() in ("1", "true", "yes")
     gateway_up = False
     try:
-        gateway_up = _gateway_up_cached()
+        if fresh or _t.time() - _GW_UP["at"] > _GW_PROBE_TTL:
+            gateway_up = await _aio.to_thread(_gateway_up_now)
+        else:
+            gateway_up = _GW_UP["up"]
     except Exception:
         gateway_up = False
     # `spa_built` exists so the documented health check can also assert the
@@ -2884,8 +2919,19 @@ async def post_notification(req: Request):
     )
     return {"status": "ok", "notification": entry}
 # ── memory browser (UI panel) ────────────────────────────────────────────────
+# What the Memory page browses. Document chunks are not memories: they are
+# spans of an uploaded file, already listed (and enabled/disabled) in the
+# Documents view. Mixing them in made the "facts" filter a mix of real facts
+# and 200-char PDF chunks, and made a page of 60 cards look like a page of
+# tool outcomes. The audit trail is review-only. Both stay reachable through
+# the gateway API for an operator/probe.
+_MEMORY_BROWSE_DRAWERS = ["working", "episode", "fact", "playbook",
+                          "policy", "profile", "legacy"]
+_MEMORY_COUNT_DRAWERS = ("working", "episode", "fact", "playbook",
+                         "policy", "profile")
 @app.get("/api/memory")
 async def list_memories(q: str | None = None, limit: int = 50,
+                              offset: int = 0,
                               drawers: str | None = None,
                               kinds: str | None = None,
                               hide_superseded: bool = False):
@@ -2895,7 +2941,8 @@ async def list_memories(q: str | None = None, limit: int = 50,
     `drawers` narrows to a comma-separated subset; `kinds` narrows to the
     agent-facing vocabulary (so the panel can show preferences on their own —
     they are stored in the `fact` drawer and a drawer filter cannot isolate
-    them). `hide_superseded` drops corrected records.
+    them). `hide_superseded` drops corrected records. `offset` pages the
+    newest-first list; `has_more` says whether another page exists.
     """
     import memory as mem_svc
     def _shape(h):
@@ -2918,9 +2965,12 @@ async def list_memories(q: str | None = None, limit: int = 50,
         return d
     try:
         drawer_list = [d.strip() for d in drawers.split(",") if d.strip()] \
-            if drawers else None
+            if drawers else list(_MEMORY_BROWSE_DRAWERS)
         kind_list = [k.strip() for k in kinds.split(",") if k.strip()] \
             if kinds else None
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 200))
+        has_more = False
         if q and q.strip():
             # Pass every filter through. The search branch used to drop
             # kinds/hide_superseded/session_id, so the Memory page's kind
@@ -2932,11 +2982,16 @@ async def list_memories(q: str | None = None, limit: int = 50,
             items = [_shape(h) for h in hits]
         else:
             # Newest-first via the gateway memory service (the JSON store
-            # moved gateway-side; there is no local _load anymore).
-            items = [_shape(it) for it in mem_svc.list_recent(
-                limit=limit, drawers=drawer_list, kinds=kind_list,
-                hide_superseded=hide_superseded)]
-        return {"items": items}
+            # moved gateway-side; there is no local _load anymore). Fetch one
+            # extra row so `has_more` is true only when a next page exists;
+            # without that the UI shows "load more" on a list whose last page
+            # happens to be full, then an empty click.
+            rows = mem_svc.list_recent(
+                limit=limit + 1, offset=offset, drawers=drawer_list,
+                kinds=kind_list, hide_superseded=hide_superseded)
+            has_more = len(rows) > limit
+            items = [_shape(it) for it in rows[:limit]]
+        return {"items": items, "has_more": has_more, "offset": offset}
     except mem_svc.MemoryBackendError as e:
         # Was `return {"items": [], "error": ...}` with a 200. A gateway 500
         # therefore rendered as an empty Memory page -- indistinguishable from
@@ -2953,6 +3008,41 @@ async def list_memories(q: str | None = None, limit: int = 50,
         return JSONResponse(status_code=502, content={
             "status": "error",
             "message": f"memory backend unavailable: {e}"[:200]})
+@app.get("/api/memory/stats")
+async def memory_statistics():
+    """Live per-kind counts, for the Memory page's filter sidebar.
+
+    The gateway has always reported these (`/v1/memory/stats`); the console
+    said it did not. Count only what the page browses: live records in the
+    agent-memory drawers, not superseded history, uploaded document chunks or
+    the audit trail. Those have their own views, and counting them here made
+    "facts" disagree with the facts a user could open.
+    """
+    import memory as mem_svc
+    try:
+        raw = mem_svc.stats()
+    except Exception as e:
+        return JSONResponse(status_code=502, content={
+            "status": "error",
+            "message": f"memory stats unavailable: {e}"[:200]})
+    drawers = raw.get("drawers") or {}
+    counts: dict[str, int] = {}
+    for name in _MEMORY_COUNT_DRAWERS:
+        d = drawers.get(name) or {}
+        by_kind = d.get("live_by_kind") or d.get("by_kind") or {}
+        for kind, n in by_kind.items():
+            counts[kind] = counts.get(kind, 0) + int(n or 0)
+    legacy = raw.get("legacy") or {}
+    for kind, n in (legacy.get("live_by_kind")
+                    or legacy.get("by_kind") or {}).items():
+        counts[kind] = counts.get(kind, 0) + int(n or 0)
+    return {
+        "kinds": counts,
+        "total": sum(counts.values()),
+        "drawers": drawers,
+        "legacy": legacy,
+        "excluded_drawers": ["document", "audit"],
+    }
 @app.post("/api/profile/document")
 async def profile_document():
     """Write the whole profile - observations AND standing preferences - into
@@ -3330,7 +3420,8 @@ async def _with_doc_context(messages: list[dict], query: str,
     out = list(messages)
     out.insert(max(0, len(out) - 1), {"role": "system", "content": block})
     return out, n
-def _chat_memory_block(query: str, session_id: str | None) -> str:
+def _chat_memory_block(query: str, session_id: str | None,
+                       doc_ids: set[str] | None = None) -> str:
     """Standing user facts for the chat prompt, as its own system turn.
     Chat had no memory at all: `flow.py` reads hits once per run and skills
     receive them as MEMORY HITS, but `chat_simple`/`chat_simple_stream` only
@@ -3342,19 +3433,28 @@ def _chat_memory_block(query: str, session_id: str | None) -> str:
     facts it should already have been given.
     Fail-soft, and deliberately shaped like the skill-side block: these are
     cross-session facts, never conversation history, and must not be woven
-    into the answer unasked. Documents are filtered by the same enabled set
-    `flow.py` uses so a disabled upload cannot leak through chat.
+    into the answer unasked.
+    `doc_ids` is THIS conversation's effective document set:
+    `_conversation_doc_ids`. It used to be the globally enabled set, which is
+    how the uploaded-document chunk came back in a thread with documents
+    switched OFF - the toggle governed the retrieval tools but not this block.
+    None keeps the old global read for callers with no conversation; an empty
+    set means "no documents", and then the document drawer is not searched at
+    all (a filter applied to the merged ranking still spends one of six slots
+    on a document, and a record with no `doc_id` would pass it).
     """
     try:
         import memory as _mem
         from skills import _format_memory_hits
-        doc_ids = None
-        try:
-            doc_ids = _gw_enabled_doc_ids()
-        except Exception:
-            doc_ids = set()
-        hits = _mem.read(query, drawers=[d for d in _mem.SESSION_DRAWERS
-                                         if d != "profile"],
+        if doc_ids is None:
+            try:
+                doc_ids = _gw_enabled_doc_ids()
+            except Exception:
+                doc_ids = set()
+        drawers = [d for d in _mem.SESSION_DRAWERS if d != "profile"]
+        if not doc_ids:
+            drawers = [d for d in drawers if d != "document"]
+        hits = _mem.read(query, drawers=drawers,
                          top_k=6, session_id=session_id,
                          doc_ids=doc_ids) or []
         if not hits:
@@ -3430,7 +3530,8 @@ def _chat_profile_block() -> str:
         print(f"[chat.profile] recall skipped: {e!r}")
         return ""
 async def _with_chat_memory(messages: list[dict], query: str,
-                            session_id: str | None) -> list[dict]:
+                            session_id: str | None,
+                            body: dict | None = None) -> list[dict]:
     """Insert the memory block just before the final user message.
     Placed adjacent to the question for the same reason as document context,
     and inserted once per turn so a long thread does not accumulate every
@@ -3441,11 +3542,18 @@ async def _with_chat_memory(messages: list[dict], query: str,
     — three in sequence, on the event loop, on every chat turn. So a slow
     gateway froze the whole console mid-answer. They now run in one worker
     thread, which also costs one thread hop instead of three blocking ones.
+    `body` is the turn's request body, so a `use_documents: false` in THIS
+    request scopes the memory block as well as the retrieval tools. Read
+    inside the worker: `_conversation_doc_ids` may hit the gateway registry.
     """
     import asyncio as _aio
-    blocks = await _aio.to_thread(
-        lambda: [b for b in (_chat_memory_block(query, session_id),
-                             _chat_profile_block()) if b])
+
+    def _blocks() -> list[str]:
+        ids = _conversation_doc_ids(session_id, body)
+        return [b for b in (_chat_memory_block(query, session_id, ids),
+                            _chat_profile_block()) if b]
+
+    blocks = await _aio.to_thread(_blocks)
     if not blocks:
         return messages
     out = list(messages)
@@ -7704,9 +7812,60 @@ def chat_write_method_allowed(tool: str, api_method: str | None) -> bool:
     if not blocked or not api_method:
         return True
     return str(api_method) not in blocked
+def _chat_a2ui_contract() -> str:
+    """The A2UI half of the chat system prompt, derived from the catalog.
+
+    This block used to be hand-written, and it drifted: it advertised Button,
+    TextField, Dropdown, Checkbox and Slider - none of which exist in
+    `a2ui_catalog` - plus a nested `props` shape, `title` table columns, a
+    `catalogId` of "default" and `gap: "small"`. A model that followed it
+    produced a surface the renderer only half-understood (the Text nodes
+    appeared, the buttons and inputs vanished), which reads as "A2UI does not
+    render". The catalog is the single source of truth for names, properties
+    and enums; generating this text from it is what keeps the two in step.
+    """
+    import a2ui_catalog as _cat
+    return (
+        "A2UI STRUCTURED SURFACES: when your answer is best shown as structured "
+        "UI instead of prose - a table of files, a list of calendar events, "
+        "action buttons, metric cards, or a card with progress and controls - "
+        "return an A2UI surface instead of plain text. The surface is a JSON "
+        "object with surfaceId, rootComponent, and a flat components list. "
+        "Each component has an id, a component name, and that component's "
+        "properties directly on the object (not nested under props). Children "
+        "reference other component ids. Exactly one component has id \"root\". "
+        "Example: "
+        '{"surfaceId":"chat-1","rootComponent":"root","components":['
+        '{"id":"root","component":"Column","children":["heading","table"],'
+        '"gap":"normal"},'
+        '{"id":"heading","component":"Text","variant":"heading",'
+        '"text":"<title>"},'
+        '{"id":"table","component":"Table",'
+        '"columns":[{"key":"name","label":"Name"}],'
+        '"rows":[{"name":"<value>"}]}]} '
+        + _cat.catalog_prompt()
+        + " "
+        "A2UI ACTIONS: an Action emits one event. Carry the action name and its "
+        'args on the component: {"id":"btn1","component":"Action",'
+        '"label":"Re-run","action":"rerun",'
+        '"args":{"query":"<the user\'s question>"}}. '
+        "Available actions: rerun (args: {query}), drive_app "
+        "(args: {app, goal}), open_app (args: {app}), run_command "
+        "(args: {command}), read_file (args: {path}), write_file "
+        "(args: {path, content}). drive_app ALWAYS needs args.app beside "
+        "args.goal. open_app ONLY launches; for actions inside an app use "
+        "drive_app with the goal in the same turn. Wrap the surface in a single "
+        "```json code block and put nothing else in that turn - do not repeat "
+        "the same answer as prose. Use plain text for short conversational "
+        "replies. "
+    )
+
+
 _CHAT_SYSTEM = (
-    "You are Aria, a concise chat assistant. Answer directly in Markdown. "
-    "Keep replies tight unless the user asks for depth. "
+    "You are Aria, a concise chat assistant. "
+    "When your answer is a list, table, or set of results, return it as an "
+    "A2UI surface (see below) instead of prose. Wrap the surface in a single "
+    "```json code block. For short conversational replies, use plain text. "
     "You have tools (web_search, fetch_url, search_knowledge, "
     "calendar_query, gmail_query, github_query, slack_history, notion_query, "
     "recall_preferences, remember_preference, list_scheduled, "
@@ -7808,10 +7967,11 @@ _CHAT_SYSTEM = (
     "fetches the full content, so you never paste it yourself. Use "
     "send_channel_message when they want it NOW; schedule_task is for a later "
     "time and is not an immediate send. "
+    + _chat_a2ui_contract()
     # The behavioural profile. The rules here are about honesty, not caution:
     # an observation is a pattern drawn from past conversations, and the quote
     # under it is the only reason to believe it.
-    "If the user corrects you or says how they want things done - " "always "
+    + "If the user corrects you or says how they want things done - " "always "
     "give me the date, stop with the preamble, shorter - do nothing "
     "the correction with their exact words, and re-reads it back to you. "
     "You have strictly less information than that pass - the same message, "
@@ -8195,6 +8355,13 @@ async def _run_handoff(brief: str, conversation_id: str | None,
 # to save - the tool resolves it from the thread, server-side.
 
 _CHAT_REPORT_STUB_CHARS = 240
+# A surface-only turn is persisted with `content: ""` - everything it said
+# lives in the A2UI payload. Replaying that blank assistant row makes strict
+# providers reject the WHOLE request (`kilo`/Cohere: "must have non-empty
+# content or tool calls"), which the gateway reports as a 502 - and because the
+# same history is sent on every later turn, one such row poisoned the thread
+# permanently. The model gets the surface as bounded text instead.
+_CHAT_SURFACE_HISTORY_CHARS = 3000
 
 
 def _chat_thread_messages(conversation_id: str | None) -> list[dict]:
@@ -8251,9 +8418,23 @@ def _chat_history_for_model(history: list[dict]) -> list[dict]:
             if isinstance(f, dict) and f.get("filename"):
                 notes.append(f'[file "{f["filename"]}" '
                              f'(handle {f.get("artifact") or "?"})]')
+        if not content.strip() and isinstance(m.get("surface"), dict):
+            digest = _a2ui_digest(m["surface"])
+            if digest:
+                if len(digest) > _CHAT_SURFACE_HISTORY_CHARS:
+                    digest = (digest[:_CHAT_SURFACE_HISTORY_CHARS].rstrip()
+                              + "…")
+                notes.append(
+                    "[you displayed an interactive dashboard to the user; "
+                    "nothing was said in prose. Its content:]\n" + digest)
         if notes:
             joined = "\n".join(notes)
             content = f"{content}\n\n{joined}".strip() if content.strip() else joined
+        if not content.strip():
+            # Never replay an empty turn. It carries no information, and a
+            # provider that rejects it fails every later turn in the thread
+            # because the same history is resent each time.
+            continue
         out.append({"role": role, "content": content})
     return out
 
@@ -8661,6 +8842,538 @@ def _chat_handoff_dispatch(conversation_id: str | None,
     return _dispatch
 
 
+def _a2ui_repair_json(raw: str, *, close_mismatch: bool = False) -> str:
+    """Repair the syntax slips models make in a JSON block, quote-aware.
+
+    The live failure this exists for: an `Action` component was closed with
+    `}}` and then a third `}` on the next line, so `json.loads` refused the
+    whole block and the user was shown ~5 KB of raw JSON. A surface is one
+    object; a stray closer is noise, not a reason to discard it.
+
+    `close_mismatch` decides how to read a closer that does not match what is
+    open. Both readings are plausible - an extra `}` is a typo, but `{"a": [1}`
+    is a missing `]` - so `_a2ui_parse_json` tries each and keeps whichever
+    parses. Everything inside a string is left alone.
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "}]":
+            want = "{" if ch == "}" else "["
+            if stack and stack[-1] == want:
+                stack.pop()
+                out.append(ch)
+            elif not stack or not close_mismatch:
+                # Nothing to close, or a closer that cannot belong here: drop
+                # the extra bracket rather than closing the parent early.
+                pass
+            else:
+                while stack and stack[-1] != want:
+                    out.append("}" if stack.pop() == "{" else "]")
+                if stack:
+                    stack.pop()
+                out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and raw[j] in " \t\r\n":
+                j += 1
+            if j < n and raw[j] in "}]":
+                i += 1          # trailing comma before a closer
+                continue
+        out.append(ch)
+        i += 1
+    while stack:
+        out.append("}" if stack.pop() == "{" else "]")
+    return "".join(out).rstrip()
+
+
+def _a2ui_parse_json(raw: str):
+    """Parse a block, tolerating the shapes a model actually produces."""
+    import json as _json
+    if not raw:
+        return None
+    decoder = _json.JSONDecoder(strict=False)
+    for text in (raw.strip(), raw):
+        try:
+            obj = _json.loads(text, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    # Leading prose before the object: decode from the first brace and ignore
+    # whatever follows the closing one.
+    start = raw.find("{")
+    if start >= 0:
+        try:
+            obj, _end = decoder.raw_decode(raw[start:].lstrip())
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    for close_mismatch in (False, True):
+        repaired = _a2ui_repair_json(raw.strip(),
+                                     close_mismatch=close_mismatch)
+        try:
+            obj = _json.loads(repaired, strict=False)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _a2ui_fenced_object(answer: str):
+    """The first fenced JSON object that looks like an A2UI surface."""
+    if not answer:
+        return None
+    import re as _re
+    for m in _re.finditer(r"```(?:json)?\s*\n?(.*?)\n?```", answer, _re.DOTALL):
+        obj = _a2ui_parse_json(m.group(1))
+        if isinstance(obj, dict) and "components" in obj:
+            return obj
+    return None
+
+
+def _a2ui_force_root(comps: list, declared) -> None:
+    """Rename the declared root component to "root" when the model used
+    another id. The validator requires a component literally named root, and
+    an otherwise-good surface should not be refused over a naming slip."""
+    ids = {c.get("id") for c in comps if isinstance(c, dict)}
+    if "root" in ids:
+        return
+    if not isinstance(declared, str) or declared not in ids:
+        return
+    for c in comps:
+        if not isinstance(c, dict):
+            continue
+        if c.get("id") == declared:
+            c["id"] = "root"
+        kids = c.get("children")
+        if isinstance(kids, list):
+            c["children"] = ["root" if k == declared else k for k in kids]
+        if c.get("child") == declared:
+            c["child"] = "root"
+
+
+# Presentational synonyms models reach for before reading the catalog. The
+# validator is right to be closed about values that change meaning; a colour
+# word is not one of those. Folding happens before validation, and only when
+# the folded value is legal for that component - `variant: "secondary"` on an
+# Action stays "secondary" because that is already its own enum.
+_A2UI_ENUM_ALIASES = {
+    "tone": {
+        "success": "good", "positive": "good", "ok": "good", "green": "good",
+        "danger": "bad", "error": "bad", "negative": "bad", "critical": "bad",
+        "red": "bad",
+        "warning": "warn", "caution": "warn", "yellow": "warn",
+        "info": "neutral", "default": "neutral", "none": "neutral",
+        "muted": "neutral", "grey": "neutral", "gray": "neutral",
+    },
+    "variant": {
+        "title": "heading", "header": "heading", "h1": "heading",
+        "h2": "heading", "h3": "heading", "subtitle": "caption",
+        "label": "caption", "small": "caption", "muted": "caption",
+        "footnote": "caption", "paragraph": "body", "text": "body",
+        "normal": "body", "default": "body", "plain": "body",
+        "code": "mono", "monospace": "mono",
+    },
+    "align": {"middle": "center", "centre": "center", "centered": "center"},
+    "size": {"sm": "small", "md": "normal", "medium": "normal",
+             "lg": "large"},
+    "axis": {"row": "horizontal", "column": "vertical", "col": "vertical"},
+}
+
+
+def _normalise_a2ui_payload(obj: dict) -> dict:
+    """Coerce the shapes models drift into onto the catalog's shape.
+
+    Models emit `type`/`props`, `Button`/`onPress`, `Group`, `title` table
+    columns and decorative properties the catalog does not know. Each of those
+    used to make the validator refuse the surface, and a refused surface fell
+    back to showing the raw JSON. Normalising here is what turns a near miss
+    into a rendered surface instead of a payload leak.
+
+    Forbidden props (html/style/href/...) are deliberately NOT dropped: they
+    still reach the validator, which still refuses them by name.
+    """
+    import a2ui_catalog as _cat
+    out = dict(obj)
+    catalog_id = out.get("catalogId")
+    if not isinstance(catalog_id, str) or catalog_id in ("", "default", "aria"):
+        out["catalogId"] = _cat.CATALOG_ID
+    comps = out.get("components")
+    if not isinstance(comps, list):
+        return out
+    normalised: list = []
+    for raw in comps:
+        if not isinstance(raw, dict):
+            normalised.append(raw)
+            continue
+        c = dict(raw)
+        nested = c.pop("props", None)
+        if isinstance(nested, dict):
+            for k, v in nested.items():
+                c.setdefault(k, v)
+        name = c.get("component") or c.get("type")
+        if isinstance(name, str):
+            if name == "Button":
+                name = "Action"
+                on = c.pop("onPress", None)
+                if not isinstance(on, dict):
+                    on = c.pop("on_press", None)
+                if isinstance(on, dict):
+                    if not isinstance(c.get("action"), str) \
+                            and isinstance(on.get("action"), str):
+                        c["action"] = on["action"]
+                    args = on.get("args")
+                    if args is None:
+                        args = on.get("params")
+                    if args is not None and "args" not in c:
+                        c["args"] = args
+            elif name == "Group":
+                name = "Column"
+            c["component"] = name
+        c.pop("type", None)
+        name = c.get("component")
+        if name == "Table":
+            cols = c.get("columns")
+            if isinstance(cols, list):
+                fixed = []
+                for col in cols:
+                    if isinstance(col, dict):
+                        cc = dict(col)
+                        if "label" not in cc:
+                            cc["label"] = cc.get("title") or cc.get("key") or ""
+                        cc.pop("title", None)
+                        cc.pop("width", None)
+                        fixed.append(cc)
+                    else:
+                        fixed.append(col)
+                c["columns"] = fixed
+            if "rows" not in c and isinstance(c.get("data"), list):
+                c["rows"] = c.pop("data")
+        elif name == "DataList":
+            if "rows" not in c and isinstance(c.get("items"), list):
+                rows = []
+                for it in c.pop("items"):
+                    if isinstance(it, dict):
+                        rows.append({"label": it.get("label", ""),
+                                     "value": it.get("value", "")})
+                    else:
+                        rows.append({"label": "", "value": str(it)})
+                c["rows"] = rows
+        spec = _cat.CATALOG.get(name) if isinstance(name, str) else None
+        if spec is not None:
+            # The old chat prompt used small/medium/large for spacing; the
+            # catalog's enum is tight/normal/loose. Fold the aliases instead
+            # of rejecting a layout that only differs in naming.
+            gap = c.get("gap")
+            if isinstance(gap, str):
+                c["gap"] = {"small": "tight", "sm": "tight",
+                            "medium": "normal", "md": "normal",
+                            "large": "loose", "lg": "loose"}.get(
+                                gap.lower(), gap)
+            # Same class of slip, and the one that cost a live dashboard its
+            # whole surface: `tone: "success"`, `variant: "title"`, an
+            # alignment spelled "middle". These are presentational words, not
+            # data - a synonym must not turn a valid answer into a JSON dump.
+            for prop, aliases in _A2UI_ENUM_ALIASES.items():
+                val = c.get(prop)
+                spec_val = spec["props"].get(prop)
+                if not isinstance(val, str) or not isinstance(spec_val, str) \
+                        or not spec_val.startswith("enum:"):
+                    continue
+                allowed_vals = spec_val[5:].split("|")
+                low = val.strip().lower()
+                folded = aliases.get(low, low)
+                if folded not in allowed_vals:
+                    # A synonym that is legal elsewhere (an Action's
+                    # "secondary") must keep its own meaning; only a value
+                    # this component cannot express falls back.
+                    folded = low if low in allowed_vals else allowed_vals[0]
+                c[prop] = folded
+            allowed = set(spec["props"]) | {"id", "component"}
+            for key in [k for k in c if k not in allowed]:
+                if key not in _cat.FORBIDDEN_PROPS:
+                    c.pop(key, None)
+        normalised.append(c)
+    out["components"] = normalised
+    _a2ui_force_root(normalised, out.get("rootComponent"))
+    _a2ui_fix_dangling(normalised)
+    return out
+
+
+def _a2ui_fix_dangling(comps: list) -> None:
+    """Give a child reference that is really prose somewhere to live.
+
+    Models routinely fill `child` with the CONTENT rather than an id - a live
+    dashboard had `{"component": "Card", "title": "Easy (30%)", "child":
+    "150 questions"}`. The validator refuses that as a dangling reference, and
+    refusing costs the user the whole surface over a value that is plainly
+    meant to be read. A ref that reads as text (it has whitespace, or
+    characters an id cannot contain) becomes a Text node; an id-shaped typo
+    (`heding`) is dropped, because rendering the typo would be worse than
+    rendering nothing.
+    """
+    import re as _re
+    ids = {c.get("id") for c in comps
+           if isinstance(c, dict) and isinstance(c.get("id"), str)}
+    id_shape = _re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+    def as_text(value: str, parent: str) -> str | None:
+        text = value.strip()
+        if not text or id_shape.match(text):
+            # Empty, or shaped like an id (a typo): dropping it is honest.
+            # Rendering the typo as content would be worse than nothing.
+            return None
+        new_id = f"{parent}-text"
+        n = 2
+        while new_id in ids:
+            new_id = f"{parent}-text-{n}"
+            n += 1
+        comps.append({"id": new_id, "component": "Text",
+                      "text": text, "variant": "body"})
+        ids.add(new_id)
+        return new_id
+
+    for c in list(comps):
+        if not isinstance(c, dict) or not isinstance(c.get("id"), str):
+            continue
+        parent = c["id"]
+        child = c.get("child")
+        if isinstance(child, str) and child not in ids:
+            fixed = as_text(child, parent)
+            if fixed:
+                c["child"] = fixed
+            else:
+                c.pop("child", None)
+        kids = c.get("children")
+        if isinstance(kids, list):
+            kept = []
+            for kid in kids:
+                if not isinstance(kid, str) or kid in ids:
+                    kept.append(kid)
+                    continue
+                fixed = as_text(kid, f"{parent}-{len(kept)}")
+                if fixed:
+                    kept.append(fixed)
+            c["children"] = kept
+
+
+def _extract_a2ui_surface(answer: str) -> dict | None:
+    """Pull a VALIDATED A2UI surface out of a model answer.
+
+    The model emits surfaces as a ```json block. This normalises the shapes
+    models drift into, then runs the same validator the rest of A2UI uses, so
+    anything the console receives is something its renderer can actually
+    draw. A rejected surface returns None; the caller shows a readable
+    digest instead of the raw JSON.
+    """
+    obj = _a2ui_fenced_object(answer)
+    if obj is None:
+        return None
+    import a2ui_catalog as _cat
+    payload = _normalise_a2ui_payload(obj)
+    try:
+        surface = _cat.validate_surface(payload)
+    except _cat.CatalogError as e:
+        print(f"[chat] a2ui surface rejected: {e}", flush=True)
+        return None
+    surface["rootComponent"] = "root"
+    return surface
+
+
+def _a2ui_prop(c: dict, name: str):
+    """Read a property from either the canonical flat shape or the nested
+    `props` shape models sometimes emit."""
+    props = c.get("props")
+    if isinstance(props, dict) and name in props:
+        return props[name]
+    return c.get(name)
+
+
+def _a2ui_digest(payload: dict) -> str:
+    """A readable plain-text rendering of a surface that failed validation.
+
+    The alternative was leaving the fenced JSON in the answer, which is
+    exactly what the user saw when a component was outside the catalog.
+    """
+    comps = payload.get("components")
+    if not isinstance(comps, list):
+        return ""
+    by_id = {c.get("id"): c for c in comps if isinstance(c, dict)}
+    root = payload.get("rootComponent") or "root"
+    lines: list[str] = []
+    seen: set = set()
+
+    def walk(cid) -> None:
+        if not isinstance(cid, str) or cid in seen or len(seen) > 200:
+            return
+        seen.add(cid)
+        c = by_id.get(cid)
+        if not isinstance(c, dict):
+            return
+        name = c.get("component") or c.get("type")
+        if name == "Text":
+            text = str(_a2ui_prop(c, "text") or "").strip()
+            if text:
+                lines.append(("# " + text)
+                             if _a2ui_prop(c, "variant") == "heading" else text)
+        elif name == "CodeBlock":
+            text = str(_a2ui_prop(c, "text") or "").strip()
+            if text:
+                lines.append(text)
+        elif name == "KeyValue":
+            lines.append(f"- {_a2ui_prop(c, 'label') or ''}: "
+                         f"{_a2ui_prop(c, 'value') or ''}")
+        elif name in ("Badge", "Action", "Link"):
+            label = _a2ui_prop(c, "text") or _a2ui_prop(c, "label")
+            if label:
+                lines.append(f"- {label}")
+        elif name == "Table":
+            cols = _a2ui_prop(c, "columns") or []
+            keys = [str(col.get("key")) for col in cols
+                    if isinstance(col, dict) and col.get("key")] \
+                if isinstance(cols, list) else []
+            labels = [str(col.get("label") or col.get("title")
+                          or col.get("key") or "") for col in cols
+                      if isinstance(col, dict)] if isinstance(cols, list) else []
+            if labels:
+                lines.append(" | ".join(labels))
+            rows = _a2ui_prop(c, "rows") or _a2ui_prop(c, "data") or []
+            if isinstance(rows, list):
+                for row in rows[:100]:
+                    if isinstance(row, dict):
+                        lines.append(" | ".join(str(row.get(k, ""))
+                                                for k in keys))
+                    elif row is not None:
+                        lines.append(str(row))
+        elif name == "DataList":
+            rows = _a2ui_prop(c, "rows") or _a2ui_prop(c, "items") or []
+            if isinstance(rows, list):
+                for row in rows[:100]:
+                    if isinstance(row, dict):
+                        lines.append(f"- {row.get('label', '')}: "
+                                     f"{row.get('value', '')}")
+        elif name == "Empty":
+            title = str(_a2ui_prop(c, "title") or "").strip()
+            sub = str(_a2ui_prop(c, "sub") or "").strip()
+            if title:
+                lines.append(title)
+            if sub:
+                lines.append(sub)
+        elif name == "Progress":
+            value = _a2ui_prop(c, "value")
+            pct = int(float(value) * 100) \
+                if isinstance(value, (int, float)) \
+                and not isinstance(value, bool) else 0
+            lines.append(f"{_a2ui_prop(c, 'label') or 'Progress'}: {pct}%")
+        kids = _a2ui_prop(c, "children")
+        if isinstance(kids, list):
+            for kid in kids:
+                walk(kid)
+        child = _a2ui_prop(c, "child")
+        if isinstance(child, str):
+            walk(child)
+
+    walk(root if isinstance(root, str) else "root")
+    if not lines:
+        for c in comps:
+            if isinstance(c, dict):
+                walk(c.get("id"))
+    return "\n\n".join(x for x in lines if x).strip()
+
+
+# Markers that only a surface attempt carries. `"components":` alone also
+# appears in ordinary API samples, so it is not enough on its own.
+_A2UI_SURFACE_MARKERS = re.compile(
+    r'"(?:surfaceId|rootComponent)"\s*:|"component"\s*:\s*"')
+
+_FENCED_JSON = re.compile("```(?:json)?\\s*\\n?(.*?)\\n?```", re.DOTALL)
+
+
+def _strip_a2ui_block(answer: str, *, digest: bool = True) -> str:
+    """Remove a surface block that could not be validated.
+
+    Replaced with a readable digest so the transcript never shows the raw
+    payload. A fenced block that is not surface-shaped (an ordinary code
+    sample in an answer) is left untouched. A block that IS surface-shaped but
+    will not parse after repair is still removed: syntax noise in a payload is
+    not an answer, and showing it verbatim is the bug this function exists to
+    prevent.
+
+    `digest=False` removes a VALID surface block and keeps only the prose
+    around it - what a stored turn needs when it is healed on read.
+    """
+    if not answer:
+        return answer
+
+    def repl(m):
+        block = m.group(1)
+        obj = _a2ui_parse_json(block)
+        if isinstance(obj, dict) and "components" in obj:
+            return _a2ui_digest(obj) if digest else ""
+        if _A2UI_SURFACE_MARKERS.search(block):
+            return ""
+        return m.group(0)
+
+    cleaned = _FENCED_JSON.sub(repl, answer).strip()
+    return cleaned or ("The structured answer for this turn could not be "
+                       "displayed. Try asking again in a different form.")
+
+
+def _heal_stored_surface(msg: dict) -> dict:
+    """Give a stored turn the surface today's extractor can read.
+
+    A thread saved before the extractor learned to repair a stray brace still
+    holds the raw payload in `content`, so re-opening it shows 5 KB of JSON -
+    the exact thing the user reported. Healing on READ repairs those turns
+    without rewriting `chat_threads.json` or losing the original text.
+    """
+    if not isinstance(msg, dict) or msg.get("surface"):
+        return msg
+    if msg.get("role") != "assistant":
+        return msg
+    content = str(msg.get("content") or "")
+    if "```" not in content or not _A2UI_SURFACE_MARKERS.search(content):
+        return msg
+    surface = _extract_a2ui_surface(content)
+    cleaned = _strip_a2ui_block(content, digest=surface is None)
+    if surface is None and cleaned == content:
+        return msg
+    healed = dict(msg)
+    healed["surface"] = surface
+    healed["content"] = cleaned
+    return healed
+
+
 def _chat_empty_answer(reply: dict | None) -> str:
     """Say WHY a turn produced no text, instead of the literal "(empty answer)".
 
@@ -8840,10 +9553,11 @@ def _chat_pending_append(conversation_id: str, query: str,
 
 
 def _chat_pending_finish(conversation_id: str, turn_id: str, *,
-                         answer: str = "", error: str = "",
-                         stopped: bool = False,
-                         files: list | None = None,
-                         kind: str = "", title: str = "") -> None:
+                          answer: str = "", error: str = "",
+                          stopped: bool = False,
+                          files: list | None = None,
+                          kind: str = "", title: str = "",
+                          surface: dict | None = None) -> None:
     """Replace the pending placeholder with the settled assistant message."""
     with _CHAT_THREADS_LOCK:
         data = _chat_threads_load()
@@ -8869,6 +9583,8 @@ def _chat_pending_finish(conversation_id: str, turn_id: str, *,
                 msg["title"] = title
             if files:
                 msg["files"] = files
+            if surface:
+                msg["surface"] = surface
         msg["turn_id"] = turn_id
         replaced = False
         for i, m in enumerate(msgs):
@@ -9004,7 +9720,8 @@ async def get_chat_thread(conversation_id: str):
     return {"conversation_id": conversation_id,
             "title": t.get("title") or "(untitled)",
             "active": active,
-            "messages": t.get("messages") or []}
+            "messages": [_heal_stored_surface(m)
+                         for m in (t.get("messages") or [])]}
 @app.delete("/api/chat/threads/{conversation_id}")
 async def delete_chat_thread(conversation_id: str):
     """Delete a thread AND its spend ledger.
@@ -9189,7 +9906,8 @@ async def chat_simple(req: Request):
         # carrying the biggest prompt. `search_knowledge` is the access, and the
         # system prompt now says so; `_conversation_doc_ids` still SCOPES the tool
         # (below), so a disabled document cannot come back through it.
-        messages = await _with_chat_memory(messages, query, conversation_id)
+        messages = await _with_chat_memory(messages, query, conversation_id,
+                                           body)
         messages = _with_channel_persona(messages, conversation_id)
         try:
             # Read-only tools so chat can answer current/external facts
@@ -9621,11 +10339,12 @@ async def chat_simple_stream(req: Request):
 
         def _finish(*, answer: str = "", error: str = "", stopped: bool = False,
                     files: list | None = None, kind: str = "",
-                    title: str = "", save_error: str = "") -> None:
+                    title: str = "", save_error: str = "",
+                    surface: dict | None = None) -> None:
             try:
                 _chat_pending_finish(conversation_id, turn_id, answer=answer,
                                      error=error, stopped=stopped, files=files,
-                                     kind=kind, title=title)
+                                     kind=kind, title=title, surface=surface)
             except Exception as e:
                 # The answer is still worth showing; the client gets the same
                 # "answer delivered but could not be saved" contract as before.
@@ -9652,13 +10371,16 @@ async def chat_simple_stream(req: Request):
                 }
                 if stopped:
                     payload["stopped"] = True
+                if surface:
+                    payload["surface"] = surface
                 _put_final("__done__", payload)
 
         started_box["t0"] = _time.perf_counter()
         try:
             # Recall first: it is three gateway round-trips and needs no
             # conversation lock. Same recall as /api/chat/simple.
-            _messages = await _with_chat_memory(messages, query, conversation_id)
+            _messages = await _with_chat_memory(messages, query,
+                                                conversation_id, body)
             _messages = _with_channel_persona(_messages, conversation_id)
             turn_lock = _turn_lock(conversation_id)
             await _aio.to_thread(turn_lock.acquire)
@@ -9746,10 +10468,22 @@ async def chat_simple_stream(req: Request):
             provider = str(reply.get("provider") or provider)
             answer = ((reply.get("text") or "").strip()
                       or _chat_empty_answer(reply))
+            # Extract A2UI surface from the model's answer if present. The
+            # model wraps it in a ```json code block; pull it out and pass it
+            # as a structured surface instead of leaving it as prose.
+            surface = _extract_a2ui_surface(answer)
+            if surface:
+                answer = ""  # surface replaces the text
+            else:
+                # A surface-shaped block that did not validate must not be
+                # shown verbatim: a wall of JSON is not an answer. Keep any
+                # prose the model wrote and render the block as a digest.
+                answer = _strip_a2ui_block(answer)
             report_title = str(handoff_report.get("topic") or "").strip()
             report_text = str(handoff_report.get("text") or "").strip()
             if report_text:
                 answer = report_text
+                surface = None  # report text replaces any surface
             files_out = (_chat_produced_files(conversation_id, answer)
                          or handoff_files)
             if report_text:
@@ -9763,7 +10497,8 @@ async def chat_simple_stream(req: Request):
             _finish(answer=answer,
                     files=files_out,
                     kind=("report" if report_text else ""),
-                    title=((report_title or query[:80]) if report_text else ""))
+                    title=((report_title or query[:80]) if report_text else ""),
+                    surface=surface)
         except _aio.CancelledError:
             # Stop. Keep the partial answer the user already paid for, and
             # persist it so reopening the thread shows the same thing.
@@ -9903,7 +10638,8 @@ def _clean_doc_setup(raw) -> dict | None:
     return out or None
 def _run_orchestrator(query: str, session_id: str,
                       should_cancel=None, doc_setup: dict | None = None,
-                      run_note: str = "", run_kind: str = "") -> str:
+                      run_note: str = "", run_kind: str = "",
+                      doc_ids: set[str] | None = None) -> str:
     """Run the async orchestrator to completion in a fresh event loop.
     `Executor.run` is a coroutine, so we drive it with `asyncio.run` inside
     a worker thread (via `asyncio.to_thread`) — that keeps the streaming
@@ -9926,7 +10662,8 @@ def _run_orchestrator(query: str, session_id: str,
     return asyncio.run(Executor().run(query, session_id=session_id,
                                       resume=False, doc_setup=doc_setup,
                                       should_cancel=should_cancel,
-                                      run_note=run_note, run_kind=run_kind))
+                                      run_note=run_note, run_kind=run_kind,
+                                      doc_ids=doc_ids))
 def _shell_intent_offline(query: str) -> str | None:
     """Local-model fallback (Todo 11): when the gateway is DOWN, still answer
     read-only shell-intent queries (disk, ip, processes, os, ram, cpu, gpu,
@@ -10089,7 +10826,8 @@ def _stream_run(query: str, conversation_id: str | None,
                    idem_key: str = "",
                    doc_setup: dict | None = None,
                    run_note: str = "",
-                   run_kind: str = "") -> StreamingResponse:
+                   run_kind: str = "",
+                   body: dict | None = None) -> StreamingResponse:
     """Build the SSE streaming response for one agent run.
     Shared by /api/chat and /api/templates/{name}/run so both produce
     identical frames (log → meta → done). `conversation_id` (when present)
@@ -10267,7 +11005,9 @@ def _stream_run(query: str, conversation_id: str | None,
                     answer_box["answer"] = _run_orchestrator(
                         query, session_id, cancel_ev.is_set,
                         doc_setup=doc_setup, run_note=run_note,
-                        run_kind=run_kind) or ""
+                        run_kind=run_kind,
+                        doc_ids=_conversation_doc_ids(conversation_id, body)
+                        ) or ""
             except Exception as e:  # pragma: no cover - runtime failure
                 fail_box["error"] = str(e)
                 _push(f"AGENT ERROR: {e}")
@@ -10277,6 +11017,21 @@ def _stream_run(query: str, conversation_id: str | None,
                 # persisting next to the `done` frame loses the answer.
                 if dag_turn_id:
                     try:
+                        # A formatter that answers with an A2UI surface carries
+                        # it as a fenced block (flow.py). Split it HERE, in the
+                        # worker, because the worker is what persists the row:
+                        # the drain generator may already be gone. The surface
+                        # goes in `surface` and the body stays empty, mirroring
+                        # the lightweight chat path; a block that fails
+                        # validation becomes readable text instead of a wall of
+                        # JSON in the transcript.
+                        _dag_answer = str(answer_box.get("answer") or "")
+                        _dag_surface = (_extract_a2ui_surface(_dag_answer)
+                                        if run_kind == "chat" else None)
+                        if _dag_surface:
+                            _dag_answer = ""
+                        elif run_kind == "chat":
+                            _dag_answer = _strip_a2ui_block(_dag_answer)
                         if fail_box["error"]:
                             _chat_pending_finish(
                                 conversation_id, dag_turn_id,
@@ -10284,12 +11039,12 @@ def _stream_run(query: str, conversation_id: str | None,
                         elif cancel_ev.is_set():
                             _chat_pending_finish(
                                 conversation_id, dag_turn_id,
-                                answer=str(answer_box.get("answer") or ""),
+                                answer=_dag_answer,
                                 stopped=True)
                         else:
                             _chat_pending_finish(
                                 conversation_id, dag_turn_id,
-                                answer=str(answer_box.get("answer") or ""))
+                                answer=_dag_answer, surface=_dag_surface)
                     except Exception as _e:
                         print(f"[chat.dag] answer write skipped: {_e!r}")
                 # Always release the cancel registry, whatever way we left.
@@ -10414,9 +11169,23 @@ def _stream_run(query: str, conversation_id: str | None,
         # empty done frame, and do not announce it as a completed task.
         if cancel_ev.is_set() and not answer_box["answer"]:
             answer_box["answer"] = "Stopped by operator before the run finished."
+        # A formatter answer can BE a surface (flow.py carries the payload as a
+        # fenced block). Split it the same way the worker did, so the frame the
+        # tab sees and the row a reload reads are identical: a surface renders
+        # as a component tree, and an unrenderable one becomes readable text
+        # rather than the raw payload. Chat turns only - a research report is
+        # prose, and must not be rewritten by a block that merely looks like
+        # JSON with a components key.
+        _dag_answer = str(answer_box["answer"] or "")
+        _dag_surface = (_extract_a2ui_surface(_dag_answer)
+                        if run_kind == "chat" else None)
+        if _dag_surface:
+            _dag_answer = ""
+        elif run_kind == "chat":
+            _dag_answer = _strip_a2ui_block(_dag_answer)
         # Smart notification: push a completion summary to Telegram if the
         # operator opted in (fire-and-forget, never blocks the response).
-        if answer_box["answer"] and not cancel_ev.is_set():
+        if _dag_answer and not cancel_ev.is_set():
             # Fire and forget on a daemon thread, the same way
             # _capture_preference_bg does. This posts to the gateway
             # synchronously (15s timeout) and would otherwise stall the loop at
@@ -10424,8 +11193,7 @@ def _stream_run(query: str, conversation_id: str | None,
             # run_in_executor: the executor keeps a future on the loop that
             # outlives the request.
             threading.Thread(target=notify_task_done,
-                             args=(query, str(answer_box["answer"]), elapsed,
-                                   session_id),
+                             args=(query, _dag_answer, elapsed, session_id),
                              daemon=True, name="notify-done").start()
         # Per-response cost: report ONLY this run's spend. The session_id is
         # reused across every turn of a conversation (that reuse is what gives
@@ -10460,10 +11228,11 @@ def _stream_run(query: str, conversation_id: str | None,
                 browser_shots.append(f"/api/artifacts/{session_id}/{rel.as_posix()}")
             except ValueError:
                 continue
-        yield _sse("done", answer=str(answer_box["answer"]),
+        yield _sse("done", answer=_dag_answer,
                    session_id=session_id,
                    conversation_id=conversation_id or "",
                    cancelled=cancel_ev.is_set(),
+                   surface=_dag_surface,
                    browser_artifacts=browser_shots,
                    files=take_produced_files(session_id))
         # The run is over: a later identical submit may start a fresh one.
@@ -10577,7 +11346,14 @@ async def chat(req: Request):
         # empty answer and "the run finished without producing a file".
         return _stream_run(query, conversation_id, request=req,
                            idem_key=idem_key, doc_setup=_doc_setup,
-                           run_note=run_note, run_kind=run_kind)
+                           run_note=run_note, run_kind=run_kind,
+                           # The per-turn `use_documents` lives in the request
+                           # body. It has to travel as an argument: `_stream_run`
+                           # is a separate function from this handler, so a
+                           # bare `body` reference inside it is a NameError -
+                           # which killed every research run with
+                           # "name 'body' is not defined" before a node ran.
+                           body=body)
     except BaseException:
         # Never leave a key claimed by a run that never started.
         _inflight_run_release(idem_key)

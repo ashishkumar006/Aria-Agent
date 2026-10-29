@@ -169,6 +169,14 @@ def test_detector_catches_standing_preferences(text):
     "Explain how asyncio task groups work",
     "hi",
     "",
+    # Live false positives from the preference drawer. Each one was stored as
+    # a standing preference and injected into every later prompt.
+    "remind me to stretch and drink water",
+    "Reply with exactly: DAG_DISCONNECT_OK",
+    "Create a one-page PDF brief comparing REST and GraphQL for a small "
+    "internal API. I want the actual file, not text pasted in chat",
+    "Research request for the topic hi with standard depth and a 3-node limit",
+    "800-word report on solid-state battery supply chains",
 ])
 def test_detector_ignores_everything_else(text):
     assert mem.detect_preference(text) is None, f"false positive: {text!r}"

@@ -297,6 +297,58 @@ def test_validate_endpoint_accepts_a_good_surface():
     assert body["summary"]["componentCount"] == 3
 
 
+def test_the_validate_endpoint_accepts_its_own_output():
+    """The endpoint advertises "validate a surface a client already holds".
+    It returned the normalised form, re-validating that form failed with
+    `unknown property 'props'`, so a client that round-tripped a surface was
+    told its own valid server response was invalid."""
+    client = TestClient(agent_server.app)
+    first = client.post("/api/a2ui/validate", json=GOOD)
+    assert first.status_code == 200, first.text
+    again = client.post("/api/a2ui/validate", json=first.json()["surface"])
+    assert again.status_code == 200, again.text
+    assert again.json()["surface"]["components"] == \
+        first.json()["surface"]["components"]
+
+
+def test_the_prompt_states_the_table_and_sparkline_shapes():
+    """`rows must be an array` was the only guidance a generating model got,
+    and it produced an object of column arrays twice out of two. The shape is
+    not inferable from the property name, so the prompt has to show it."""
+    system, user = S.generation_prompt("a table of runs")
+    text = system + user
+    assert '"rows": [{"' in text, "no row-object example"
+    assert "ONE OBJECT PER ROW" in text
+    assert "an object of column arrays" in text
+    assert '"series": [1, 4, 9, 16]' in text
+    assert "Collections - Table rows" in text
+
+
+def test_a_generated_table_with_column_major_rows_is_normalised():
+    """A model that sends the column-oriented form still gets a rendered
+    table, instead of spending the retry (and the user's view) on a shape the
+    validator can transpose mechanically."""
+    import asyncio
+    table = {
+        "surfaceId": "runs",
+        "components": [
+            {"id": "root", "component": "Table",
+             "columns": [{"key": "skill", "label": "Skill"},
+                         {"key": "runs", "label": "Runs"}],
+             "rows": {"skill": ["research", "author"], "runs": [3, 5]}},
+        ],
+    }
+    out = asyncio.run(S.generate_surface(
+        "runs by skill", call_model=model_returning(table)))
+    assert out["ok"] is True
+    assert out["attempts"] == 1
+    table = out["surface"]["components"][0]
+    assert table["props"]["rows"] == [
+        {"skill": "research", "runs": 3},
+        {"skill": "author", "runs": 5},
+    ]
+
+
 def test_validate_endpoint_rejects_a_bad_surface_with_422_and_a_reason():
     """422 not 400: the JSON was well-formed, the content was not. A client
     needs to tell "retry" from "give up"."""

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { Search, FlaskConical } from 'lucide-react';
 import { isTerminal, isSuccess, renderMarkdown, runStatusFromNodes } from '../components/markdown';
@@ -9,6 +9,55 @@ import { api, headers, displayTopic, ago, CONF, type GraphPayload, type GraphNod
 
 type Depth = 'quick' | 'standard' | 'deep';
 type CanvasView = 'graph' | 'report' | 'log';
+type ResearchTurn = {
+  id: string; q: string; a: string; sid: string; done: boolean; ts: number;
+};
+
+/** A report parsed once per source string.
+ *
+ *  Research repaints on every fast graph poll and every topics poll, and the
+ *  answer was re-parsed inline on each of those renders. `memo` + `useMemo`
+ *  make an unchanged report free: a poll now reconciles three words of chrome
+ *  instead of walking a long document line by line. */
+const ReportBody = memo(function ReportBody({ text }: { text: string }) {
+  const html = useMemo(() => renderMarkdown(text, 1, true), [text]);
+  return <div dangerouslySetInnerHTML={{ __html: html }} />;
+});
+
+/** One question and its answer. Only the turn that is actually changing gets a
+ *  new object from `setTurns`, so `memo` keeps every earlier answer out of the
+ *  repaint path while a new turn streams in. */
+const TurnView = memo(function TurnView({ turn, index, running }: {
+  turn: ResearchTurn; index: number; running: boolean;
+}) {
+  return (
+    <section aria-label={`Turn ${index + 1}`} className="flex flex-col gap-3">
+      <div className="flex justify-end">
+        <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-violet-500/15 px-3.5 py-2.5 text-[13.5px] leading-relaxed text-zinc-100">
+          {turn.q}
+        </p>
+      </div>
+      <article
+        aria-live="polite"
+        aria-busy={!turn.done && running}
+        className="prose-chat prose-report text-[14px] leading-[1.75] text-zinc-200"
+      >
+        {turn.a
+          ? <ReportBody text={turn.a} />
+          : (
+            <p className="flex items-center gap-2 text-[13px] text-zinc-muted">
+              <FlaskConical size={13} className="animate-pulse" />
+              {running ? 'Researching…' : 'No answer produced.'}
+            </p>
+          )}
+      </article>
+      <div className="font-mono text-[10.5px] text-zinc-muted">
+        {turn.done ? `turn ${index + 1} · answered` : `turn ${index + 1} · running`}
+        {turn.sid ? ` · ${turn.sid.slice(0, 12)}…` : ''}
+      </div>
+    </section>
+  );
+});
 
 /** Pull readable markdown out of a formatter node's stored output
  *  ({final_answer} today; tolerant of older shapes). */
@@ -96,9 +145,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
   /* The conversation, oldest first. A page-level `answer` could only ever hold
      ONE answer, which is why a follow-up used to overwrite the question it was
      following up on. Each turn carries its own question, answer and session. */
-  const [turns, setTurns] = useState<{
-    id: string; q: string; a: string; sid: string; done: boolean; ts: number;
-  }[]>([]);
+  const [turns, setTurns] = useState<ResearchTurn[]>([]);
   /* Live reasoning log. The server streams a `log` frame per orchestrator
      stdout line, and this view used to DISCARD them all — so a five-minute
      run showed a static canvas and a heartbeat, with no sense of what the
@@ -701,7 +748,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Topics
-          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{shownTopics.length}</span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{topicsLoaded ? shownTopics.length : '—'}</span>
         </div>
         {/* Chat has "Start new chat"; Research had no way back to an empty
             brief except reloading, which is how a user ends up staring at the
@@ -880,7 +927,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                     {!turns.length && !!answer && (
                       <section aria-label="Report" className="flex flex-col gap-3">
                         <article className="prose-chat prose-report text-[14px] leading-[1.75] text-zinc-200">
-                          <div dangerouslySetInnerHTML={{ __html: renderMarkdown(answer, 1, true) }} />
+                          <ReportBody text={answer} />
                         </article>
                         <div className="font-mono text-[10.5px] text-zinc-muted">
                           stored report{sid ? ` · ${sid.slice(0, 12)}…` : ''}
@@ -888,31 +935,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                       </section>
                     )}
                     {turns.map((t, i) => (
-                      <section key={t.id} aria-label={`Turn ${i + 1}`} className="flex flex-col gap-3">
-                        <div className="flex justify-end">
-                          <p className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-violet-500/15 px-3.5 py-2.5 text-[13.5px] leading-relaxed text-zinc-100">
-                            {t.q}
-                          </p>
-                        </div>
-                        <article
-                          aria-live="polite"
-                          aria-busy={!t.done && running}
-                          className="prose-chat prose-report text-[14px] leading-[1.75] text-zinc-200"
-                        >
-                          {t.a
-                            ? <div dangerouslySetInnerHTML={{ __html: renderMarkdown(t.a, 1, true) }} />
-                            : (
-                              <p className="flex items-center gap-2 text-[13px] text-zinc-muted">
-                                <FlaskConical size={13} className="animate-pulse" />
-                                {running ? 'Researching…' : 'No answer produced.'}
-                              </p>
-                            )}
-                        </article>
-                        <div className="font-mono text-[10.5px] text-zinc-muted">
-                          {t.done ? `turn ${i + 1} · answered` : `turn ${i + 1} · running`}
-                          {t.sid ? ` · ${t.sid.slice(0, 12)}…` : ''}
-                        </div>
-                      </section>
+                      <TurnView key={t.id} turn={t} index={i} running={running} />
                     ))}
                   </>
                 )}

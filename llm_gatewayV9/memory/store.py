@@ -162,13 +162,26 @@ class MemoryStore:
             self._save_locked(list(items))
 
     def list_recent(self, limit: int = 50,
-                    session_id: str | None = None) -> list[MemoryRecord]:
-        """Newest-first items, optionally scoped to one session (+ globals)."""
+                    session_id: str | None = None,
+                    kinds: set[str] | None = None,
+                    hide_superseded: bool = False) -> list[MemoryRecord]:
+        """Newest-first items, optionally scoped to one session (+ globals).
+
+        Filters are applied BEFORE the newest-`limit` slice. Slicing first
+        was a correctness bug once corrections exist: with 393 superseded
+        rows newer than 7 live facts, `hide_superseded=True, limit=20`
+        fetched only superseded rows, filtered all of them out, and reported
+        an empty drawer while its stats said 7 live records.
+        """
         with self._lock:
             items = self._load_locked()
         if session_id is not None:
             items = [i for i in items
                      if i.session_id is None or i.session_id == session_id]
+        if kinds:
+            items = [i for i in items if i.kind in kinds]
+        if hide_superseded:
+            items = [i for i in items if i.superseded_by is None]
         return list(reversed(items))[:max(0, limit)]
 
     def remove(self, predicate) -> list[MemoryRecord]:

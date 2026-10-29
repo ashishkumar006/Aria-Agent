@@ -191,9 +191,13 @@ export default function Scheduler() {
         <TopBar crumb="Scheduler" />
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
-            <Stat k="JOBS" v={String(jobs.length)} s="total scheduled" />
-            <Stat k="ACTIVE" v={String(active.length)} s="armed & waiting" tone={active.length ? 'ok' : undefined} />
-            <Stat k="NEXT FIRE" v={active.length ? fmtFire(active[0].next_fire).split(' (')[0] : '—'} s={active.length ? (active[0].query || '').slice(0, 40) : 'no active jobs'} />
+            <Stat k="JOBS" v={String(jobs.length)} s="total scheduled" loading={!loaded} />
+            <Stat k="ACTIVE" v={String(active.length)} s="armed & waiting" loading={!loaded}
+              tone={active.length ? 'ok' : undefined} />
+            <Stat k="NEXT FIRE"
+              v={active.length ? fmtFire(active[0].next_fire).split(' (')[0] : '—'}
+              s={!loaded ? 'reading schedule…' : active.length ? (active[0].query || '').slice(0, 40) : 'no active jobs'}
+              loading={!loaded} />
           </div>
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">NEW JOB</div>
           <section className="mx-3.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
@@ -208,7 +212,9 @@ export default function Scheduler() {
             </div>
             {out && <div className="mt-2 text-[11px] text-zinc-muted" role="status">{out}</div>}
           </section>
-          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">ALL JOBS · {jobs.length} total · {active.length} active</div>
+          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">
+            ALL JOBS · {loaded ? `${jobs.length} total · ${active.length} active` : 'reading jobs…'}
+          </div>
           <section className="mx-3.5 mb-3.5 overflow-x-auto rounded-[10px] border border-white/10 bg-[#0e0e12]">
             <table className="w-full min-w-[560px] border-collapse text-[12.5px]">
               <thead>
@@ -245,9 +251,9 @@ export default function Scheduler() {
                     </td>
                     <td className="px-2.5 py-2 text-right">
                       <div className="flex items-center justify-end gap-1.5">
-                        {!j.enabled && j.id && <button onClick={() => toggle(j.id, true)} title="Enable" aria-label={`Enable job ${j.query || j.key}`} className="rounded-md border border-white/15 px-2 py-1 hover:border-ok hover:text-ok"><Play size={13} /></button>}
-                        {j.enabled && j.id && <button onClick={() => cancel(j.id)} title="Cancel" aria-label={`Cancel job ${j.query || j.key}`} className="rounded-md border border-white/15 px-2 py-1 hover:border-red-400 hover:text-red-300"><X size={13} /></button>}
-                        {!j.enabled && j.id && <button onClick={() => remove(j.id)} title="Delete" aria-label={`Delete job ${j.query || j.key}`} className="rounded-md border border-white/15 px-2 py-1 hover:border-red-400 hover:text-red-300"><Trash2 size={13} /></button>}
+                        {!j.enabled && j.id && <button onClick={() => toggle(j.id, true)} title="Enable" aria-label={`Enable job ${j.query || j.key}`} className="flex min-h-6 min-w-6 items-center justify-center rounded-md border border-white/15 px-2 py-1 hover:border-ok hover:text-ok"><Play size={13} /></button>}
+                        {j.enabled && j.id && <button onClick={() => cancel(j.id)} title="Cancel" aria-label={`Cancel job ${j.query || j.key}`} className="flex min-h-6 min-w-6 items-center justify-center rounded-md border border-white/15 px-2 py-1 hover:border-red-400 hover:text-red-300"><X size={13} /></button>}
+                        {!j.enabled && j.id && <button onClick={() => remove(j.id)} title="Delete" aria-label={`Delete job ${j.query || j.key}`} className="flex min-h-6 min-w-6 items-center justify-center rounded-md border border-white/15 px-2 py-1 hover:border-red-400 hover:text-red-300"><Trash2 size={13} /></button>}
                       </div>
                     </td>
                     </tr>

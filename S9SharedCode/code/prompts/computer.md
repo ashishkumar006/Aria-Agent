@@ -54,14 +54,14 @@ TWO ROUTES, ONE SKILL:
                   description and say the host must restart with live mode.
    - "done"     - it ran.
    - "blocked"  - the safety gates refused it (denylisted command or
-                  protected path). Report the reason; do not rephrase it
-                  to get around the gate.
-
+protected path). Report the reason; do not rephrase it
+                   to get around the gate.
 Output (JSON, no markdown):
-{
-  "action": "<what was requested>",
-  "layer": "<engine layer that finished the run>",
-  "result": <the engine's result object>,
-  "status": "done" | "error",
-  "message_to_user": "<plain-language summary of the outcome>"
-}
+
+  {
+    "action": "<what was requested>",
+    "layer": "<engine layer that finished the run>",
+    "result": <the engine's result object>,
+    "status": "done" | "error",
+    "message_to_user": "<plain-language summary of the outcome>"
+  }

@@ -513,3 +513,221 @@ async def test_a_superseding_write_hides_the_old_record(api_client):
                if i["descriptor"] == "converge-check-9931"]
     assert len(visible) == 1, visible
     assert visible[0]["id"] != old_id
+
+
+# ── exact-repeat convergence (standing claims, every writer) ──────────────
+# The profile drawer held 149 rows for one preference. The agent's fuzzy
+# matcher was the only dedupe and it ran on the agent's write path alone, so
+# a retry, a second extractor thread or a direct API client could append
+# another copy. Convergence now lives in the plane, where every writer passes.
+
+
+@pytest.mark.asyncio
+async def test_exact_repeat_observation_converges_to_one_live_row(api_client):
+    marker = "Converge-Repeat 5521!"
+    first = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": marker,
+        "keywords": ["conv-alpha"], "value": {"observation": marker},
+        "source": "test", "run_id": "t1", "confidence": 0.4})
+    assert first.status_code == 200, first.text
+    old_id = first.json()["item"]["id"]
+
+    # Case/punctuation/whitespace are normalised, not fuzzily matched.
+    second = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": "converge   repeat 5521",
+        "keywords": ["conv-beta"],
+        "value": {"observation": "converge   repeat 5521",
+                  "evidence": "second sighting"},
+        "source": "test", "run_id": "t2", "confidence": 0.9})
+    assert second.status_code == 200, second.text
+    new_id = second.json()["item"]["id"]
+    assert new_id != old_id
+    assert second.json()["item"]["value"]["seen_count"] == 2
+
+    r = await api_client.get("/v1/memory", params={
+        "limit": 500, "drawers": "profile"})
+    assert r.status_code == 200, r.text
+    rows = [i for i in r.json()["items"] if i["descriptor"] == marker]
+    assert len(rows) == 2, rows
+    by_id = {i["id"]: i for i in rows}
+    assert by_id[old_id]["superseded_by"] == new_id
+    assert by_id[new_id].get("superseded_by") is None
+    # One memory, seen twice: the sighting count is folded in, the quote that
+    # established the claim is kept, and the newest quote sits beside it.
+    assert by_id[new_id]["value"]["seen_count"] == 2
+    assert by_id[new_id]["value"]["observation"] == marker
+    assert by_id[new_id]["value"]["evidence"] == "second sighting"
+    assert by_id[new_id]["value"]["latest_quote"] == "second sighting"
+    assert set(by_id[new_id]["keywords"]) >= {"conv-alpha", "conv-beta"}
+    assert by_id[new_id]["confidence"] == 0.9
+
+    live = await api_client.get("/v1/memory", params={
+        "limit": 500, "drawers": "profile", "hide_superseded": "true"})
+    assert live.status_code == 200, live.text
+    survivors = [i["id"] for i in live.json()["items"]
+                 if i["descriptor"] == marker]
+    assert survivors == [new_id], survivors
+
+
+@pytest.mark.asyncio
+async def test_exact_repeat_preference_converges_too(api_client):
+    """Preferences are the claim the agent injects into every later prompt,
+    so they must not multiply either."""
+    marker = "Prefers no emoji anywhere 6610"
+    first = await api_client.post("/v1/memory/remember", json={
+        "kind": "preference", "descriptor": marker,
+        "keywords": ["emoji"], "value": {"rule": "no emoji"},
+        "source": "test", "run_id": "t1"})
+    assert first.status_code == 200, first.text
+    old_id = first.json()["item"]["id"]
+
+    second = await api_client.post("/v1/memory/remember", json={
+        "kind": "preference", "descriptor": marker.lower(),
+        "keywords": ["formatting"], "value": {"rule": "no emoji"},
+        "source": "test", "run_id": "t2"})
+    assert second.status_code == 200, second.text
+    item = second.json()["item"]
+    assert item["drawer"] == "fact"
+    assert item["id"] != old_id
+    assert item["value"]["seen_count"] == 2
+
+    live = await api_client.get("/v1/memory", params={
+        "limit": 500, "kinds": "preference", "hide_superseded": "true"})
+    assert [i["id"] for i in live.json()["items"]
+            if i["descriptor"].lower() == marker.lower()] == [item["id"]]
+
+
+@pytest.mark.asyncio
+async def test_identical_facts_do_not_converge(api_client):
+    """Two identical facts are legitimate: the same sentence can be quoted in
+    two documents, and document spans must never be folded together."""
+    marker = "fact-repeat-1180 is an exact duplicate"
+    ids = []
+    for _ in range(2):
+        r = await api_client.post("/v1/memory/remember", json={
+            "kind": "fact", "descriptor": marker, "keywords": ["facts"],
+            "value": {"raw": marker}, "source": "test", "run_id": "t1"})
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["item"]["id"])
+
+    live = await api_client.get("/v1/memory", params={
+        "limit": 500, "kinds": "fact", "hide_superseded": "true"})
+    found = [i["id"] for i in live.json()["items"]
+             if i["descriptor"] == marker]
+    assert sorted(found) == sorted(ids), found
+
+
+@pytest.mark.asyncio
+async def test_api_list_offset_pages_without_gaps_or_repeats(api_client):
+    """Pages are slices of one merged newest-first list.
+
+    Asking each drawer for only `limit` rows restarted every drawer at its
+    own newest row, so page 2 could skip records that belonged on it.
+    """
+    prefix = "offset-page-7742"
+    for i in range(5):
+        r = await api_client.post("/v1/memory/remember", json={
+            "kind": "fact", "descriptor": f"{prefix} row {i}",
+            "keywords": [prefix], "value": {"n": i},
+            "source": "test", "run_id": "t1"})
+        assert r.status_code == 200, r.text
+
+    full = await api_client.get("/v1/memory", params={
+        "limit": 500, "drawers": "fact"})
+    assert full.status_code == 200, full.text
+    expected = [i["id"] for i in full.json()["items"]][:12]
+    assert len(expected) >= 5
+
+    paged: list[str] = []
+    for off in range(0, len(expected), 4):
+        r = await api_client.get("/v1/memory", params={
+            "limit": 4, "offset": off, "drawers": "fact"})
+        assert r.status_code == 200, r.text
+        paged.extend(i["id"] for i in r.json()["items"])
+    assert paged == expected
+    assert len(set(paged)) == len(paged)
+
+    past_end = await api_client.get("/v1/memory", params={
+        "limit": 4, "offset": 10_000, "drawers": "fact"})
+    assert past_end.status_code == 200
+    assert past_end.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_stats_reports_live_and_superseded(api_client):
+    """`by_kind` counted corrections, so a drawer with 149 duplicates of one
+    live claim reported 149 facts. The page needs the live split."""
+    marker = "stats-live-8830"
+    for _ in range(2):
+        r = await api_client.post("/v1/memory/remember", json={
+            "kind": "observation", "descriptor": marker,
+            "keywords": ["stats"], "value": {"observation": marker},
+            "source": "test", "run_id": "t1"})
+        assert r.status_code == 200, r.text
+
+    r = await api_client.get("/v1/memory/stats")
+    assert r.status_code == 200, r.text
+    profile = r.json()["drawers"]["profile"]
+    assert profile["items"] == profile["live"] + profile["superseded"]
+    assert sum(profile["live_by_kind"].values()) == profile["live"]
+    assert profile["superseded"] >= 1
+    assert profile["live_by_kind"]["observation"] >= 1
+    assert (profile["by_kind"]["observation"]
+            >= profile["live_by_kind"]["observation"])
+
+
+@pytest.mark.asyncio
+async def test_hide_superseded_is_applied_before_the_page_limit(api_client):
+    """A dead newest row must not consume the page.
+
+    With 393 superseded rows newer than 7 live facts,
+    `hide_superseded=true, limit=20` fetched only corrections, filtered all
+    of them out, and returned an empty list while stats said 7 live.
+    """
+    marker = "live-window-6612"
+    target = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": f"{marker} target",
+        "keywords": ["livewindow"], "value": {"observation": f"{marker} target"},
+        "source": "test", "run_id": "t1"})
+    assert target.status_code == 200, target.text
+    target_id = target.json()["item"]["id"]
+    doomed = await api_client.post("/v1/memory/remember", json={
+        "kind": "observation", "descriptor": f"{marker} doomed",
+        "keywords": ["livewindow"], "value": {"observation": f"{marker} doomed"},
+        "source": "test", "run_id": "t1"})
+    assert doomed.status_code == 200, doomed.text
+    # Supersede the newer observation from a fact write, so every profile
+    # row above the target is dead and a limit of one would only see death.
+    fact = await api_client.post("/v1/memory/remember", json={
+        "kind": "fact", "descriptor": f"{marker} tombstone",
+        "keywords": ["livewindow"], "value": {"raw": marker},
+        "source": "test", "run_id": "t1",
+        "supersedes": doomed.json()["item"]["id"]})
+    assert fact.status_code == 200, fact.text
+
+    r = await api_client.get("/v1/memory", params={
+        "drawers": "profile", "hide_superseded": "true", "limit": 1})
+    assert r.status_code == 200, r.text
+    assert [i["id"] for i in r.json()["items"]] == [target_id]
+
+
+@pytest.mark.asyncio
+async def test_kind_filter_is_applied_before_the_page_limit(api_client):
+    """A newer row of another kind must not consume the fact page."""
+    marker = "kind-page-3390"
+    fact = await api_client.post("/v1/memory/remember", json={
+        "kind": "fact", "descriptor": f"{marker} fact",
+        "keywords": ["kindpage"], "value": {"raw": marker},
+        "source": "test", "run_id": "t1"})
+    assert fact.status_code == 200, fact.text
+    fact_id = fact.json()["item"]["id"]
+    pref = await api_client.post("/v1/memory/remember", json={
+        "kind": "preference", "descriptor": f"{marker} preference",
+        "keywords": ["kindpage"], "value": {"rule": marker},
+        "source": "test", "run_id": "t1"})
+    assert pref.status_code == 200, pref.text
+
+    r = await api_client.get("/v1/memory", params={
+        "drawers": "fact", "kinds": "fact", "limit": 1})
+    assert r.status_code == 200, r.text
+    assert [i["id"] for i in r.json()["items"]] == [fact_id]

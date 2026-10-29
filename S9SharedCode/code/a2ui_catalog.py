@@ -83,8 +83,9 @@ CATALOG: dict[str, dict[str, Any]] = {
     },
     "Card": {
         "aria_widget": "glass-card",
-        "doc": "Bordered surface. One per record in a list.",
-        "props": {"child": "id", "title": "text"},
+        "doc": ("Bordered surface. One per record in a list. Takes one `child` "
+                "or a `children` stack."),
+        "props": {"child": "id", "children": "ids", "title": "text"},
     },
     "Divider": {
         "aria_widget": "hairline",
@@ -161,8 +162,10 @@ CATALOG: dict[str, dict[str, Any]] = {
     # are scalars only (never nested objects).
     "Table": {
         "aria_widget": "data-table",
-        "doc": "Columns x rows from the data model. Sortable and paginated.",
-        "props": {"columns": "list<{key,label}>", "rows": "list<scalar>",
+        "doc": ("Columns x rows from the data model. Sortable and paginated. "
+                "`columns` is [{key,label}]; `rows` is one object per row, "
+                "keyed by those column keys."),
+        "props": {"columns": "list<{key,label}>", "rows": "list<{columnKey:scalar}>",
                   "rowKey": "text|literal", "searchable": "bool",
                   "paginated": "bool", "emptyText": "text|literal"},
     },
@@ -182,7 +185,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "aria_widget": "button",
         "doc": "A button that emits ONE event. No form submission.",
         "props": {"label": "text|literal", "variant": "enum:primary|secondary",
-                  "action": "event"},
+                  "action": "event", "args": "object"},
     },
     "FilterChips": {
         "aria_widget": "chip-row",
@@ -252,7 +255,15 @@ def catalog_prompt() -> str:
     ]
     for name in sorted(CATALOG):
         spec = CATALOG[name]
-        props = ", ".join(sorted(spec["props"])) or "(none)"
+        # Enums are shown WITH their allowed values, not just their name.
+        # The name alone was enough for a model to guess: asked for a
+        # dashboard it emitted `gap: "small"`, the validator rejected it
+        # ("not one of loose, normal, tight"), and the retry produced the
+        # same view one call later. The catalog is the only source of truth
+        # for these values, so it belongs in the prompt that quotes it.
+        props = ", ".join(
+            f"{key}[{kind[5:]}]" if kind.startswith("enum:") else key
+            for key, kind in sorted(spec["props"].items())) or "(none)"
         lines.append(f"- {name} ({props}): {spec['doc']}")
     lines += [
         "",
@@ -322,6 +333,25 @@ def validate_components(components: Any) -> list[dict[str, Any]]:
             raise CatalogError(
                 f"{cid}: unknown component {name!r}. This catalog has: "
                 + ", ".join(sorted(CATALOG)))
+
+        # The canonical wire shape is FLAT (`{"id", "component", ...props}`),
+        # but this validator RETURNS `{id, component, props: {...}}` and every
+        # endpoint hands that value back to the client. Re-validating our own
+        # output therefore failed with `unknown property 'props'` - a round
+        # trip the API advertises (`POST /api/a2ui/validate` accepts "a surface
+        # a client already holds"). Accept the normalised form on input too.
+        # Flat keys win when a payload carries both: it says the same thing
+        # twice, and what it puts at the top level is what it means.
+        packed = raw.get("props")
+        if packed is not None:
+            if not isinstance(packed, dict):
+                raise CatalogError(f"{cid}.props must be an object")
+            if "props" in packed:
+                raise CatalogError(f"{cid}.props must not contain 'props'")
+            flat = {k: v for k, v in packed.items()
+                    if k not in ("id", "component")}
+            flat.update({k: v for k, v in raw.items() if k != "props"})
+            raw = flat
 
         for key in raw:
             if key in ("id", "component"):
@@ -393,7 +423,10 @@ def validate_components(components: Any) -> list[dict[str, Any]]:
             raise CatalogError(f"{cid} declares too many actions")
 
         if name == "Table":
-            _validate_table(cid, raw.get("columns"), raw.get("rows"))
+            normalised_rows = _validate_table(
+                cid, raw.get("columns"), raw.get("rows"))
+            if normalised_rows is not None:
+                raw["rows"] = normalised_rows
         elif name == "Sparkline":
             _validate_series(cid, raw.get("series"))
 
@@ -424,13 +457,21 @@ def validate_components(components: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _validate_table(cid: str, columns: Any, rows: Any) -> None:
-    """Shape and bounds for `Table`.
+def _validate_table(cid: str, columns: Any, rows: Any) -> Any:
+    """Shape and bounds for `Table`; returns rows normalised to row objects.
 
     Cells are scalars only. A nested object in a cell would be data the console
     has no contract for, and the general text budget does not bound it - 500
     rows x 40 columns of nested structure is the one shape that could make the
     response enormous while every individual string stayed legal.
+
+    Two column-oriented near-misses are normalised instead of rejected:
+    `rows` as `{columnKey: [values...]}` (column-major) and `rows` as
+    `[[cell, ...], ...]` (positional). Both are unambiguous given `columns`,
+    both were produced live by surface generation (`rows must be an array`
+    failed 2 of 2 generated tables), and the console cannot tell either from
+    the documented shape once it is transposed. Anything else still fails
+    loudly, with the expected shape in the message so the retry can fix it.
     """
     if not isinstance(columns, list) or not columns:
         raise CatalogError(f"{cid}.columns must be a non-empty array")
@@ -451,16 +492,56 @@ def _validate_table(cid: str, columns: Any, rows: Any) -> None:
     if len(set(keys)) != len(keys):
         raise CatalogError(f"{cid}.columns has duplicate keys")
     if rows is None:
-        return
+        return None
+    if isinstance(rows, dict):
+        # A binding is `{"path": "/pointer"}`. Check that BEFORE the
+        # column-major form, because "path" is also a perfectly ordinary
+        # column key (a table of files) and a column-major table with that
+        # key must still be transposable. A list value means column data,
+        # not a binding.
+        if (isinstance(rows.get("path"), str)
+                and "path" not in keys):
+            raise CatalogError(
+                f"{cid}.rows must be a literal array of row objects, e.g. "
+                f"[{{\"{keys[0]}\": 1}}]; a data binding is not supported here")
+        not_lists = [k for k, v in rows.items() if not isinstance(v, list)]
+        if not_lists:
+            raise CatalogError(
+                f"{cid}.rows must be an array of row objects, keyed by the "
+                f"column keys ({', '.join(keys)}); got an object whose "
+                f"{not_lists[0]!r} is not an array")
+        widths = {len(v) for v in rows.values()}
+        if len(widths) > 1:
+            raise CatalogError(
+                f"{cid}.rows is column-oriented but its columns have "
+                f"different lengths")
+        unknown = [k for k in rows if k not in keys]
+        if unknown:
+            raise CatalogError(
+                f"{cid}.rows names {unknown[0]!r}, which is not a column key "
+                f"({', '.join(keys)})")
+        n = widths.pop() if widths else 0
+        rows = [{k: rows[k][i] for k in rows} for i in range(n)]
     if not isinstance(rows, list):
-        raise CatalogError(f"{cid}.rows must be an array")
+        raise CatalogError(
+            f"{cid}.rows must be an array of row objects, e.g. "
+            f"[{{\"{keys[0]}\": 1}}]")
     if len(rows) > MAX_TABLE_ROWS:
         raise CatalogError(
             f"{cid}.rows has {len(rows)}; the limit is {MAX_TABLE_ROWS}. "
             f"Add a filter or aggregate server-side.")
+    out: list[dict] = []
     for i, row in enumerate(rows):
+        if isinstance(row, (list, tuple)):
+            if len(row) != len(keys):
+                raise CatalogError(
+                    f"{cid}.rows[{i}] has {len(row)} cells but there are "
+                    f"{len(keys)} columns; give each row an object keyed by "
+                    f"the column keys ({', '.join(keys)})")
+            row = dict(zip(keys, row))
         if not isinstance(row, dict):
-            raise CatalogError(f"{cid}.rows[{i}] must be an object")
+            raise CatalogError(
+                f"{cid}.rows[{i}] must be an object keyed by the column keys")
         for k, v in row.items():
             if isinstance(v, (dict, list)):
                 raise CatalogError(
@@ -470,6 +551,8 @@ def _validate_table(cid: str, columns: Any, rows: Any) -> None:
                 raise CatalogError(
                     f"{cid}.rows[{i}].{k} is {len(v)} chars; the cell limit "
                     f"is {MAX_CELL_CHARS}")
+        out.append(row)
+    return out
 
 
 def _validate_series(cid: str, series: Any) -> None:
@@ -480,7 +563,8 @@ def _validate_series(cid: str, series: Any) -> None:
     series instead of showing an outlier.
     """
     if not isinstance(series, list):
-        raise CatalogError(f"{cid}.series must be an array of numbers")
+        raise CatalogError(
+            f"{cid}.series must be an array of numbers, e.g. [1, 4, 9]")
     if len(series) > MAX_SERIES_POINTS:
         raise CatalogError(
             f"{cid}.series has {len(series)} points; the limit is "
@@ -488,7 +572,8 @@ def _validate_series(cid: str, series: Any) -> None:
     import math as _math
     for i, v in enumerate(series):
         if isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise CatalogError(f"{cid}.series[{i}] must be a number")
+            raise CatalogError(
+                f"{cid}.series[{i}] must be a number, e.g. [1, 4, 9]")
         if not _math.isfinite(float(v)):
             raise CatalogError(f"{cid}.series[{i}] must be finite")
 
@@ -602,6 +687,53 @@ def _resolve(data: Any, pointer: str) -> Any:
     return node
 
 
+def _resolve_scalar_bindings(components: list[dict[str, Any]],
+                             data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replace `{"path": ...}` bindings on scalar props with their values.
+
+    The generation prompt tells the model to BIND a value from `data` rather
+    than interpolate it, and the catalog accepts the binding. The console's
+    renderer, however, reads `props` literally - it has no data-model
+    implementation - so a bound KeyValue rendered as `[object Object]`. The
+    full-surface validator is the last place that still has both the
+    components and the data, so it resolves scalar bindings here.
+
+    Only props the catalog declares as scalar are touched. `Action.args` is an
+    object and is deliberately left alone: `{"path": "C:\\reports\\q3.pdf"}`
+    is a file argument there, not a JSON-Pointer binding, and rewriting it
+    would break the action.
+    """
+    if not components:
+        return components
+    out: list[dict[str, Any]] = []
+    for comp in components:
+        spec = CATALOG.get(comp["component"]) or {}
+        props = dict(comp["props"])
+        for key, value in list(props.items()):
+            declared = spec.get("props", {}).get(key, "")
+            if declared not in ("text|literal", "number"):
+                continue
+            if not (isinstance(value, dict)
+                    and isinstance(value.get("path"), str)):
+                continue
+            got = _resolve(data, value["path"])
+            if isinstance(got, (dict, list)):
+                raise CatalogError(
+                    f"{comp['id']}.{key} binds to a non-scalar value at "
+                    f"{value['path']!r}")
+            if got is None:
+                raise CatalogError(
+                    f"{comp['id']}.{key} binds to {value['path']!r}, which "
+                    f"is not in the surface's data")
+            if isinstance(got, str) and len(got) > MAX_TEXT_LEN:
+                raise CatalogError(
+                    f"{comp['id']}.{key} binds to {len(got)} chars; the "
+                    f"limit is {MAX_TEXT_LEN}")
+            props[key] = got
+        out.append({**comp, "props": props})
+    return out
+
+
 def validate_surface(payload: Any) -> dict[str, Any]:
     """Validate one `createSurface` + components + data bundle.
 
@@ -638,6 +770,7 @@ def validate_surface(payload: Any) -> dict[str, Any]:
         raise CatalogError("data must be an object")
 
     components = validate_components(payload.get("components"))
+    components = _resolve_scalar_bindings(components, data or {})
     return {"surfaceId": surface_id, "catalogId": catalog_id,
             "data": data or {}, "components": components,
             "text": render_to_text(components, data or {})}

@@ -1,6 +1,6 @@
 /* Typed client over the agent's existing REST + SSE surface. */
 
-import { cachedGet, invalidate } from './lib/getCache';
+import { cachedGet, invalidate, DEFAULT_TTL_MS } from './lib/getCache';
 
 /** Single source of truth for environment knobs (ports, poll cadence).
     Views must import these instead of hardcoding numbers/URLs. */
@@ -216,6 +216,15 @@ export interface MemItem {
       value; everything else was written before the field had a writer and
       defaults to 1.0. */
   confidence?: number;
+}
+
+export interface MemStats {
+  /** Live records per kind, for the kinds the Memory page browses. */
+  kinds: Record<string, number>;
+  total: number;
+  /** Raw per-drawer shapes, kept for a future drawer view. */
+  drawers?: Record<string, { live?: number; live_by_kind?: Record<string, number> }>;
+  excluded_drawers?: string[];
 }
 
 export interface DocItem {
@@ -524,7 +533,7 @@ export interface FeedEvent {
 export type ChatEvent =
   | { type: 'started'; session_id?: string; conversation_id?: string }
   | { type: 'log'; text?: string }
-  | { type: 'done'; answer?: string; session_id?: string }
+  | { type: 'done'; answer?: string; session_id?: string; surface?: A2uiSurface }
   | { type: 'error'; text?: string }
   | { type: string; [k: string]: unknown };
 
@@ -553,7 +562,7 @@ export type SimpleStreamEvent =
   /* `kind: "report"` + `title` mark an answer that IS a research report shown
      in full (delegated from chat). The console renders those as a preview
      card that opens in a dialog, instead of inlining several thousand words. */
-  | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number; model?: string; provider?: string; kind?: string; title?: string; stopped?: boolean }
+   | { type: 'done'; answer?: string; conversation_id?: string; files?: StreamFile[]; elapsed_ms?: number; model?: string; provider?: string; kind?: string; title?: string; stopped?: boolean; surface?: A2uiSurface }
   | { type: 'error'; text?: string }
   | { type: string; [k: string]: unknown };
 
@@ -675,7 +684,19 @@ function notifyStaleToken(): void {
   } catch { /* no DOM: nothing to show it on */ }
 }
 
-async function j<T>(url: string, init?: RequestInit): Promise<T> {
+/** How long a list read may be reused for a section switch.
+ *
+ *  Lists were all `no-store`, so every hop back to Runs/Documents/Skills paid
+ *  the full round-trip again even though the user had just looked at the same
+ *  rows (measured: 224 ms for Runs, 673 ms for Documents). 10 s makes a quick
+ *  hop instant while leaving every poll cadence (15 s) genuinely fresh; a
+ *  write still invalidates the whole cache immediately. */
+export const LIST_TTL_MS = 10_000;
+
+/** Options a caller may pass to `j`. `ttlMs` only applies to GETs. */
+type JInit = RequestInit & { ttlMs?: number };
+
+async function j<T>(url: string, init?: JInit): Promise<T> {
   const method = (init?.method || 'GET').toUpperCase();
   /* Read-through cache on GET only. This is the single funnel every view
      goes through, so caching here covers all of them without touching a call
@@ -703,7 +724,7 @@ async function j<T>(url: string, init?: RequestInit): Promise<T> {
      probes need it: a 30s-cached /api/health made the gateway-down banner's
      Retry replay the very failure the user was trying to clear. */
   if (init?.cache === 'no-store') return load();
-  return cachedGet<T>(url, load);
+  return cachedGet<T>(url, load, init?.ttlMs ?? DEFAULT_TTL_MS);
 }
 
 /** POST a JSON body through the same pipeline as `j` (auth header + server
@@ -752,7 +773,11 @@ export interface FlagRow {
 }
 
 export interface A2uiProps { [k: string]: unknown }
-export interface A2uiComponent { id: string; component: string; props: A2uiProps }
+
+/** Handler for A2UI Action component clicks. */
+export type A2uiActionHandler = (action: string, args: Record<string, unknown>) => void;
+
+export interface A2uiComponent { id: string; component: string; props: A2uiProps; type?: string }
 export interface A2uiSurface {
   surfaceId: string;
   catalogId: string;
@@ -828,7 +853,8 @@ async function* sseFrames(r: Response, signal?: AbortSignal): AsyncGenerator<Rec
 }
 
 export const api = {
-  health: () => j<{ agent: string; gateway_up: boolean }>('/api/health', { cache: 'no-store' }),
+  health: (fresh = false) => j<{ agent: string; gateway_up: boolean }>(
+    `/api/health${fresh ? '?fresh=1' : ''}`, { cache: 'no-store' }),
   /* ── computer-use (gated desktop control) ──────────────────────────────
      The gates live server-side: a sensitive action returns a PENDING
      approval and waits for a human. This view is where that human is -
@@ -855,16 +881,21 @@ export const api = {
    *  approval the user came to read is at the end. */
   computerAudit: (redact = true, limit = 400) =>
     j<{ lines: string[]; count: number; total?: number }>(
-      `/api/audit?redact=${redact ? 'true' : 'false'}&limit=${limit}`, { cache: 'no-store' }),
+      `/api/audit?redact=${redact ? 'true' : 'false'}&limit=${limit}`, { ttlMs: LIST_TTL_MS }),
   /** Recorded trajectories (start/stop recording, replay). */
   computerRuns: () => j<{ runs: { id: string; turns?: number; path?: string }[] }>(
-    '/api/computer/runs', { cache: 'no-store' }),
+    '/api/computer/runs', { ttlMs: LIST_TTL_MS }),
   computerRun: (id: string) =>
     j<{ id: string; turns?: { turn: string; calls: unknown[] }[] }>(
       `/api/computer/runs/${encodeURIComponent(id)}`, { cache: 'no-store' }),
   computerReplay: (id: string) =>
     pj<{ status: string; result?: unknown }>(
       `/api/computer/replay/${encodeURIComponent(id)}`, {}),
+  /** Dispatch a computer action (drive_app, open_app, click, type, etc.) */
+  computerAction: (action: string, params: Record<string, unknown>) =>
+    pj<{ status: string; output?: unknown; error?: string }>(
+      '/api/computer/action',
+      { action, params }),
   /* ── document authoring (PDF / PPTX / DOCX / XLSX) ──
      The gateway owns the generators; these two routes proxy them so the
      console never holds the gateway token. `docgen` returns the BLOB (it
@@ -916,10 +947,10 @@ export const api = {
     }),
   sessions: (limit = 50) =>
     j<{ sessions: SessionSummary[] }>(
-      `/api/sessions?limit=${limit}`, { cache: 'no-store' }),
+      `/api/sessions?limit=${limit}`, { ttlMs: LIST_TTL_MS }),
   runsSummary: (limit = 200) =>
     j<{ runs: RunRow[]; totals?: { runs?: number; nodes?: number; dollars?: number } }>(
-      `/api/runs/summary?limit=${limit}`, { cache: 'no-store' },
+      `/api/runs/summary?limit=${limit}`, { ttlMs: LIST_TTL_MS },
     ),
   /** The graph is always requested `light`: `light=false` makes the server
       serialise every NodeState (untrimmed, "some nodes are megabytes") into
@@ -950,7 +981,7 @@ export const api = {
       `/api/nodes/health?limit=200${conversationId ? `&conversation_id=${encodeURIComponent(conversationId)}` : ''}`,
     ),
   scheduleList: () => j<{ schedules?: ScheduleJob[] | Record<string, ScheduleJob> }>(
-    '/api/schedule', { cache: 'no-store' }),
+    '/api/schedule', { ttlMs: LIST_TTL_MS }),
   scheduleCreate: (query: string, when: string) =>
     pj<{ status: string; id?: string; message?: string }>('/api/schedule', { query, when }),
   scheduleCancel: (id: string) =>
@@ -963,7 +994,7 @@ export const api = {
   scheduleToggle: (id: string, enabled: boolean) =>
     pj<{ ok: boolean; schedule_id?: string; enabled?: boolean; error?: string; hint?: string }>(
       `/api/schedule/${encodeURIComponent(id)}/enabled`, { enabled }),
-  tools: () => j<{ tools: ToolSpec[] }>('/api/tools', { cache: 'no-store' }),
+  tools: () => j<{ tools: ToolSpec[] }>('/api/tools', { ttlMs: LIST_TTL_MS }),
   toolsGuard: () =>
     j<{ disabled: string[] | null; error?: string }>('/api/config/tools'),
   setTool: (tool: string, enabled: boolean) =>
@@ -974,7 +1005,7 @@ export const api = {
     pj<{ name?: string; value?: unknown; cleared?: boolean; flags?: FlagRow[]; error?: string }>(
       '/api/apps/flags', { name, value },
     ),
-  trackerApps: () => j<{ apps: TrackerApp[] }>('/api/apps', { cache: 'no-store' }),
+  trackerApps: () => j<{ apps: TrackerApp[] }>('/api/apps', { ttlMs: LIST_TTL_MS }),
   trackerApp: (id: string) =>
     j<TrackerAppDetail>(
       `/api/apps/${encodeURIComponent(id)}`, { cache: 'no-store' }),
@@ -1053,7 +1084,10 @@ export const api = {
       `/api/apps/${encodeURIComponent(id)}/prefab-token`,
     ),
   memory: (params: URLSearchParams, signal?: AbortSignal) =>
-    j<{ items?: MemItem[]; error?: string }>(`/api/memory?${params}`, { signal }),
+    j<{ items?: MemItem[]; has_more?: boolean; error?: string }>(
+      `/api/memory?${params}`, { signal }),
+  memoryStats: (signal?: AbortSignal) =>
+    j<MemStats>('/api/memory/stats', { signal }),
   remember: (body: Record<string, unknown>) =>
     pj<{ status: string; id?: string }>('/api/memory/remember', body),
   /* The behavioural profile. Separate from `memory` because the evidence is
@@ -1100,14 +1134,20 @@ export const api = {
   deleteMemory: (id: string) =>
     j<Record<string, unknown>>(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   events: (limit = 200) => j<{ events?: FeedEvent[]; count?: number }>(
-    `/api/events?limit=${limit}`, { cache: 'no-store' }),
+    `/api/events?limit=${limit}`, { ttlMs: LIST_TTL_MS }),
   config: () => j<{ raw?: string; error?: string }>('/api/config'),
   templates: () => j<{ templates?: unknown[] }>('/api/templates'),
   /* Documents. Upload returns as soon as the bytes are stored; indexing
-     continues in the background, so the caller polls the list. */
-  documents: (signal?: AbortSignal) =>
+     continues in the background, so the caller polls the list. `fresh` opts
+     the poll out of the read-through cache: statuses change every few seconds
+     while a file is being indexed, but a section switch can still reuse the
+     list the user just saw. */
+  documents: (signal?: AbortSignal, fresh = false) =>
     j<{ documents?: DocItem[]; error?: string }>(
-      '/api/documents', { cache: 'no-store', ...(signal ? { signal } : {}) }),
+      '/api/documents',
+      fresh
+        ? { cache: 'no-store', ...(signal ? { signal } : {}) }
+        : { ttlMs: LIST_TTL_MS, ...(signal ? { signal } : {}) }),
   documentDetail: (id: string) =>
     j<{ document?: DocItem; error?: string }>(
       `/api/documents/${encodeURIComponent(id)}`),

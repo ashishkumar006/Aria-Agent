@@ -138,6 +138,71 @@ class TestClientPlumbing:
         assert body["session_id"] == "sess-flow-1"
         assert body["run_id"] == "sess-flow-1"
 
+    def test_classifier_cannot_invent_a_preference(self, gw, monkeypatch):
+        """A task request is not a standing rule.
+
+        Live, 46 of 47 preference rows were one-off tasks ("remind me to
+        stretch and drink water", "Reply with exactly: DAG_DISCONNECT_OK")
+        because the classifier's `preference` label was trusted
+        unconditionally. Preferences are injected into every later prompt, so
+        a misfiled task becomes a permanent instruction.
+        """
+        text = "remind me to stretch and drink water"
+        monkeypatch.setattr(mem, "_llm_classify", lambda raw, schema: {"parsed": {
+            "kind": "preference", "descriptor": text,
+            "keywords": ["stretch", "water"],
+            "value": {"raw": text}}})
+        item = mem.remember(text, source="user_query", run_id="r1")
+        body = _last_post(gw, "/v1/memory/remember")
+        assert body["kind"] == "fact", body
+        assert item.kind == "fact"
+
+    def test_classifier_preference_survives_when_the_detector_confirms(
+            self, gw, monkeypatch):
+        text = "From now on always include the publication date for every source."
+        monkeypatch.setattr(mem, "_llm_classify", lambda raw, schema: {"parsed": {
+            "kind": "preference", "descriptor": text,
+            "keywords": ["publication", "date"], "value": {"rule": text}}})
+        item = mem.remember(text, source="user_query", run_id="r1")
+        body = _last_post(gw, "/v1/memory/remember")
+        assert body["kind"] == "preference", body
+        assert item.kind == "preference"
+
+
+# ── the executor's per-query write ──────────────────────────────────────────
+# Storing every request filed a query log in the fact drawer: 374 of 398 live
+# fact rows were `source=user_query`, including "Capital of France" three
+# times. Per-conversation history lives in the turn log; memory is for facts
+# that should survive the conversation.
+
+class TestExecutorQueryWrites:
+    def test_safe_remember_skips_an_ordinary_request(self, gw):
+        import flow
+        flow._safe_remember("What is the capital of France?", "sess-skip")
+        assert [p for p, _ in gw.posts if p == "/v1/memory/remember"] == []
+
+    def test_safe_remember_writes_an_identity_fact(self, gw, mock_llm_classify):
+        import flow
+        flow._safe_remember("My name is Ada and my timezone is GMT",
+                            "sess-keep")
+        body = _last_post(gw, "/v1/memory/remember")
+        assert body["source"] == "user_query"
+        assert body["session_id"] == "sess-keep"
+
+    @pytest.mark.parametrize("query", [
+        "show my scheduled tasks",
+        "What is my name?",
+        "remind me to stretch and drink water",
+    ])
+    def test_safe_remember_skips_requests_that_mention_personal_data(
+            self, gw, query):
+        """A request is not a fact even when it contains a marker word.
+        "show my scheduled tasks" matched the "my schedule" marker and was
+        stored as a durable fact; the task gate now wins."""
+        import flow
+        flow._safe_remember(query, "sess-skip")
+        assert [p for p, _ in gw.posts if p == "/v1/memory/remember"] == []
+
 
 # ── Tier 2: write paths ──────────────────────────────────────────────────────
 
@@ -208,6 +273,47 @@ class TestReadPaths:
         monkeypatch.setattr(mem, "_post",
                             mock.Mock(side_effect=Exception("down")))
         assert mem.read("anything") == []
+
+    def test_list_recent_forwards_offset(self, monkeypatch):
+        """Offset is the page cursor; dropping it makes "load more" refetch
+        page 1 forever."""
+        seen = {}
+
+        def fake_get(path, params=None, timeout=30.0):
+            seen.update(path=path, params=dict(params or {}))
+            return {"items": []}
+
+        monkeypatch.setattr(mem, "_get", fake_get)
+        mem.list_recent(limit=20, offset=40, kinds=["fact"])
+        assert seen["path"] == "/v1/memory"
+        assert seen["params"]["offset"] == 40
+        assert seen["params"]["limit"] == 20
+
+    def test_list_recent_omits_offset_on_the_first_page(self, monkeypatch):
+        seen = {}
+
+        def fake_get(path, params=None, timeout=30.0):
+            seen.update(params=dict(params or {}))
+            return {"items": []}
+
+        monkeypatch.setattr(mem, "_get", fake_get)
+        mem.list_recent(limit=20)
+        assert "offset" not in seen["params"]
+
+    def test_stats_forwards_to_the_gateway(self, monkeypatch):
+        """The Memory page said the gateway did not report counts; it always
+        did. This forwarder is the whole reason the page can show them."""
+        seen = {}
+
+        def fake_get(path, params=None, timeout=30.0):
+            seen["path"] = path
+            return {"legacy": {"live": 0},
+                    "drawers": {"fact": {"live": 3, "superseded": 1}}}
+
+        monkeypatch.setattr(mem, "_get", fake_get)
+        st = mem.stats()
+        assert seen["path"] == "/v1/memory/stats"
+        assert st["drawers"]["fact"]["live"] == 3
 
 
 # ── Tier 4: concurrency ──────────────────────────────────────────────────────

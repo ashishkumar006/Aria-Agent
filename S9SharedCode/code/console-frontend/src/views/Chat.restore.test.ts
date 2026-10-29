@@ -36,4 +36,22 @@ describe('Chat restore guard', () => {
   it('does not write a DAG turn a second time from the client', () => {
     expect(SRC).not.toMatch(/chatThreadTurn/);
   });
+
+  /* The detached-run poll used to rebuild the transcript with fresh ids every
+     1.5s. Every bubble remounted, which reset A2UI table sort/page state and
+     killed text selection mid-answer. Identity is the fix, so pin both halves:
+     an unchanged row keeps its object, and the poll merges rather than sets. */
+  it('merges polled rows instead of re-keying the transcript', () => {
+    expect(SRC).toContain('setMsgs((prev) => mergeMsgs(prev, d.messages || []));');
+    expect(SRC).toContain('if (old && old.sig === sig) {');
+  });
+
+  /* Arrays rebuilt on every parent render are not data changes. Keying the
+     page reset on identity reset the table every poll tick. */
+  it('resets an A2UI table page only when its data changes', () => {
+    const A2UI = readFileSync(
+      resolve(__dirname, '../components/A2ui.tsx'), 'utf-8');
+    expect(A2UI).toContain('const dataKey = useMemo(() => JSON.stringify([columns, rows]), [columns, rows]);');
+    expect(A2UI).toContain('useEffect(() => setPage(0), [dataKey]);');
+  });
 });

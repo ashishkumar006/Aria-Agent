@@ -36,10 +36,12 @@ class Result:
     cost: dict = field(default_factory=dict)
 
 
-def check_service(name: str, url: str) -> bool:
+def check_service(name: str, url: str, token: str = None) -> bool:
     """Check if a service is reachable."""
     try:
         req = urllib.request.Request(url, method="GET")
+        if token and name.lower() == "gateway":
+            req.add_header("X-Gateway-Token", token)
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status == 200
     except Exception:
@@ -51,7 +53,7 @@ def chat(query: str, conversation_id: str | None = None, timeout: int = 180) -> 
     body = json.dumps({"query": query, "conversation_id": conversation_id or ""}).encode()
     req = urllib.request.Request(
         f"{BASE}/api/chat", data=body,
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers={"Content-Type": "application/json", "X-Aria-Token": "vM1nziucYeovFwYoEGBFKP3p5cPrApAl7JJSpxHViJM"}, method="POST",
     )
     out = {"answer": "", "elapsed_s": 0.0, "logs": [], "error": "", "session_id": "", "cost": {}}
     try:
@@ -318,7 +320,7 @@ def main():
 
     # Pre-flight checks
     print("\n--- Pre-flight ---")
-    gw_ok = check_service("Gateway", f"{GATEWAY}/v1/status")
+    gw_ok = check_service("Gateway", f"{GATEWAY}/v1/status", token="Ei7XqYlDNo2kzwNbADOIDV0sfJUng1GkaELCBYCCuRA")
     ag_ok = check_service("Agent", f"{BASE}/api/health")
     print(f"  Gateway (:8109): {'UP' if gw_ok else 'DOWN'}")
     print(f"  Agent   (:8500): {'UP' if ag_ok else 'DOWN'}")
@@ -357,7 +359,7 @@ def main():
         if r.error:
             print(f"       ERROR: {r.error[:80]}")
         if r.dag:
-            print(f"       DAG: {' → '.join(r.dag)}")
+            print(f"       DAG: {' -> '.join(r.dag)}")
 
     # Summary
     print("\n" + "=" * 78)

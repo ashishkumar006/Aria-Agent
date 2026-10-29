@@ -47,9 +47,9 @@ export default function Documents() {
   const reqRef = useRef(0);
   const previewReq = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (fresh = false) => {
     try {
-      const d = await api.documents();
+      const d = await api.documents(undefined, fresh);
       setDocs(d.documents || []);
       setLoadError('');
     } catch (e) {
@@ -61,13 +61,25 @@ export default function Documents() {
 
   const active = useSectionActive();
   useRefreshOnActive(active, load);
+  /* Put rows the server has already confirmed on screen without waiting for a
+     list read. Kept idempotent because it runs both before the read (instant
+     feedback) and after it (the read can still be the pre-upload list). */
+  const mergeAdded = useCallback((items: DocItem[]) => {
+    setDocs((prev) => {
+      const seen = new Set(prev.map((d) => d.id));
+      const fresh = items.filter((d) => !seen.has(d.id));
+      return fresh.length ? [...fresh, ...prev] : prev;
+    });
+  }, []);
   // Indexing runs in the background, so poll until nothing is in flight.
   // Hidden views stop polling; coming back refreshes immediately (H26).
   useEffect(() => {
     if (!active) return;
     if (!docs.length) load();
+    /* Indexing status can change between polls; bypass the read cache for
+       this fast cadence so the progress bar is not 10 s behind. */
     const t = setInterval(() => {
-      if (docs.some((d) => ['pending', 'parsing', 'chunking', 'embedding'].includes(d.status))) load();
+      if (docs.some((d) => ['pending', 'parsing', 'chunking', 'embedding'].includes(d.status))) load(true);
     }, 3000);
     return () => clearInterval(t);
   }, [active, docs, load]);
@@ -102,9 +114,17 @@ export default function Documents() {
        successes AND the failures together. */
     const ok: string[] = [];
     const bad: string[] = [];
+    /* Documents the server has already accepted. The list read below races the
+       gateway's own write: on a slow indexing queue the GET can return the OLD
+       list, and because no row is pending the 3 s index poll never starts — the
+       file the user just uploaded was invisible for up to 15 s (measured). The
+       POST response is authoritative, so put its row on screen now and let the
+       normal poll reconcile it. */
+    const added: DocItem[] = [];
     for (const f of list) {
       try {
         const r = await api.uploadDocument(f);
+        if (r.document) added.push(r.document);
         const nw = (r.warnings || []).length;
         const w = nw ? ` (${nw} warning(s))` : '';
         ok.push(`${r.document.filename}${w}`);
@@ -113,7 +133,9 @@ export default function Documents() {
         bad.push(`${f.name}: ${why}`);
       }
     }
+    if (added.length) { mergeAdded(added); setLoaded(true); }
     if (ok.length) await load().catch(() => { /* keep the notes */ });
+    if (added.length) mergeAdded(added);
     const parts: string[] = [];
     if (ok.length) {
       parts.push(`uploaded ${ok.length === 1 ? '' : `${ok.length} files: `}`
@@ -268,7 +290,7 @@ export default function Documents() {
             className="rounded-md border border-white/15 bg-white/5 px-2.5 py-1.5 text-xs hover:border-violet-400 disabled:opacity-40">
             <Search size={13} />
           </button>
-          <button onClick={load} aria-label="Refresh documents"
+          <button onClick={() => load()} aria-label="Refresh documents"
             className="flex items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs hover:border-violet-400">
             <RefreshCw size={13} /> refresh
           </button>
@@ -276,12 +298,13 @@ export default function Documents() {
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
-            <Stat k="DOCUMENTS" v={String(docs.length)} s="uploaded" />
-            <Stat k="READY" v={String(ready.length)} s="fully embedded"
+            <Stat k="DOCUMENTS" v={String(docs.length)} s="uploaded" loading={!loaded} />
+            <Stat k="READY" v={String(ready.length)} s="fully embedded" loading={!loaded}
               tone={ready.length ? 'ok' : undefined} />
-            <Stat k="IN USE" v={String(enabled.length)} s="enabled for chat" />
+            <Stat k="IN USE" v={String(enabled.length)} s="enabled for chat" loading={!loaded} />
             <Stat k="BLOCKED" v={String(docs.filter((d) => d.status === 'blocked').length)}
-              s="waiting for the embedder" tone={docs.some((d) => d.status === 'blocked') ? 'warn' : undefined} />
+              s="waiting for the embedder" loading={!loaded}
+              tone={docs.some((d) => d.status === 'blocked') ? 'warn' : undefined} />
           </div>
 
           {/* Drop zone: there is no size cap, so a large file is fine; the
@@ -313,7 +336,7 @@ export default function Documents() {
 
           {loadError && (
             <p role="alert" className="mx-3.5 mt-3 rounded-lg border border-red-400/30 bg-red-400/5 p-3 text-xs text-red-200">
-              couldn&apos;t load documents ({loadError}). <button onClick={load} className="underline">retry</button>
+              couldn&apos;t load documents ({loadError}). <button onClick={() => load()} className="underline">retry</button>
             </p>
           )}
 

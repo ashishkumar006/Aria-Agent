@@ -291,6 +291,88 @@ def test_memory_list_client_error_keeps_its_status(monkeypatch):
     assert r.status_code == 400, r.text
 
 
+# --- the browser pages, and does not mix documents into memories ---------
+# The page used to render a fixed 60-row list with no way to see the rest,
+# and its "all memory" count included uploaded PDF chunks and the audit log.
+
+def test_memory_list_pages_and_excludes_non_browsable_drawers(monkeypatch):
+    import types
+
+    mod = importlib.import_module("memory")
+    calls = []
+
+    def fake_list_recent(**kw):
+        calls.append(kw)
+        return [types.SimpleNamespace(id=f"mem:{i}", kind="fact",
+                                      descriptor=f"row {i}", keywords=[],
+                                      source="test")
+                for i in range(kw["offset"], kw["offset"] + kw["limit"])]
+
+    monkeypatch.setattr(mod, "list_recent", fake_list_recent)
+    with TestClient(app) as c:
+        r = c.get("/api/memory?limit=2&offset=4")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [i["id"] for i in body["items"]] == ["mem:4", "mem:5"]
+    assert body["offset"] == 4 and body["has_more"] is True
+    call = calls[-1]
+    assert call["offset"] == 4
+    # One extra row is requested so `has_more` is not guessed from a full page.
+    assert call["limit"] == 3
+    assert "document" not in call["drawers"]
+    assert "audit" not in call["drawers"]
+
+
+def test_memory_list_last_page_does_not_claim_more(monkeypatch):
+    import types
+
+    mod = importlib.import_module("memory")
+    monkeypatch.setattr(mod, "list_recent", lambda **kw: [
+        types.SimpleNamespace(id=f"mem:{i}", kind="fact", descriptor="d",
+                              keywords=[], source="test") for i in range(2)])
+    with TestClient(app) as c:
+        r = c.get("/api/memory?limit=2")
+    assert r.status_code == 200, r.text
+    assert r.json()["has_more"] is False
+
+
+def test_memory_stats_counts_live_records_only(monkeypatch):
+    """Live, not `by_kind`: the profile drawer held 149 rows for one claim,
+    and counting corrections made the sidebar disagree with the list."""
+    mod = importlib.import_module("memory")
+    monkeypatch.setattr(mod, "stats", lambda: {
+        "legacy": {"live_by_kind": {"fact": 1}},
+        "drawers": {
+            "fact": {"live_by_kind": {"fact": 2, "preference": 3},
+                     "by_kind": {"fact": 9, "preference": 9}},
+            "profile": {"live_by_kind": {"observation": 4}},
+            "document": {"live_by_kind": {"document": 77}},
+            "audit": {"live_by_kind": {"audit": 4467}},
+        }})
+    with TestClient(app) as c:
+        r = c.get("/api/memory/stats")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kinds"] == {"fact": 3, "preference": 3, "observation": 4}
+    assert body["total"] == 10
+    assert body["excluded_drawers"] == ["document", "audit"]
+
+
+def test_memory_stats_failure_is_an_error_not_zero(monkeypatch):
+    """A gateway outage must not render as "0 memories" — that is
+    indistinguishable from a wiped store."""
+    mod = importlib.import_module("memory")
+
+    def boom():
+        raise mod.MemoryBackendError("gateway down", 502)
+
+    monkeypatch.setattr(mod, "stats", boom)
+    with TestClient(app) as c:
+        r = c.get("/api/memory/stats")
+    assert r.status_code == 502, r.text
+    assert "kinds" not in r.json()
+
+
 # --- remember bridge input validation -----------------------------------
 
 @pytest.mark.parametrize("body", [

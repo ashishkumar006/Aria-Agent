@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from providers import OpenAICompatProvider  # noqa: E402
+from providers import OpenAICompatProvider, drop_empty_turns  # noqa: E402
 
 
 def _provider():
@@ -46,3 +46,33 @@ def test_real_tool_result_is_unchanged():
     out = _provider()._translate_messages(_turn('{"text":"hi"}'), "")
     tool = [m for m in out if m["role"] == "tool"]
     assert tool[0]["content"] == '{"text":"hi"}'
+
+
+def test_an_empty_assistant_turn_is_dropped_before_it_can_poison_the_thread():
+    """Aria persists a surface-only answer as `content: ""`. Replaying it made
+    every later turn of that chat fail with a 502 (`kilo`/Cohere 400: "must
+    have non-empty content or tool calls"), because the same history is sent
+    each time. The blank row carries nothing; it must not be forwarded."""
+    messages = [
+        {"role": "user", "content": "show my tasks"},
+        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": "   \n"},
+        {"role": "user", "content": "and the second one?"},
+    ]
+    out = drop_empty_turns(messages)
+    assert [m["role"] for m in out] == ["user", "user"]
+    assert [m["content"] for m in out] == ["show my tasks", "and the second one?"]
+
+
+def test_the_drop_never_removes_tool_pairs_instructions_or_media():
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "name": "read", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": ""},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]},
+    ]
+    out = drop_empty_turns(messages)
+    assert [m["role"] for m in out] == ["system", "assistant", "tool", "user"]
+

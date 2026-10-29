@@ -521,7 +521,7 @@ app.include_router(parts_optimise_router)
 
 def _normalize_messages(req: ChatRequest):
     if req.messages:
-        return list(req.messages)
+        return P.drop_empty_turns(list(req.messages))
     msgs = []
     msgs.append({"role": "user", "content": req.prompt or ""})
     return msgs

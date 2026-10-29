@@ -169,7 +169,7 @@ const nav = useNavigate();
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[264px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Runs
-          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{totals.runs || 0}</span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{loaded ? (totals.runs ?? 0) : '—'}</span>
         </div>
         <div className="flex gap-1.5 px-2.5 pb-2">
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter runs" className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
@@ -252,7 +252,9 @@ const nav = useNavigate();
             <Square size={11} /> Stop run
           </button>
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10.5px] font-bold text-zinc-400">
-            {totals.runs || 0} runs · {totals.nodes || 0} nodes · ${Number(totals.dollars || 0).toFixed(4)}
+            {loaded
+              ? `${totals.runs || 0} runs · ${totals.nodes || 0} nodes · $${Number(totals.dollars || 0).toFixed(4)}`
+              : 'reading runs…'}
           </span>
         </TopBar>
         {note && (

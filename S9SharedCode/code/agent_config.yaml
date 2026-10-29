@@ -92,6 +92,12 @@ researcher:
   # articles mid-sentence. 0 = no harness clip; fetch_url's own 300k runaway
   # guard still applies and marks any page it had to cut.
   max_tool_result_chars: 0
+  # The single JSON answer condensed 6-20 full pages into a median ~1,000
+  # words (only 3.1% of 1,112 recorded finals passed 2,000), and output did
+  # not grow with input. The harness now writes the findings up page by page
+  # from the pages this run actually fetched (skills._sectioned_findings) and
+  # hands the formatter complete evidence instead of a digest.
+  sectioned_findings: true
   description: Performs multi-step web research and produces normalised text outputs.
 
 distiller:

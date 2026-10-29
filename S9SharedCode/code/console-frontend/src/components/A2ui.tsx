@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { A2uiComponent, A2uiProps, A2uiSurface } from '../api';
+import type { A2uiComponent, A2uiProps, A2uiSurface, A2uiActionHandler } from '../api';
+import { Stat, Pill } from './ui';
 
-export type { A2uiComponent, A2uiProps, A2uiSurface };
+export type { A2uiComponent, A2uiProps, A2uiSurface, A2uiActionHandler };
+
+/* Tone words are the catalog's; Stat/Pill speak the console's. */
+const STAT_TONE: Record<string, 'ok' | 'warn' | 'bad' | undefined> = {
+  good: 'ok', warn: 'warn', bad: 'bad', neutral: undefined,
+};
+const PILL_TONE: Record<string, 'ok' | 'err' | 'warn' | 'info' | 'muted'> = {
+  good: 'ok', warn: 'warn', bad: 'err', info: 'info', neutral: 'muted',
+};
 
 /* A2UI surface renderer.
 
@@ -32,13 +41,19 @@ function num(v: unknown): number | null {
    A real polyline, not a bar chart: the point is shape-over-time at 74px wide.
    `preserveAspectRatio="none"` on a viewBox is what lets 1 data point still
    draw a flat line instead of an empty box. */
-function Sparkline({ series, label }: { series: number[]; label?: string }) {
+function Sparkline({ series, label, max }: { series: number[]; label?: string; max?: number | null }) {
   const w = 240, h = 40;
   const path = useMemo(() => {
     const pts = series.map(num).filter((n): n is number => n !== null);
     if (pts.length === 0) return '';
     if (pts.length === 1) return `M0,${h / 2} L${w},${h / 2}`;
-    const lo = Math.min(...pts), hi = Math.max(...pts);
+    const lo = Math.min(...pts);
+    const rawHi = Math.max(...pts);
+    // A declared `max` is the scale's ceiling (e.g. 0..1 progress): without it
+    // every series is normalised to its own peak, so "0.42 of 1" and "0.98 of
+    // 1" draw the same line. Data above the declared max still wins, so the
+    // path can never leave the box.
+    const hi = max != null && Number.isFinite(max) && max > lo ? Math.max(max, rawHi) : rawHi;
     const span = hi - lo || 1;
     return pts
       .map((v, i) => {
@@ -47,7 +62,7 @@ function Sparkline({ series, label }: { series: number[]; label?: string }) {
         return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
       })
       .join(' ');
-  }, [series]);
+  }, [series, max]);
 
   if (!path) return null;
   return (
@@ -103,17 +118,39 @@ function Table({ columns, rows, rowKey, searchable, paginated, emptyText }: {
   const pages = paginated ? Math.max(1, Math.ceil(filtered.length / per)) : 1;
   const shown = paginated ? filtered.slice(page * per, page * per + per) : filtered;
 
+  /* Right-align a column whose every non-empty value is a number. A
+     "Questions"/"Size"/"Count" column reads far faster flush right, and the
+     catalog carries no alignment prop for Table, so the data itself is the
+     only honest signal. */
+  const numeric = useMemo(() => {
+    const keys = new Set<string>();
+    for (const c of columns) {
+      const vals = filtered.map((r) => str(r[c.key]).trim()).filter(Boolean);
+      if (vals.length > 0 && vals.every((v) => num(v) !== null)) keys.add(c.key);
+    }
+    return keys;
+  }, [columns, filtered]);
+
   // A stale page index after the data changes makes the table lie: paged to
   // page 3 of a 3-page feed, then a refresh shrinks it to one page — `shown`
   // becomes empty and the panel prints "No items" while rows exist.
-  useEffect(() => setPage(0), [rows, columns]);
+  //
+  // Object identity is not data identity: the parent rebuilds `columns`, and
+  // the transcript poll rebuilds the surface, on every tick. Depending on the
+  // arrays themselves reset the page every 1.5s while the user was reading.
+  // Compare their contents instead.
+  const dataKey = useMemo(() => JSON.stringify([columns, rows]), [columns, rows]);
+  useEffect(() => setPage(0), [dataKey]);
   useEffect(() => {
     if (page >= pages) setPage(pages - 1);
   }, [page, pages]);
 
   return (
     <div className="min-w-0">
-      {searchable ? (
+      {/* A filter row above a four-row table is chrome, not a tool: a
+          dashboard with three small tables ended up with three search boxes
+          and looked like a form. Deep tables keep theirs. */}
+      {searchable && rows.length > 8 ? (
         <input
           value={q}
           onChange={(e) => { setQ(e.target.value); setPage(0); }}
@@ -130,15 +167,19 @@ function Table({ columns, rows, rowKey, searchable, paginated, emptyText }: {
           <table className="w-full border-collapse text-left text-[11.5px]">
             <thead>
               <tr>
+                {/* `aria-sort` belongs on the columnheader, not on the button
+                    inside it. On a button it is not an allowed ARIA attribute
+                    (Lighthouse flagged it), and a screen reader announcing the
+                    header would never see it. */}
                 {columns.map((c) => (
                   <th key={c.key} scope="col"
-                    className="border-b border-glass-border px-2 py-1 font-medium text-zinc-muted">
+                    aria-sort={sort?.key === c.key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}
+                    className={`border-b border-glass-border bg-white/[0.02] px-2 py-1.5 font-medium text-zinc-400 ${numeric.has(c.key) ? 'text-right' : ''}`}>
                     <button
                       type="button"
                       onClick={() => setSort((s) => (s?.key === c.key ? (s.dir === 1 ? { key: c.key, dir: -1 } : null) : { key: c.key, dir: 1 }))}
-                      className="inline-flex items-center gap-1 hover:text-zinc-100"
+                      className="inline-flex items-center gap-1 transition-colors hover:text-zinc-100"
                       aria-label={`Sort by ${c.label}`}
-                      aria-sort={sort?.key === c.key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}
                     >
                       {c.label}
                       {sort?.key === c.key ? <span aria-hidden>{sort.dir === 1 ? '▲' : '▼'}</span> : null}
@@ -151,11 +192,12 @@ function Table({ columns, rows, rowKey, searchable, paginated, emptyText }: {
               {shown.map((r, i) => {
                 const key = rowKey && r[rowKey] !== undefined ? str(r[rowKey]) : String(i);
                 return (
-                  <tr key={key} className="border-b border-glass-border/40">
+                  <tr key={key} className="row-in border-b border-glass-border/40 transition-colors last:border-b-0 hover:bg-white/[0.035]">
                     {columns.map((c) => {
                       const isNew = c.key === '_new' && str(r[c.key]) === 'yes';
                       return (
-                        <td key={c.key} className="px-2 py-1 align-top text-zinc-200">
+                        <td key={c.key}
+                          className={`px-2 py-1.5 align-top text-zinc-200 ${numeric.has(c.key) ? 'text-right tabular-nums' : ''}`}>
                           {isNew ? <span className="text-accent">{str(r[c.key])}</span> : str(r[c.key])}
                         </td>
                       );
@@ -184,34 +226,58 @@ function Table({ columns, rows, rowKey, searchable, paginated, emptyText }: {
 }
 
 /* ── everything else ──────────────────────────────────────────────────────── */
-function Leaf({ c }: { c: A2uiComponent }) {
+function Leaf({ c, onAction }: { c: A2uiComponent; onAction?: A2uiActionHandler }) {
   const p = c.props;
   switch (c.component) {
-    case 'Text':
-      return <p className="m-0 whitespace-pre-wrap text-[12px] text-zinc-200">{str(p.text)}</p>;
+    case 'Text': {
+      /* `variant` is the catalog's whole point for Text: without it a
+         dashboard title, its section headings and its body copy all rendered
+         as identical 12px paragraphs, which is why a correct surface still
+         looked like a wall of text. */
+      const variant = str(p.variant) || 'body';
+      const text = str(p.text);
+      if (variant === 'heading') {
+        return <h4 className="m-0 whitespace-pre-wrap text-[13.5px] font-semibold tracking-tight text-zinc-50">{text}</h4>;
+      }
+      if (variant === 'caption') {
+        return <p className="m-0 whitespace-pre-wrap text-[10.5px] leading-snug text-zinc-muted">{text}</p>;
+      }
+      if (variant === 'mono') {
+        return <p className="m-0 whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-zinc-200">{text}</p>;
+      }
+      return <p className="m-0 whitespace-pre-wrap text-[12px] leading-relaxed text-zinc-200">{text}</p>;
+    }
     case 'CodeBlock':
       return <pre className="m-0 overflow-x-auto rounded bg-surface-0 p-2 text-[11.5px] text-zinc-200"><code>{str(p.text)}</code></pre>;
     case 'Badge':
-      return <span className="inline-flex items-center rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10.5px] text-accent">{str(p.text)}</span>;
+      return <Pill tone={PILL_TONE[str(p.tone)] || 'muted'}>{str(p.text)}</Pill>;
     case 'KeyValue':
-      return (
-        <div className="min-w-0">
-          <div className="text-[10px] uppercase tracking-wide text-zinc-muted">{str(p.label)}</div>
-          <div className="truncate text-[15px] text-zinc-100">{str(p.value)}</div>
-        </div>
-      );
+      /* KeyValue is documented as "the console's Stat", so render exactly
+         that: a real metric card, with the tone preserved. The old markup
+         silently dropped `tone`, so "0% progress" in warn looked the same as
+         a healthy number. */
+      return <Stat k={str(p.label)} v={str(p.value)} tone={STAT_TONE[str(p.tone)]} />;
     case 'Divider':
-      return <hr className="my-1 border-0 border-t border-glass-border" />;
-    case 'Spacer':
-      return <div className="h-2" />;
+      return str(p.axis) === 'vertical'
+        ? <span role="separator" aria-orientation="vertical" className="mx-0.5 inline-block w-px self-stretch bg-glass-border" />
+        : <hr className="my-1 border-0 border-t border-glass-border" />;
+    case 'Spacer': {
+      const size = str(p.size) || 'normal';
+      return <div className={size === 'small' ? 'h-1' : size === 'large' ? 'h-5' : 'h-2'} />;
+    }
     case 'Link':
       /* `target` is validated to enum:console - a surface cannot emit an
          external URL, so this never becomes an anchor to somewhere else. */
       return <span className="text-[11.5px] text-accent underline">{str(p.label)}</span>;
-    case 'Table':
+    case 'Table': {
+      /* The catalog says {key,label}. Older chat payloads and AG-UI samples
+         use {key,title}; without the fallback every header rendered blank,
+         which looks like an empty grid rather than a table. */
+      const cols = ((p.columns as { key: string; label?: string; title?: string }[]) || [])
+        .map((c) => ({ key: c.key, label: c.label || c.title || c.key }));
       return (
         <Table
-          columns={(p.columns as { key: string; label: string }[]) || []}
+          columns={cols}
           rows={(p.rows as Record<string, unknown>[]) || []}
           rowKey={p.rowKey ? str(p.rowKey) : undefined}
           searchable={p.searchable !== false}
@@ -219,8 +285,9 @@ function Leaf({ c }: { c: A2uiComponent }) {
           emptyText={p.emptyText ? str(p.emptyText) : undefined}
         />
       );
+    }
     case 'Sparkline':
-      return <Sparkline series={(p.series as number[]) || []} label={p.label ? str(p.label) : undefined} />;
+      return <Sparkline series={(p.series as number[]) || []} label={p.label ? str(p.label) : undefined} max={num(p.max)} />;
     case 'DataList': {
       const rows = (p.rows as { label: unknown; value: unknown }[]) || [];
       if (!rows.length) return <p className="m-0 text-[11.5px] text-zinc-muted">{str(p.emptyText) || 'Nothing to show.'}</p>;
@@ -236,15 +303,77 @@ function Leaf({ c }: { c: A2uiComponent }) {
       );
     }
     case 'Action':
-      /* Read-only catalog: there is no action route on the server, so a button
-         that emitted an event would be inert. Rendered disabled and honest
-         rather than as a control that silently does nothing. */
+    case 'Button': {
+      /* `Action` is the catalog name; `Button` is the AG-UI name older chat
+         payloads used. Both carry their event as action/args or, in the old
+         shape, as onPress.{action,args|params}. Without threading the handler
+         through Node recursion every button nested in a Column rendered
+         disabled, which is why an action surface looked inert. */
+      const press = (c.props.onPress as Record<string, unknown> | undefined) || {};
+      const action = str(c.props.action || press.action || '');
+      const args = (c.props.args ?? press.args ?? press.params ?? {}) as Record<string, unknown>;
+      /* `variant` decides weight: a dashboard's main call to action has to
+         look different from a secondary one, and the old renderer drew both
+         as the same hairline outline. */
+      const primary = str(c.props.variant) === 'primary';
+      const primaryCls = 'rounded-md bg-accent px-3 py-1.5 text-[11.5px] font-semibold text-[#0b0b0e] transition hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60';
+      const secondaryCls = 'rounded-md border border-glass-border bg-white/[0.03] px-3 py-1.5 text-[11.5px] text-zinc-200 transition hover:border-white/20 hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40';
+      if (onAction && action) {
+        return (
+          <button
+            type="button"
+            onClick={() => onAction(action, args)}
+            title={str((c.props as Record<string, unknown>).tooltip || '')}
+            className={primary ? primaryCls : secondaryCls}
+          >
+            {str(p.label)}
+          </button>
+        );
+      }
+      /* Read-only catalog fallback: no action route on the server. */
       return (
         <button type="button" disabled
           title="Agent-generated actions are not enabled"
-          className="rounded border border-glass-border px-2 py-1 text-[11.5px] text-zinc-muted opacity-60">
+          className={`${primary ? primaryCls : secondaryCls} cursor-not-allowed opacity-60`}>
           {str(p.label)}
         </button>
+      );
+    }
+    /* Legacy, display-only: these were advertised by an older chat prompt but
+       are not in the catalog (which deliberately has no form submission). A
+       stored surface from before the prompt was corrected still names them,
+       and a read-only view of the value beats an invisible hole. */
+    case 'TextField':
+      return (
+        <div className="rounded border border-glass-border bg-surface-0 px-2 py-1 text-[11.5px] text-zinc-muted">
+          {str(p.value) || str(p.placeholder) || '…'}
+        </div>
+      );
+    case 'Dropdown': {
+      const opts = (p.options as { value: string; label: string }[]) || [];
+      const sel = opts.find((o) => o.value === p.value);
+      return (
+        <div className="rounded border border-glass-border bg-surface-0 px-2 py-1 text-[11.5px] text-zinc-200">
+          {str(sel?.label ?? p.value ?? 'Select…')}
+        </div>
+      );
+    }
+    case 'Checkbox':
+      return (
+        <span className="inline-flex items-center gap-1.5 text-[11.5px] text-zinc-200">
+          <input type="checkbox" checked={!!p.checked} disabled
+            aria-label={str(p.label) || 'checkbox'} />
+          {str(p.label)}
+        </span>
+      );
+    case 'Slider':
+      return (
+        <span className="inline-flex items-center gap-1.5 text-[11.5px] text-zinc-200">
+          {str(p.label)}
+          <span className="text-zinc-muted">
+            {str(p.value)} ({str(p.min)}–{str(p.max)})
+          </span>
+        </span>
       );
     case 'FilterChips': {
       const opts = (p.options as { id: string; label: string; selected?: boolean }[]) || [];
@@ -263,9 +392,15 @@ function Leaf({ c }: { c: A2uiComponent }) {
       const items = (p.items as A2uiComponent[]) || [];
       return (
         <div className="flex flex-wrap items-center gap-1">
-          {items.map((it, i) => (
-            <span key={i} className="inline-flex items-center rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10.5px] text-accent">{str(it.props.text)}</span>
-          ))}
+          {items.map((it, i) => {
+            const props = (it.props || {}) as A2uiProps;
+            const tone = str(props.tone) || str((it as unknown as { tone?: unknown }).tone);
+            return (
+              <Pill key={i} tone={PILL_TONE[tone] || 'muted'}>
+                {str(props.text ?? (it as unknown as { text?: unknown }).text)}
+              </Pill>
+            );
+          })}
         </div>
       );
     }
@@ -292,42 +427,56 @@ function Leaf({ c }: { c: A2uiComponent }) {
       );
     }
     default:
-      /* Unreachable for a validated surface; kept so a future catalog addition
-         degrades to visible nothing rather than throwing mid-render. */
-      return null;
+      /* A validated surface never reaches this branch, but a stored surface
+         written before the catalog was enforced can. Rendering nothing made
+         the component vanish silently (the "A2UI is not rendering" bug);
+         naming it keeps the gap visible and debuggable. */
+      return (
+        <p className="m-0 text-[11px] text-zinc-muted">
+          [{str(c.component)}]
+        </p>
+      );
   }
 }
 
-function Node({ c, byId, depth }: { c: A2uiComponent; byId: Map<string, A2uiComponent>; depth: number }) {
+function Node({ c, byId, depth, onAction }: { c: A2uiComponent; byId: Map<string, A2uiComponent>; depth: number; onAction?: A2uiActionHandler }) {
   const kids = ((c.props.children as string[]) || []).map((id) => byId.get(id)).filter(Boolean) as A2uiComponent[];
   const gap = c.props.gap === 'tight' ? 'gap-1' : c.props.gap === 'loose' ? 'gap-4' : 'gap-2';
 
   if (c.component === 'Card') {
     const child = c.props.child ? byId.get(str(c.props.child)) : undefined;
     return (
-      <section className="rounded border border-glass-border bg-surface-1 p-2">
-        {c.props.title ? <h3 className="m-0 mb-1 text-[12px] font-medium text-zinc-100">{str(c.props.title)}</h3> : null}
-        {child ? <Node c={child} byId={byId} depth={depth + 1} /> : null}
+      <section className="rounded-lg border border-glass-border bg-surface-1 p-3">
+        {c.props.title ? <h3 className="m-0 mb-1.5 text-[12px] font-semibold text-zinc-100">{str(c.props.title)}</h3> : null}
+        {kids.length ? (
+          <div className={`flex min-w-0 flex-col ${gap}`}>
+            {kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} onAction={onAction} />)}
+          </div>
+        ) : child ? <Node c={child} byId={byId} depth={depth + 1} onAction={onAction} /> : null}
       </section>
     );
   }
   if (c.component === 'MetricRow') {
+    /* KeyValues are Stat cards, which carry their own flex-1/min-width, so the
+       strip only has to wrap them evenly. The old gap-4 left a metric strip
+       noticeably looser than the sections under it. */
     return (
-      <div className="flex flex-wrap gap-4">
-        {kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} />)}
+      <div className="flex flex-wrap items-stretch gap-2">
+        {kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} onAction={onAction} />)}
       </div>
     );
   }
   if (c.component === 'Row') {
-    return <div className={`flex flex-wrap items-start ${gap}`}>{kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} />)}</div>;
+    const align = c.props.align === 'center' ? 'items-center' : c.props.align === 'bottom' ? 'items-end' : 'items-start';
+    return <div className={`flex flex-wrap ${align} ${gap}`}>{kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} onAction={onAction} />)}</div>;
   }
   if (c.component === 'Column') {
-    return <div className={`flex min-w-0 flex-col ${gap}`}>{kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} />)}</div>;
+    return <div className={`flex min-w-0 flex-col ${gap}`}>{kids.map((k) => <Node key={k.id} c={k} byId={byId} depth={depth + 1} onAction={onAction} />)}</div>;
   }
-  return <Leaf c={c} />;
+  return <Leaf c={c} onAction={onAction} />;
 }
 
-export function A2ui({ surface, notes }: { surface: A2uiSurface; notes?: string[] }) {
+export function A2ui({ surface, notes, onAction }: { surface: A2uiSurface; notes?: string[]; onAction?: A2uiActionHandler }) {
   const byId = useMemo(() => new Map(surface.components.map((c) => [c.id, c])), [surface]);
   const root = byId.get(surface.rootComponent);
   if (!root) {
@@ -338,7 +487,7 @@ export function A2ui({ surface, notes }: { surface: A2uiSurface; notes?: string[
     );
   }
   return (
-    <div className="min-w-0">
+    <div className="surface-in min-w-0">
       {notes && notes.length ? (
         <ul className="mb-2 space-y-0.5">
           {notes.map((n, i) => (
@@ -346,7 +495,7 @@ export function A2ui({ surface, notes }: { surface: A2uiSurface; notes?: string[
           ))}
         </ul>
       ) : null}
-      <Node c={root} byId={byId} depth={0} />
+      <Node c={root} byId={byId} depth={0} onAction={onAction} />
     </div>
   );
 }

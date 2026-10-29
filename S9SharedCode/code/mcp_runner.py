@@ -316,7 +316,8 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                          prepare_fn=None,
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
-                         max_tool_result_chars: int | None = None) -> dict:
+                         max_tool_result_chars: int | None = None,
+                         capture_transcript: bool = False) -> dict:
     """The tool-use loop, factored for testability: `chat_fn(messages)`
     returns a gateway reply dict; `dispatch_fn(name, args)` returns result
     text. Returns the FINAL reply dict. Stops early with an explicit error
@@ -358,7 +359,15 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     loop with a stated reason rather than a gateway rejection.
     `max_tool_result_chars` overrides how much of a single tool result is fed
     back to the model; None uses the 32k default, and 0 or less means no
-    harness clip (the tool's own guard still applies)."""
+    harness clip (the tool's own guard still applies).
+
+    `capture_transcript` attaches every dispatched call and its FULL result to
+    the reply under `transcript` ([{name, arguments, ok, result}]). The
+    researcher uses it to write its findings up from the pages it actually
+    fetched instead of from a single summarising pass (see
+    skills._sectioned_findings). Off by default: the transcript can hold
+    megabytes of page text, and replies that travel to a client must not
+    carry it."""
     def _emit(kind: str, payload: dict) -> None:
         if on_event is None:
             return
@@ -391,6 +400,16 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
         except Exception:
             pass
 
+    # Optional evidence trail. Only populated when the caller asked for it, so
+    # the normal path pays nothing and the reply stays small.
+    transcript: list[dict] = []
+
+    def _finish(rep: dict) -> dict:
+        if capture_transcript:
+            rep = dict(rep)
+            rep["transcript"] = transcript
+        return rep
+
     # Unlimited when `max_hops <= 0`. A coding agent that has to read a dozen
     # files must not be cut off mid-investigation and then answer nothing —
     # which is exactly what an old fixed cap produced live. What stops a
@@ -413,13 +432,13 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                    and _elide_oldest_tool_output(messages)):
                 pass
             if _context_chars(messages) > max_context_chars:
-                return {"text": "", "tool_calls": [],
+                return _finish({"text": "", "tool_calls": [],
                         "provider": last_reply.get("provider", ""),
                         "input_tokens": usage_in,
                         "output_tokens": usage_out,
                         "error": f"context budget exceeded "
                                  f"({_context_chars(messages)} chars) — "
-                                 "answer from what you already have"}
+                                 "answer from what you already have"})
         if chat_stream_fn is not None:
             try:
                 # The streamed path forwards each text delta through on_event as
@@ -459,12 +478,12 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 hop -= 1
                 chat_stream_fn = None
                 continue
-            return {"text": "", "tool_calls": [],
+            return _finish({"text": "", "tool_calls": [],
                     "provider": reply.get("provider", ""),
                     "input_tokens": usage_in,
                     "output_tokens": usage_out,
                     "error": "the model returned an empty reply twice "
-                             "(no text and no tool call)"}
+                             "(no text and no tool call)"})
         if not tool_calls:
             # No tool calls = the run is over. Replace the single turn's
             # usage with the loop's accumulated total so the node reports
@@ -472,7 +491,7 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             reply = dict(reply)
             reply["input_tokens"] = usage_in
             reply["output_tokens"] = usage_out
-            return reply
+            return _finish(reply)
 
         # Prepare EVERY call before dispatching any: the repeat guard is cheap
         # and must judge the whole batch, and `prepare_fn` is the only place a
@@ -498,20 +517,20 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                     # PDF, the model called it again unchanged, and this guard
                     # aborted the loop - so the node died holding a real document
                     # and the receipt reported nothing. Break out and keep it.
-                    return {"text": reply.get("text", "") or "",
+                    return _finish({"text": reply.get("text", "") or "",
                             "tool_calls": [],
                             "provider": reply.get("provider", ""),
                             "input_tokens": usage_in,
                             "output_tokens": usage_out,
                             "note": ("repeated an already-successful call; "
-                                     "stopping the loop")}
-                return {"text": "", "tool_calls": [],
+                                     "stopping the loop")})
+                return _finish({"text": "", "tool_calls": [],
                         "provider": reply.get("provider", ""),
                         "input_tokens": usage_in,
                         "output_tokens": usage_out,
                         "error": f"verifier stall: tool '{tc.get('name')}' "
                                  f"called with identical arguments "
-                                 f"{repeats[key]}x — aborting loop"}
+                                 f"{repeats[key]}x — aborting loop"})
             _args = _raw
             if prepare_fn is not None:
                 try:
@@ -621,6 +640,16 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                     on_outcome(p["name"], p["args"], ok, result_text, latency)
                 except Exception:
                     pass
+            if capture_transcript:
+                # The FULL result, not the model-facing clip: this is evidence
+                # for a second writing pass that never sees the tool messages.
+                transcript.append({
+                    "name": p["name"],
+                    "arguments": p["args"] if isinstance(p["args"], dict) else {},
+                    "ok": bool(ok),
+                    "result": result_text if isinstance(result_text, str)
+                    else str(result_text),
+                })
             body = result_text
             if result_cap > 0 and len(body) > result_cap:
                 # Never clip silently. A model handed a cut-off result with no
@@ -647,28 +676,28 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
         else:
             no_progress += 1
             if no_progress >= MAX_NO_PROGRESS_HOPS:
-                return {"text": "", "tool_calls": [],
+                return _finish({"text": "", "tool_calls": [],
                         "provider": reply.get("provider", ""),
                         "input_tokens": usage_in,
                         "output_tokens": usage_out,
                         "error": f"stopped after {no_progress} consecutive "
                                  "steps with no successful tool result — the "
-                                 "agent is stuck"}
+                                 "agent is stuck"})
 
     # Hit the hop cap. If the model never produced final text (only
     # tool_calls), returning last_reply would hand skills.py an empty
     # `text` that it parses as a successful-but-empty answer. Surface the
     # cap explicitly so the node fails loudly instead of silently.
     if last_reply.get("tool_calls"):
-        return {"text": "", "tool_calls": last_reply.get("tool_calls"),
+        return _finish({"text": "", "tool_calls": last_reply.get("tool_calls"),
                 "provider": last_reply.get("provider", ""),
                 "input_tokens": usage_in,
                 "output_tokens": usage_out,
-                "error": f"tool-use hop cap ({max_hops}) reached without final text"}
+                "error": f"tool-use hop cap ({max_hops}) reached without final text"})
     last_reply = dict(last_reply)
     last_reply["input_tokens"] = usage_in
     last_reply["output_tokens"] = usage_out
-    return last_reply
+    return _finish(last_reply)
 
 
 async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
@@ -687,6 +716,7 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
                          max_tool_result_chars: int | None = None,
+                         capture_transcript: bool = False,
                          stream: bool = False) -> dict:
     """Multi-turn chat: dispatch tool_calls via MCP, keep going until the
     model returns text. Returns the FINAL gateway reply dict (so callers
@@ -713,7 +743,9 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
     emit any name - so the Code agent passes its allowlist here. `None` keeps
     the     old behaviour for callers that rely on the full server surface.
     `max_context_chars` bounds the accumulating prompt; see run_tool_loop.
-    `max_tool_result_chars` overrides the per-result clip; 0 disables it."""
+    `max_tool_result_chars` overrides the per-result clip; 0 disables it.
+    `capture_transcript` returns every tool result verbatim under `transcript`;
+    see run_tool_loop."""
     _messages: list[dict] = messages if messages is not None else [{"role": "user", "content": prompt}]
     # `_os` was first imported sixteen lines below its use, so Python bound it as
     # a local and every entry raised `UnboundLocalError: cannot access local
@@ -847,7 +879,8 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                     prepare_fn=prepare_fn,
                     allowed_tools=allowed_tools,
                     max_context_chars=max_context_chars,
-                    max_tool_result_chars=max_tool_result_chars)
+                    max_tool_result_chars=max_tool_result_chars,
+                    capture_transcript=capture_transcript)
     except McpUnavailable:
         raise
     except BaseException as e:

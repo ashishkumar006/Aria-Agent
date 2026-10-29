@@ -66,8 +66,48 @@ const TABLE_SEP = /^\|?[\s:|-]+\|[\s:|-]*$/;
     anywhere, so a screen reader and an outline view saw one flat list of
     sub-headings under nothing. Clamped to >= 2, so it never emits an h1 and
     never outranks the page's own structure. */
+/* A parsed report is rendered from the same source string over and over: the
+ * Research and Authoring panes sit behind a poll, Chat re-renders its
+ * transcript on every frame, and a document of a few hundred KB costs real
+ * milliseconds to walk line by line. Parsing is pure, so cache the HTML by
+ * source and heading options. The cap is deliberately tiny: live streaming
+ * mints a new string per delta, so a larger cache would retain every prefix of
+ * every answer for no benefit. */
+const MD_CACHE_MAX = 8;
+/** source -> (heading options -> rendered html). Keying the outer map by the
+ *  source itself avoids copying a whole report into a composite cache key on
+ *  every render. */
+const mdCache = new Map<string, Map<string, string>>();
+
 export function renderMarkdown(src: string, headingOffset = 0,
                                fitTopLevel = false): string {
+  const source = String(src || '');
+  const opts = `${headingOffset}\u0000${fitTopLevel ? 1 : 0}`;
+  let byOpts = mdCache.get(source);
+  if (byOpts) {
+    const hit = byOpts.get(opts);
+    if (hit !== undefined) {
+      // Refresh LRU position so the visible report survives poll churn.
+      mdCache.delete(source);
+      mdCache.set(source, byOpts);
+      return hit;
+    }
+  }
+  const html = renderMarkdownUncached(source, headingOffset, fitTopLevel);
+  if (!byOpts) {
+    byOpts = new Map();
+    mdCache.set(source, byOpts);
+  }
+  byOpts.set(opts, html);
+  if (mdCache.size > MD_CACHE_MAX) {
+    const oldest = mdCache.keys().next().value;
+    if (oldest !== undefined && oldest !== source) mdCache.delete(oldest);
+  }
+  return html;
+}
+
+function renderMarkdownUncached(src: string, headingOffset = 0,
+                                fitTopLevel = false): string {
   const lines = String(src || '').split('\n');
   let off = headingOffset;
   if (fitTopLevel) {

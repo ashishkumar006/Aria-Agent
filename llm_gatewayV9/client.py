@@ -47,6 +47,46 @@ def _auth_headers() -> dict:
     return {"X-Gateway-Token": tok} if tok else {}
 
 
+def _raise_for_status(r: httpx.Response) -> None:
+    """Raise, but keep the gateway's explanation of what went wrong.
+
+    `httpx.Response.raise_for_status()` renders only "Server error '502 Bad
+    Gateway' for url ...". That is what the Chat view showed when a provider
+    rejected the request; the actual diagnosis - `kilo failed: ... 400 ...
+    must have non-empty content or tool calls` - was in the response body and
+    was thrown away. Callers cannot fix, or even report, a fault they are not
+    told about, so fold the body into the exception message.
+    """
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # `stream()` hands us an unread response; read it so the diagnosis is
+        # available. On a normal response this is a no-op.
+        try:
+            r.read()
+        except Exception:
+            pass
+        detail = ""
+        try:
+            body = r.json()
+        except Exception:
+            try:
+                detail = r.text
+            except Exception:
+                detail = ""
+        else:
+            if isinstance(body, dict):
+                detail = str(body.get("detail") or body.get("error") or "")
+            elif body is not None:
+                detail = str(body)
+        detail = " ".join((detail or "").split())[:400]
+        if detail:
+            raise httpx.HTTPStatusError(
+                f"{e} | {detail}", request=e.request, response=e.response,
+            ) from None
+        raise
+
+
 class LLM:
     def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 600):
         self.base_url = base_url.rstrip("/")
@@ -79,7 +119,7 @@ class LLM:
         }
         body = {k: v for k, v in body.items() if v is not None}
         r = httpx.post(f"{self.base_url}/v1/chat", json=body, timeout=self.timeout, headers=self.headers)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     def vision(self, image: str, prompt: str, *,
@@ -98,7 +138,7 @@ class LLM:
         }
         body = {k: v for k, v in body.items() if v is not None}
         r = httpx.post(f"{self.base_url}/v1/vision", json=body, timeout=self.timeout, headers=self.headers)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     def stream(self, prompt: str = None, **kw):
@@ -112,7 +152,7 @@ class LLM:
         body.update({k: v for k, v in kw.items() if v is not None})
         with httpx.stream("POST", f"{self.base_url}/v1/chat", json=body,
                       timeout=self.timeout, headers=self.headers) as r:
-            r.raise_for_status()
+            _raise_for_status(r)
             buf = ""
             for chunk in r.iter_text():
                 buf += chunk
@@ -128,7 +168,7 @@ class LLM:
         `{"error": ..., "status_code": ...}` rather than raising."""
         body = {"calls": calls, "max_concurrency": max_concurrency}
         r = httpx.post(f"{self.base_url}/v1/chat/batch", json=body, timeout=self.timeout, headers=self.headers)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json().get("results", [])
 
     def capabilities(self):
@@ -142,7 +182,7 @@ class LLM:
         if agent:
             params["agent"] = agent
         r = httpx.get(f"{self.base_url}/v1/cost/by_agent", params=params, timeout=30, headers=self.headers)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     def embed(self, text: str,
@@ -159,7 +199,7 @@ class LLM:
         if session:
             body["session"] = session
         r = httpx.post(f"{self.base_url}/v1/embed", json=body, timeout=self.timeout, headers=self.headers)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
 

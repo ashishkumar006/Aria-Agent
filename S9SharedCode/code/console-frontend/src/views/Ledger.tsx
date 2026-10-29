@@ -270,11 +270,13 @@ export default function Ledger() {
               v={hasSpend ? `$${Number(totals.dollars || 0).toFixed(4)}` : 'n/a'}
               s={hasSpend ? (scopedCid ? 'this conversation' : 'lifetime USD')
                           : 'cost data unavailable'}
+              loading={!loaded}
             />
-            <Stat k="CALLS" v={String(totals.calls || 0)} s="llm calls" />
-            <Stat k="SKILLS" v={String(rows.length)} s={hasSpend ? 'with spend' : 'ran'} />
+            <Stat k="CALLS" v={String(totals.calls || 0)} s="llm calls" loading={!loaded} />
+            <Stat k="SKILLS" v={String(rows.length)} s={hasSpend ? 'with spend' : 'ran'} loading={!loaded} />
             <Stat k="TURNS" v={String(turns.length)}
-              s={scopedCid ? 'in this conversation' : 'recorded (most recent 200)'} />
+              s={scopedCid ? 'in this conversation' : 'recorded (most recent 200)'}
+              loading={!loaded} />
           </div>
           {/* ── NODE RELIABILITY ──────────────────────────────────────────
               Spend alone cannot tell you whether the work happened. This

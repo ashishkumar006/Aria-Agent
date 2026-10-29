@@ -126,7 +126,14 @@ test('route fallback keeps the shell visible while a chunk is in flight', async 
      real view — a full-height nav column and a full-width content area — so
      those boxes are what gets measured. */
   const shell = await page.evaluate(async () => {
-    for (let i = 0; i < 240; i++) {
+    /* Wall clock, not a frame count. A 240-frame budget reads as "four
+       seconds", but rAF runs at ~40fps while the shell is still downloading, so
+       the real budget was ~5.7s — and the throttled shell itself needs ~6.7s
+       before it can mount. The assertion is about the skeleton's geometry, not
+       about how fast the bundle arrives; a fixed frame count only measured the
+       network and started failing as the bundle grew. */
+    const deadline = performance.now() + 20000;
+    while (performance.now() < deadline) {
       await new Promise((r) => requestAnimationFrame(r));
       const aside = document.querySelector('aside');
       const main = document.querySelector('main');

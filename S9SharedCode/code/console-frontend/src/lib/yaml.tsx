@@ -22,13 +22,17 @@ import type { ReactNode } from 'react';
 type Span = { text: string; cls: string };
 
 const C = {
-  comment: 'text-zinc-600 italic',
+  /* Comments are CONTENT here - the config file explains itself in them - so
+     they still have to be readable. zinc-600 on the viewer's #0a0a0d measured
+     2.56:1, well under the 4.5:1 minimum at 11.5px; Lighthouse failed the whole
+     Settings page on it. zinc-400 keeps the "muted" look at ~7.7:1. */
+  comment: 'text-zinc-400 italic',
   key: 'text-sky-300',
   str: 'text-emerald-300',
   num: 'text-amber-300',
   bool: 'text-violet-300',
-  nullv: 'text-zinc-500',
-  dash: 'text-zinc-500',
+  nullv: 'text-zinc-400',
+  dash: 'text-zinc-400',
   plain: '',
 };
 

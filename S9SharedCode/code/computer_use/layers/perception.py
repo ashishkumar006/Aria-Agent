@@ -23,10 +23,26 @@ def filter_ax_markdown(tree_markdown: str, query: str | None = None,
     _STOP = {"the", "a", "an", "to", "of", "in", "on", "and", "or", "is",
              "what", "does", "do", "show", "me", "my", "please", "click",
              "open", "app", "window"}
+    # Media control synonyms: when query mentions one, also search for related
+    # control labels so the filter keeps the full playback UI (Play/Pause toggle,
+    # Next/Previous, etc.).
+    _MEDIA_SYNONYMS = {
+        "play": ["play", "pause"],
+        "pause": ["pause", "play"],
+        "next": ["next", "skip", "forward"],
+        "previous": ["previous", "prev", "back"],
+        "stop": ["stop", "pause"],
+    }
     lines = [ln for ln in tree_markdown.splitlines() if ln.strip()]
     if query:
         kws = [w.lower() for w in _re.findall(r"[a-z0-9]+", query.lower())
                if w not in _STOP and len(w) > 2]
+        # Expand media control keywords
+        expanded_kws = set(kws)
+        for k in kws:
+            if k in _MEDIA_SYNONYMS:
+                expanded_kws.update(_MEDIA_SYNONYMS[k])
+        kws = list(expanded_kws)
         if kws:
             scored = []
             for ln in lines:

@@ -913,8 +913,10 @@ class ComputerUseSkill:
             self._dry_run_plan.append(f"[pending {aid}] {t} skipped awaiting approval")
             return False
         # Cua Driver 0.17 requires snapshot_id + window_id for element actions.
+        # Coordinate clicks (x,y without element_index) must NOT carry snapshot_id,
+        # or the driver refuses with "snapshot_id requires element_index".
         base = {"pid": pid, "window_id": window_id}
-        if snapshot_id:
+        if snapshot_id and act.get("element_index") is not None:
             base["snapshot_id"] = snapshot_id
         try:
             if t == "click":

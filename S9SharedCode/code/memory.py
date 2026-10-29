@@ -149,7 +149,8 @@ def list_recent(limit: int = 50,
                 session_id: str | None = None,
                 drawers: list[str] | None = None,
                 kinds: list[str] | None = None,
-                hide_superseded: bool = False) -> list[MemoryItem]:
+                hide_superseded: bool = False,
+                offset: int = 0) -> list[MemoryItem]:
     """Newest-first items for the dashboard Memory panel.
 
     `kinds` filters the agent-facing vocabulary (fact / preference /
@@ -165,6 +166,8 @@ def list_recent(limit: int = 50,
     """
     try:
         params: dict = {"limit": limit}
+        if offset:
+            params["offset"] = max(0, int(offset))
         if session_id:
             params["session_id"] = session_id
         if drawers:
@@ -327,7 +330,13 @@ _PREF_PATTERNS = (
     r"\bfrom now on\b",
     r"\bgoing forward\b",
     r"\bfrom henceforth\b",
-    r"\bi (?:always|never|prefer|like|want|hate|need) (?:to |you to |my )?\w+",
+    # `prefer|always|never` only. The old `like|want|hate|need` arm matched
+    # ordinary task requests ("I want the actual file", "I need the report in
+    # PDF") and stored the whole request as a standing preference. Measured
+    # live: 46 of 47 preference rows were tasks, including "remind me to
+    # stretch and drink water". A phrase like "I like tea" is a fact about
+    # taste, not an instruction for how future answers should be made.
+    r"\bi (?:always|never|prefer)\b",
     r"\bi'?d rather\b",
     r"\bplease always\b",
     r"\balways (?:give|show|use|include|put|return|format|answer|use)\b",
@@ -356,6 +365,17 @@ _PREF_THIRD_PARTY_RE = re.compile(
     r"he (?:said|asked|prefer)|she (?:said|asked|prefer)|"
     r"asked me to|the doc(?:ument|umentation) says)\b",
     re.IGNORECASE)
+# A request for an artifact or an action is not a standing rule, even when it
+# contains "always" or "I want" somewhere ("Create a one-page PDF… I want the
+# actual file, not text pasted in chat"). These are the live false positives
+# that filled the preference drawer with task descriptions.
+_PREF_TASK_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:create|make|write|draft|produce|generate|render|"
+    r"run|show|list|find|compare|research|explain|summari[sz]e|analy[sz]e|"
+    r"design|build|fix|update|open|send|remind|display|reply|give|produce)\b"
+    r"|\b(?:request for|report on|essay request|prompt to|reminder to|"
+    r"scheduled tasks?)\b",
+    re.IGNORECASE)
 _PREF_MAX_CHARS = 400
 
 
@@ -372,6 +392,8 @@ def detect_preference(text: str) -> str | None:
     if _PREF_META_RE.search(t):
         return None
     if _PREF_THIRD_PARTY_RE.search(t):
+        return None
+    if _PREF_TASK_RE.search(t):
         return None
     if not _PREF_RE.search(t):
         return None
@@ -443,6 +465,17 @@ def remember(
         "keywords": parsed.get("keywords") or list(_tokens(raw_text))[:10],
         "value": parsed_value,
     })
+    # Free-form classification is not allowed to invent a standing rule.
+    # A whole user query is often a task ("remind me to stretch", "write an
+    # 800-word report"); the classifier used to file those as `preference`,
+    # and preferences are injected into every later skill prompt. Only a
+    # message the deterministic detector recognises as a genuine standing
+    # statement may become a preference. Explicit writes still exist:
+    # `remember_preference()` names the kind itself.
+    if c.kind == "preference" and not detect_preference(raw_text):
+        print("[memory.remember] classifier called it a preference, but the "
+              "text is not a standing instruction; storing as fact")
+        c.kind = "fact"
 
     data = _post("/v1/memory/remember", {
         "kind": c.kind, "descriptor": c.descriptor,
@@ -461,6 +494,12 @@ def _llm_classify(raw_text: str, schema: dict) -> dict:
             f"CONTENT: {raw_text!r}\n\n"
             "Return a JSON object with these fields:\n"
             "- kind ∈ {fact, preference, tool_outcome, scratchpad}.\n"
+            "  `preference` means a STANDING instruction about how future\n"
+            "  answers or artifacts should be made ('always include the\n"
+            "  publication date', 'never use emoji'). A task request, a\n"
+            "  question, or a one-off instruction ('write a report', 'remind\n"
+            "  me to stretch', 'reply with exactly OK') is NOT a preference;\n"
+            "  use `fact` for the minimum durable fact it contains, if any.\n"
             "- descriptor: one short human-readable line. MUST include any\n"
             "  specific dates (e.g. '15 May 2026'), numbers, names, places,\n"
             "  or other concrete entities present in the content — these are\n"
@@ -1200,6 +1239,16 @@ def save_profile_document() -> dict:
             "filename": "what-aria-knows-about-me.md",
             "bytes": len(text),
             "observations": len(list_observations(k=200))}
+
+
+def stats() -> dict:
+    """Per-drawer counts from the gateway (`GET /v1/memory/stats`).
+
+    The Memory page used to say the gateway did not report counts; it always
+    did. This is the thin forwarder so the console has one origin.
+    """
+    body = _get("/v1/memory/stats")
+    return body if isinstance(body, dict) else {}
 
 
 def list_observations(k: int = 50, *, min_confidence: float = 0.0) -> list[dict]:

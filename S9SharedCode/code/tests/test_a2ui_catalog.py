@@ -82,6 +82,21 @@ def test_prompt_mentions_every_component_and_the_key_rules():
     assert "rejected" in p
 
 
+def test_prompt_shows_enum_values_so_the_model_cannot_guess_them():
+    """`gap: "small"` was generated and rejected ("not one of loose, normal,
+    tight"), costing a retry on the first live generate. The catalog knows the
+    values; the prompt that quotes the catalog must show them."""
+    p = C.catalog_prompt()
+    assert "gap[tight|normal|loose]" in p
+    assert "variant[body|caption|heading|mono]" in p
+    for name, spec in C.CATALOG.items():
+        for prop, kind in spec["props"].items():
+            if not kind.startswith("enum:"):
+                continue
+            for value in kind[5:].split("|"):
+                assert value in p, f"{name}.{prop} value {value!r} not in prompt"
+
+
 def test_catalog_has_no_interactive_text_input():
     """Deliberate. A generated form whose submit performs an action is an
     approval flow wearing a disguise."""
@@ -447,6 +462,157 @@ def test_a_non_json_serialisable_surface_is_rejected():
         assert "serialis" in str(e) or "text" in str(e)
     else:
         raise AssertionError("a non-serialisable payload must be rejected")
+
+
+# ── the validated form must itself validate ────────────────────────────────
+# `/api/a2ui/validate` and `/api/a2ui/generate` return the NORMALISED surface
+# (`components[].props`), and the API tells clients to re-validate a surface
+# they already hold. That round trip failed with `unknown property 'props'`
+# because only the flat wire form was accepted on input.
+
+def test_a_validated_surface_validates_again():
+    surface = C.validate_surface(ok(components=[
+        {"id": "root", "component": "Column", "children": ["head", "table"]},
+        {"id": "head", "component": "Text", "text": "Runs", "variant": "heading"},
+        {"id": "table", "component": "Table",
+         "columns": [{"key": "run", "label": "Run"}],
+         "rows": [{"run": "s8-1"}]},
+    ]))
+    again = C.validate_surface(surface)
+    assert again["components"] == surface["components"], (
+        "the surface a client received from the server does not validate")
+
+
+def test_the_nested_props_form_is_flattened_not_shipped_back_nested():
+    out = C.validate_components([
+        {"id": "root", "component": "Column", "props": {"children": ["t"]}},
+        {"id": "t", "component": "Text", "props": {"text": "hello"}},
+    ])
+    assert out[0]["props"] == {"children": ["t"]}
+    assert out[1]["props"] == {"text": "hello"}
+    assert "props" not in out[1]["props"]
+
+
+def test_flat_keys_win_when_a_component_says_it_twice():
+    out = C.validate_components([
+        {"id": "root", "component": "Text", "props": {"text": "nested"},
+         "text": "flat"},
+    ])
+    assert out[0]["props"]["text"] == "flat"
+
+
+def test_a_non_object_props_is_rejected_by_name():
+    try:
+        C.validate_components([
+            {"id": "root", "component": "Column", "props": ["children"]}])
+    except C.CatalogError as e:
+        assert "props must be an object" in str(e), str(e)
+    else:
+        raise AssertionError("a non-object props must be rejected")
+
+
+# ── table row shapes ────────────────────────────────────────────────────────
+# Generated surfaces produced rows as an object of column arrays and failed
+# 2 of 2 with `rows must be an array`. Both column-oriented near-misses are
+# unambiguous given `columns`, so they are transposed rather than refused.
+
+def test_column_major_table_rows_are_transposed():
+    out = C.validate_components([
+        {"id": "root", "component": "Table",
+         "columns": [{"key": "run", "label": "Run"},
+                     {"key": "cost", "label": "Cost"}],
+         "rows": {"run": ["s8-1", "s8-2"], "cost": [0.42, 0.31]}}])
+    assert out[0]["props"]["rows"] == [
+        {"run": "s8-1", "cost": 0.42},
+        {"run": "s8-2", "cost": 0.31},
+    ]
+
+
+def test_positional_table_rows_are_transposed_in_column_order():
+    out = C.validate_components([
+        {"id": "root", "component": "Table",
+         "columns": [{"key": "a", "label": "A"},
+                     {"key": "b", "label": "B"}],
+         "rows": [["1", "2"], ["3", "4"]]}])
+    assert out[0]["props"]["rows"] == [{"a": "1", "b": "2"},
+                                       {"a": "3", "b": "4"}]
+
+
+def test_a_table_row_binding_is_refused_with_the_expected_shape():
+    try:
+        C.validate_components([
+            {"id": "root", "component": "Table",
+             "columns": [{"key": "run", "label": "Run"}],
+             "rows": {"path": "/runs"}}])
+    except C.CatalogError as e:
+        assert "literal array of row objects" in str(e), str(e)
+    else:
+        raise AssertionError("a rows binding is not a documented shape")
+
+
+def test_a_ragged_column_major_table_is_refused_rather_than_padded():
+    try:
+        C.validate_components([
+            {"id": "root", "component": "Table",
+             "columns": [{"key": "a", "label": "A"},
+                         {"key": "b", "label": "B"}],
+             "rows": {"a": ["1", "2"], "b": ["3"]}}])
+    except C.CatalogError as e:
+        assert "different lengths" in str(e), str(e)
+    else:
+        raise AssertionError("ragged rows must be refused, not padded")
+
+
+def test_a_path_column_is_data_not_a_binding():
+    """"path" is an ordinary column key (a table of files), and a
+    column-major table that happens to use it must still transpose. The
+    binding guard must key on a STRING value, not on the name alone."""
+    out = C.validate_components([
+        {"id": "root", "component": "Table",
+         "columns": [{"key": "path", "label": "Path"},
+                     {"key": "words", "label": "Words"}],
+         "rows": {"path": ["/a.pdf", "/b.pdf"], "words": [10, 20]}}])
+    assert out[0]["props"]["rows"] == [
+        {"path": "/a.pdf", "words": 10},
+        {"path": "/b.pdf", "words": 20},
+    ]
+
+
+
+def test_scalar_bindings_are_resolved_before_the_console_sees_them():
+    """The generation prompt tells the model to BIND, but the renderer reads
+    `props` literally - a bound KeyValue shipped as `[object Object]`."""
+    out = C.validate_surface(ok(components=[
+        {"id": "root", "component": "Column", "children": ["k"]},
+        {"id": "k", "component": "KeyValue", "label": "Total",
+         "value": {"path": "/stats/runs"}},
+    ], data={"stats": {"runs": 42}}))
+    assert out["components"][1]["props"]["value"] == 42
+    assert "42" in out["text"]
+
+
+def test_an_object_prop_is_never_rewritten_as_a_binding():
+    """`Action.args` carries an object. `{"path": "C:\\reports\\q3.pdf"}` is
+    a file argument there, not a JSON Pointer, and resolving it would break
+    the action."""
+    out = C.validate_surface(ok(components=[
+        {"id": "root", "component": "Action", "label": "Open",
+         "action": "read_file", "args": {"path": "/home/u/report.txt"}},
+    ], data={}))
+    assert out["components"][0]["props"]["args"] == {
+        "path": "/home/u/report.txt"}
+
+
+def test_a_binding_to_a_missing_key_is_rejected():
+    try:
+        C.validate_surface(ok(components=[
+            {"id": "root", "component": "KeyValue", "label": "Total",
+             "value": {"path": "/nope"}},
+        ], data={"total": 1}))
+    except C.CatalogError as e:
+        assert "not in the surface's data" in str(e), str(e)
+    else:
+        raise AssertionError("an unresolved binding must not reach the client")
 
 
 # ── pointer resolution ──────────────────────────────────────────────────────

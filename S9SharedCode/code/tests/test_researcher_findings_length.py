@@ -27,10 +27,35 @@ def test_the_old_paragraph_cap_is_gone():
 
 
 def test_findings_length_is_specified_with_real_numbers():
+    """A concrete floor, expressed in something the model can act on.
+
+    This used to demand the literal range "1,500-4,000 words". That range was
+    the old framing: it capped a single-facet write-up at 4,000 words, so the
+    researcher stopped there and the formatter had nothing to stitch beyond it.
+    The contract is now a per-page floor (every page fetched is written up in
+    full), which scales with how much was actually read and has no ceiling.
+    """
     low = PROMPT.read_text(encoding="utf-8").lower()
     assert "findings length" in low, "no FINDINGS LENGTH section"
-    assert ("1,500-4,000 words" in low or "1,500–4,000 words" in low), (
-        "no concrete word range for a normal single-facet question")
+    assert "at least 200 words per page" in low, (
+        "no concrete per-page floor for the write-up")
+    assert "no upper limit" in low, (
+        "the floor is still being read as a ceiling")
+
+
+def test_findings_must_be_arranged_not_condensed():
+    """The researcher is the only node that sees the pages.
+
+    Condensing there throws evidence away before the formatter can use it; the
+    formatter can organise material but cannot recover a fact that was dropped
+    upstream. The delegation of responsibility has to be stated in the prompt,
+    or the model optimises for a tidy short summary.
+    """
+    low = PROMPT.read_text(encoding="utf-8").lower()
+    assert "arrange the evidence, not to condense it" in low, (
+        "the arrange-not-condense instruction is gone")
+    assert "keep every fact you read" in low, (
+        "the prompt no longer tells the researcher to keep the facts")
 
 
 def test_findings_length_is_framed_as_a_floor():

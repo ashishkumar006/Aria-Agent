@@ -73,22 +73,46 @@ class TestRemember:
 
     def test_classifier_result_parsed(self):
         """A successful classifier reply is parsed into the right kind/keywords."""
+        text = "From now on always include the publication date with every source."
+        fake_reply = {"parsed": {"kind": "preference", "descriptor": text,
+                                 "keywords": ["publication", "date"],
+                                 "value": {}}}
+        posted = {}
+
+        def fake_post(path, body, timeout=60.0):
+            posted.update(body)
+            return {"item": _item_dict(kind="preference", descriptor=text,
+                                       keywords=["publication", "date"],
+                                       value={"raw": text})}
+
+        with mock.patch.object(memory_svc, "_llm_classify", return_value=fake_reply), \
+             mock.patch.object(memory_svc, "_post", side_effect=fake_post):
+            item = memory_svc.remember(text, source="user", run_id="r1")
+        assert item.kind == "preference"
+        assert "publication" in item.keywords
+        assert posted["kind"] == "preference"
+
+    def test_classifier_preference_is_downgraded_for_a_taste_statement(self):
+        """The classifier is not allowed to invent a standing rule.
+
+        "I like tea" is a durable fact about taste, not an instruction for
+        how future answers should be written. Stored as a preference it was
+        injected into every later prompt.
+        """
         fake_reply = {"parsed": {"kind": "preference", "descriptor": "I like tea",
                                  "keywords": ["tea", "preference"], "value": {}}}
         posted = {}
 
         def fake_post(path, body, timeout=60.0):
             posted.update(body)
-            return {"item": _item_dict(kind="preference", descriptor="I like tea",
-                                       keywords=["tea", "preference"],
-                                       value={"raw": "I like tea."})}
+            return {"item": _item_dict(kind=body["kind"], descriptor="I like tea",
+                                       keywords=["tea"], value={})}
 
         with mock.patch.object(memory_svc, "_llm_classify", return_value=fake_reply), \
              mock.patch.object(memory_svc, "_post", side_effect=fake_post):
             item = memory_svc.remember("I like tea.", source="user", run_id="r1")
-        assert item.kind == "preference"
-        assert "tea" in item.keywords
-        assert posted["kind"] == "preference"
+        assert posted["kind"] == "fact"
+        assert item.kind == "fact"
 
     def test_empty_value_falls_back_to_raw(self):
         """Classifier returning empty value keeps the raw text retrievable."""

@@ -530,9 +530,39 @@ def _splice_recovery(graph: Graph, added: list[str],
             for t in new:
                 if t.startswith("n:") and t in graph.g.nodes:
                     graph.g.add_edge(t, s)
+        # Structured, not just prose: the end-of-run verdict needs to know
+        # whether this hole was actually filled. Parsing the error string was
+        # the alternative, and it broke the moment the wording changed.
+        graph.g.nodes[r]["replaced_by"] = list(terminals)
         graph.mark(r, "skipped",
                    error=f"replaced by recovery plan ({', '.join(terminals)})")
     return True
+
+
+def _replacement_answered(graph: Graph, nid: str) -> bool:
+    """Did a recovery plan actually fill this skipped node's place?
+
+    `_splice_recovery` marks the failed original `skipped` and rewires its
+    consumers to the replacement terminals. The end-of-run verdict saw only
+    the `skipped` status, so a run whose recovery researcher succeeded still
+    reported "this part of the question went unanswered" - and persisted
+    `degraded: true` for a report that was complete. Follow the replacement
+    edges (a recovery node can itself be recovered) and look for a complete
+    replacement; a failed replacement is counted separately by the caller.
+    """
+    seen: set[str] = set()
+    stack = list(graph.g.nodes[nid].get("replaced_by") or [])
+    while stack:
+        cur = stack.pop()
+        if cur in seen or cur not in graph.g.nodes:
+            continue
+        seen.add(cur)
+        node = graph.g.nodes[cur]
+        if node.get("status") == "complete":
+            return True
+        if node.get("status") == "skipped":
+            stack.extend(node.get("replaced_by") or [])
+    return False
 
 
 def _fallback_facets(query: str) -> list[str]:
@@ -695,13 +725,23 @@ def ensure_authoring_research(graph: Graph, query: str,
 
 
 def _safe_remember(query: str, sid: str) -> None:
-    """Best-effort memory write for the user query, safe to run on a daemon
+    """Best-effort memory write for a user query, safe to run on a daemon
     thread off the critical path. Any failure is logged and swallowed so a
     bad embed or classifier can never abort the agent run.
+
+    Only queries that carry something durable about the user are written.
+    Storing EVERY request filed a query log in the `fact` drawer: live, 374
+    of 398 fact rows were `source=user_query`, including "Capital of France"
+    three times. Those rows then competed with real facts in session recall,
+    so a question about a new topic could surface an old task description.
+    Per-conversation history already lives in the turn log; memory is for
+    facts that should survive the conversation.
 
     Phase 1 drawers: the write carries the run's session id (additive
     metadata — global reads still see the item; drawer recall can scope
     to it later without any backfill)."""
+    if not _is_identity_write(query):
+        return
     try:
         memory_svc.remember(query, source="user_query", run_id=sid,
                              session_id=sid)
@@ -975,17 +1015,35 @@ def _safe_purge_working(sid: str, run_start_iso: str) -> None:
 # user ("my name is X", "remember that ...") must be persisted BEFORE the
 # next turn reads memory — a daemon-thread write (classifier + embed ≈ 3-7s)
 # loses the race when the user immediately asks "what is my name?". Detect
-# these identity-bearing queries and write them synchronously; everything
-# else keeps the fast async path.
+# these identity-bearing queries and write them synchronously; every other
+# request is not remembered at all.
 _IDENTITY_MARKERS = (
     "my name is", "i am called", "call me ", "remember that",
-    "remember this", "my favorite", "my favourite", "i like", "i prefer",
-    "i work at", "i live in",
+    "remember this", "remember the", "don't forget", "do not forget",
+    "my favorite", "my favourite", "i like", "i prefer",
+    "i work at", "i live in", "my birthday", "my email", "my phone",
+    "my address", "my timezone", "my meeting", "my schedule",
+    "i'm allergic", "i am allergic", "i use ",
 )
+
+# A request that merely MENTIONS something personal is still a request.
+# "show my scheduled tasks" contains the marker "my schedule" and was written
+# as a durable fact; a question ("what is my name?") is not a statement
+# either. The task gate wins over the marker, because the marker is only a
+# hint that the sentence might be about the user.
+_TASK_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:show|list|create|make|write|draft|produce|"
+    r"generate|render|run|find|compare|research|explain|summari[sz]e|"
+    r"analy[sz]e|design|build|fix|update|open|send|remind|display|reply|"
+    r"give|tell|describe|calculate|compute|what|who|when|where|why|how|"
+    r"is|are|do|does|can|could|would)\b",
+    re.IGNORECASE)
 
 
 def _is_identity_write(query: str) -> bool:
     q = query.lower().strip()
+    if not q or _TASK_REQUEST_RE.match(q):
+        return False
     return any(m in q for m in _IDENTITY_MARKERS)
 
 
@@ -998,13 +1056,19 @@ class Executor:
         # Planner-only run parameters, set by run() (see _research_depth_note
         # in agent_server). Empty means "no operator override".
         self._run_note = ""
+        # This run's effective document set (see run(doc_ids=...)). Set by
+        # run() before any node executes; every skill gets it so a document
+        # the conversation switched off cannot come back through
+        # `search_knowledge` either.
+        self._doc_ids: set[str] | None = None
 
     async def run(self, query: str, *, session_id: str | None = None,
                      resume: bool = False,
                      doc_setup: dict | None = None,
                      should_cancel: Callable[[], bool] | None = None,
                      run_note: str = "",
-                     run_kind: str = "") -> str:
+                     run_kind: str = "",
+                     doc_ids: set[str] | None = None) -> str:
         sid = session_id or f"s8-{uuid.uuid4().hex[:8]}"
         store = SessionStore(sid)
         # Planner-only run parameters (the operator's research depth, etc.).
@@ -1058,19 +1122,34 @@ class Executor:
         # Phase 2: explicit session-start drawer set (working notes are
         # run-scoped — a new run has none yet — so recall is everything
         # else, legacy included until backfilled).
-        # Document allowlist: a research run may only draw on documents that are
-        # currently enabled. A failure to read the registry fails CLOSED (no
-        # documents) rather than silently exposing every document.
-        doc_ids = None
-        try:
-            from agent_server import _gw_enabled_doc_ids as _enabled
-            doc_ids = _enabled()
-        except Exception as e:
-            print(f"[documents] registry unavailable ({e!r}); "
-                  f"excluding documents from this run")
-            doc_ids = set()
+        # Document allowlist: a research run may only draw on documents that
+        # are currently enabled AND that this conversation's toggle allows. A
+        # failure to read the registry fails CLOSED (no documents) rather than
+        # silently exposing every document.
+        #
+        # `doc_ids` comes from the caller (`_conversation_doc_ids`), because
+        # the per-conversation toggle is the user's decision and a run that
+        # ignored it leaked exactly what they switched off. The global enabled
+        # set is only the fallback for a run with no conversation (CLI).
+        if doc_ids is not None:
+            self._doc_ids = set(doc_ids)
+        else:
+            try:
+                from agent_server import _gw_enabled_doc_ids as _enabled
+                self._doc_ids = _enabled()
+            except Exception as e:
+                print(f"[documents] registry unavailable ({e!r}); "
+                      f"excluding documents from this run")
+                self._doc_ids = set()
+        doc_ids = self._doc_ids
+        # With no documents allowed, do not search the document drawer at all:
+        # a merged-ranking filter still spends one of the top_k slots on a
+        # document chunk, and a record with no doc_id would slip through.
+        _drawers = list(memory_svc.SESSION_DRAWERS)
+        if not doc_ids:
+            _drawers = [d for d in _drawers if d != "document"]
         memory_hits = memory_svc.read(
-            query, drawers=memory_svc.SESSION_DRAWERS, doc_ids=doc_ids) or []
+            query, drawers=_drawers, doc_ids=doc_ids) or []
         if memory_hits:
             print(f"[memory.read] {len(memory_hits)} hit(s) visible to every skill this run")
         # Phase 3: active policies constrain behavior and reach EVERY skill
@@ -1092,15 +1171,12 @@ class Executor:
             print(f"[turnlog] {len(prior_turns)} prior turn(s) loaded for this conversation")
         # F5 FIX: identity-bearing writes go synchronously (bounded by the
         # classifier's 60s client timeout) so the fact is durable before the
-        # user's next turn reads memory. All other queries keep the fast
-        # daemon-thread path — the current answer never depends on those.
+        # user's next turn reads memory. Everything else is not remembered at
+        # all: a request is not a durable fact, and the old daemon-thread
+        # write of every query filled the fact drawer with a task log.
         if _is_identity_write(query):
             print("[memory.remember] identity-bearing query; writing synchronously")
             _safe_remember(query, sid)
-        else:
-            threading.Thread(
-                target=_safe_remember, args=(query, sid), daemon=True
-            ).start()
 
         formatter_answer: str | None = None
         executed_count = 0
@@ -1322,6 +1398,21 @@ class Executor:
                         fa = result.output.get("final_answer")
                         if isinstance(fa, str) and fa.strip():
                             formatter_answer = fa
+                        elif (self._run_kind == "chat"
+                              and isinstance(result.output.get("a2ui"), dict)):
+                            # The formatter's A2UI branch answers with
+                            # `final_answer: null` plus a surface. Leaving it
+                            # here made `formatter_answer` stay None, so the
+                            # last-resort branch below dumped the raw output
+                            # dict as the user's answer. Carry the payload as a
+                            # fenced block on the one answer channel; the chat
+                            # endpoints extract and validate it, and turn an
+                            # unrenderable one into readable text.
+                            formatter_answer = (
+                                "```json\n"
+                                + json.dumps(result.output["a2ui"],
+                                             ensure_ascii=False)
+                                + "\n```")
                     # Structured research plan. The planner may emit a
                     # `research_plan` block; persisting it makes the topic,
                     # facets and source hints first-class instead of something
@@ -1586,6 +1677,16 @@ class Executor:
         for nid in list(graph.g.nodes):
             d = graph.g.nodes[nid]
             res = d.get("result")
+            status = str(d.get("status") or "").lower()
+            # A node the splice replaced is NOT a failure any more, even
+            # though its `result` object still carries the error that caused
+            # the splice. Checking `res.success` first counted it twice: once
+            # from the stale result and once from its `skipped` status, and
+            # the result half survived the `_replacement_answered` guard
+            # below - which is why a fully recovered run still persisted
+            # `degraded: true` on reload.
+            if status == "skipped" and _replacement_answered(graph, nid):
+                continue
             if isinstance(res, AgentResult) and not res.success:
                 failed.append(f"{d.get('skill', '?')}: "
                               f"{str(res.error or 'failed')[:120]}")
@@ -1600,11 +1701,19 @@ class Executor:
             # NOT a deliberate stop: the user pressing Stop also leaves nodes
             # skipped, and telling someone who cancelled that their answer is
             # incomplete would blame them for their own cancellation.
-            status = str(d.get("status") or "").lower()
             if status in ("skipped", "abandoned") and not (
                     should_cancel is not None and should_cancel()):
                 failed.append(f"{d.get('skill', '?')}: {status} "
                               f"(this part of the question went unanswered)")
+        # One sentence for the answer, used by both endings below: a produced
+        # document must not hide a failed branch either. This used to be inside
+        # `elif failed`, so "a file was rendered" silently dropped the warning.
+        _fail_note = ""
+        if failed:
+            _fail_note = ("\n\n---\n\n**This answer is incomplete.** "
+                          + "; ".join(failed)
+                          + ". Treat the missing parts as unknown rather than "
+                            "settled - the run log has the full detail.")
         produced: list[dict] = []
         for nid in list(graph.g.nodes):
             res = graph.g.nodes[nid].get("result")
@@ -1772,32 +1881,22 @@ class Executor:
                 f"Created {len(produced)} document{plural}.\n\n"
                 + "\n".join(lines)
                 + f"\n\nDownload {them} from the file list above.")
+            if _fail_note:
+                formatter_answer = formatter_answer.rstrip() + _fail_note
         elif failed:
             # A failed node must not be hidden, but it must not veto the
             # answer either: the orchestrator recovers by retrying and then
             # skipping a transient branch, and those runs DO have a real
-            # answer ("recovered...", "final after skip"). So note the
-            # failures rather than replacing the reply - and only when there
-            # is nothing to keep.
+            # answer ("recovered...", "final after skip"). So the answer is
+            # kept and the warning is appended to it.
             # Say what is missing in the reader's terms, not just the node's
             # status: "researcher: skipped" tells an operator nothing, while
             # "this part of the question went unanswered" tells a reader why
             # the report is shorter than they expected.
-            _note = ("\n\n---\n\n**This answer is incomplete.** "
-                     + "; ".join(failed)
-                     + ". Treat the missing parts as unknown rather than "
-                       "settled - the run log has the full detail.")
-            formatter_answer = ((formatter_answer or "").rstrip() + _note
+            formatter_answer = ((formatter_answer or "").rstrip() + _fail_note
                                 if (formatter_answer or "").strip()
                                 else ("I could not finish this request."
-                                      + _note))
-            # Persist the warning, not just return it. The note lived only in
-            # the SSE `done` frame, so re-opening the run from /research or
-            # /runs showed a report that looked complete and was not: the
-            # warning had been shown once, live, and then was gone forever.
-            # The answer text is recovered from the formatter node on reload,
-            # which never carries this suffix, so it has to live on disk.
-            _write_run_status(sid, degraded=True, detail=list(failed))
+                                      + _fail_note))
 
         # A run that WAS asked for a file and produced none must never look
         # like a success. The planner can short-circuit on `{"answer": ...}`
@@ -1815,6 +1914,21 @@ class Executor:
                 + "Nothing was written to a file. The run log has the detail; "
                   "if this repeats, a stored preference may be overriding the "
                   "request.")
+
+        # Persist the verdict, not just return it. The warning used to live only
+        # in the SSE `done` frame, so re-opening the run from /research or
+        # /runs showed a report that looked complete and was not - the answer
+        # recovered on reload is the formatter node's own `final_answer`, which
+        # never carries the suffix. Written on EVERY run, not only degraded
+        # ones: a clean run must also CLEAR a stale `degraded: true` left by an
+        # earlier attempt in the same session, otherwise the console keeps
+        # warning about a branch that no longer exists. A run the operator
+        # stopped is not degraded - `stopped` is its own, accurate state.
+        _was_cancelled = bool(should_cancel is not None and should_cancel())
+        _write_run_status(
+            sid,
+            degraded=bool(failed) and not _was_cancelled,
+            detail=[] if _was_cancelled else list(failed))
 
         print(f"\n{'=' * 78}\nFINAL: {formatter_answer or ''}\n{'=' * 78}\n")
         # F10 FIX: persist the completed turn so the NEXT turn in this
@@ -1851,7 +1965,8 @@ class Executor:
                                               prior_turns=prior_turns,
                                               policy_notes=policy_notes,
                                               doc_setup=doc_setup,
-                                              budget_note=budget_note)
+                                              budget_note=budget_note,
+                                              doc_ids=self._doc_ids)
         except Exception as e:  # pragma: no cover - dispatcher fault path
             result = AgentResult(success=False, agent_name=skill_name,
                                  error=f"exception: {_readable_exc(e)}")

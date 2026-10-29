@@ -1251,6 +1251,7 @@ async def memory_record_outcome(req: OutcomeRequest, request: Request):
 
 @router.get("/v1/memory")
 async def memory_list(request: Request, limit: int = 50,
+                      offset: int = 0,
                       session_id: str | None = None,
                       drawers: str | None = None,
                       kinds: str | None = None,
@@ -1268,7 +1269,10 @@ async def memory_list(request: Request, limit: int = 50,
     kind = vocabulary. Both filters are useful; only this one answers
     "show me what the agent learned about how the user likes things".
     ``hide_superseded`` drops corrected records (the policy injector uses
-    it; the review panel does not).
+    it; the review panel does not). ``offset`` pages the newest-first list;
+    it is applied after the drawers are merged, so a page boundary cannot
+    repeat or skip a record because each drawer restarts at its own newest
+    row.
     """
     plane = _plane(request)
     try:
@@ -1280,7 +1284,8 @@ async def memory_list(request: Request, limit: int = 50,
                                   session_id=session_id,
                                   drawers=drawer_list,
                                   kinds=kind_list,
-                                  hide_superseded=hide_superseded)
+                                  hide_superseded=hide_superseded,
+                                  offset=max(0, offset))
     except ValueError as e:
         raise HTTPException(400, str(e))
     # `embedding` is excluded on purpose: it is a 768-float vector (~15KB of

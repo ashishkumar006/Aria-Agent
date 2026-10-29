@@ -16,8 +16,18 @@
      sizes this tier uses. This is 5.6:1 on #0e0e12 and still reads as
      clearly secondary next to zinc-300 body copy. */
   --color-zinc-muted: #8b8b95;
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  /* The variable families are the ones @fontsource-variable actually loads
+     (see main.tsx). Keeping the old names first meant the declared face was
+     never the rendered face: "Inter" resolved to whatever the OS had. */
+  --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+
+  /* The desktop shell has a 1100px floor, but the browser console is used in
+     narrower windows. At the stock 1024px lg breakpoint a 1000px window fell
+     into the stacked phone layout: the thread pane became a 34vh strip and the
+     transcript lost most of its height. 1000px keeps the three panes usable
+     without moving every other page's grid far from its designed width. */
+  --breakpoint-lg: 1000px;
 
   /* Arcturus surface hierarchy — luminance steps with cool blue undertone */
   --color-surface-0: #0a0c13;
@@ -193,6 +203,46 @@ html, body, #root {
 .stagger > *:nth-child(6) { animation-delay: 200ms; }
 .stagger > *:nth-child(7) { animation-delay: 240ms; }
 .stagger > *:nth-child(8) { animation-delay: 280ms; }
+
+/* === CHAT / ROUTE MOTION ===
+   One vocabulary, used by the places the user actually lives in. These are
+   mount animations (not transitions) so a stable message key runs them once,
+   and a re-render never re-plays them. */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes surface-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.997); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes row-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.msg-in { animation: msg-in 180ms var(--ease-out) backwards; }
+/* `backwards`, not `both`: a forwards-filled keyframe keeps a transform on
+   the element, and any transformed ancestor becomes the containing block for
+   a `position: fixed` dialog inside it. Fill only the pre-animation state so
+   the transform is gone once the entry finishes. */
+.surface-in { animation: surface-in 220ms var(--ease-out) backwards; }
+.row-in { animation: row-in 120ms ease-out both; }
+
+/* Stable gutter: the transcript crosses the overflow threshold mid-answer,
+   and without this the scrollbar's arrival shifts every line sideways. */
+.scroll-stable { scrollbar-gutter: stable; }
+
+/* === INTERACTION BASELINE ===
+   Tailwind's initial transition values are all/0s, so a control with no
+   transition utility changes in one frame. This gives every native control
+   the same short, eased state change; utility classes still override it. */
+button, a, input, textarea, select, summary, [role="button"] {
+  transition-property: color, background-color, border-color, opacity,
+    box-shadow, filter, transform;
+  transition-duration: 150ms;
+  transition-timing-function: var(--ease-out);
+}
 
 /* === REACT FLOW DARK TUNING === */
 .react-flow {
@@ -483,8 +533,22 @@ html, body, #root {
   .animate-slide-in-right,
   .animate-scale-in,
   .animate-pulse-glow,
+  .msg-in,
+  .surface-in,
+  .row-in,
   .stagger > * {
     animation: none !important;
+  }
+  /* A blanket override, not a list: any motion added later must inherit it
+     without remembering this block. */
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    /* Staggered entries carry delays up to 280ms; with a 0.01ms duration the
+       element would still sit empty until its delay elapsed. */
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
   }
   .instrument-card,
   .instrument-card::before {
@@ -626,6 +690,11 @@ html, body, #root {
 }
 .docview-thumb.on { border-color: #7c6ee6; box-shadow: 0 0 0 1px #7c6ee6; }
 .docview-thumb img { width: 100%; height: auto; display: block; }
+.docview-thumb-num {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; aspect-ratio: 3 / 4; background: #17171f;
+  color: #8b8b99; font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 .docview-thumb-svg { display: block; width: 100%; }
 .docview-thumb-svg svg { width: 100%; height: auto; display: block; }
 

@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Database, SearchX, Trash2 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, SkipLink } from '../components/ui';
 import { useMainId } from '../components/KeepAlive';
-import { api, type MemItem } from '../api';
+import { api, type MemItem, type MemStats } from '../api';
+import { mergeMemoryPage } from '../lib/memoryPage';
 
 /* The four memory types the agent actually works with. This list used to be
    the seven gateway DRAWERS (working / episode / fact / playbook / policy /
@@ -77,6 +78,13 @@ export default function Memory() {
   const [items, setItems] = useState<MemItem[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState('');
+  /** Another page exists after `items`. False for semantic search, which has
+   *  one ranked result set rather than pages. */
+  const [hasMore, setHasMore] = useState(false);
+  const [moreBusy, setMoreBusy] = useState(false);
+  /** Live per-kind counts. Null while loading or if the stats read failed;
+   *  the sidebar then shows no number rather than a made-up one. */
+  const [stats, setStats] = useState<MemStats | null>(null);
   const [q, setQ] = useState('');
   const [submitted, setSubmitted] = useState('');
   const [hide, setHide] = useState(true);
@@ -103,15 +111,21 @@ export default function Memory() {
   const [formOpen, setFormOpen] = useState(false);
   const reqRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+  /** Current rows, for the append offset. A ref (not state) because `load`
+   *  must not be recreated whenever a page arrives - its effect would refetch. */
+  const itemsRef = useRef<MemItem[]>([]);
 
   // Fetch on submit/scope change only — typing must not refetch (the old
   // version fired a gateway recall per keystroke and reset nothing).
-  const load = useCallback(async () => {
+  // `mode='append'` asks for the page after the rows already on screen.
+  const load = useCallback(async (mode: 'replace' | 'append' = 'replace') => {
     const req = ++reqRef.current;
     abortRef.current?.abort();
     const ctl = new AbortController();
     abortRef.current = ctl;
+    const offset = mode === 'append' ? itemsRef.current.length : 0;
     const params = new URLSearchParams({ limit: '60' });
+    if (offset) params.set('offset', String(offset));
     if (submitted) params.set('q', submitted);
     /* Filter by kind, not drawer: the four types are the vocabulary the agent
        works with, and `preference` is only isolatable this way because it is
@@ -130,7 +144,14 @@ export default function Memory() {
          read like a failed save. Load problems now live in their own region,
          and every success overwrites them. */
       setLoadError(d.error || '');
-      setItems(d.items || []);
+      const page = d.items || [];
+      if (mode === 'append') {
+        setItems((prev) => mergeMemoryPage(prev, page));
+        setHasMore(Boolean(d.has_more) && page.length > 0);
+      } else {
+        setItems(page);
+        setHasMore(Boolean(d.has_more));
+      }
       setLoaded(true);
     } catch (e) {
       if (ctl.signal.aborted || reqRef.current !== req) return;
@@ -140,9 +161,23 @@ export default function Memory() {
   }, [submitted, kindFilter, hide]);
 
   useEffect(() => {
-    load();
+    load('replace');
     return () => { abortRef.current?.abort(); };
   }, [load]);
+
+  useEffect(() => { itemsRef.current = items; }, [items]);
+
+  /* Counts are a separate read from the list: a stats outage must not blank
+     the rows, and a list failure must not hide the counts. */
+  const loadStats = useCallback(async () => {
+    try {
+      setStats(await api.memoryStats());
+    } catch {
+      setStats(null);
+    }
+  }, []);
+
+  useEffect(() => { void loadStats(); }, [loadStats]);
 
   /* The profile is fetched separately and deliberately not folded into
      `load`: it lives behind its own flag, and a failure there must not blank
@@ -182,6 +217,10 @@ export default function Memory() {
       await api.deleteMemory(o.id);
       setObservations((prev) => prev.filter((x) => x.id !== o.id));
       setOut(`deleted ${o.id}`);
+      // The row is also a card in the generic list and a count in the
+      // sidebar; refresh both rather than leaving two stale views.
+      void load('replace');
+      void loadStats();
     } catch (e) {
       setOut(String((e as Error)?.message || e));
     } finally {
@@ -229,7 +268,8 @@ export default function Memory() {
       if (r.status === 'ok') {
         setOut(`remembered${r.id ? ` ${r.id}` : ''}`);
         setDesc('');
-        load();
+        load('replace');
+        void loadStats();
       } else setOut('save failed');
     } catch (e) { setOut(String((e as Error).message || e)); }
     finally { setBusy(false); }
@@ -263,7 +303,8 @@ export default function Memory() {
          (gateway hiccup), and a successful delete must never
          leave a ghost row on screen because of it. */
       setItems((prev) => prev.filter((m) => m.id !== id));
-      load();
+      load('replace');
+      void loadStats();
     } catch (e) { setOut(String((e as Error).message || e)); }
     finally { setBusy(false); }
   };
@@ -296,9 +337,28 @@ export default function Memory() {
       setOut(cleared
         ? `wiped: ${JSON.stringify(counts).slice(0, 160)}`
         : `nothing to wipe for session ${sess.trim().slice(0, 24)}`);
-      load();
+      load('replace');
+      void loadStats();
+      void loadProfile();
     } catch (e) { setOut(String((e as Error).message || e)); }
     finally { setBusy(false); }
+  };
+
+  /* One extra page. `load` already aborts any in-flight request and ignores a
+     stale response, so a double click cannot interleave two pages. */
+  const loadMore = async () => {
+    if (moreBusy) return;
+    setMoreBusy(true);
+    try {
+      await load('append');
+    } finally {
+      setMoreBusy(false);
+    }
+  };
+
+  const countFor = (id: string): number | null => {
+    if (!stats) return null;
+    return id ? (stats.kinds[id] ?? 0) : stats.total;
   };
 
   /* Announced once per result set, not per token — the list is not a stream
@@ -335,20 +395,19 @@ export default function Memory() {
       <div className="flex w-full flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:h-full lg:w-[248px] lg:flex-none lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3 text-xs font-bold tracking-wide">
           <h2 className="text-xs font-bold tracking-wide">Memory types</h2>
-          {/* this badge counted filter buttons, not memories: 4 kinds + "all"
-              rendered as "5" under the heading "Memory types", which reads as
-              "5 memories stored". the API returns no per-kind counts and no
-              total, so it cannot show real ones — say what it is instead. */}
+          {/* Real live counts, not filter buttons. The gateway reports them;
+              the old "5 filters" badge read as "5 memories stored" and then
+              explained that counts were unavailable. */}
           <span
             className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400"
-            title="This is the number of type filters, not the number of stored memories"
+            title="Live records in agent memory (superseded, document and audit rows are not counted)"
           >
-            {KINDS.length + 1} filters
+            {stats ? `${stats.total} live` : '—'}
           </span>
         </div>
         <p className="hidden px-3.5 pb-2 text-[10.5px] leading-snug text-zinc-muted lg:block">
-          the gateway does not report how many memories each type holds, so
-          these filters carry no counts
+          Live records the Memory page browses. Uploaded document chunks and the
+          audit log have their own views and are not counted here.
         </p>
         {/* ONE scroll container for the whole list. The kind list used to sit
             in a fixed block above a separately-scrolling drawer list, which
@@ -358,6 +417,7 @@ export default function Memory() {
           {[{ id: '', label: 'all memory', sub: 'search everything' },
             ...KINDS].map((k) => {
             const on = kindFilter === k.id;
+            const count = countFor(k.id);
             return (
             <button
               key={k.id || 'all'}
@@ -370,6 +430,11 @@ export default function Memory() {
                     readers, this dot covers everyone else. */}
                 <span aria-hidden className={`mr-1.5 h-1.5 w-1.5 flex-none rounded-full ${on ? 'bg-violet-400' : 'bg-transparent'}`} />
                 <span className="truncate">{k.label}</span>
+                {count !== null && (
+                  <span className="ml-auto pl-2 font-mono text-[10.5px] font-normal text-zinc-400">
+                    {count}
+                  </span>
+                )}
               </div>
               <div className="mt-1 hidden text-[11px] text-zinc-muted lg:block">{k.sub}</div>
             </button>
@@ -417,9 +482,13 @@ export default function Memory() {
           </>) : (<>
             <span className="text-[11px] font-bold tracking-[0.12em] text-zinc-muted">MEMORY</span>
             <span className="text-[11.5px] text-zinc-300">
-              <span className="font-bold">{items.length}</span> items
-              {kindFilter ? ` of type ${kindFilter}` : ' across all types'}
-              {' · '}newest first, up to 60 per fetch
+              <span className="font-bold">{items.length}</span> shown
+              {kindFilter
+                ? <> of <span className="font-bold">{countFor(kindFilter) ?? '…'}</span> {kindFilter}</>
+                : stats
+                  ? <> of <span className="font-bold">{stats.total}</span> across all types</>
+                  : ' across all types'}
+              {' · '}newest first, 60 at a time
             </span>
           </>)}
         </div>
@@ -499,7 +568,7 @@ export default function Memory() {
                         onClick={() => forgetObservation(o)}
                         title="Delete this observation"
                         aria-label={`Delete observation: ${o.observation}`}
-                        className="rounded-md border border-white/15 px-2 py-1 text-zinc-muted hover:border-red-400 hover:text-red-300"
+                        className="flex min-h-6 min-w-6 items-center justify-center rounded-md border border-white/15 px-2 py-1 text-zinc-muted hover:border-red-400 hover:text-red-300"
                       >
                         <Trash2 size={13} />
                       </button>
@@ -523,7 +592,7 @@ export default function Memory() {
         {loadError && (
           <div role="alert" className="mx-3.5 mt-2 flex flex-wrap items-center gap-2 rounded-[10px] border border-red-400/30 bg-red-400/5 px-3 py-2 text-[11.5px] text-red-200">
             <span className="min-w-0 flex-1">couldn't load memory — {loadError}</span>
-            <button onClick={load} className="rounded border border-red-400/40 px-2 py-0.5 text-[10.5px] font-bold underline">retry</button>
+            <button onClick={() => void load('replace')} className="rounded border border-red-400/40 px-2 py-0.5 text-[10.5px] font-bold underline">retry</button>
           </div>
         )}
         {/* write form: a disclosure below lg so the list gets the viewport */}
@@ -633,7 +702,7 @@ export default function Memory() {
                     forget
                   </button>
                 )}
-                <span className="font-mono text-[11px] text-zinc-600">{shortId(it.id)}</span>
+                <span className="font-mono text-[11px] text-zinc-400">{shortId(it.id)}</span>
               </div>
               {/* A tool_outcome descriptor is a raw JSON log line. Rendered
                   verbatim it exposed internal artifact handles on 51 of 500
@@ -668,6 +737,17 @@ export default function Memory() {
             </section>
             );
           })}
+          {loaded && !loadError && !submitted && hasMore && (
+            <div className="flex justify-center pt-1">
+              <button
+                onClick={() => void loadMore()}
+                disabled={moreBusy}
+                className="rounded-md border border-white/15 bg-white/5 px-4 py-2 text-xs font-bold text-zinc-200 hover:border-violet-400 disabled:opacity-50"
+              >
+                {moreBusy ? 'Loading…' : `Load more${kindFilter ? ` ${kindFilter}` : ' memory'}`}
+              </button>
+            </div>
+          )}
         </div>
       </main>
     </div>

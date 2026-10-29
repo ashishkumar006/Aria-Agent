@@ -109,7 +109,7 @@ async def test_with_chat_memory_inserts_before_final_user_turn(monkeypatch):
     had remembered, and went red the moment memory was cleared.
     """
     monkeypatch.setattr(agent_server, "_chat_memory_block",
-                        lambda q, s: "REMEMBERED: user is in IST")
+                        lambda q, s, d=None: "REMEMBERED: user is in IST")
     msgs = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "old"},
@@ -126,7 +126,8 @@ async def test_with_chat_memory_inserts_before_final_user_turn(monkeypatch):
 
 
 async def test_with_chat_memory_is_a_noop_without_hits(monkeypatch):
-    monkeypatch.setattr(agent_server, "_chat_memory_block", lambda q, s: "")
+    monkeypatch.setattr(agent_server, "_chat_memory_block",
+                        lambda q, s, d=None: "")
     msgs = [{"role": "system", "content": "sys"},
             {"role": "user", "content": "q"}]
     assert await agent_server._with_chat_memory(msgs, "q", "s1") == msgs

@@ -72,9 +72,61 @@ COMPLETENESS CHECK before you finish — this matters more than polish:
 
 Output schema (JSON, no prose, no markdown fences):
 
+EITHER a plain text answer:
+
   {
     "final_answer": "<the answer the user sees>"
   }
+
+OR an A2UI surface when the answer is best shown as structured UI
+(tables, goal cards, action buttons, progress, metric lists) instead of
+prose. This branch is for CHAT answers - a follow-up question answered with
+a table or a set of controls. A research report is prose and stays prose;
+never replace a report with a surface.
+
+  {
+    "final_answer": null,
+    "a2ui": {
+      "surfaceId": "chat-response-<unique>",
+      "rootComponent": "root",
+      "components": [
+        { "id": "root", "component": "Column", "children": ["heading", "content", "actions"], "gap": "normal" },
+        { "id": "heading", "component": "Text", "variant": "heading", "text": "<title>" },
+        { "id": "content", "component": "Text", "text": "<body text>" },
+        { "id": "actions", "component": "Row", "children": ["btn1"], "gap": "tight" },
+        { "id": "btn1", "component": "Action", "label": "Re-run", "action": "rerun", "args": { "query": "<the user's question>" } }
+      ]
+    }
+  }
+
+Available A2UI components and their properties (use exactly these names and
+properties; anything else is refused before render):
+  - Column (children, gap): vertical stack; the usual root.
+  - Row (children, gap, align): horizontal stack.
+  - Card (child or children, title): bordered surface.
+  - Divider (axis), Spacer (size)
+  - Text (text, variant: body|heading|caption|mono)
+  - KeyValue (label, value, tone): a label above a value.
+  - Badge (text, tone), StatusRow (items), Empty (title, sub), Progress (label, value)
+  - MetricRow (children): a row of KeyValues.
+  - CodeBlock (text)
+  - DataList (rows: [{label, value}], emptyText)
+  - Table (columns: [{key, label}], rows: [{<key>: <scalar>}], rowKey, searchable, paginated, emptyText)
+  - Sparkline (series: [number], label)
+  - Action (label, variant, action, args): emits ONE event, no form submit.
+  - FilterChips (options: [{id, label, selected}], action)
+  - Link (label, target: console)
+
+Rules:
+  - Exactly one component has id "root"; every referenced child id must exist.
+  - Properties sit directly on the component, not nested under "props".
+  - gap is tight|normal|loose.
+  - Action actions: rerun (args: {query}), drive_app (args: {app, goal}),
+    open_app (args: {app}), run_command (args: {command}),
+    read_file (args: {path}), write_file (args: {path, content}).
+  - drive_app ALWAYS needs args.app beside args.goal. open_app ONLY launches;
+    for actions inside an app use drive_app with that goal in the same turn.
+  - Every element needs a unique string id; children reference ids, not indices.
 
 Rules:
   - This is the LAST node. Do not add successors.

@@ -16,6 +16,8 @@ place that knows there are eight stores.
 """
 from __future__ import annotations
 
+import asyncio
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -80,6 +82,51 @@ def _check_payload_size(value: dict | None,
                 f"{MAX_PAYLOAD_BYTES}) — chunk the content instead")
 
 
+# Kinds that describe a standing claim about the user, where a second
+# identical write is a REINFORCEMENT rather than a second memory. Facts are
+# deliberately excluded: two identical facts can be legitimate (the same
+# sentence quoted in two documents), and document spans must never merge.
+_CONVERGING_KINDS = frozenset({"observation", "preference"})
+
+
+def _descriptor_key(text: str) -> str:
+    """Case/punctuation/whitespace-insensitive key for exact repeated claims.
+
+    This is intentionally EQUALITY, not similarity: the agent already has a
+    fuzzy topic matcher for paraphrases. The gateway only guarantees that an
+    identical claim arriving twice (a retry, two extractor threads, a client
+    re-post) cannot become two rows.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _merge_repeat(prior: MemoryRecord, descriptor: str,
+                  keywords: list[str] | None, value: dict | None,
+                  confidence: float) -> tuple[str, list[str], dict, float]:
+    """Fold a repeat sighting into the shape of the existing record.
+
+    Keeps the established descriptor, evidence and keywords; counts the new
+    sighting; records the newest quote for review; never lowers confidence.
+    """
+    incoming = dict(value or {})
+    merged = dict(prior.value or {})
+    for k, v in incoming.items():
+        if k not in merged or merged[k] in (None, "", [], {}):
+            merged[k] = v
+    old_seen = int((prior.value or {}).get("seen_count") or 0) or 1
+    new_seen = int(incoming.get("seen_count") or 0) or 1
+    merged["seen_count"] = old_seen + new_seen
+    if incoming.get("evidence"):
+        # `evidence` stays the quote that established the claim; the newest
+        # one is added beside it so a reviewer can see the fresh support.
+        merged.setdefault("evidence", incoming["evidence"])
+        merged["latest_quote"] = str(incoming["evidence"])[:600]
+    kws = list(dict.fromkeys([*(prior.keywords or []),
+                              *(keywords or [])]))[:12]
+    return (prior.descriptor or descriptor, kws, merged,
+            max(float(prior.confidence or 0.0), float(confidence or 0.0)))
+
+
 class MemoryPlane:
     """Single-writer cabinet over one state root."""
 
@@ -97,6 +144,13 @@ class MemoryPlane:
         }
         import threading as _th
         self._versions_lock = _th.Lock()
+        # Serialises "is this an exact repeat?" + write for profile claims.
+        # Two extractor threads two seconds apart used to read the same
+        # snapshot and both append; the agent's lock only covers one process.
+        # Embeds are awaited inside this section, but observation/preference
+        # writes are rare and one short descriptor each, so the trade is
+        # deliberate: correctness on a standing claim beats a few ms.
+        self._converge_lock = asyncio.Lock()
         # Startup sweep: drop already-expired records (working TTL) before
         # serving traffic, loudly so expiry is observable, not silent.
         swept = self.sweep()
@@ -181,31 +235,72 @@ class MemoryPlane:
                 minutes=WORKING_TTL_MINUTES)
         svc = self.drawers[routed]
         svc.sweep_expired()  # opportunistic: one cheap load, keeps TTL honest
-        if supersedes:
-            # The target must exist BEFORE the new record is written.
-            #
-            # It used to be linked afterwards, so a write whose target was
-            # missing persisted the new record and then raised: the client
-            # saw a 404 and believed nothing was stored, while the drawer
-            # kept the orphan. Every repeat sighting of one observation
-            # therefore left a duplicate behind - the profile drawer held 80
-            # copies of a single claim, and because they all superseded the
-            # same vanished record, the duplicates crowded every search
-            # (including exact keyword matches) out of the results.
-            self._require_supersede_target(supersedes)
-        item = await svc.remember(
-            kind=kind, descriptor=descriptor, keywords=keywords,
-            value=value, source=source, run_id=run_id, goal_id=goal_id,
-            session_id=session_id, drawer=routed,
-            principal_role=principal_role,  # type: ignore[arg-type]
-            principal_id=principal_id, scope=scope, sources=sources,
-            expires_at=expires_at, supersedes=supersedes, doc=doc,
-            confidence=confidence)
-        if supersedes:
-            await self._mark_superseded(supersedes, item.id, routed)
-        if routed == "document" and doc and doc.doc_id:
-            self._note_doc_version(doc.doc_id, doc.version)
-        return item
+        # An exact repeat of a standing claim is one memory seen twice, not
+        # two memories. This used to depend entirely on the agent's fuzzy
+        # matcher, so any other writer (a retry, a test, a direct API client)
+        # could append a duplicate - and once one existed, the matcher kept
+        # finding only the newest, leaving the rest live. Convergence belongs
+        # here, where every writer passes.
+        converge = kind in _CONVERGING_KINDS and not supersedes
+        if converge:
+            await self._converge_lock.acquire()
+        try:
+            if converge:
+                prior = self._live_duplicate(routed, kind, descriptor)
+                if prior is not None:
+                    descriptor, keywords, value, confidence = _merge_repeat(
+                        prior, descriptor, keywords, value, confidence)
+                    supersedes = prior.id
+            if supersedes:
+                # The target must exist BEFORE the new record is written.
+                #
+                # It used to be linked afterwards, so a write whose target was
+                # missing persisted the new record and then raised: the client
+                # saw a 404 and believed nothing was stored, while the drawer
+                # kept the orphan. Every repeat sighting of one observation
+                # therefore left a duplicate behind - the profile drawer held
+                # 80 copies of a single claim, and because they all superseded
+                # the same vanished record, the duplicates crowded every
+                # search (including exact keyword matches) out of the results.
+                self._require_supersede_target(supersedes)
+            item = await svc.remember(
+                kind=kind, descriptor=descriptor, keywords=keywords,
+                value=value, source=source, run_id=run_id, goal_id=goal_id,
+                session_id=session_id, drawer=routed,
+                principal_role=principal_role,  # type: ignore[arg-type]
+                principal_id=principal_id, scope=scope, sources=sources,
+                expires_at=expires_at, supersedes=supersedes, doc=doc,
+                confidence=confidence)
+            if supersedes:
+                await self._mark_superseded(supersedes, item.id, routed)
+            if routed == "document" and doc and doc.doc_id:
+                self._note_doc_version(doc.doc_id, doc.version)
+            return item
+        finally:
+            if converge:
+                self._converge_lock.release()
+
+    def _live_duplicate(self, drawer: str, kind: str,
+                        descriptor: str) -> MemoryRecord | None:
+        """Newest live record in `drawer` with an identical descriptor.
+
+        Equality is normalised (case/punctuation/whitespace), never fuzzy:
+        "prefers short answers" and "prefers brief answers" are the agent
+        matcher's job, and merging them here would be a guess. A record that
+        already has a successor is skipped - it is history, not a live claim.
+        """
+        key = _descriptor_key(descriptor)
+        if not key:
+            return None
+        newest: MemoryRecord | None = None
+        for rec in self.drawers[drawer].store.load():
+            if rec.kind != kind or rec.superseded_by is not None:
+                continue
+            if _descriptor_key(rec.descriptor) != key:
+                continue
+            if newest is None or rec.created_at > newest.created_at:
+                newest = rec
+        return newest
 
     def _require_supersede_target(self, old_id: str) -> None:
         """Raise if the record a write wants to supersede is not there.
@@ -430,14 +525,13 @@ class MemoryPlane:
                     drawers: list[str] | None = None,
                     kinds: list[str] | None = None,
                     hide_superseded: bool = False,
+                    offset: int = 0,
                     ) -> list[MemoryRecord]:
-        svcs, include_legacy = self._sources(drawers)
-        pool: list[MemoryRecord] = []
-        if include_legacy:
-            pool.extend(self.legacy.list_recent(limit=limit,
-                                                session_id=session_id))
-        for svc in svcs:
-            pool.extend(svc.list_recent(limit=limit, session_id=session_id))
+        offset = max(0, int(offset))
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
+        want: set[str] | None = None
         if kinds:
             want = {k.strip() for k in kinds if k and k.strip()}
             bad = want - set(MemoryKind.__args__)
@@ -445,11 +539,30 @@ class MemoryPlane:
                 raise ValueError(
                     f"unknown kind(s) {sorted(bad)} (one of: "
                     f"{list(MemoryKind.__args__)})")
+        # Each source is asked for `offset + limit` rows AFTER its own
+        # filters, then the merged newest-first pool is sliced. Filtering
+        # after the slice was a real bug: once the fact drawer held 393
+        # superseded rows newer than 7 live ones, `hide_superseded=True,
+        # limit=20` saw only corrections and reported an empty fact list
+        # while stats said 7 live. Asking each drawer only for `limit` rows
+        # would also make page 2 skip records that belong on it.
+        take = offset + limit
+        svcs, include_legacy = self._sources(drawers)
+        pool: list[MemoryRecord] = []
+        if include_legacy:
+            pool.extend(self.legacy.list_recent(
+                limit=take, session_id=session_id, kinds=want,
+                hide_superseded=hide_superseded))
+        for svc in svcs:
+            pool.extend(svc.list_recent(
+                limit=take, session_id=session_id, kinds=want,
+                hide_superseded=hide_superseded))
+        if want:
             pool = [r for r in pool if r.kind in want]
         if hide_superseded:
             pool = [r for r in pool if r.superseded_by is None]
         pool.sort(key=lambda r: r.created_at, reverse=True)
-        return pool[:max(0, limit)]
+        return pool[offset:take]
 
     def active_policies(self, limit: int = 50) -> list[MemoryRecord]:
         """Policies that actually constrain behavior right now: the policy

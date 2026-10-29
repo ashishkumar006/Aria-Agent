@@ -167,6 +167,21 @@ def generation_prompt(request: str,
         "(label + value). A row of numbers goes in a MetricRow whose "
         "\"children\" list holds one KeyValue per number.",
         "",
+        "Tables and sparklines have a fixed shape - copy it exactly:",
+        '  Table:    "columns": [{"key": "run", "label": "Run"}, '
+        '{"key": "cost", "label": "Cost"}], '
+        '"rows": [{"run": "s8-1", "cost": 0.42}, {"run": "s8-2", "cost": 0.31}]',
+        "    `rows` is an ARRAY with ONE OBJECT PER ROW, keyed by the column "
+        "keys. It is NOT a list of arrays, NOT an object of column arrays, "
+        "and NOT a single object. Never replace a table with one Text "
+        "component per row.",
+        '  Sparkline: "series": [1, 4, 9, 16] - an array of numbers.',
+        "",
+        "Data bindings are for SCALAR properties (text, value, label). "
+        "Collections - Table rows, DataList rows, Sparkline series, "
+        "FilterChips options - are literal arrays in the payload, because the "
+        "console cannot resolve a binding to an array.",
+        "",
         "Do not invent a different top-level shape. Do not add a \"summary\", "
         "\"view_type\", \"data_points\" or similar wrapper - the data belongs in "
         "\"data\" and the layout belongs in \"components\".",

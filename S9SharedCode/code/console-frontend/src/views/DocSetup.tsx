@@ -270,35 +270,104 @@ function Toggle({ label, checked, disabled, onChange }:
 // user left the control on Auto would be its own kind of lie.
 const previewFormat = (f: DocSetup['format']) => (f === 'auto' ? 'pdf' : f);
 
+/* Previews are expensive: the server rasterises the whole file on every
+ * request (measured 0.5-1.0 s and 22 KB-525 KB for a short report), and the
+ * Authoring pane refetched each one whenever the user switched rows or came
+ * back to the page. An artifact id names immutable bytes and the layout
+ * preview is a fixed sample, so a remount should never pay twice. Uploaded
+ * documents live in a mutable registry, so their entry expires instead of
+ * being trusted forever. */
+const PREVIEW_TTL_MS = 60_000;
+const PREVIEW_CACHE_MAX = 12;
+type CachedPreview = { at: number; value: DocPreviewResult };
+const previewCache = new Map<string, CachedPreview>();
+/** Requests already on the wire. The Authoring pane mounts a viewer more than
+ *  once while a run's metadata settles (measured: four identical
+ *  `/api/doc/preview` requests for one click), and every one of them used to
+ *  render the whole file again because the cache was still empty. */
+const previewInflight = new Map<string, Promise<DocPreviewResult>>();
+
+function readPreviewCache(key: string): DocPreviewResult | null {
+  const hit = previewCache.get(key);
+  if (!hit) return null;
+  const immutable = key.startsWith('artifact:') || key.startsWith('spec:');
+  if (!immutable && Date.now() - hit.at > PREVIEW_TTL_MS) {
+    previewCache.delete(key);
+    return null;
+  }
+  // Refresh LRU position: the document on screen must survive churn.
+  previewCache.delete(key);
+  previewCache.set(key, hit);
+  return hit.value;
+}
+
+function writePreviewCache(key: string, value: DocPreviewResult) {
+  previewCache.set(key, { at: Date.now(), value });
+  while (previewCache.size > PREVIEW_CACHE_MAX) {
+    const oldest = previewCache.keys().next().value;
+    if (oldest === undefined) break;
+    previewCache.delete(oldest);
+  }
+}
+
+/** Share one request between every viewer showing the same source. The
+ *  returned promise is deliberately not tied to one viewer's AbortSignal: a
+ *  preview populates the cache for whoever mounts next, and each caller still
+ *  checks its own signal before writing React state. */
+function loadPreview(key: string,
+                     make: () => Promise<DocPreviewResult>): Promise<DocPreviewResult> {
+  const pending = previewInflight.get(key);
+  if (pending) return pending;
+  const request = make()
+    .then((r) => { writePreviewCache(key, r); return r; })
+    .finally(() => { previewInflight.delete(key); });
+  previewInflight.set(key, request);
+  return request;
+}
+
+/** How many page thumbnails around the current page are drawn. Beyond this,
+ *  a numbered placeholder keeps every page reachable without parsing an SVG
+ *  (or decoding a PNG) the reader has not scrolled to. */
+const THUMB_RADIUS = 5;
+
 export function DocumentViewer({ source }: { source: Source }) {
-  const [data, setData] = useState<DocPreviewResult | null>(null);
-  const [err, setErr] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [page, setPage] = useState(0);
-  const [zoom, setZoom] = useState<'fit' | '100'>('fit');
-  const abort = useRef<AbortController | null>(null);
   const key = source.kind === 'spec'
     ? `spec:${JSON.stringify(source.setup)}`
     : source.kind === 'artifact'
       ? `artifact:${source.artifact}`
       : `document:${source.docId}`;
+  const [data, setData] = useState<DocPreviewResult | null>(() => readPreviewCache(key));
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(() => !readPreviewCache(key));
+  const [page, setPage] = useState(0);
+  const [zoom, setZoom] = useState<'fit' | '100'>('fit');
+  const abort = useRef<AbortController | null>(null);
 
   useEffect(() => {
+    // A fetch for the previous source must never paint this one.
     abort.current?.abort();
+    abort.current = null;
+    const hit = readPreviewCache(key);
+    if (hit) {
+      setData(hit);
+      setErr('');
+      setBusy(false);
+      setPage(0);
+      return;
+    }
     const ctl = new AbortController();
     abort.current = ctl;
     setBusy(true);
     setErr('');
     setPage(0);
-    const request = source.kind === 'spec'
+    const request = loadPreview(key, () => source.kind === 'spec'
       ? previewDocument({
           format: previewFormat(source.setup.format),
           spec: SAMPLE_SPEC(source.setup),
-        }, ctl.signal)
+        })
       : source.kind === 'artifact'
-        ? previewDocument(
-            { artifact: source.artifact, format: source.format }, ctl.signal)
-        : previewStoredDocument(source.docId, ctl.signal);
+        ? previewDocument({ artifact: source.artifact, format: source.format })
+        : previewStoredDocument(source.docId));
     request
       .then((r) => { if (!ctl.signal.aborted) setData(r); })
       .catch((e) => {
@@ -370,7 +439,7 @@ export function DocumentViewer({ source }: { source: Source }) {
         <div className="docview-stage">
           {pages[shown].kind === 'png' ? (
             <img className="docview-page" alt={`Page ${shown + 1}`}
-              src={pages[shown].data}
+              src={pages[shown].data} decoding="async"
               style={styleFor(pages[shown].width_pt)} />
           ) : (
             <div className="docview-slide"
@@ -387,10 +456,12 @@ export function DocumentViewer({ source }: { source: Source }) {
               aria-selected={i === shown} title={`Page ${i + 1}`}
               className={classNames('docview-thumb', i === shown && 'on')}
               onClick={() => setPage(i)}>
-              {p.kind === 'png'
-                ? <img src={p.data} alt="" />
-                : <span className="docview-thumb-svg"
-                    dangerouslySetInnerHTML={{ __html: p.data }} />}
+              {Math.abs(i - shown) > THUMB_RADIUS
+                ? <span className="docview-thumb-num" aria-hidden="true">{i + 1}</span>
+                : p.kind === 'png'
+                  ? <img src={p.data} alt="" loading="lazy" decoding="async" />
+                  : <span className="docview-thumb-svg"
+                      dangerouslySetInnerHTML={{ __html: p.data }} />}
             </button>
           ))}
         </div>

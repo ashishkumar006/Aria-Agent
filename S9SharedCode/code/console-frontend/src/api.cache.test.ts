@@ -70,9 +70,60 @@ describe('health bypasses the read cache', () => {
       const a = await api.health();
       up = true;                          // gateway recovers
       const b = await api.health();       // must NOT replay the cached failure
-      expect(calls).toEqual(['GET /api/health', 'GET /api/health']);
+      const c = await api.health(true);   // banner Retry: ask the server to probe
+      expect(calls).toEqual([
+        'GET /api/health', 'GET /api/health', 'GET /api/health?fresh=1',
+      ]);
       expect(a.gateway_up).toBe(false);
       expect(b.gateway_up).toBe(true);
+      expect(c.gateway_up).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+/**
+ * The other half of the section-switch cache: the heavy lists were all
+ * `cache: 'no-store'`, so leaving Runs and coming back two seconds later
+ * re-read 192 rows / 64 KB (measured 224 ms) even though keep-alive had kept
+ * the component and its rows on screen. A short TTL makes the hop instant and
+ * leaves the 15 s poll cadence untouched.
+ */
+describe('list reads survive a quick section switch', () => {
+  function mockFetch(calls: string[]) {
+    return vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(`${(init?.method || 'GET').toUpperCase()} ${String(url)}`);
+      return new Response(JSON.stringify({ runs: [], sessions: [], documents: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+  }
+
+  it('serves a repeated runs summary without a second request', async () => {
+    invalidate();
+    const calls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch(calls);
+    try {
+      await api.runsSummary(200);
+      await api.runsSummary(200);
+      expect(calls).toEqual(['GET /api/runs/summary?limit=200']);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('still lets the documents indexing poll force a fresh read', async () => {
+    invalidate();
+    const calls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch(calls);
+    try {
+      await api.documents(undefined, true);
+      await api.documents(undefined, true);
+      expect(calls).toEqual(['GET /api/documents', 'GET /api/documents']);
     } finally {
       globalThis.fetch = origFetch;
     }

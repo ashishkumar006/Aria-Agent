@@ -143,7 +143,7 @@ endsolid cube`;
     await expect(page.getByText('area')).toBeVisible({ timeout: 15000 });
 
     // Verify objective is displayed
-    await expect(page.getByText('Objective')).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText('Objective', { exact: true })).toBeVisible({ timeout: 15000 });
 
     await page.screenshot({ path: `${SHOTS}/parts-uploaded.png` });
     expect(errors, `console errors during upload: ${errors.join(' | ')}`).toEqual([]);
@@ -420,7 +420,7 @@ endsolid cube`;
       await page.waitForTimeout(15000); // Wait for optimization to complete
 
       // Check history appears
-      await expect(page.getByText('Loop')).toBeVisible({ timeout: 15000 });
+      await expect(page.getByText('Loop', { exact: true })).toBeVisible({ timeout: 15000 });
     }
 
     expect(errors, `console errors during optimization: ${errors.join(' | ')}`).toEqual([]);

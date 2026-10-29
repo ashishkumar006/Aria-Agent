@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronRight, Clock, Copy,
+  memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
+} from 'react';
+import {
+  AlertTriangle, Check, ChevronDown, ChevronRight, Clock, Copy,
   FileCode2, History, Loader2, Plus, RotateCcw, ShieldQuestion, Sparkles,
   Square, ThumbsDown, ThumbsUp, Trash2, Wrench, X,
 } from 'lucide-react';
@@ -98,6 +100,9 @@ type Props = {
   /** Model id chosen in the picker; '' means "let the gateway decide". */
   model?: string;
   onModelChange?: (id: string) => void;
+  /** Close the panel. Only rendered on the stacked layout, where the panel is
+   *  an overlay and the top-bar toggle is the only other way out. */
+  onClose?: () => void;
 };
 
 let seq = 0;
@@ -211,14 +216,6 @@ function ago(at: number): string {
   return `${Math.round(s / 86400)}d`;
 }
 
-/** `cohere/north-mini-code:free` is an API id, not a label. The footer shows
-    the friendly tail; the raw id stays in the title for anyone who needs it. */
-function friendlyModel(id: string): string {
-  if (!id) return '';
-  const tail = id.split('/').pop() ?? id;
-  return tail.replace(/:free$/i, '').replace(/[-_]+/g, ' ').trim();
-}
-
 /* ── step row ──────────────────────────────────────────────────────────────── */
 
 function stepIcon(kind: Step['kind'], spin: boolean) {
@@ -278,21 +275,197 @@ function StepRow({ step, count = 1, busy, open, onToggle }:
   );
 }
 
+/* The wait before the first token is 8-15 seconds on a cold model. A static
+ * "thinking…" gives no evidence that anything is happening; a clock does. It
+ * ticks inside its own component so a second passing never re-renders the
+ * transcript around it. */
+function WaitNote({ from }: { from?: number }) {
+  const at = from ?? Date.now();
+  const [s, setS] = useState(() => Math.max(0, Math.round((Date.now() - at) / 1000)));
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setS(Math.max(0, Math.round((Date.now() - at) / 1000)));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [at]);
+  return (
+    <p className="flex items-center gap-1.5 text-[11.5px] text-zinc-500">
+      <Loader2 size={11} className="animate-spin" />
+      <span className="tabular-nums">{s >= 3 ? `thinking… ${s}s` : 'thinking…'}</span>
+    </p>
+  );
+}
+
+/* ── one transcript row ────────────────────────────────────────────────────── */
+
+/* Extracted and memoised for the same reason Chat's MessageRow is: an answer
+ * streams in token by token, and without this every finished turn re-rendered
+ * (and re-parsed its markdown) on every token of the newest one. `t` is a stable
+ * object between tokens — the panel only replaces the live turn — so the
+ * identity comparison is enough.
+ *
+ * The activity list follows the turn's OWN `busy`, not the panel's. The old
+ * `stepsOpen || busy` used the panel flag, so asking a follow-up force-opened
+ * every earlier turn's tool list at once: the transcript ballooned, the scroll
+ * jumped, and it all collapsed again when the answer settled. */
+type TurnRowProps = {
+  t: Turn;
+  stepsOpen: boolean;
+  thinkOpen: Record<string, boolean>;
+  onToggleSteps: (id: string) => void;
+  onToggleThink: (key: string) => void;
+  onRegen: (t: Turn) => void;
+  onCopy: (text: string) => void;
+  onVote: (id: string, v: 1 | -1) => void;
+};
+
+const TurnRow = memo(function TurnRow({
+  t, stepsOpen, thinkOpen, onToggleSteps, onToggleThink, onRegen, onCopy, onVote,
+}: TurnRowProps) {
+  // Parsed once per distinct answer, not once per token (and not at all for the
+  // finished turns above the live one).
+  const html = useMemo(() => (t.text ? renderMarkdown(t.text) : ''), [t.text]);
+
+  // Same tool, several times in a row, is the normal case for an agent that
+  // reads a folder ("read_file ×6"). Collapsing them keeps a real
+  // investigation readable instead of a wall of rows. The DETAIL must match
+  // too, or a parallel batch reading three DIFFERENT files collapses into one
+  // row and hides two of them.
+  const displaySteps: { key: string; step: Step; count: number }[] = [];
+  for (const [i, s] of (t.steps ?? []).entries()) {
+    const key = s.id ?? `s${i}`;
+    const prev = displaySteps[displaySteps.length - 1];
+    if (s.kind === 'think' || !prev
+        || s.kind !== prev.step.kind || s.label !== prev.step.label
+        || (s.detail ?? '') !== (prev.step.detail ?? '')) {
+      displaySteps.push({ key, step: s, count: 1 });
+      continue;
+    }
+    // A repeat is one we have NOT already collapsed, so it counts.
+    prev.count += 1;
+  }
+  const toolCount = (t.steps ?? []).filter(
+    (s) => s.kind === 'call' || s.kind === 'ok' || s.kind === 'err'
+  ).length;
+  // A turn that only carries context switches has no tools and no prose, so
+  // the agent bubble above renders as an "ACTIVITY · 0 tools" card per file
+  // click. It reads as a one-line marker.
+  const ctxOnly = t.role === 'agent' && !t.text && !t.error
+    && !!t.steps?.length && t.steps.every((s) => s.kind === 'status');
+
+  return (
+    <li className="space-y-1.5">
+      {t.role === 'user' ? (
+        <div className="ml-8 rounded-2xl rounded-br-md bg-white/[0.05] px-3 py-2 text-[12px] leading-relaxed text-zinc-200">
+          {t.text}
+        </div>
+      ) : ctxOnly ? (
+        <div className="flex items-center gap-1.5 px-1 text-[10.5px] text-zinc-500">
+          <FileCode2 size={11} className="flex-none text-zinc-600" />
+          <span className="font-semibold text-zinc-500">{(t.steps ?? [])[0]?.label}</span>
+          <span className="min-w-0 truncate">{(t.steps ?? [])[0]?.detail}</span>
+        </div>
+      ) : (
+        <div className="rounded-2xl rounded-bl-md border border-white/8 bg-surface-0 px-3 py-2">
+          {t.steps && t.steps.length > 0 && (
+            <div className="mb-2 overflow-hidden rounded-xl border border-white/8 bg-black/20">
+              <button type="button"
+                      onClick={() => onToggleSteps(t.id)}
+                      aria-expanded={stepsOpen}
+                      className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[10.5px] font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-300">
+                {stepsOpen
+                  ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                {t.busy && !t.text ? 'working' : 'activity'}
+                <span className="font-normal normal-case tracking-normal text-zinc-600">
+                  {toolCount} tool{toolCount === 1 ? '' : 's'}
+                </span>
+                <span className="flex-1" />
+                {t.busy && <Loader2 size={10} className="animate-spin" />}
+              </button>
+              {(stepsOpen || t.busy) && (
+                <ul className="max-h-56 overflow-y-auto border-t border-white/8 px-2 py-1">
+                  {displaySteps.map((s) => (
+                    <StepRow key={s.key} step={s.step}
+                             count={s.count} busy={!!t.busy}
+                             open={!!thinkOpen[s.key]}
+                             onToggle={() => onToggleThink(s.key)} />
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {t.error && (
+            <div className="flex items-start gap-1.5 text-[11.5px] text-rose-300">
+              <AlertTriangle size={12} className="mt-0.5 flex-none" />
+              {t.error}
+            </div>
+          )}
+          {t.text ? (
+            <div className="prose-chat text-[12.5px] leading-relaxed text-zinc-200"
+                 dangerouslySetInnerHTML={{ __html: html }} />
+          ) : t.busy ? (
+            <WaitNote from={t.at} />
+          ) : null}
+
+          {/* message actions */}
+          {!t.busy && (t.text || t.error) && (
+            <div className="mt-1.5 flex items-center gap-0.5 text-zinc-500">
+              <button type="button" onClick={() => onRegen(t)}
+                      title="Regenerate"
+                      className="rounded p-1 hover:bg-white/5 hover:text-zinc-200">
+                <RotateCcw size={11} />
+              </button>
+              <button type="button" onClick={() => onCopy(t.text)}
+                      title="Copy" aria-label="Copy answer"
+                      className="rounded p-1 hover:bg-white/5 hover:text-zinc-200">
+                <Copy size={11} />
+              </button>
+              <button type="button" onClick={() => onVote(t.id, 1)}
+                      title="Good answer" aria-pressed={t.vote === 1}
+                      className={`rounded p-1 hover:bg-white/5 ${
+                        t.vote === 1 ? 'text-emerald-300' : 'hover:text-zinc-200'}`}>
+                <ThumbsUp size={11} />
+              </button>
+              <button type="button" onClick={() => onVote(t.id, -1)}
+                      title="Bad answer" aria-pressed={t.vote === -1}
+                      className={`rounded p-1 hover:bg-white/5 ${
+                        t.vote === -1 ? 'text-rose-300' : 'hover:text-zinc-200'}`}>
+                <ThumbsDown size={11} />
+              </button>
+              {t.model && (
+                <span className="ml-1 truncate text-[10px] text-zinc-600">
+                  {t.model}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </li>
+  );
+});
+
 /* ── panel ─────────────────────────────────────────────────────────────────── */
 
 export default function AgentPanel({
   path, body, onAsk, files = [],
   gitView = 'status', gitBusy = false, gitOut = null, onGit,
   model = '', onModelChange,
+  onClose,
 }: Props) {
   void body;   // sent through onAsk by the caller; kept in Props for the shape
   const [turns, setTurns] = useState<Turn[]>(() => loadTurns());
   // Persist on every settled change. Skipping a busy turn means an in-flight
   // answer is never written, so a reload mid-stream cannot leave a truncated
   // reply in the history that the next question is sent against.
+  //
+  // Deferred by a tick: the write serialises the whole transcript (tool results
+  // included) and hits localStorage synchronously. Doing that inside the commit
+  // that hides the spinner delayed the first frame of the finished answer.
   useEffect(() => {
     if (turns.some((t) => t.busy)) return;
-    saveTurns(turns);
+    const id = window.setTimeout(() => saveTurns(turns), 0);
+    return () => window.clearTimeout(id);
   }, [turns]);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
@@ -361,7 +534,12 @@ export default function AgentPanel({
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
-  useEffect(() => {
+  /* Pinned BEFORE paint, not after it. As a passive effect the browser painted
+     the freshly grown answer at the old scroll offset and then jumped to the
+     bottom on the next frame — one visible hitch per token. A layout effect
+     runs after React commits the new text and before the frame is painted, so
+     the text is already at the bottom the first time it is seen. */
+  useLayoutEffect(() => {
     const el = scroller.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [turns, view]);
@@ -441,6 +619,31 @@ export default function AgentPanel({
 
     const ctrl = new AbortController();
     ac.current = ctrl;
+    /* Coalesce token paints to one per animation frame. The gateway delivers
+       deltas in bursts (a dozen can land in the same millisecond), and each one
+       used to be its own React update: the whole transcript re-rendered and
+       every answer's markdown was re-parsed for a handful of characters. A
+       screen cannot show more than one frame of that anyway. */
+    let pending = '';
+    let frame = 0;
+    const flush = () => {
+      frame = 0;
+      if (!pending) return;
+      const chunk = pending;
+      pending = '';
+      setTurns((t) => t.map((x) => (
+        x.id === agentId ? { ...x, text: x.text + chunk } : x
+      )));
+    };
+    const flushNow = () => {
+      if (frame) { cancelAnimationFrame(frame); frame = 0; }
+      flush();
+    };
+    const queue = (chunk: string) => {
+      pending += chunk;
+      if (!frame) frame = requestAnimationFrame(flush);
+    };
+
     try {
       const answer = await onAsk(
         q,
@@ -486,18 +689,19 @@ export default function AgentPanel({
           )));
         },
         ctrl.signal,
-        // Live token streaming: append as the model writes.
-        (chunk: string) => {
-          setTurns((t) => t.map((x) => (
-            x.id === agentId ? { ...x, text: x.text + chunk } : x
-          )));
-        },
+        // Live token streaming: buffer as the model writes; flush happens once
+        // per frame (see above).
+        (chunk: string) => queue(chunk),
         extra.length ? extra : undefined,
       );
+      flushNow();
       setTurns((t) => t.map((x) => (
         x.id === agentId ? { ...x, text: answer || x.text, busy: false } : x
       )));
     } catch (e) {
+      // Keep every token that arrived before the failure/Stop, not just the
+      // ones that happened to be committed to state already.
+      flushNow();
       if ((e as Error).name === 'AbortError') {
         setTurns((t) => t.map((x) => (
           x.id === agentId
@@ -510,10 +714,20 @@ export default function AgentPanel({
         )));
       }
     } finally {
+      flushNow();
       setBusy(false);
       ac.current = null;
     }
   }, [busy, onAsk, turns]);
+
+  /* Latest-value mirrors so the memoised rows can receive callbacks that never
+     change identity. Without this, every token produced a new `regen` (it
+     closes over `turns`), which re-rendered every finished row and defeated the
+     memo. `ask` itself still gets the current state through these refs. */
+  const askRef = useRef(ask);
+  const turnsRef = useRef(turns);
+  useEffect(() => { askRef.current = ask; }, [ask]);
+  useEffect(() => { turnsRef.current = turns; }, [turns]);
 
   const send = useCallback(() => {
     const q = draft.trim();
@@ -532,15 +746,26 @@ export default function AgentPanel({
     void ask(q, undefined, extra ?? []);
   }, [ask, draft, busy, attached]);
   const regen = useCallback((turn: Turn) => {
-    // Re-run the question that produced this answer.
-    const idx = turns.findIndex((t) => t.id === turn.id);
+    // Re-run the question that produced this answer. Read through the ref: the
+    // row is memoised, so its callback is the one from the first render.
+    const all = turnsRef.current;
+    const idx = all.findIndex((t) => t.id === turn.id);
     let q = '';
     for (let i = idx - 1; i >= 0; i--) {
-      if (turns[i].role === 'user') { q = turns[i].text; break; }
+      if (all[i].role === 'user') { q = all[i].text; break; }
     }
-    if (q) void ask(q, turn.id);
-  }, [ask, turns]);
+    if (q) void askRef.current(q, turn.id);
+  }, []);
   const stop = () => { setQueued([]); ac.current?.abort(); };
+
+  /* Stable toggles for the memoised rows: they take the row's id, not a
+     closure over its current open state. */
+  const toggleSteps = useCallback((id: string) => {
+    setShowSteps((s) => ({ ...s, [id]: !s[id] }));
+  }, []);
+  const toggleThink = useCallback((key: string) => {
+    setShowThinking((s) => ({ ...s, [key]: !s[key] }));
+  }, []);
 
   /* Run the next queued follow-up as soon as the current turn settles.
      Dequeuing here rather than inside `ask` keeps exactly one turn in flight. */
@@ -619,10 +844,6 @@ export default function AgentPanel({
   };
 
   const title = useMemo(() => titleOf(turns), [turns]);
-  const modelLabel = useMemo(() => {
-    const m = [...turns].reverse().find((t) => t.model)?.model;
-    return friendlyModel(m || model) || 'Auto';
-  }, [turns, model]);
 
   const [showThinking, setShowThinking] = useState<Record<string, boolean>>({});
 
@@ -654,23 +875,17 @@ export default function AgentPanel({
           </>
         ) : (
           <>
-            <button type="button" onClick={() => setView('sessions')}
-                    title="All sessions"
-                    className="text-zinc-muted hover:text-zinc-200">
-              <ChevronLeft size={14} />
-            </button>
+            {/* One way into Sessions, not two. The back chevron and the
+                history icon were the same `setView('sessions')` call sitting
+                three centimetres apart, and the file chip repeated the tab,
+                the breadcrumb and the composer's context chip. */}
             <Sparkles size={12} className="flex-none text-zinc-500" />
             <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-zinc-200">
               {title}
             </span>
-            {path && (
-              <span className="flex max-w-[9rem] items-center gap-1 text-[10.5px] text-zinc-muted">
-                <FileCode2 size={11} className="flex-none" />
-                <span className="truncate">{path.split('/').pop()}</span>
-              </span>
-            )}
             <button type="button" onClick={() => setView('sessions')}
-                    title="Sessions" className="text-zinc-muted hover:text-zinc-200">
+                    title="All sessions" aria-label="All sessions"
+                    className="text-zinc-muted hover:text-zinc-200">
               <History size={12} />
             </button>
             {turns.length > 0 && (
@@ -678,6 +893,16 @@ export default function AgentPanel({
                       className="text-zinc-muted hover:text-zinc-200"
                       aria-label="Clear the conversation">
                 <Trash2 size={12} />
+              </button>
+            )}
+            {/* Only on the stacked layout: there the panel is an overlay, so
+                it needs a way out of itself. On desktop the splitter and the
+                top-bar toggle already close it. */}
+            {onClose && (
+              <button type="button" onClick={onClose}
+                      className="text-zinc-muted hover:text-zinc-200 lg:hidden"
+                      aria-label="Close the agent panel" title="Close">
+                <X size={13} />
               </button>
             )}
           </>
@@ -752,166 +977,49 @@ export default function AgentPanel({
           )}
 
           {turns.length === 0 && (
-            <div className="mt-4 space-y-2">
-              <p className="px-1 text-[12px] leading-relaxed text-zinc-400">
-                Ask about this file or your workspace. The agent reads your
-                buffer and explores the workspace with its own tools — every
-                step it takes is shown.
+            <div className="mt-3">
+              <p className="px-1.5 text-[11.5px] leading-relaxed text-zinc-500">
+                {path
+                  ? 'Ask about this file, or send the agent into the workspace.'
+                  : 'The agent reads the workspace with its own tools.'}
               </p>
-              {/* Chips, not form fields: full-width bordered rows read as
-                  inputs to fill in, and there were four of them. With no file
-                  open, "this module" referred to nothing - the seeds change
-                  with the context. */}
-              <div className="flex flex-wrap gap-1.5 px-1">
+              {/* Three suggestions as plain rows. Four bordered pills wrapped
+                  into a block of boxes at panel width, which read as form
+                  fields and was the single busiest thing in the panel. The
+                  seed text also has to change with the context: with no file
+                  open, "this module" refers to nothing. */}
+              <ul className="mt-1.5 space-y-0.5 px-0.5">
                 {(path
-                  ? [
-                      'What does this module do?',
-                      'Where is this function used?',
-                      'What breaks if I change the signature?',
-                      'Which tests cover this?',
-                    ]
-                  : [
-                      'What is in this workspace?',
-                      'Explain the folder layout',
-                      'Create a hello world script',
-                      'Add a README.md',
-                    ]
+                  ? ['Explain this file', 'Where is this used?', 'What could break?']
+                  : ['Explore the workspace', 'Create a hello world script', 'Add a README']
                 ).map((s) => (
-                  <button key={s} type="button" onClick={() => setDraft(s)}
-                          className="rounded-full border border-white/10 px-2.5 py-1 text-[11px] text-zinc-400 transition-colors hover:border-zinc-600 hover:text-zinc-200">
-                    {s}
-                  </button>
+                  <li key={s}>
+                    <button type="button" onClick={() => setDraft(s)}
+                            className="group flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-[11.5px] text-zinc-400 transition-colors hover:bg-white/[0.04] hover:text-zinc-200">
+                      <ChevronRight size={11}
+                                    className="flex-none text-zinc-600 group-hover:text-zinc-400" />
+                      {s}
+                    </button>
+                  </li>
                 ))}
-              </div>
+              </ul>
             </div>
           )}
 
           <ol className="space-y-3">
-            {turns.map((t) => {
-              const stepsOpen = showSteps[t.id] ?? false;
-              // Same tool, several times in a row, is the normal case for an
-              // agent that reads a folder ("read_file ×6"). Collapsing them
-              // keeps a real investigation readable instead of a wall of rows.
-              // The DETAIL must match too, or a parallel batch reading three
-              // DIFFERENT files collapses into one row and hides two of them.
-              const displaySteps: { key: string; step: Step; count: number }[] = [];
-              for (const [i, s] of (t.steps ?? []).entries()) {
-                const key = s.id ?? `s${i}`;
-                const prev = displaySteps[displaySteps.length - 1];
-                if (s.kind === 'think' || !prev
-                    || s.kind !== prev.step.kind || s.label !== prev.step.label
-                    || (s.detail ?? '') !== (prev.step.detail ?? '')) {
-                  displaySteps.push({ key, step: s, count: 1 });
-                  continue;
-                }
-                // A repeat is one we have NOT already collapsed, so it counts.
-                prev.count += 1;
-              }
-              const toolCount = (t.steps ?? []).filter(
-                (s) => s.kind === 'call' || s.kind === 'ok' || s.kind === 'err'
-              ).length;
-              // A turn that only carries context switches has no tools and no
-              // prose, so the agent bubble above renders as an "ACTIVITY · 0
-              // tools" card per file click. It reads as a one-line marker.
-              const ctxOnly = t.role === 'agent' && !t.text && !t.error
-                && !!t.steps?.length && t.steps.every((s) => s.kind === 'status');
-              return (
-              <li key={t.id} className="space-y-1.5">
-                {t.role === 'user' ? (
-                  <div className="ml-8 rounded-2xl rounded-br-md bg-white/[0.05] px-3 py-2 text-[12px] leading-relaxed text-zinc-200">
-                    {t.text}
-                  </div>
-                ) : ctxOnly ? (
-                  <div className="flex items-center gap-1.5 px-1 text-[10.5px] text-zinc-500">
-                    <FileCode2 size={11} className="flex-none text-zinc-600" />
-                    <span className="font-semibold text-zinc-500">{(t.steps ?? [])[0]?.label}</span>
-                    <span className="min-w-0 truncate">{(t.steps ?? [])[0]?.detail}</span>
-                  </div>
-                ) : (
-                  <div className="rounded-2xl rounded-bl-md border border-white/8 bg-surface-0 px-3 py-2">
-                    {t.steps && t.steps.length > 0 && (
-                      <div className="mb-2 overflow-hidden rounded-xl border border-white/8 bg-black/20">
-                        <button type="button"
-                                onClick={() => setShowSteps((s) => ({
-                                  ...s, [t.id]: !stepsOpen,
-                                }))}
-                                aria-expanded={stepsOpen}
-                                className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[10.5px] font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-300">
-                          {stepsOpen
-                            ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                          {t.busy && !t.text ? 'working' : 'activity'}
-                          <span className="font-normal normal-case tracking-normal text-zinc-600">
-                            {toolCount} tool{toolCount === 1 ? '' : 's'}
-                          </span>
-                          <span className="flex-1" />
-                          {t.busy && <Loader2 size={10} className="animate-spin" />}
-                        </button>
-                        {(stepsOpen || busy) && (
-                          <ul className="max-h-56 overflow-y-auto border-t border-white/8 px-2 py-1">
-                            {displaySteps.map((s) => (
-                              <StepRow key={s.key} step={s.step}
-                                       count={s.count} busy={!!t.busy}
-                                       open={!!showThinking[s.key]}
-                                       onToggle={() => setShowThinking((st) => ({
-                                         ...st, [s.key]: !st[s.key],
-                                       }))} />
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-                    )}
-                    {t.error && (
-                      <div className="flex items-start gap-1.5 text-[11.5px] text-rose-300">
-                        <AlertTriangle size={12} className="mt-0.5 flex-none" />
-                        {t.error}
-                      </div>
-                    )}
-                    {t.text ? (
-                      <div className="prose-chat text-[12.5px] leading-relaxed text-zinc-200"
-                           dangerouslySetInnerHTML={{ __html: renderMarkdown(t.text) }} />
-                    ) : t.busy ? (
-                      <p className="flex items-center gap-1.5 text-[11.5px] text-zinc-500">
-                        <Loader2 size={11} className="animate-spin" /> thinking…
-                      </p>
-                    ) : null}
-
-                    {/* message actions */}
-                    {!t.busy && (t.text || t.error) && (
-                      <div className="mt-1.5 flex items-center gap-0.5 text-zinc-500">
-                        <button type="button" onClick={() => regen(t)}
-                                title="Regenerate"
-                                className="rounded p-1 hover:bg-white/5 hover:text-zinc-200">
-                          <RotateCcw size={11} />
-                        </button>
-                        <button type="button" onClick={() => copy(t.text)}
-                                title="Copy" aria-label="Copy answer"
-                                className="rounded p-1 hover:bg-white/5 hover:text-zinc-200">
-                          <Copy size={11} />
-                        </button>
-                        <button type="button" onClick={() => vote(t.id, 1)}
-                                title="Good answer" aria-pressed={t.vote === 1}
-                                className={`rounded p-1 hover:bg-white/5 ${
-                                  t.vote === 1 ? 'text-emerald-300' : 'hover:text-zinc-200'}`}>
-                          <ThumbsUp size={11} />
-                        </button>
-                        <button type="button" onClick={() => vote(t.id, -1)}
-                                title="Bad answer" aria-pressed={t.vote === -1}
-                                className={`rounded p-1 hover:bg-white/5 ${
-                                  t.vote === -1 ? 'text-rose-300' : 'hover:text-zinc-200'}`}>
-                          <ThumbsDown size={11} />
-                        </button>
-                        {t.model && (
-                          <span className="ml-1 truncate text-[10px] text-zinc-600">
-                            {t.model}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </li>
-              );
-            })}
+            {turns.map((t) => (
+              <TurnRow
+                key={t.id}
+                t={t}
+                stepsOpen={!!showSteps[t.id]}
+                thinkOpen={showThinking}
+                onToggleSteps={toggleSteps}
+                onToggleThink={toggleThink}
+                onRegen={regen}
+                onCopy={copy}
+                onVote={vote}
+              />
+            ))}
           </ol>
 
         </div>
@@ -921,32 +1029,26 @@ export default function AgentPanel({
       <form onSubmit={(e) => { e.preventDefault(); void send(); }}
             className="flex-none border-t border-glass-border p-2">
         <div className="relative rounded-xl border border-white/[0.08] bg-surface-1 focus-within:border-zinc-600">
-          {/* context chips */}
-          <div className="flex flex-wrap items-center gap-1 px-2 pt-2">
-            {path ? (
-              <span className="flex items-center gap-1 rounded-md border border-white/10 bg-black/30 px-1.5 py-0.5 text-[10.5px] text-zinc-300">
-                <FileCode2 size={10} className="text-zinc-500" />
-                {path.split('/').pop()}
-              </span>
-            ) : (
-              <span className="rounded-md border border-white/10 px-1.5 py-0.5 text-[10.5px] text-zinc-600">
-                no file open
-              </span>
-            )}
-            {attached.map((f) => (
-              <span key={f} title={f}
-                    className="flex items-center gap-1 rounded-md border border-white/10 bg-white/[0.05] px-1.5 py-0.5 text-[10.5px] text-zinc-300">
-                <FileCode2 size={10} />
-                {f.split('/').pop()}
-                <button type="button"
-                        onClick={() => setAttached((a) => a.filter((x) => x !== f))}
-                        aria-label={`Detach ${f}`}
-                        className="text-zinc-500 hover:text-zinc-200">
-                  <X size={9} />
-                </button>
-              </span>
-            ))}
-          </div>
+          {/* Attachments only. The active file used to get a chip here too,
+              but it is already in the placeholder and in the breadcrumb; the
+              row existed to repeat one filename and cost the composer a line. */}
+          {attached.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1 px-2 pt-2">
+              {attached.map((f) => (
+                <span key={f} title={f}
+                      className="flex items-center gap-1 rounded-md border border-white/10 bg-white/[0.05] px-1.5 py-0.5 text-[10.5px] text-zinc-300">
+                  <FileCode2 size={10} />
+                  {f.split('/').pop()}
+                  <button type="button"
+                          onClick={() => setAttached((a) => a.filter((x) => x !== f))}
+                          aria-label={`Detach ${f}`}
+                          className="text-zinc-500 hover:text-zinc-200">
+                    <X size={9} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <textarea
             ref={ta}
             value={draft}
@@ -959,9 +1061,9 @@ export default function AgentPanel({
             }}
             rows={1}
             placeholder={busy
-              ? 'Queue a follow-up — it runs when this turn finishes…'
+              ? 'Queue a follow-up…'
               : path
-                ? `Ask about ${path.split('/').pop()}…  (Enter to send)`
+                ? `Ask about ${path.split('/').pop()}…`
                 : 'Describe what to build…'}
             aria-label="Ask the agent about this code"
             className="max-h-36 min-h-[36px] w-full resize-none bg-transparent px-2.5 py-2 text-[12.5px] leading-snug text-zinc-100 outline-none placeholder:text-zinc-600 disabled:opacity-50"
@@ -982,12 +1084,20 @@ export default function AgentPanel({
                       pickQ !== null ? 'text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}>
               <Plus size={13} />
             </button>
-            {/* The panel header already says Agent; this pill only earns its
-                width when the panel is roomy. */}
-            <span className="hidden flex-none items-center gap-1 rounded-md border border-white/10 px-1.5 py-0.5 text-[10.5px] text-zinc-400 xl:flex">
-              <Sparkles size={10} className="text-zinc-500" /> Agent
-            </span>
             <ModelPicker model={model} onChange={onModelChange} busy={busy} onMeta={onCtx} />
+            {/* The context meter moved here from a second status bar under the
+                composer. It only earns the width once a turn has actually used
+                the window, so a fresh chat shows no meter at all. */}
+            {usedTokens > 0 && ctxLen > 0 && (
+              <span className="flex flex-none items-center gap-1"
+                    title={`context window: ${usedTokens.toLocaleString()} of ${ctxLen.toLocaleString()} tokens used`}>
+                <span className="h-1 w-8 overflow-hidden rounded-full bg-white/10">
+                  <span className="block h-full rounded-full bg-violet-400/70"
+                        style={{ width: `${pct}%` }} />
+                </span>
+                <span className="tabular-nums text-[10px] text-zinc-500">{kfmt(usedTokens)}</span>
+              </span>
+            )}
             <span className="min-w-0 flex-1" />
             {queued.length > 0 && (
               <span
@@ -1049,28 +1159,6 @@ export default function AgentPanel({
           )}
         </div>
       </form>
-
-      {/* ── status bar ─────────────────────────────────────────────────────── */}
-      <div className="flex flex-none items-center gap-1.5 border-t border-glass-border px-3 py-1 text-[10px] text-zinc-muted">
-        <span className="flex items-center gap-1">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400/80" /> Local
-        </span>
-        <span>·</span>
-        <span className="min-w-0 truncate">{modelLabel}</span>
-        <span className="flex-1" />
-        {ctxLen > 0 && (
-          <span className="flex items-center gap-1"
-                title={`context window: about ${usedTokens} of ${ctxLen} tokens used`}>
-            <span className="h-1 w-14 overflow-hidden rounded-full bg-white/10">
-              <span className="block h-full rounded-full bg-violet-400/70"
-                    style={{ width: `${pct}%` }} />
-            </span>
-            <span className="tabular-nums">
-              {kfmt(usedTokens)}/{kfmt(ctxLen)}
-            </span>
-          </span>
-        )}
-      </div>
     </div>
   );
 }

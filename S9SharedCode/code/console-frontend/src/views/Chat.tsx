@@ -1,4 +1,7 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Suspense, lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
+} from 'react';
+import { createPortal } from 'react-dom';
 import {
   Plus, RefreshCw, Send, Download, Eye, X, Loader2, FileText, Table2, Presentation,
   Paperclip, Clock,
@@ -14,9 +17,10 @@ import { useMainId, useSectionActive } from '../components/KeepAlive';
 const UPLOAD_ACCEPT =
   '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm';
 import { renderMarkdown } from '../components/markdown';
-import { api, ago, CONF, headers, type ChatThread, type DocPreview, type StreamFile } from '../api';
+import { api, ago, CONF, headers, type ChatThread, type DocPreview, type StreamFile, type A2uiSurface } from '../api';
 import { ModelPicker } from '../components/ModelPicker';
 import { useFocusTrap } from '../lib/a11y';
+import { A2ui } from '../components/A2ui';
 
 /* The document viewer drags the whole setup panel in behind it and chat has no
    setup panel, so it is route-split the same way App.tsx splits the views: the
@@ -63,6 +67,56 @@ interface Msg {
   /** A server-owned turn that has not settled yet. The placeholder survives
    *  a refresh, so the transcript can show work instead of an empty thread. */
   pending?: boolean;
+  /** A2UI surface for structured responses. */
+  surface?: A2uiSurface;
+  /** Identity of the stored turn this row came from. Local-only turns have
+   *  none. Used by the poll merge, never by the renderer. */
+  sig?: string;
+}
+
+/** The shape the thread endpoint returns. */
+interface StoredMsg {
+  role: string;
+  content: string;
+  kind?: string;
+  title?: string;
+  pending?: boolean;
+  surface?: A2uiSurface;
+}
+
+/** What makes two stored turns the same row. The server list is append-only
+ *  within a thread, so this is enough to know a poll changed nothing. */
+function storedSig(m: StoredMsg): string {
+  return JSON.stringify([m.role, m.content, m.kind, m.title, !!m.pending, m.surface ?? null]);
+}
+
+/** One stored turn → one bubble. The id is derived from the row's position,
+ *  not minted from a counter: a poll that returns the same list must produce
+ *  the same keys, or React remounts the whole transcript. */
+function toMsg(m: StoredMsg, id: number, sig: string): Msg {
+  if (m.role === 'user') return { id, who: 'you', text: m.content, sig };
+  if (m.pending) {
+    /* An unsettled server turn is a slot, not a wall of "…". The bubble paints
+       its own working state; the poll fills it in without the row vanishing. */
+    return { id, who: 'aria', html: '', pending: true, sig };
+  }
+  if (m.surface) {
+    return { id, who: 'aria', surface: m.surface, arts: [], sig };
+  }
+  if (m.kind === 'report') {
+    return { id, who: 'aria', text: m.content,
+      kind: 'report', title: m.title || '', arts: artRefs(m.content), sig };
+  }
+  if (m.kind === 'error') {
+    return { id, who: 'aria', text: m.content,
+      meta: 'failed', arts: artRefs(m.content), sig };
+  }
+  if (m.kind === 'stopped') {
+    return { id, who: 'aria', html: renderMarkdown(m.content),
+      meta: 'stopped', arts: artRefs(m.content), sig };
+  }
+  return { id, who: 'aria', html: renderMarkdown(m.content),
+    arts: artRefs(m.content), sig };
 }
 
 /** Stored thread messages → transcript bubbles. One mapper for both load
@@ -70,31 +124,34 @@ interface Msg {
  *  a fix to one silently missed the other. A stored `kind: "report"` message
  *  comes back as the preview card it rendered as live - not as a wall of
  *  markdown - and keeps its title. */
-function toMsgs(
-  list: Array<{ role: string; content: string; kind?: string; title?: string;
-               pending?: boolean }>,
-  nextId: () => number,
-): Msg[] {
-  return (list || []).map((m) => {
-    if (m.role === 'user') return { id: nextId(), who: 'you' as const, text: m.content };
-    if (m.pending) {
-      return { id: nextId(), who: 'aria' as const,
-        html: renderMarkdown('…'), meta: 'working on the server…', pending: true };
+function toMsgs(list: StoredMsg[]): Msg[] {
+  return (list || []).map((m, i) => toMsg(m, -(i + 1), storedSig(m)));
+}
+
+/** Merge a poll result into the transcript instead of replacing it.
+ *
+ *  `toMsgs` used to mint a fresh id for every message on every tick, and the
+ *  transcript was rebuilt from scratch every 1.2-1.5s. Every bubble remounted:
+ *  A2UI table sort/page state reset moments after the user set it, text
+ *  selection was lost, and transitions were cut off mid-flight. A row that did
+ *  not change keeps its object (so a memoised row can skip), and a row whose
+ *  content changed keeps its id (so React updates it in place rather than
+ *  replacing it). */
+function mergeMsgs(prev: Msg[], list: StoredMsg[]): Msg[] {
+  const rows = list || [];
+  const out: Msg[] = [];
+  let changed = prev.length !== rows.length;
+  rows.forEach((m, i) => {
+    const sig = storedSig(m);
+    const old = prev[i];
+    if (old && old.sig === sig) {
+      out.push(old);
+      return;
     }
-    if (m.kind === 'report') {
-      return { id: nextId(), who: 'aria' as const, text: m.content,
-        kind: 'report', title: m.title || '', arts: artRefs(m.content) };
-    }
-    if (m.kind === 'error') {
-      return { id: nextId(), who: 'aria' as const, text: m.content,
-        meta: 'failed', arts: artRefs(m.content) };
-    }
-    if (m.kind === 'stopped') {
-      return { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content),
-        meta: 'stopped', arts: artRefs(m.content) };
-    }
-    return { id: nextId(), who: 'aria' as const, html: renderMarkdown(m.content), arts: artRefs(m.content) };
+    changed = true;
+    out.push(toMsg(m, old ? old.id : -(i + 1), sig));
   });
+  return changed ? out : prev;
 }
 
 /** The artifact handles an answer names.
@@ -332,10 +389,13 @@ function ReportCard({ title, body }: { title: string; body: string }) {
           <Eye size={12} /> Read the full report
         </button>
       </div>
-      {open && (
+      {open && createPortal(
         /* The same surface as the command palette (Ctrl+K): dim, blurred
            backdrop, panel near the top. Escape and a backdrop click close it;
-           focus is trapped inside the dialog while it is up. */
+           focus is trapped inside the dialog while it is up. Portaled to
+           <body>: `.msg-in` animates a transform, and a transformed ancestor
+           becomes the containing block for `position: fixed` - which made this
+           dialog render inside the message bubble instead of over the page. */
         <div
           className="fixed inset-0 z-[300] flex items-start justify-center bg-black/55 p-4 pt-[6vh] backdrop-blur-[3px]"
           onMouseDown={(e) => { if (e.target === e.currentTarget) setOpen(false); }}
@@ -367,11 +427,91 @@ function ReportCard({ title, body }: { title: string; body: string }) {
               dangerouslySetInnerHTML={{ __html: html }}
             />
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
 }
+
+/* One transcript row.
+ *
+ *  Extracted and memoised for one reason: the live answer repaints on every
+ *  animation frame, and without this every finished bubble in the thread
+ *  re-rendered with it. A row's `m` is stable between polls (see mergeMsgs),
+ *  so the comparator can be identity-based; it only ignores the shared artifact
+ *  map for rows that name no artifact. */
+const MessageRow = memo(function MessageRow({
+  m, streaming, artStates, onAction,
+}: {
+  m: Msg;
+  streaming: boolean;
+  artStates: Record<string, ArtState>;
+  onAction: (action: string, args: Record<string, unknown>) => void;
+}) {
+  return (
+    <div
+      /* An error is an error, not something Aria said. role=alert announces
+         it as one; without it a rejected turn was read out in the
+         transcript's own voice, in the middle of a conversation. */
+      role={m.who === 'err' ? 'alert' : undefined}
+      aria-live={m.who === 'aria' && streaming ? 'polite' : undefined}
+      aria-atomic={m.who === 'aria' && streaming ? 'false' : undefined}
+      /* A surface is a dashboard, not prose. The 720px reading column left its
+         tables cramped while a third of the pane sat empty. */
+      className={`${m.surface ? 'max-w-[900px]' : 'max-w-[720px]'} msg-in rounded-[10px] border p-4 transition-colors duration-150 ${
+        m.who === 'you'
+          ? 'ml-auto border-violet-400/30 bg-violet-400/[0.07]'
+          : m.who === 'err'
+            ? 'border-red-400/40 bg-red-400/5'
+            : 'border-white/10 bg-[#0e0e12]'
+      }`}
+    >
+      <div className="mb-1 text-xs font-bold text-violet-300">
+        {m.who === 'you' ? 'You' : m.who === 'err' ? 'Error' : 'Aria'}
+      </div>
+      {m.pending && !m.html ? (
+        /* The slot exists from the moment the turn is sent, so the transcript
+           grows once instead of on first delta and again on settle. */
+        <div className="flex items-center gap-2 py-0.5 text-[13px] text-zinc-400">
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-violet-400" />
+          working…
+        </div>
+      ) : m.surface ? (
+        <A2ui surface={m.surface} onAction={onAction} />
+      ) : m.kind === 'report' ? (
+        <ReportCard title={m.title || ''} body={m.text || ''} />
+      ) : m.html ? (
+        <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200"
+          dangerouslySetInnerHTML={{ __html: m.html }} />
+      ) : (
+        <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">{m.text}</p>
+      )}
+      {/* A document this run rendered. It used to exist only as prose: the
+          model says "you can download it here", the markdown sanitiser keeps
+          http(s) links only, so the handle in that sentence was dropped on the
+          floor and a real 4,698-byte PDF sat in the artifact store with no row,
+          no preview and no download. */}
+      {m.who === 'aria' && !!m.arts?.length && (
+        <div className="mt-3 space-y-2">
+          {m.arts.map((a) => (
+            <ArtRow
+              key={a.id}
+              art={a.id}
+              label={a.label}
+              state={artStates[a.id] || { status: 'pending' }}
+            />
+          ))}
+        </div>
+      )}
+      {m.meta && <div className="mt-1.5 text-[11px] text-zinc-muted">{m.meta}</div>}
+    </div>
+  );
+}, (a, b) =>
+  a.m === b.m
+  && a.streaming === b.streaming
+  && a.onAction === b.onAction
+  && (!a.m.arts?.length || a.artStates === b.artStates));
 
 /* Lightweight chat: one direct LLM call per turn via /api/chat/simple.
    No DAG, no sessions, no cost ledger — threads live in their own store
@@ -421,6 +561,14 @@ export default function Chat() {
     } catch { /* private mode: the thread still lives server-side */ }
   };
   const [msgs, setMsgs] = useState<Msg[]>([]);
+  /* Read by the stable A2UI action handler. The handler used to depend on
+     `msgs`, so it was a new function on every render and every memoised row
+     re-rendered anyway. */
+  const msgsRef = useRef<Msg[]>([]);
+  msgsRef.current = msgs;
+  /* Set at the end of each render to the CURRENT send closure, so the queue
+     drain and A2UI "rerun" never call a stale one. */
+  const sendRef = useRef<(q?: string) => void>(() => {});
   const [input, setInput] = useState('');
   const nearLimit = input.length > CHAT_MAX_QUERY * 0.9;
   const overLimit = input.length > CHAT_MAX_QUERY;
@@ -431,6 +579,14 @@ export default function Chat() {
   const [remoteActive, setRemoteActive] = useState(false);
   const remoteActiveRef = useRef(false);
   useEffect(() => { remoteActiveRef.current = remoteActive; }, [remoteActive]);
+  /* A Stop the user asked for, until the server confirms the run is gone.
+     `stop()` aborts this tab's stream, which flips `remoteActive` back on to
+     keep the composer busy while the cancellation is persisted — and the
+     abort's `finally` clears `status`, so the banner fell through to "still
+     running on the server…" at the exact moment the user had asked it to
+     stop. This flag names that window honestly. */
+  const [stopping, setStopping] = useState(false);
+  const stoppingRef = useRef(false);
   // Thread id currently being deleted, so the control can disable itself and
   // a rapid second click cannot fire a second DELETE.
   const [dropping, setDropping] = useState('');
@@ -469,6 +625,34 @@ export default function Chat() {
     } catch { /* private mode */ }
   }, [aiModel]);
   const [status, setStatus] = useState('');
+
+  const handleA2uiAction = useCallback((action: string, args: Record<string, unknown>) => {
+    // Dispatch the action to the appropriate handler. Stable identity: every
+    // A2UI row is memoised on this prop, and a new function per render would
+    // have defeated the memo for the whole transcript.
+    switch (action) {
+      case 'rerun': {
+        // Re-run the last query
+        const lastUserMsg = [...msgsRef.current].reverse().find(m => m.who === 'you');
+        if (lastUserMsg?.text) {
+          sendRef.current(lastUserMsg.text);
+        }
+        break;
+      }
+      case 'approve':
+        // Approve a pending action
+        if (args.approvalId) {
+          void api.computerDecide(args.approvalId as string, true);
+        }
+        break;
+      case 'computer_action':
+        // Dispatch computer action
+        void api.computerAction(args.action as string, args.params as Record<string, unknown>);
+        break;
+      default:
+        console.warn('Unknown A2UI action:', action, args);
+    }
+  }, []);
   /* The gateway pill reads the shared health hook like every other page.
      A hand-rolled one-shot fetch here stayed stale after a gateway flap
      while the rail dot next to it updated — two indicators disagreeing. */
@@ -481,6 +665,13 @@ export default function Chat() {
   // Synchronous mirror of `sending` — see the guard in send().
   const sendingRef = useRef(false);
   const stickRef = useRef(true);
+  /* The same value as a state, for the jump-to-latest pill. A ref alone does
+     not repaint the pill when the user scrolls up while the answer is idle. */
+  const [stuck, setStuck] = useState(true);
+  const scrollRaf = useRef(0);
+  const progRef = useRef(false);
+  const jumpRef = useRef(false);
+  const taRef = useRef<HTMLTextAreaElement>(null);
   // Mirror of `threads` so loadMore can read the current length without
   // re-creating its callback on every poll.
   const threadsRef = useRef<ChatThread[]>([]);
@@ -491,6 +682,11 @@ export default function Chat() {
   useEffect(() => { modeRef.current = mode; }, [mode]);
   const mountedRef = useRef(true);
   const [nowS, setNowS] = useState(Date.now() / 1000);
+  /* How long the current turn has been waiting. The status pill used to say a
+     flat "thinking…", which is indistinguishable from a hang during the 10-15
+     seconds a cold model can take before its first token. */
+  const [waitedS, setWaitedS] = useState(0);
+  const turnStartRef = useRef(0);
   /* A composer-level message: why a send did not happen. Whitespace-only Enter
      used to clear the box and say nothing, which reads as a dead key. */
   const [hint, setHint] = useState<{ text: string; tone: 'warn' | 'err' } | null>(null);
@@ -572,8 +768,19 @@ export default function Chat() {
       const d = await api.chatThread(id);
       if (!mountedRef.current || reqRef.current !== req) return;
       setCrumb((d.title || fallback).slice(0, 40));
-      setMsgs(toMsgs(d.messages || [], nextId));
+      /* Opening a thread starts at its latest turn, not wherever the previous
+         thread happened to be scrolled. */
+      stickRef.current = true;
+      setStuck(true);
+      jumpRef.current = true;
+      setMsgs(toMsgs(d.messages || []));
       setRemoteActive(!!d.active);
+      // A thread the server says is not running is not stopping either. This
+      // is the reload `stop()` schedules, so it is where a Stop normally ends.
+      if (!d.active) {
+        stoppingRef.current = false;
+        setStopping(false);
+      }
     } catch {
       if (!mountedRef.current || reqRef.current !== req) return;
       if (forget) {
@@ -601,6 +808,8 @@ export default function Chat() {
     sendingRef.current = false;
     setSending(false);
     setStatus('');
+    stoppingRef.current = false;
+    setStopping(false);
     setMode(next);
     modeRef.current = next;
     let nextCid = '';
@@ -613,6 +822,9 @@ export default function Chat() {
     setTotal(0);
     setRemoteActive(false);
     setMsgs([]);
+    stickRef.current = true;
+    setStuck(true);
+    jumpRef.current = true;
     setCrumb('Chat');
     if (nextCid) void loadThread(nextCid, reqRef.current, 'Chat', true);
     void refresh();
@@ -695,8 +907,15 @@ export default function Chat() {
         const d = await api.chatThread(cid);
         if (cancelled || !mountedRef.current) return;
         setCrumb((d.title || 'Chat').slice(0, 40));
-        setMsgs(toMsgs(d.messages || [], nextId));
+        stickRef.current = true;
+        setStuck(true);
+        jumpRef.current = true;
+        setMsgs(toMsgs(d.messages || []));
         setRemoteActive(!!d.active);
+        if (!d.active) {
+          stoppingRef.current = false;
+          setStopping(false);
+        }
       } catch {
         // Gone for good: forget it, so the next visit starts clean instead of
         // retrying a dead id on every mount.
@@ -716,7 +935,7 @@ export default function Chat() {
      reload again. */
   const hasPending = msgs.some((m) => m.pending);
   useEffect(() => {
-    if (!active || !cid || (!hasPending && !remoteActive)) return;
+    if (!active || !cid || sending || (!hasPending && !remoteActive)) return;
     let alive = true;
     let timer: number | undefined;
     const tick = async () => {
@@ -729,8 +948,16 @@ export default function Chat() {
         const d = await api.chatThread(cid);
         if (!alive || !mountedRef.current) return;
         setCrumb((d.title || 'Chat').slice(0, 40));
-        setMsgs(toMsgs(d.messages || [], nextId));
+        /* Merge, never replace. Replacing re-keyed every bubble and reset
+           every A2UI table twice a second while a detached run finished. */
+        setMsgs((prev) => mergeMsgs(prev, d.messages || []));
         setRemoteActive(!!d.active);
+        if (!d.active) {
+          // The run is gone (cancelled or finished): the stopping window is
+          // over, and the banner must stop saying so.
+          stoppingRef.current = false;
+          setStopping(false);
+        }
         if (d.active || (d.messages || []).some((m) => m.pending)) {
           timer = window.setTimeout(tick, 1500);
         } else {
@@ -745,21 +972,80 @@ export default function Chat() {
       alive = false;
       if (timer) window.clearTimeout(timer);
     };
-  }, [active, cid, hasPending, remoteActive, refresh]);
+  }, [active, cid, sending, hasPending, remoteActive, refresh]);
 
   /* Follow the stream only while the user is already at the bottom. The
      unconditional `scrollTop = scrollHeight` on every delta physically
      prevented scrolling up to re-read earlier text mid-answer, because
-     every arriving frame yanked the transcript back down. */
-  useEffect(() => {
+     every arriving frame yanked the transcript back down.
+
+     Incremental growth is applied directly, so the text tracks the bottom
+     exactly. A large jump - a settled answer replaced by a report or a 900px
+     surface - is eased instead of teleporting the transcript. */
+  const smoothTo = (el: HTMLDivElement, target: number, dur = 220) => {
+    cancelAnimationFrame(scrollRaf.current);
+    const from = el.scrollTop;
+    const dist = target - from;
+    if (Math.abs(dist) < 2) {
+      el.scrollTop = target;
+      return;
+    }
+    progRef.current = true;
+    const start = performance.now();
+    const step = (now: number) => {
+      const t = Math.min(1, (now - start) / dur);
+      const eased = 1 - Math.pow(1 - t, 3);
+      el.scrollTop = from + dist * eased;
+      if (t < 1) {
+        scrollRaf.current = requestAnimationFrame(step);
+      } else {
+        progRef.current = false;
+      }
+    };
+    scrollRaf.current = requestAnimationFrame(step);
+  };
+
+  /* Pinned before paint. As a passive effect the transcript painted the new
+     text at the previous offset and then jumped, which is the visible stutter
+     on every arriving chunk. A layout effect sets the offset in the same frame
+     the text is committed. */
+  useLayoutEffect(() => {
     const el = boxRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    if (nearBottom || stickRef.current) {
-      el.scrollTop = el.scrollHeight;
-      stickRef.current = true;
+    if (!stickRef.current) return;
+    const target = Math.max(0, el.scrollHeight - el.clientHeight);
+    const dist = target - el.scrollTop;
+    if (dist <= 1) return;
+    cancelAnimationFrame(scrollRaf.current);
+    progRef.current = false;
+    if (jumpRef.current || dist < 140) {
+      el.scrollTop = target;
+      jumpRef.current = false;
+      return;
     }
+    smoothTo(el, target);
   }, [msgs]);
+
+  useEffect(() => () => {
+    cancelAnimationFrame(scrollRaf.current);
+    progRef.current = false;
+  }, []);
+
+  /* The composer grows with the draft instead of being a two-row box the user
+     has to drag open. Capped at 200px, then it scrolls internally. */
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const height = el.scrollHeight + 2;
+    el.style.height = `${Math.min(height, 200)}px`;
+    el.style.overflowY = height > 200 ? 'auto' : 'hidden';
+    /* A taller composer steals height from the transcript above it. If the
+       reader was at the bottom, keep them there instead of letting the last
+       message slide under the composer as they type. */
+    const box = boxRef.current;
+    if (box && stickRef.current) box.scrollTop = box.scrollHeight;
+  }, [input]);
 
   /* Every artifact handle the transcript names, verified against the artifact
      store. `api.artifactPreview` resolves the bytes, so it is the honest
@@ -808,6 +1094,23 @@ export default function Chat() {
     }, CONF.pollSlowMs);
     return () => clearInterval(t);
   }, [active, refresh]);
+
+  /* One clock for the whole turn, however it is being served: a local stream, a
+     reattached server run, or the wait for the first token. */
+  useEffect(() => {
+    if (!sending && !remoteActive) {
+      turnStartRef.current = 0;
+      setWaitedS(0);
+      return;
+    }
+    if (!turnStartRef.current) turnStartRef.current = Date.now();
+    const tick = () => {
+      setWaitedS(Math.max(0, Math.floor((Date.now() - turnStartRef.current) / 1000)));
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [sending, remoteActive]);
 
   const select = async (t: ChatThread) => {
     // Switching threads only DETACHES the current viewer. The server-owned
@@ -976,11 +1279,23 @@ export default function Chat() {
     };
     setSending(true);
     setHint(null);
+    // A new turn is never a stopping one; leaving the flag set would make its
+    // own `finally` keep a "stopping…" status alive forever.
+    stoppingRef.current = false;
+    setStopping(false);
     // An override comes from a starter chip or the queue drain; clearing the
     // composer then would wipe whatever the user is typing for the next turn.
     if (override === undefined) setInput('');
     setStatus('thinking…');
-    setMsgs((m) => [...m, { id: nextId(), who: 'you', text: q }]);
+    /* The assistant slot is reserved in the same commit as the question. It
+       used to appear only when the first delta arrived, then change height
+       again at settle: three layout steps for one turn. */
+    const userId = nextId();
+    const bubbleId = nextId();
+    setMsgs((m) => [...m,
+      { id: userId, who: 'you', text: q },
+      { id: bubbleId, who: 'aria', html: '', pending: true },
+    ]);
     /* The crumb names the CONVERSATION, so only the first message of a thread may
        set it. This used to overwrite it on every turn, so after a follow-up the
        breadcrumb showed the latest question while the sidebar kept the thread's
@@ -988,8 +1303,7 @@ export default function Chat() {
        you looked. */
     if (!cid) setCrumb(q.length > 40 ? q.slice(0, 40) + '…' : q);
     const t0 = Date.now();
-    // Aria's bubble appears immediately and fills in as deltas arrive.
-    const bubbleId = nextId();
+    // Aria's bubble fills in as deltas arrive.
     const ac = new AbortController();
     abortRef.current = ac;
     let acc = '';
@@ -998,17 +1312,26 @@ export default function Chat() {
     // answer and rebuilding the array on every one is O(n²) on the main
     // thread, which is what made long answers feel like they stuttered.
     let queued = 0;
+    let lastHtml = '';
     const paint = () => {
       if (!mountedRef.current || reqRef.current !== req) return;
       if (queued) return;
       queued = requestAnimationFrame(() => {
         queued = 0;
         if (!mountedRef.current || reqRef.current !== req) return;
-        const secs = ((Date.now() - t0) / 1000).toFixed(1);
+        const html = renderMarkdown(acc || '…');
+        /* A frame that produced no visible change must not rebuild the row (or
+           its footer). The elapsed clock used to live here too, so the bubble
+           re-rendered ten times a second even when the model paused. */
+        if (html === lastHtml) return;
+        lastHtml = html;
         setMsgs((m) => {
-          const rest = m.filter((x) => x.id !== bubbleId);
-          const meta = acc ? `streaming · ${secs}s` : 'working…';
-          return [...rest, { id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), meta }];
+          const i = m.findIndex((x) => x.id === bubbleId);
+          if (i === -1) return [...m, { id: bubbleId, who: 'aria', html, pending: true }];
+          if (m[i].html === html) return m;
+          const out = m.slice();
+          out[i] = { ...m[i], html, pending: true };
+          return out;
         });
       });
     };
@@ -1018,21 +1341,40 @@ export default function Chat() {
     // A report settles as a CARD, not as rendered markdown: the server sends
     // the research agent's own text as the answer, and inlining several
     // thousand words would bury the conversation it belongs to.
-    const settle = (meta: string, files?: StreamFile[], kind?: string, title?: string) => {
+const settle = (meta: string, files?: StreamFile[], kind?: string,
+    title?: string, surface?: A2uiSurface) => {
       if (queued) { cancelAnimationFrame(queued); queued = 0; }
-      setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), kind === 'report'
-        ? { id: bubbleId, who: 'aria' as const, meta, text: acc,
+      const next: Msg = kind === 'report'
+        ? { id: bubbleId, who: 'aria', meta, text: acc,
             kind: 'report', title: title || '', arts: artRefs(acc) }
+        : surface
+        ? { id: bubbleId, who: 'aria', meta, surface, arts: [] }
         : {
           id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), meta,
-          // The server's list first (verified against the artifact store), with
-          // the scraped handles kept as a fallback for a model that names one in
-          // prose without rendering anything. Before this, a document the model
-          // rendered was invisible here unless its handle appeared in the text.
           arts: files?.length
             ? files.map((f) => ({ id: f.artifact, label: f.filename }))
             : artRefs(acc),
-        }]);
+        };
+      /* Replace the reserved slot, never filter-and-append: the bubble keeps
+         its position and its identity, so the transcript does not collapse
+         and regrow when the answer arrives. */
+      setMsgs((m) => {
+        const i = m.findIndex((x) => x.id === bubbleId);
+        if (i === -1) return [...m, next];
+        const out = m.slice();
+        out[i] = next;
+        return out;
+      });
+    };
+    /* Errors replace the slot in place for the same reason. */
+    const replaceBubble = (next: Msg) => {
+      setMsgs((m) => {
+        const i = m.findIndex((x) => x.id === bubbleId);
+        if (i === -1) return [...m, next];
+        const out = m.slice();
+        out[i] = next;
+        return out;
+      });
     };
     try {
       // DAG frames are log/done; the lightweight stream is status/delta/done.
@@ -1047,13 +1389,14 @@ export default function Chat() {
           const nid = (ev as { conversation_id?: string }).conversation_id as string;
           rememberCid(nid, useMode);
           pinThis(nid);
-        } else if (ev.type === 'status' || ev.type === 'log') {
-          setStatus((ev as { text?: string }).text || 'working…');
-        } else if (ev.type === 'delta') {
-          acc += (ev as { text?: string }).text ?? '';
-          paint();
-        } else if (ev.type === 'done') {
-          acc = (ev as { answer?: string }).answer ?? acc;
+      } else if (ev.type === 'status' || ev.type === 'log') {
+            setStatus((ev as { text?: string }).text || 'working…');
+          } else if (ev.type === 'delta') {
+            acc += (ev as { text?: string }).text ?? '';
+            paint();
+          } else if (ev.type === 'done') {
+            acc = (ev as { answer?: string }).answer ?? acc;
+
           if ((ev as { conversation_id?: string }).conversation_id) {
             const nid = (ev as { conversation_id?: string }).conversation_id as string;
             rememberCid(nid, useMode);
@@ -1069,13 +1412,18 @@ export default function Chat() {
             ? serverMs
             : Date.now() - t0;
           const secs = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
-          const stopped = !!(ev as { stopped?: boolean }).stopped;
-          settle(stopped
-            ? `stopped after ${secs}`
-            : `done in ${secs} · ${useMode === 'dag' ? 'DAG' : 'lightweight'}`,
-            (ev as { files?: StreamFile[] }).files,
-            (ev as { kind?: string }).kind,
-            (ev as { title?: string }).title);
+           const stopped = !!(ev as { stopped?: boolean }).stopped;
+           const surfaceVal = (ev as { surface?: A2uiSurface }).surface;
+           if (surfaceVal) {
+             acc = '';  // surface replaces text
+           }
+           settle(stopped
+             ? `stopped after ${secs}`
+             : `done in ${secs} · ${useMode === 'dag' ? 'DAG' : 'lightweight'}`,
+             (ev as { files?: StreamFile[] }).files,
+             (ev as { kind?: string }).kind,
+             (ev as { title?: string }).title,
+             surfaceVal);
           /* Both engines persist their own turn server-side now. Writing the
              DAG turn a second time here duplicated it, and was the reason a
              refresh could show the answer twice. */
@@ -1094,9 +1442,7 @@ export default function Chat() {
               text: humanError((ev as { text?: string }).text),
             }]);
           } else {
-            setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
-              id: nextId(), who: 'err', text: humanError((ev as { text?: string }).text),
-            }]);
+            replaceBubble({ id: bubbleId, who: 'err', text: humanError((ev as { text?: string }).text) });
           }
           setRemoteActive(false);
           refresh();
@@ -1113,8 +1459,7 @@ export default function Chat() {
            whose text says "stopped before any answer arrived", for a
            deliberate action that simply had nothing to show. Say what
            happened, in the normal voice. */
-        else setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
-          id: nextId(), who: 'aria', text: 'Stopped.' }]);
+        else replaceBubble({ id: bubbleId, who: 'aria', text: 'Stopped.' });
         // Stop cancels server-side too; keep the composer busy until the
         // cancellation has been persisted and the thread is reloaded.
         setRemoteActive(!!cidRef.current);
@@ -1126,9 +1471,7 @@ export default function Chat() {
            nobody. Put it back: this failure is the one case where the turn
            provably never got to the model. */
         if (isTooLong(msg) && override === undefined) setInput(q);
-        setMsgs((m) => [...m.filter((x) => x.id !== bubbleId), {
-          id: nextId(), who: 'err', text: humanError(msg, q.length),
-        }]);
+        replaceBubble({ id: bubbleId, who: 'err', text: humanError(msg, q.length) });
       }
     } finally {
       // The busy flag and the controller must clear even when this turn was
@@ -1140,7 +1483,9 @@ export default function Chat() {
       sendingRef.current = false;
       if (mountedRef.current) {
         setSending(false);
-        setStatus('');
+        // A Stop is still in flight until the server confirms it: keep the
+        // status line saying so instead of dropping back to the idle guess.
+        setStatus(stoppingRef.current ? 'stopping…' : '');
       }
     }
   };
@@ -1161,7 +1506,14 @@ export default function Chat() {
     const liveCid = cidRef.current;
     if (liveCid) void api.cancelRun({ conversation_id: liveCid }).catch(() => { });
     abortRef.current?.abort();
-    setStatus('stopping...');
+    // Only a run the SERVER owns has a cancellation to wait for. With no
+    // conversation id the abort ends this tab's turn and `busy` clears
+    // immediately, so there is no window to describe.
+    if (liveCid) {
+      stoppingRef.current = true;
+      setStopping(true);
+      setStatus('stopping…');
+    }
     // Give the worker a moment to persist its partial/stopped row, then
     // reattach so the transcript matches what a reload would show.
     if (liveCid) {
@@ -1176,8 +1528,9 @@ export default function Chat() {
 
   /* `send` is recreated every render, so the drain reads it through a ref and
      depends only on the state it must react to (a turn ending, the queue
-     changing). Including `send` would re-fire the effect on every render. */
-  const sendRef = useRef<(q?: string) => void>(() => {});
+     changing). Including `send` would re-fire the effect on every render.
+     The ref itself is declared with the transcript state, because the stable
+     A2UI action handler needs it too. */
   useEffect(() => { sendRef.current = send; });
 
   /* Run the next queued follow-up once the current turn has ended. Dequeuing
@@ -1209,13 +1562,17 @@ export default function Chat() {
     setCrumb('Chat');
     setHint(null);
     setRemoteActive(false);
+    stickRef.current = true;
+    setStuck(true);
+    jumpRef.current = true;
     sendingRef.current = false;
     setSending(false);
     setStatus('');
+    stoppingRef.current = false;
+    setStopping(false);
   };
 
-  const dropThread = async (id: string) => {
-    if (!id || sending || dropping === id) return;
+  const dropThread = async (id: string) => {    if (!id || sending || dropping === id) return;
     // This is the only destructive control in the console with neither a
     // confirm() nor a disabled state, so N clicks issued N DELETEs.
     if (!confirm('Delete this conversation? This cannot be undone.')) return;
@@ -1248,6 +1605,19 @@ export default function Chat() {
     refresh();
   };
 
+  const jumpToLatest = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    stickRef.current = true;
+    setStuck(true);
+    const target = Math.max(0, el.scrollHeight - el.clientHeight);
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      el.scrollTop = target;
+    } else {
+      smoothTo(el, target, 260);
+    }
+  };
+
   const vis = threads.filter((t) => !filter || (t.title || '').toLowerCase().includes(filter.toLowerCase()));
 
   /* Only the bubble streaming right now is a live region. Every aria
@@ -1255,9 +1625,10 @@ export default function Chat() {
      whole transcript as a stack of regions to re-announce whenever
      any of them re-rendered. */
   const busy = sending || remoteActive;
-  const streamingId = busy && msgs.length
-    ? (sending ? msgs[msgs.length - 1].id
-      : (msgs.find((m) => m.pending)?.id ?? null))
+  /* The reserved slot carries `pending`, whether this tab is streaming it or
+     reattached to a server run. One definition for both paths. */
+  const streamingId = busy
+    ? (msgs.find((m) => m.pending)?.id ?? null)
     : null;
 
   /* Never a fallback number. Unread is "tools unknown", and switched off is
@@ -1274,7 +1645,7 @@ export default function Chat() {
             Threads
           {/* "showing 50 of 65", not a bare 50 that reads as a total. */}
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">
-            {total > threads.length ? `${threads.length} of ${total}` : threads.length}
+            {!loaded ? '—' : total > threads.length ? `${threads.length} of ${total}` : threads.length}
           </span>
         </div>
         <div className="px-2.5 pb-2">
@@ -1329,7 +1700,7 @@ export default function Chat() {
           {vis.map((t) => (
             <div
               key={t.conversation_id}
-              className={`group relative rounded-[10px] border ${t.conversation_id === cid && cid ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
+              className={`group relative rounded-[10px] border transition-colors duration-150 ${t.conversation_id === cid && cid ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
             >
               <button
                 onClick={() => select(t)}
@@ -1346,7 +1717,7 @@ export default function Chat() {
                 disabled={dropping === t.conversation_id}
                 title={`Delete thread "${(t.title || 'untitled').slice(0, 40)}"`}
                 aria-label={`Delete thread ${(t.title || 'untitled').slice(0, 40)}`}
-                className="absolute right-1.5 top-1.5 rounded px-1.5 py-0.5 text-sm leading-none text-zinc-muted opacity-0 hover:bg-red-400/15 hover:text-red-200 focus:opacity-100 group-hover:opacity-100 disabled:opacity-40"
+                className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded text-sm leading-none text-zinc-muted opacity-0 transition-opacity duration-150 hover:bg-red-400/15 hover:text-red-200 focus:opacity-100 group-hover:opacity-100 disabled:opacity-40"
               >
                 ×
               </button>
@@ -1389,91 +1760,99 @@ export default function Chat() {
           <Pill tone={gwUp ? 'ok' : 'muted'}>{gwUp ? 'gateway' : 'gateway…'}</Pill>
           <button onClick={() => { refresh(); loadCaps(); }} title="Refresh" aria-label="Refresh threads" className="rounded-md border border-white/15 bg-white/5 px-2.5 py-1.5 hover:border-violet-400"><RefreshCw size={14} /></button>
           <button onClick={fresh} title="New chat" aria-label="Start new chat" className="rounded-md border border-white/15 bg-white/5 px-2.5 py-1.5 hover:border-violet-400"><Plus size={14} /></button>
-        </TopBar>        <div
-          ref={boxRef}
-          onScroll={() => {
-            const el = boxRef.current;
-            if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-          }}
-          className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"
-        >
-          {!msgs.length && (
-            <div className="max-w-[640px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-4">
-              <div className="mb-1 text-xs font-bold text-violet-300">Aria</div>
-              <p className="text-[13px] leading-relaxed text-zinc-300">
-                Quick answers, no pipeline, nothing recorded in Runs. For deep research with a visible pipeline, use <a href="/research" className="text-violet-300 hover:underline">Research</a>.
-              </p>
-              <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Starter prompts">
-                {STARTERS.map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => send(s)}
-                    disabled={busy}
-                    className="rounded-full border border-violet-400/30 bg-violet-400/[0.07] px-3 py-1.5 text-xs text-violet-200 transition-colors hover:border-violet-400/60 hover:bg-violet-400/[0.14] disabled:opacity-50"
-                  >
-                    {s}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          {msgs.map((m) => (
-            <div
-              key={m.id}
-              /* An error is an error, not something Aria said. role=alert
-                 announces it as one; without it a rejected turn was read out
-                 in the transcript's own voice, in the middle of a
-                 conversation. */
-              role={m.who === 'err' ? 'alert' : undefined}
-              aria-live={m.who === 'aria' && streamingId === m.id ? 'polite' : undefined}
-              aria-atomic={m.who === 'aria' && streamingId === m.id ? 'false' : undefined}
-              className={`max-w-[720px] rounded-[10px] border p-4 ${m.who === 'you' ? 'ml-auto border-violet-400/30 bg-violet-400/[0.07]' : m.who === 'err' ? 'border-red-400/40 bg-red-400/5' : 'border-white/10 bg-[#0e0e12]'}`}
-            >
-              <div className="mb-1 text-xs font-bold text-violet-300">{m.who === 'you' ? 'You' : m.who === 'err' ? 'Error' : 'Aria'}</div>
-              {m.kind === 'report'
-                ? <ReportCard title={m.title || ''} body={m.text || ''} />
-                : m.html
-                  ? <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200" dangerouslySetInnerHTML={{ __html: m.html }} />
-                  : <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-zinc-200">{m.text}</p>}
-              {/* A document this run rendered. It used to exist only as prose:
-                  the model says "you can download it here", the markdown
-                  sanitiser keeps http(s) links only, so the handle in that
-                  sentence was dropped on the floor and a real 4,698-byte PDF
-                  sat in the artifact store with no row, no preview and no
-                  download. */}
-              {m.who === 'aria' && !!m.arts?.length && (
-                <div className="mt-3 space-y-2">
-                  {m.arts.map((a) => (
-                    <ArtRow
-                      key={a.id}
-                      art={a.id}
-                      label={a.label}
-                      state={arts[a.id] || { status: 'pending' }}                    />
+        </TopBar>
+        {/* The transcript and its two transient controls. The controls float
+            over the scroller instead of occupying rows inside it: adding a
+            status row at send and removing it at settle changed the scroll
+            height twice per turn. */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <div
+            ref={boxRef}
+            onScroll={() => {
+              /* Ignore the scroll events our own follow animation emits; the
+                 user has not moved, so they must not cancel the follow. */
+              if (progRef.current) return;
+              const el = boxRef.current;
+              if (!el) return;
+              const at = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+              stickRef.current = at;
+              setStuck(at);
+            }}
+            className="scroll-stable min-h-0 flex-1 space-y-3 overflow-y-auto p-4 pb-20"
+          >
+            {!msgs.length && (
+              <div className="max-w-[640px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-4">
+                <div className="mb-1 text-xs font-bold text-violet-300">Aria</div>
+                <p className="text-[13px] leading-relaxed text-zinc-300">
+                  Quick answers, no pipeline, nothing recorded in Runs. For deep research with a visible pipeline, use <a href="/research" className="text-violet-300 hover:underline">Research</a>.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Starter prompts">
+                  {STARTERS.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => send(s)}
+                      disabled={busy}
+                      className="rounded-full border border-violet-400/30 bg-violet-400/[0.07] px-3 py-1.5 text-xs text-violet-200 transition-colors hover:border-violet-400/60 hover:bg-violet-400/[0.14] disabled:opacity-50"
+                    >
+                      {s}
+                    </button>
                   ))}
                 </div>
-              )}
-              {m.meta && <div className="mt-1.5 text-[11px] text-zinc-muted">{m.meta}</div>}
-            </div>
-          ))}
-          {!stickRef.current && msgs.length > 0 && (
-            <div className="sticky bottom-0 flex justify-center">
+              </div>
+            )}
+            {msgs.map((m) => (
+              <MessageRow
+                key={m.id}
+                m={m}
+                streaming={m.who === 'aria' && streamingId === m.id}
+                artStates={arts}
+                onAction={handleA2uiAction}
+              />
+            ))}
+          </div>
+          <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex flex-col items-center gap-2 px-3">
+            <div className={`transition-all duration-200 ${
+              stuck || !msgs.length
+                ? 'pointer-events-none translate-y-1 opacity-0'
+                : 'pointer-events-auto translate-y-0 opacity-100'
+            }`}>
               <button
-                onClick={() => { stickRef.current = true; const el = boxRef.current; if (el) el.scrollTop = el.scrollHeight; }}
-                className="rounded-full border border-white/15 bg-[#0e0e12] px-3 py-1 text-[11px] font-bold text-zinc-300 hover:border-violet-400"
+                onClick={jumpToLatest}
+                className="rounded-full border border-white/15 bg-[#0e0e12]/95 px-3 py-1 text-[11px] font-bold text-zinc-300 shadow-lg backdrop-blur hover:border-violet-400"
               >
                 jump to latest
               </button>
             </div>
-          )}
-          {busy && (
-            <div className="flex items-center gap-2 text-xs text-zinc-muted" role="status" aria-live="polite">
-              <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-violet-400" />
-              {status || (remoteActive ? 'still running on the server…' : 'thinking…')}
-              <button onClick={stop} title="Stop the server run"
-                className="rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 hover:border-red-400/60 hover:text-red-200">stop</button>
+            <div
+              role="status"
+              aria-live="polite"
+              className={`flex items-center gap-2 rounded-full border border-white/10 bg-[#0e0e12]/95 px-3 py-1.5 text-[11.5px] text-zinc-300 shadow-lg backdrop-blur transition-all duration-200 ${
+                busy
+                  ? 'pointer-events-auto translate-y-0 opacity-100'
+                  : 'pointer-events-none translate-y-1 opacity-0'
+              }`}
+            >
+              {busy && (
+                <>
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-violet-400" />
+                  <span className="max-w-[46ch] truncate">
+                    {status || (stopping ? 'stopping…' : remoteActive ? 'still running on the server…' : 'thinking…')}
+                  </span>
+                  {/* Visual clock only: a live region announcing a new number
+                      every second would bury the actual status. */}
+                  {waitedS >= 3 && (
+                    <span aria-hidden="true" className="tabular-nums text-[10.5px] text-zinc-500">
+                      {waitedS}s
+                    </span>
+                  )}
+                  <button onClick={stop} title="Stop the server run"
+                    className="rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 transition-colors hover:border-red-400/60 hover:text-red-200">stop</button>
+                </>
+              )}
             </div>
-          )}
-        </div>        <div className="border-t border-white/10 p-3">
+          </div>
+        </div>
+        <div className="border-t border-white/10 p-3">
           <div className="flex items-end gap-2">
             {/* Attach. Chat had no upload affordance at all, so the only way
                 to get a file into a conversation was to leave for Documents
@@ -1495,12 +1874,13 @@ export default function Chat() {
               disabled={busy || uploading}
               title="Attach a document: PDF, DOCX, MD, TXT, HTML, CSV or XLSX (images cannot be read yet)"
               aria-label="Attach files"
-              className="flex flex-none items-center gap-1.5 self-end rounded-md border border-white/15 bg-white/5 px-3 py-2.5 text-xs font-bold text-zinc-300 hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
+              className="flex min-w-[112px] flex-none items-center justify-center gap-1.5 self-end rounded-md border border-white/15 bg-white/5 px-3 py-2.5 text-xs font-bold text-zinc-300 transition-colors hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
             >
               <Paperclip size={13} />
               {uploading ? 'Uploading…' : 'Attach'}
             </button>
             <textarea
+              ref={taRef}
               value={input}
               /* No maxLength, deliberately. It was the whole bug: the browser
                  clamped the value at 4000, so a 5000-character paste lost 1000
@@ -1518,12 +1898,12 @@ export default function Chat() {
                 if (e.nativeEvent.isComposing || (e.nativeEvent as unknown as { keyCode?: number }).keyCode === 229) return;
                 if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
               }}
-              placeholder="Message Aria… (Enter to send, Shift+Enter for newline)"
+              placeholder="Message Aria…"
               aria-label="Message Aria"
               aria-describedby="chat-len chat-help"
               aria-invalid={overLimit || undefined}
-              rows={2}
-              className="min-h-[44px] flex-1 resize-y rounded-lg border border-white/10 bg-black/40 p-2.5 text-[13px] outline-none focus:border-violet-400 aria-invalid:border-red-400/70"
+              rows={1}
+              className="min-h-[44px] max-h-[200px] flex-1 resize-none rounded-lg border border-white/10 bg-black/40 p-2.5 text-[13px] outline-none transition-colors focus:border-violet-400 aria-invalid:border-red-400/70"
             />
             {/* Not disabled while over the limit: a disabled Send is a dead
                 key that explains nothing. send() refuses it and states the
@@ -1534,7 +1914,7 @@ export default function Chat() {
             <button onClick={() => send()} disabled={busy && !input.trim()}
               aria-label={busy ? 'Queue message' : 'Send message'}
               title={busy ? 'Queue — runs when this turn finishes' : undefined}
-              className="flex items-center gap-1.5 self-end rounded-md bg-violet-400 px-4 py-2.5 text-xs font-bold text-[#0b0b0e] shadow-[0_0_16px_rgba(139,124,246,0.35)] hover:brightness-110 disabled:opacity-50">
+              className="flex min-w-[86px] items-center justify-center gap-1.5 self-end rounded-md bg-violet-400 px-4 py-2.5 text-xs font-bold text-[#0b0b0e] shadow-[0_0_16px_rgba(139,124,246,0.35)] transition-[filter,opacity] hover:brightness-110 disabled:opacity-50">
               {busy ? <Clock size={13} /> : <Send size={13} />} {busy ? 'Queue' : 'Send'}
             </button>
           </div>
@@ -1545,6 +1925,13 @@ export default function Chat() {
                 character is noise. */}
             <span id="chat-help" className="sr-only">
               Up to 4000 characters. Longer than that cannot be sent.
+              Enter sends, Shift+Enter starts a new line.
+            </span>
+            {/* The keys used to live in the placeholder, which at a 1000px
+                window wrapped to two lines and made the empty composer 17px
+                taller than a typed one. Stated here it also survives typing. */}
+            <span aria-hidden className="text-[11px] text-zinc-muted">
+              Enter to send · Shift+Enter for a new line
             </span>
             {hint && (
               <span
