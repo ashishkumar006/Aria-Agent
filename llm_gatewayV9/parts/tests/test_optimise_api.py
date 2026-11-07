@@ -225,3 +225,51 @@ def test_the_result_can_be_chained_into_the_next_iteration(client):
             break
         assert f1 < f0, "faces must fall every accepted iteration"
     assert blob is not None
+
+def test_repair_returns_a_real_mesh_not_just_a_report(client):
+    """The agent needs bytes to keep a repair; a report alone cannot become a
+    version. This endpoint is what makes the Parts library's repair step real."""
+    import base64
+    r = client.post("/v1/parts/repair",
+                    files={"file": ("s.stl", SPHERE, "application/octet-stream")})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pass"] == "repair"
+    assert body["changed"] is True
+    assert body["steps"]
+    blob = base64.b64decode(body["result_stl_base64"])
+    assert len(blob) >= 84
+    # The repaired mesh is a valid binary STL: 80-byte header, uint32 count.
+    count = int.from_bytes(blob[80:84], "little")
+    assert count > 0
+    assert body["metrics_after"]["faces"] == count
+    assert body["objective_after"] is not None
+
+
+def test_the_repair_route_is_declared(client):
+    routes = {(r.path, tuple(sorted(r.methods))) for r in router.routes}
+    assert ("/v1/parts/repair", ("POST",)) in routes
+
+
+def test_metrics_returns_measurements_without_render_buffers(client):
+    """Import metrics must describe the upload, not a decimated preview."""
+    from parts.export import to_binary_stl
+    from parts.mesh import Mesh
+    from parts.tests import primitives as prim
+    v, f = prim.cube()
+    cube = to_binary_stl(Mesh.create(v, f, source_format="stl"))
+    r = client.post("/v1/parts/metrics",
+                    files={"file": ("cube.stl", cube,
+                                    "application/octet-stream")})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["metrics"]["faces"] == 12
+    assert body["metrics"]["vertices"] == 8
+    assert body["metrics"]["volume_mm3"] == 1.0
+    assert "geometry" not in body
+    assert body["objective"] is not None
+
+
+def test_the_metrics_route_is_declared(client):
+    routes = {(r.path, tuple(sorted(r.methods))) for r in router.routes}
+    assert ("/v1/parts/metrics", ("POST",)) in routes

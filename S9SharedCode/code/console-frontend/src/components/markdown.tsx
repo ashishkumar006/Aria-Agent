@@ -9,6 +9,9 @@
    to http(s) by SAFE_URL. Nothing here interpolates unescaped input into
    a tag, an attribute name, or a URL. */
 
+import { stripCitations } from '../lib/citations';
+import { renderMath } from '../lib/math';
+
 export function esc(s: string): string {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
@@ -24,6 +27,10 @@ const SAFE_URL = /^https?:\/\/[^\s"'<>]+$/i;
     already-escaped text, so `<b>` etc. are the only tags it introduces. */
 function inline(s: string): string {
   return esc(s)
+    // Math FIRST. The italic rule below matches a lone pair of underscores,
+    // so `$d_k$` would otherwise reach the reader as `d<em>k</em>` around a
+    // surviving dollar. renderMath consumes those underscores as subscripts.
+    .replace(/[\s\S]+/, (body) => renderMath(body))
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[\s(])_([^_]+)_(?=$|[\s.,;:)!?])/g, '$1<i>$2</i>')
@@ -108,7 +115,11 @@ export function renderMarkdown(src: string, headingOffset = 0,
 
 function renderMarkdownUncached(src: string, headingOffset = 0,
                                 fitTopLevel = false): string {
-  const lines = String(src || '').split('\n');
+  // Page citations (`[[p:3|words]]`) are for the document viewer, not the
+  // reader. Stripping them here rather than at each call site is what keeps a
+  // discussion thread reopened tomorrow — where the raw text is the stored
+  // answer — free of marker noise.
+  const lines = stripCitations(String(src || '')).split('\n');
   let off = headingOffset;
   if (fitTopLevel) {
     let min = Infinity;

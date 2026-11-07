@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ThumbsUp, ThumbsDown, RotateCcw, Clock, DollarSign } from 'lucide-react';
+import { ThumbsUp, ThumbsDown, RotateCcw, Clock, DollarSign, MessageSquare, Send } from 'lucide-react';
 import { renderMarkdown } from './markdown';
 import { api, type NodeDetail } from '../api';
 
@@ -33,12 +33,18 @@ export default function Inspector({
   const [d, setD] = useState<NodeDetail | null>(null);
   const [err, setErr] = useState('');
   const [vote, setVote] = useState<0 | 1 | -1>(0);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [note, setNote] = useState('');
+  const [noteStatus, setNoteStatus] = useState('');
 
   useEffect(() => {
     let live = true;
     setD(null);
     setErr('');
     setVote(0);
+    setNoteOpen(false);
+    setNote('');
+    setNoteStatus('');
     api.node(sid, nid).then(
       (v) => { if (live) setD(v); },
       (e) => { if (live) setErr(String(e.message || e)); },
@@ -47,7 +53,16 @@ export default function Inspector({
        per-run counters, so an unscoped read would show a vote
        cast on the same index in a different run. */
     api.feedbackGet(nid, sid).then(
-      (v) => { if (live && (v.vote === 1 || v.vote === -1)) setVote(v.vote); },
+      (v) => {
+        if (!live) return;
+        if (v.vote === 1 || v.vote === -1) setVote(v.vote);
+        // Restore the free-text note too: reloading a run used to lose it.
+        if (v.note && v.note.trim()) {
+          setNote(v.note);
+          setNoteOpen(true);
+          setNoteStatus('saved note');
+        }
+      },
       () => {},
     );
     return () => { live = false; };
@@ -62,6 +77,28 @@ export default function Inspector({
       setVote(v);
     } catch {
       /* best-effort */
+    }
+  };
+
+  const submitNote = async () => {
+    const text = note.trim();
+    if (!text) return;
+    try {
+      // A note with no thumb still needs a vote to be recorded; pair it with
+      // an upvote, exactly as the Chat feedback row does.
+      const res = await api.feedbackPost(
+        sid, nid, vote === -1 ? -1 : 1, String(d?.skill || ''), '', text);
+      setNote('');
+      setNoteOpen(false);
+      setNoteStatus(res.learning === 'queued'
+        ? 'note saved — Aria is learning from this'
+        : res.learning === 'disabled'
+          ? 'note saved — automatic learning is off'
+          : res.learning === 'error'
+            ? 'note saved — the learning worker could not start'
+            : 'note saved');
+    } catch {
+      setNoteStatus('could not save note');
     }
   };
 
@@ -210,6 +247,30 @@ export default function Inspector({
           </dl>
         )}
       </div>
+      {noteOpen && (
+        <div className="border-t border-white/10 px-4 py-2">
+          <textarea
+            value={note}
+            onChange={(e) => setNote(e.target.value.slice(0, 280))}
+            placeholder="What should the agent do differently next time?"
+            rows={2}
+            className="w-full resize-y rounded border border-white/10 bg-black/40 p-1.5 text-[12px] text-zinc-200 outline-none focus:border-violet-400"
+          />
+          <div className="mt-1 flex items-center gap-2">
+            <span className="text-[10.5px] text-zinc-muted">
+              A durable preference is learned from this note; the rated answer is context.
+            </span>
+            <div className="flex-1" />
+            <button
+              type="button"
+              disabled={!note.trim()}
+              onClick={() => void submitNote()}
+              className="flex items-center gap-1 rounded border border-violet-400/40 bg-violet-400/10 px-2 py-1 text-[10.5px] font-bold text-violet-200 disabled:opacity-40">
+              <Send size={11} /> send
+            </button>
+          </div>
+        </div>
+      )}
       <div className="flex items-center gap-1.5 border-t border-white/10 px-4 py-2.5">
         <button
           onClick={() => cast(1)}
@@ -229,6 +290,20 @@ export default function Inspector({
         >
           <ThumbsDown size={15} className={vote === -1 ? 'text-violet-300' : 'text-zinc-400'} />
         </button>
+        <button
+          onClick={() => setNoteOpen((v) => !v)}
+          title="Add a feedback note"
+          aria-label="Add a feedback note"
+          aria-pressed={noteOpen}
+          className={`rounded-md border border-white/10 bg-white/5 p-2 hover:border-violet-400 ${noteOpen ? 'border-violet-400 bg-violet-400/15' : ''}`}
+        >
+          <MessageSquare size={15} className={noteOpen ? 'text-violet-300' : 'text-zinc-400'} />
+        </button>
+        {noteStatus && (
+          <span role="status" className="ml-1 text-[10.5px] text-emerald-300/80">
+            {noteStatus}
+          </span>
+        )}
       </div>
     </div>
   );

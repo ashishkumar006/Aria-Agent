@@ -28,9 +28,14 @@ import hmac
 import os
 import secrets
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 TOKEN_HEADER = "x-gateway-token"
+# A per-user credential, separate from the operator/transport token. The agent
+# sends it on every call; the gateway uses it to pick that user's provider
+# keys. It is sufficient for inference routes, never for /v1/users.
+USER_TOKEN_HEADER = "x-aria-user-token"
 ENV_TOKEN = "GATEWAY_V9_TOKEN"
 # Generated once and cached for the process when nothing is configured, so the
 # agent can read it after start-up without either side being configured.
@@ -62,14 +67,19 @@ def token() -> str:
         configured = (os.getenv(ENV_TOKEN) or "").strip()
         if configured:
             _token = configured
-            return _token
-        existing = _read_token_file()
-        if existing:
-            _token = existing
-            return _token
-        if _generated is None:
-            _generated = secrets.token_urlsafe(32)
-        _token = _generated
+        else:
+            existing = _read_token_file()
+            if existing:
+                _token = existing
+            else:
+                if _generated is None:
+                    _generated = secrets.token_urlsafe(32)
+                _token = _generated
+        try:
+            import redact
+            redact.register_secret(_token)
+        except Exception:
+            pass
         return _token
 
 
@@ -125,6 +135,66 @@ def header_value() -> str:
     return token()
 
 
+# A user token is an INFERENCE credential, not an operator credential. These
+# are the only surfaces it may reach; memory, documents, calls, spend, config,
+# status, control, deploy and user administration stay operator-only. Without
+# this allowlist a user token from a remote agent could read the operator's
+# memory and call log, or change channel keys.
+USER_ROUTE_PREFIXES = (
+    "/v1/chat", "/v1/vision", "/v1/embed", "/v1/tts", "/v1/stt",
+)
+USER_ROUTE_EXACT = ("/v1/users/me",)
+
+
+def user_route_allowed(path: str) -> bool:
+    p = str(path or "")
+    if p in USER_ROUTE_EXACT:
+        return True
+    return any(p == prefix or p.startswith(prefix + "/")
+               or p.startswith(prefix + "?")
+               for prefix in USER_ROUTE_PREFIXES)
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    """Who made this request, and what they may do.
+
+    `admin` is the operator credential (the gateway token). `user_id` is the
+    non-secret id of the person whose provider keys should be used. A caller
+    may hold both: an agent sends the operator token for transport plus its
+    user token for key selection. A remote user sends only the latter and gets
+    inference routes, never user administration.
+    """
+    admin: bool
+    user_id: str | None
+    via: str
+
+
+def authenticate(gateway_header: str | None,
+                 user_header: str | None,
+                 store=None) -> AuthContext | None:
+    """Resolve the request identity.
+
+    Precedence: a valid user token selects that user's keys even when the
+    operator token is also present. The operator token alone keeps the shared
+    pool, so every existing single-user client continues to work. An invalid
+    user token alongside a valid operator token degrades to the operator
+    rather than locking the local agent out after a rotation.
+    """
+    admin = bool(check_header_value(gateway_header))
+    user_id = None
+    if store is not None and (user_header or "").strip():
+        try:
+            user_id = store.user_id_for_token(str(user_header).strip())
+        except Exception:
+            user_id = None
+    if user_id:
+        return AuthContext(admin=admin, user_id=user_id, via="user")
+    if admin:
+        return AuthContext(admin=True, user_id=None, via="operator")
+    return None
+
+
 META_NAME = "gateway-token"
 
 # The gateway ships its own console (static/*.html: dashboard, connections,
@@ -176,7 +246,8 @@ def inject_into_html(html: str) -> str:
 
 def host_is_loopback(host: str | None) -> bool:
     h = (host or "127.0.0.1").strip().lower()
-    return h in ("127.0.0.1", "localhost", "::1", "[::1]")
+    # `testclient` is Starlette's in-process ASGI host, never a network peer.
+    return h in ("127.0.0.1", "localhost", "::1", "[::1]", "testclient")
 
 
 def assert_safe_bind(host: str | None) -> tuple[bool, str]:

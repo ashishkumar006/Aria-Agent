@@ -7,8 +7,23 @@ DB_PATH = str(Path(__file__).parent / "gateway_v8.db")
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=10.0)
     c.row_factory = sqlite3.Row
+    # WAL, and a busy timeout, because this database is written from inside
+    # async request handlers on a single event loop. In the default rollback
+    # journal a writer blocks every reader, so a ledger insert could hold up
+    # /health — and /health has a 1-second budget, so a held lock was reported
+    # to the console as "gateway unreachable" while the gateway was fine.
+    # WAL lets readers work against the previous snapshot while a writer is
+    # mid-transaction; NORMAL keeps that cheap without risking committed data.
+    # `timeout` makes a genuine contention wait a short retry instead of an
+    # immediate "database is locked" error.
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA busy_timeout=10000")
+    except sqlite3.Error:
+        pass  # an older SQLite still works, just without the concurrency fix
     try:
         yield c
         c.commit()
@@ -46,7 +61,9 @@ def init():
             channel TEXT,
             trust_level TEXT,
             policy_verdict TEXT,
-            policy_rule TEXT
+            policy_rule TEXT,
+            thinking_tokens INTEGER DEFAULT 0,
+            output_tps REAL
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ts ON calls(ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_prov_ts ON calls(provider, ts DESC)")
@@ -71,6 +88,20 @@ def init():
             c.execute("ALTER TABLE calls ADD COLUMN policy_verdict TEXT")
         if "policy_rule" not in cols:
             c.execute("ALTER TABLE calls ADD COLUMN policy_rule TEXT")
+        if "user_id" not in cols:
+            c.execute("ALTER TABLE calls ADD COLUMN user_id TEXT")
+        # Tokens/second and thinking tokens, per call.
+        #
+        # Before this the ledger had latency and output_tokens and nothing
+        # else, so a Gemini call that spent 80 s thinking and returned one
+        # token was indistinguishable from a hung request, and the one number
+        # that would have told them apart — thoughtsTokenCount — was read out
+        # of the response and thrown away. Stored here so the question can be
+        # answered from the database instead of from a guess.
+        if "thinking_tokens" not in cols:
+            c.execute("ALTER TABLE calls ADD COLUMN thinking_tokens INTEGER DEFAULT 0")
+        if "output_tps" not in cols:
+            c.execute("ALTER TABLE calls ADD COLUMN output_tps REAL")
         c.execute("CREATE INDEX IF NOT EXISTS idx_agent_ts ON calls(agent, ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_session_ts ON calls(session, ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_channel_ts ON calls(channel, ts DESC)")
@@ -100,7 +131,28 @@ def log_call(provider, model, input_tokens=0, output_tokens=0, latency_ms=0,
              call_role="worker", router_decision=None, embed_dim=None,
              agent=None, session=None, retries=0,
              channel=None, trust_level=None, policy_verdict=None,
-             policy_rule=None):
+             policy_rule=None, user_id=None, thinking_tokens=0):
+    try:
+        import redact as _redact
+        error = _redact.redact(error)
+        attempted = _redact.redact(attempted)
+    except Exception:
+        pass
+    # Tokens/second over everything the model generated, thinking included.
+    #
+    # Dividing latency by output_tokens alone is the number that made a 30 s
+    # Gemini call look inexplicable: a call that thinks 6,000 tokens and
+    # answers in one reports 0.03 tok/s on that formula, which reads like a
+    # hung request rather than a model that spent its time reasoning. With
+    # thinking in the denominator the same call reports ~200 tok/s and the
+    # cost is visible as what it is.
+    tps = None
+    try:
+        generated = int(output_tokens or 0) + int(thinking_tokens or 0)
+        if latency_ms and generated >= 0:
+            tps = round(generated / (float(latency_ms) / 1000.0), 2)
+    except (TypeError, ValueError):
+        tps = None
     with conn() as c:
         c.execute(
             """INSERT INTO calls (ts, provider, model, input_tokens, output_tokens,
@@ -109,15 +161,17 @@ def log_call(provider, model, input_tokens=0, output_tokens=0, latency_ms=0,
                                   override, attempted, tool_calls, reasoning_applied, tool_dialect,
                                   call_role, router_decision, embed_dim,
                                   agent, session, retries,
-                                  channel, trust_level, policy_verdict, policy_rule)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  channel, trust_level, policy_verdict, policy_rule,
+                                  user_id, thinking_tokens, output_tps)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (time.time(), provider, model, input_tokens, output_tokens,
              cache_create_tokens, cache_read_tokens, latency_ms,
              status, error, prompt_chars, response_chars,
              override, attempted, tool_calls, 1 if reasoning_applied else 0, tool_dialect,
              call_role, router_decision, embed_dim,
              agent, session, retries,
-             channel, trust_level, policy_verdict, policy_rule),
+             channel, trust_level, policy_verdict, policy_rule,
+             user_id, int(thinking_tokens or 0), tps),
         )
 
 
@@ -275,3 +329,33 @@ def day_spend(agent=None, session=None):
     if session:
         out["session_day_usd"] = _scope("session=?", [session])
     return out
+
+
+def user_usage(user_id: str, days: int = 30) -> dict:
+    """Token usage attributed to one user, grouped by provider and agent.
+
+    The call ledger already carries `user_id`; this is the read side that
+    makes per-user administration more than a key locker.
+    """
+    cutoff = time.time() - max(1, int(days)) * 86400
+    with conn() as c:
+        rows = c.execute(
+            """SELECT provider, agent, COUNT(*) AS calls,
+                      COALESCE(SUM(input_tokens),0) AS input_tokens,
+                      COALESCE(SUM(output_tokens),0) AS output_tokens
+               FROM calls
+               WHERE user_id = ? AND ts >= ?
+               GROUP BY provider, agent
+               ORDER BY input_tokens + output_tokens DESC""",
+            (user_id, cutoff)).fetchall()
+    out = [dict(r) for r in rows]
+    return {
+        "user_id": user_id,
+        "days": days,
+        "rows": out,
+        "totals": {
+            "calls": sum(r["calls"] for r in out),
+            "input_tokens": sum(r["input_tokens"] for r in out),
+            "output_tokens": sum(r["output_tokens"] for r in out),
+        },
+    }

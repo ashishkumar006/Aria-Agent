@@ -2,7 +2,7 @@ import {
   memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import {
-  AlertTriangle, Check, ChevronDown, ChevronRight, Clock, Copy,
+  AlertTriangle, Check, ChevronDown, ChevronRight, Circle, Clock, Copy,
   FileCode2, History, Loader2, Plus, RotateCcw, ShieldQuestion, Sparkles,
   Square, ThumbsDown, ThumbsUp, Trash2, Wrench, X,
 } from 'lucide-react';
@@ -35,6 +35,16 @@ import { renderMarkdown } from './markdown';
 /** `kind` chooses the step's icon and tone, so a failed tool call cannot read
  *  like a successful one. `text` marks a step as prose rather than a one-line
  *  status, so the panel can collapse it instead of rendering a wall of text. */
+export type PlanStatus = 'pending' | 'doing' | 'done' | 'blocked';
+
+export type PlanStep = {
+  id?: string;
+  title: string;
+  status: PlanStatus;
+};
+
+export type ApprovalMode = 'ask' | 'auto-edit' | 'auto-all' | 'read-only';
+
 export type Step = {
   label: string;
   detail?: string;
@@ -46,7 +56,9 @@ export type Step = {
   /** Stable id for a tool call, so its result updates the SAME row instead of
    *  appending a duplicate. */
   id?: string;
-  kind?: 'status' | 'call' | 'ok' | 'err' | 'read' | 'model' | 'think' | 'ask';
+  kind?: 'status' | 'call' | 'ok' | 'err' | 'read' | 'model' | 'think' | 'ask' | 'plan';
+  /** A plan frame: the whole checklist, applied to the turn. */
+  plan?: PlanStep[];
 };
 
 export type Turn = {
@@ -66,6 +78,8 @@ export type Turn = {
   at?: number;
   /** Local thumbs vote, so the control reflects the user's own action. */
   vote?: 1 | -1 | 0;
+  /** Visible task checklist emitted by the agent's update_plan tool. */
+  plan?: PlanStep[];
 };
 
 type Props = {
@@ -89,6 +103,9 @@ type Props = {
     /** Workspace-relative paths to read into the prompt, besides the open
      *  file. The server caps them; the panel shows every one as a chip. */
     paths?: string[],
+    /** Clear the in-flight answer when the server starts a verification fix
+     *  round, so the corrected answer does not concatenate onto the old one. */
+    onReset?: () => void,
   ) => Promise<string>;
   /** The workspace's file list, for the attach picker. */
   files?: string[];
@@ -100,9 +117,18 @@ type Props = {
   /** Model id chosen in the picker; '' means "let the gateway decide". */
   model?: string;
   onModelChange?: (id: string) => void;
+  /** Ask = every write/command needs approval; Auto-edit = writes apply with
+   *  Keep/Revert and commands still ask; Read-only = no writes or commands. */
+  approvalMode?: ApprovalMode;
+  onApprovalModeChange?: (mode: ApprovalMode) => void;
   /** Close the panel. Only rendered on the stacked layout, where the panel is
    *  an overlay and the top-bar toggle is the only other way out. */
   onClose?: () => void;
+  /** Agent surface: threads live in a tab strip instead of a drawer. Same
+   *  store, same `openSession`, same bounded history — just always visible,
+   *  because on a full-width surface "which session am I in" has to be
+   *  answerable without opening a menu first. */
+  tabs?: boolean;
 };
 
 let seq = 0;
@@ -162,8 +188,8 @@ function saveTurns(turns: Turn[]): void {
     // showed a settled conversation with a dead context meter and unvoted
     // thumbs, which is the "persistence is broken" shape all over again.
     const keep = turns.filter((t) => !t.busy).slice(-MAX_TURNS)
-      .map(({ id, role, text, steps, error, at, model, usage, thinking, vote }) => ({
-        id, role, text, steps, error, at, model, usage, thinking, vote,
+      .map(({ id, role, text, steps, error, at, model, usage, thinking, vote, plan }) => ({
+        id, role, text, steps, error, at, model, usage, thinking, vote, plan,
       }));
     localStorage.setItem(STORE_KEY, JSON.stringify(keep));
   } catch {
@@ -275,6 +301,41 @@ function StepRow({ step, count = 1, busy, open, onToggle }:
   );
 }
 
+function PlanCard({ steps }: { steps: PlanStep[] }) {
+  const done = steps.filter((s) => s.status === 'done').length;
+  return (
+    <div className="mb-2 rounded-xl border border-white/8 bg-black/20 px-2 py-1.5">
+      <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+        <span>plan</span>
+        <span className="font-normal normal-case tracking-normal text-zinc-600">
+          {done}/{steps.length} done
+        </span>
+      </div>
+      <ul className="space-y-0.5">
+        {steps.map((s, i) => (
+          <li key={s.id || i}
+              className="flex items-start gap-1.5 text-[11px] leading-snug">
+            <span className="mt-[1px] flex-none">
+              {s.status === 'done'
+                ? <Check size={10} className="text-emerald-400" />
+                : s.status === 'doing'
+                  ? <Loader2 size={10} className="animate-spin text-sky-300" />
+                  : s.status === 'blocked'
+                    ? <AlertTriangle size={10} className="text-rose-300" />
+                    : <Circle size={10} className="text-zinc-600" />}
+            </span>
+            <span className={
+              s.status === 'done'
+                ? 'text-zinc-500 line-through decoration-zinc-700'
+                : s.status === 'doing' ? 'text-zinc-200' : 'text-zinc-400'
+            }>{s.title}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /* The wait before the first token is 8-15 seconds on a cold model. A static
  * "thinking…" gives no evidence that anything is happening; a clock does. It
  * ticks inside its own component so a second passing never re-renders the
@@ -367,6 +428,7 @@ const TurnRow = memo(function TurnRow({
         </div>
       ) : (
         <div className="rounded-2xl rounded-bl-md border border-white/8 bg-surface-0 px-3 py-2">
+          {t.plan && t.plan.length > 0 && <PlanCard steps={t.plan} />}
           {t.steps && t.steps.length > 0 && (
             <div className="mb-2 overflow-hidden rounded-xl border border-white/8 bg-black/20">
               <button type="button"
@@ -450,8 +512,8 @@ const TurnRow = memo(function TurnRow({
 export default function AgentPanel({
   path, body, onAsk, files = [],
   gitView = 'status', gitBusy = false, gitOut = null, onGit,
-  model = '', onModelChange,
-  onClose,
+  model = '', onModelChange, approvalMode = 'ask', onApprovalModeChange,
+  onClose, tabs = false,
 }: Props) {
   void body;   // sent through onAsk by the caller; kept in Props for the shape
   const [turns, setTurns] = useState<Turn[]>(() => loadTurns());
@@ -649,6 +711,12 @@ export default function AgentPanel({
         q,
         history,
         (s: Step) => {
+          if (s.kind === 'plan' && s.plan) {
+            setTurns((t) => t.map((x) => (
+              x.id === agentId ? { ...x, plan: s.plan } : x
+            )));
+            return;
+          }
           setTurns((t) => t.map((x) => {
             if (x.id !== agentId) return x;
             const steps = x.steps ?? [];
@@ -693,6 +761,9 @@ export default function AgentPanel({
         // per frame (see above).
         (chunk: string) => queue(chunk),
         extra.length ? extra : undefined,
+        () => setTurns((t) => t.map((x) => (
+          x.id === agentId ? { ...x, text: '' } : x
+        ))),
       );
       flushNow();
       setTurns((t) => t.map((x) => (
@@ -858,6 +929,47 @@ export default function AgentPanel({
   return (
     <div className="agent-panel flex min-h-0 min-w-0 flex-1 flex-col bg-surface-0">
       {/* ── header ─────────────────────────────────────────────────────────── */}
+      {/* ── session tabs ──────────────────────────────────────────────────
+          The agent surface shows every open thread at once, the way an editor
+          shows every open file. Same `sessions` store, same `openSession`,
+          same 20-session bound — the drawer just stops being the only door. */}
+      {tabs && (
+        <div role="tablist" aria-label="Agent sessions"
+             className="flex flex-none items-stretch gap-px overflow-x-auto border-b border-glass-border bg-surface-1">
+          <button type="button" role="tab" aria-selected
+                  onClick={() => setView('chat')}
+                  title={title}
+                  className="flex max-w-[220px] flex-none items-center gap-1.5 border-b-2 border-violet-400/70 bg-white/[0.06] px-2.5 py-1.5 text-left">
+            <span className="h-1.5 w-1.5 flex-none rounded-full bg-violet-300" />
+            <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium text-zinc-100">
+              {title}
+            </span>
+            {turns.length > 0 && (
+              <span className="flex-none text-[10px] text-zinc-muted">
+                {turns.filter((t) => t.role === 'user').length}
+              </span>
+            )}
+          </button>
+          {sessions.map((s) => (
+            <button key={s.id} type="button" role="tab" aria-selected={false}
+                    onClick={() => { openSession(s); setView('chat'); }}
+                    title={`${s.title} - ${ago(s.at)} ago`}
+                    className="flex max-w-[200px] flex-none items-center gap-1.5 border-b-2 border-transparent px-2.5 py-1.5 text-left hover:bg-white/5">
+              <span className="h-1.5 w-1.5 flex-none rounded-full bg-zinc-600" />
+              <span className="min-w-0 flex-1 truncate text-[11.5px] text-zinc-400">
+                {s.title}
+              </span>
+              <span className="flex-none text-[10px] text-zinc-muted">{ago(s.at)}</span>
+            </button>
+          ))}
+          <button type="button" onClick={newChat}
+                  title="New session" aria-label="New session"
+                  className="ml-0.5 flex flex-none items-center rounded my-1 px-1.5 text-zinc-muted hover:bg-white/5 hover:text-zinc-200">
+            <Plus size={13} />
+          </button>
+        </div>
+      )}
+
       <header className="flex flex-none items-center gap-1.5 border-b border-glass-border px-2.5 py-2">
         {view === 'sessions' ? (
           <>
@@ -1085,6 +1197,24 @@ export default function AgentPanel({
               <Plus size={13} />
             </button>
             <ModelPicker model={model} onChange={onModelChange} busy={busy} onMeta={onCtx} />
+            <select
+              value={approvalMode}
+              onChange={(e) => onApprovalModeChange?.(e.target.value as ApprovalMode)}
+              aria-label="Agent approval mode"
+              title={approvalMode === 'ask'
+                ? 'Ask: every write and command waits for your approval'
+                : approvalMode === 'auto-edit'
+                  ? 'Auto-edit: writes apply immediately with Keep/Revert; commands still ask'
+                  : approvalMode === 'auto-all'
+                    ? 'Auto-all: writes AND commands run without asking. Destructive commands are still refused, and every command is audited.'
+                    : 'Read-only: the agent may read and analyse but cannot write or run commands'}
+              className="w-[92px] flex-none rounded border border-white/10 bg-black/40 px-1 py-1 text-[10px] font-semibold text-zinc-300 outline-none focus:border-violet-400"
+            >
+              <option value="ask">Ask</option>
+              <option value="auto-edit">Auto edit</option>
+              <option value="auto-all">Auto all</option>
+              <option value="read-only">Read only</option>
+            </select>
             {/* The context meter moved here from a second status bar under the
                 composer. It only earns the width once a turn has actually used
                 the window, so a fresh chat shows no meter at all. */}

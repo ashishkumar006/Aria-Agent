@@ -172,17 +172,21 @@ def test_authoring_sends_no_setup_because_it_offers_none():
        It used to send a full `doc_setup` of defaults while offering nothing to
        change them: the renderer was told "the user chose A4, portrait, Report,
        cover page" when the user had chosen nothing. That is a lie in the
-       request, and it is worse than sending none. The format now travels in
-       the brief ("as a PDF"), and `_clean_doc_setup` still enforces a forced
-       setup from any other caller.
+       request, and it is worse than sending none. The page now offers exactly
+       one setup control - the style - and that is the ONLY key it may send,
+       only when the user picked something other than Auto. The format still
+       travels in the brief ("as a PDF").
        """
        src = open("console-frontend/src/views/Authoring.tsx", encoding="utf-8").read()
        assert "setupDirective" not in src, \
            "the setup directive is still built and sent"
-       assert "docSetup" not in src, \
-           "authoring still sends a doc_setup it no longer offers controls for"
        assert "SetupPanel" not in src, \
            "the setup panel is still mounted"
+       assert ("docSetup: docStyle === 'auto' ? undefined : { style: docStyle }"
+               in src), "the style selector is not the only setup key sent"
+       for key in ("page_size", "citation_style"):
+           assert key not in src, \
+               f"authoring sends a {key} default it offers no control for"
        # The brief is the only instruction now, so it has to say it can be
        # specific about the format.
        assert "as a PDF" in src, \
@@ -191,9 +195,18 @@ def test_authoring_sends_no_setup_because_it_offers_none():
 
 def test_the_viewer_shows_the_document_rather_than_text():
     src = open("console-frontend/src/views/Authoring.tsx", encoding="utf-8").read()
-    # The four format branches each mount the real viewer.
-    assert src.count("<DocumentViewer") >= 4, \
+    # Every format branch mounts a real viewer. The count used to be of
+    # `<DocumentViewer` alone; the PDF and discussion branches now mount
+    # `<FilePreview`, which is the same three-way choice the document window
+    # makes (pdf.js / the browser's own text view / the server pager) and which
+    # a plain txt or html artifact must reach, because the pager endpoint
+    # answers 415 for them.
+    viewers = src.count("<DocumentViewer") + src.count("<FilePreview")
+    assert viewers >= 4, \
         "some formats still show only extracted text"
+    assert "<DocumentViewer source={discTarget}" not in src, \
+        "the Discuss page routes every non-PDF straight to the raster pager " \
+        "again, which is the 415 strip the user sees as 'the renderer is broken'"
 
 # ── the setup panel must be a DECISION, not a suggestion ──────────────────
 def test_doc_setup_is_whitelisted_at_the_boundary():
@@ -341,3 +354,121 @@ def test_node_health_reports_rate_against_each_skills_own_nodes():
         # Worst skill sorts first.
         assert body["rows"][0]["skill"] == "author", body["rows"]
         assert body["totals"]["attempted"] == 4, body["totals"]
+
+# --------------------------------------------------------------------------
+# Caching. An artifact id is content-addressed, so a description of its bytes
+# can never go stale — which makes it safe to keep the answer beside the file
+# instead of recomputing it. Both preview routes used to recompute on every
+# single open: the text extraction measured 0.45-0.80 s and the raster ~1.2 s.
+# --------------------------------------------------------------------------
+
+def _gateway_stub(seen):
+    """An httpx.Client stand-in that counts how often the gateway is called."""
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+            self.content = json.dumps(payload).encode()
+            self.text = self.content.decode()
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, **kw):
+            seen["calls"] = seen.get("calls", 0) + 1
+            n = int(json.get("max_pages") or 12)
+            return _Resp({"mode": "pages", "format": "pdf",
+                          "pages": [{"n": i} for i in range(n)],
+                          "page_count": n})
+
+    return _Client
+
+
+def test_the_text_preview_is_cached_after_the_first_read(client):
+    """Second read must be served from disk, byte-identically."""
+    c, hdr = client
+    import artifacts as arts
+    art = arts.put(b"%PDF-1.4 caching-probe-A", content_type="application/pdf",
+                   source="author:pdf", descriptor="Probe A (pdf)")
+
+    r1 = c.get(f"/api/artifact/{art}/preview", headers=hdr)
+    r2 = c.get(f"/api/artifact/{art}/preview", headers=hdr)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.headers.get("X-Artifact-Cache") == "miss", r1.headers
+    assert r2.headers.get("X-Artifact-Cache") == "hit", r2.headers
+    assert r1.json() == r2.json(), "a cache hit must not change the answer"
+
+
+def test_the_artifact_bytes_are_marked_immutable(client):
+    """Without these headers every open re-pulls the whole file over loopback.
+
+    `immutable` is honest here because the URL *is* the content hash.
+    """
+    c, hdr = client
+    import artifacts as arts
+    art = arts.put(b"%PDF-1.4 caching-probe-B", content_type="application/pdf",
+                   source="author:pdf", descriptor="Probe B (pdf)")
+    r = c.get(f"/api/artifact/{art}?download=0", headers=hdr)
+    assert r.status_code == 200
+    assert r.headers.get("ETag") == f'"{art}"'
+    assert "immutable" in (r.headers.get("Cache-Control") or "")
+
+
+def test_the_raster_is_cached_and_both_parameter_sets_survive(
+        client, monkeypatch):
+    """The cache is keyed by the parameters, not just by the artifact.
+
+    One slot per artifact passed this test when it only ever checked a repeat
+    of the same request, and failed in practice: a default call followed by a
+    4-page one overwrote the first, so alternating caps recomputed forever.
+    """
+    c, hdr = client
+    import artifacts as arts
+    import httpx
+    art = arts.put(b"%PDF-1.4 caching-probe-C", content_type="application/pdf",
+                   source="author:pdf", descriptor="Probe C (pdf)")
+    seen = {}
+    monkeypatch.setattr(httpx, "Client", _gateway_stub(seen))
+
+    def ask(**extra):
+        return c.post("/api/doc/preview",
+                      json={"artifact": art, "format": "pdf", **extra},
+                      headers=hdr)
+
+    d1 = ask()
+    n_default = len(d1.json()["pages"])
+    d2 = ask()
+    assert seen["calls"] == 1, "the second identical call must not hit the gateway"
+    assert d2.headers.get("X-Raster-Cache") == "hit"
+
+    d3 = ask(max_pages=4)
+    assert seen["calls"] == 2, "a different page cap is a different answer"
+    assert len(d3.json()["pages"]) == 4
+    assert len(d3.json()["pages"]) != n_default
+
+    # The original must STILL be cached: this is the alternation the single-slot
+    # version got wrong.
+    d4 = ask()
+    assert seen["calls"] == 2, "the 4-page call must not have evicted the default"
+    assert d4.headers.get("X-Raster-Cache") == "hit"
+    assert len(d4.json()["pages"]) == n_default
+
+
+def test_cache_roundtrip_and_unknown_name():
+    import artifacts as arts
+    art = arts.put(b"%PDF-1.4 caching-probe-D", content_type="application/pdf",
+                   source="author:pdf", descriptor="Probe D (pdf)")
+    assert arts.get_cache(art, "nothing") is None
+    arts.put_cache(art, "nothing", {"a": 1})
+    assert arts.get_cache(art, "nothing") == {"a": 1}
+    assert arts.get_cache(art, "other") is None, "names must not share a slot"

@@ -36,7 +36,7 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from gateway import LLM
+from gateway import LLM, cancel_requested
 
 MCP_SERVER = Path(__file__).parent / "mcp_server.py"
 MAX_TOOL_HOPS = 6  # hard cap so a model that loves tool-use can't cost a fortune
@@ -78,6 +78,137 @@ PROGRESS_LEDGER_CALLS = 12
 # files whole while still bounding a runaway tool. Distinct from the TRUNCATED
 # copy shown in stream events (~400 chars), which is display only.
 MAX_TOOL_RESULT_MESSAGE_CHARS = 32_000
+# ── consume-then-fold ───────────────────────────────────────────────────────
+# The problem this measures. A node's tool results are appended to `messages`
+# and re-sent on EVERY later hop, so a researcher that batch-fetches 20 pages
+# carries all 20 forward for the rest of its life. The researcher also sets
+# `max_tool_result_chars: 0` — no harness clip — because clipping mid-page is
+# what made a model re-read the same file until it hit the hop cap. The two
+# together produced the calls in the ledger: 330,468 to 429,333 characters of
+# prompt, and median researcher OUTPUT collapsing from ~1,070 tokens (under
+# 150k) to 266 (over 150k). The instruction that makes a document long tells
+# each researcher to fetch exhaustively, so the feature is the trigger.
+#
+# Folding is what the 4 KB artifact design was for, applied to the path that
+# actually holds the bytes. The node has already read the page — what it has
+# not done is stop sending it. So a consumed result keeps its full text in the
+# store and leaves the prompt as a handle plus a readable opening.
+#
+# Threshold below which folding is a bad trade: a handle, preview and note cost
+# a few hundred characters themselves, so folding something small saves nothing
+# and costs the model a tool call.
+FOLD_MIN_CHARS = 6_000
+# How many of the newest tool-result rounds stay whole. 1 means the model always
+# has the material it JUST asked for in full, and folding only ever touches
+# what it has already had a turn to use. Folding the newest would take back the
+# page the node is in the middle of writing from.
+FOLD_KEEP_ROUNDS = 1
+FOLD_PREVIEW_CHARS = 1_200
+# Only tools whose payload IS the document/answer text. Everything else keeps
+# travelling whole, because for those the result is not prose to read once but
+# facts that stay load-bearing: an artifact handle, a schedule id, a delivery
+# receipt. Folding `schedule_task` would hide the very id the user types back
+# to cancel the job.
+FOLD_CONTENT_TOOLS = frozenset({
+    "fetch_url", "fetch_pdf", "wayback_fetch", "extract_tables",
+    "read_file", "read_document", "search_files", "list_dir", "lookup",
+    "web_search", "wikipedia_search", "arxiv_search", "openalex_search",
+    "news_search", "marginalia_search", "slack_history", "gmail_query",
+    "github_query", "notion_query", "search_knowledge",
+})
+# `read_artifact` is the un-folding step. Folding what it returned would put the
+# text back behind a handle and the node would re-fetch it, which is a loop.
+FOLD_NEVER_TOOLS = frozenset({"read_artifact"})
+
+_fold_notes = {"n": 0, "chars": 0}
+
+
+def _fold_enabled() -> bool:
+    try:
+        from flags import is_enabled
+        return bool(is_enabled("agent.fold_tool_results", True))
+    except Exception as e:
+        # Folding is an optimisation, so the safe default on a broken flag read
+        # is the behaviour that has always worked. But a silent off-switch here
+        # is how a feature can be dead for weeks while looking configured: say
+        # once that the switch could not be read.
+        if not _fold_notes.get("warned"):
+            _fold_notes["warned"] = True
+            print(f"[mcp] could not read agent.fold_tool_results ({e!r}); "
+                  f"NOT folding this process — check flags.py/state/flags.json")
+        return False
+
+
+def _fold_consumed(messages: list, names_by_id: dict[str, str]) -> tuple[int, int]:
+    """Replace already-consumed content results with a handle + preview.
+
+    Returns (rounds_folded, characters_removed). Mutates `messages` in place.
+
+    The switch is checked HERE, not only at the call site: a gate that only one
+    caller honours is not a kill switch, it is a default.
+    """
+    import artifacts as _arts
+    import json as _json
+
+    if not _fold_enabled():
+        return 0, 0
+
+    # Find the tool rounds, newest first, and leave the newest few alone.
+    rounds: list[list[int]] = []   # indices of tool messages sharing one assistant turn
+    current: list[int] = []
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "tool":
+            current.append(i)
+        elif isinstance(m, dict) and m.get("role") == "assistant" and current:
+            rounds.append(current)
+            current = []
+    if current:
+        rounds.append(current)
+    if len(rounds) <= FOLD_KEEP_ROUNDS:
+        return 0, 0
+
+    folded = 0
+    saved = 0
+    for rnd in rounds[:-FOLD_KEEP_ROUNDS]:
+        for i in rnd:
+            m = messages[i]
+            body = m.get("content")
+            if not isinstance(body, str) or len(body) < FOLD_MIN_CHARS:
+                continue
+            if "folded" in body[:80]:
+                continue                      # already a stand-in
+            name = names_by_id.get(str(m.get("tool_call_id") or ""), "")
+            if (name in FOLD_NEVER_TOOLS
+                    or (name and name not in FOLD_CONTENT_TOOLS)):
+                # Unnamed is possible when ids do not survive a replay; leave
+                # anything we cannot classify alone rather than hide it.
+                continue
+            try:
+                art_id = _arts.put(body.encode("utf-8"),
+                                   content_type="text/plain",
+                                   source=f"folded:{name or 'tool'}",
+                                   descriptor=(name or "tool result")[:200])
+            except Exception:
+                continue                      # never lose text to a store hiccup
+            cut = len(body) - FOLD_PREVIEW_CHARS
+            m["content"] = _json.dumps({
+                "folded": True,
+                "tool": name,
+                "artifact": art_id,
+                "bytes": len(body.encode("utf-8")),
+                "chars": len(body),
+                "preview": body[:FOLD_PREVIEW_CHARS]
+                           + ("\n…" if cut > 0 else ""),
+                "note": ("You already read this on an earlier turn. It is folded "
+                         "to keep this request bounded, not deleted — the full "
+                         f"text is at read_artifact(\"{art_id}\"). Do NOT re-run "
+                         "the original call to get it back."),
+            }, ensure_ascii=False)
+            folded += 1
+            saved += max(0, len(body) - len(m["content"]))
+    return folded, saved
+
+
 # Per-tool wall clock: a hung tool must fail the node, never the run.
 TOOL_CALL_TIMEOUT_S = 120.0
 # `run_checks` is the exception: a real test suite routinely takes minutes, and
@@ -279,6 +410,13 @@ def _elide_oldest_tool_output(messages: list[dict]) -> bool:
         c = str(m.get("content") or "")
         if len(c) <= 600 or c.startswith("[earlier tool output elided"):
             continue
+        # A folded message already gave up its bulk and kept a handle. Eliding
+        # it would replace JSON containing that handle with a marker telling the
+        # model to re-run the call — losing the pointer to text that is still
+        # intact in the store, and paying for the network again. Never trade a
+        # handle for a "call it again".
+        if '"folded"' in c[:80]:
+            continue
         m["content"] = ("[earlier tool output elided to stay within the "
                         "context budget - call the tool again with a narrower "
                         "request if you still need it]")
@@ -317,7 +455,9 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
                          max_tool_result_chars: int | None = None,
-                         capture_transcript: bool = False) -> dict:
+                         capture_transcript: bool = False,
+                         max_seconds: float = 0,
+                         max_total_tokens: int = 0) -> dict:
     """The tool-use loop, factored for testability: `chat_fn(messages)`
     returns a gateway reply dict; `dispatch_fn(name, args)` returns result
     text. Returns the FINAL reply dict. Stops early with an explicit error
@@ -410,6 +550,23 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             rep["transcript"] = transcript
         return rep
 
+    def _stopped() -> dict:
+        # The operator pressed Stop. `error` rather than a bare empty reply
+        # because every caller reads the two differently: an empty `text` with
+        # no reason is treated as a model that produced nothing, and the author
+        # and deck paths RESPOND to that by re-asking (skills.py's "empty
+        # reply" retry), which spends a call on a run that has been called off.
+        # `cancelled` is the honest label for a receipt — a stop is not a
+        # fault — and the caller can already confirm it from its own flag.
+        #
+        # What this loop cannot do is interrupt the call it is awaiting: one
+        # model round trip always finishes first.
+        return _finish({"text": "", "tool_calls": [],
+                "provider": last_reply.get("provider", ""),
+                "input_tokens": usage_in, "output_tokens": usage_out,
+                "cancelled": True,
+                "error": "stopped by the operator"})
+
     # Unlimited when `max_hops <= 0`. A coding agent that has to read a dozen
     # files must not be cut off mid-investigation and then answer nothing —
     # which is exactly what an old fixed cap produced live. What stops a
@@ -419,11 +576,57 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     # means exactly that many model calls (the old check allowed one extra).
     no_progress = 0
     empty_retries = 0
+    # Consecutive hops on which the streamed call raised. One is a bad moment;
+    # two is a backend that cannot stream this payload. See the except below.
+    stream_failures = 0
+    # Set on the hop AFTER an empty streamed reply, so that retry goes out
+    # unstreamed — a different transport, and the empty completion is usually a
+    # streaming-path event. It clears itself: the answer for the rest of the run
+    # still streams. See the empty-reply branch below.
+    _batched_once = False
+    # tool_call_id -> tool name, so a later hop can tell WHAT KIND of bulk it is
+    # looking at. The `tool` message itself only carries the id.
+    tool_names_by_id: dict[str, str] = {}
     hop = 0
+    run_started = time.time()
     while True:
+        # The boundary a Stop can actually reach. A node is one model call away
+        # from here, and until Stop was honoured at this line a long document
+        # (ONE author node, 160 section calls) and a deep researcher (thirty
+        # hops) both kept billing after the console said "stopped" — while
+        # holding their idempotency claim, which is what made re-asking the
+        # same question answer "an identical run is already in progress".
+        if cancel_requested():
+            return _stopped()
+        if max_seconds > 0 and time.time() - run_started >= max_seconds:
+            return _finish({
+                "text": "", "tool_calls": [],
+                "provider": last_reply.get("provider", ""),
+                "input_tokens": usage_in, "output_tokens": usage_out,
+                "error": (f"run time ceiling ({max_seconds:.0f}s) reached "
+                          "without final text")})
+        if max_total_tokens > 0 and (usage_in + usage_out) >= max_total_tokens:
+            return _finish({
+                "text": "", "tool_calls": [],
+                "provider": last_reply.get("provider", ""),
+                "input_tokens": usage_in, "output_tokens": usage_out,
+                "error": (f"run token ceiling ({max_total_tokens}) reached "
+                          "without final text")})
         if max_hops > 0 and hop >= max_hops:
             break
         hop += 1
+        # Consume-then-fold, BEFORE any elision: this keeps the text and asks
+        # nothing of the caller's budget. See the constants above for the
+        # measurement that motivated it. The switch is honoured inside
+        # `_fold_consumed`, so there is exactly one place that decides.
+        _n, _saved = _fold_consumed(messages, tool_names_by_id)
+        if _n:
+            _fold_notes["n"] += _n
+            _fold_notes["chars"] += _saved
+            print(f"[mcp] folded {_n} consumed tool result(s) into artifact "
+                  f"handles, -{_saved:,} chars this hop "
+                  f"(process total: {_fold_notes['n']} folded / "
+                  f"{_fold_notes['chars']:,} chars)")
         # Context budget: elide the oldest tool output until the prompt fits.
         # Without this an uncapped run feeds every prior result back on every
         # hop until the gateway rejects the request outright, losing the run.
@@ -439,7 +642,7 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                         "error": f"context budget exceeded "
                                  f"({_context_chars(messages)} chars) — "
                                  "answer from what you already have"})
-        if chat_stream_fn is not None:
+        if chat_stream_fn is not None and not _batched_once:
             try:
                 # The streamed path forwards each text delta through on_event as
                 # it arrives, so the answer appears token by token instead of in
@@ -448,12 +651,23 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                     messages, lambda d: _emit("text", {"delta": d}))
             except Exception:
                 # A backend that cannot stream with tools (or a mid-stream drop)
-                # must not fail the run: fall back to the batched call for this
-                # and every remaining hop.
-                chat_stream_fn = None
+                # must not fail the run: fall back to the batched call for THIS
+                # hop. It used to also switch streaming off for every remaining
+                # hop, which is what made a Discuss turn feel dead: one empty
+                # or dropped stream at hop 1 meant the answer to the user's
+                # actual question arrived as one lump at the end, even though
+                # the next three hops were perfectly streamable. Two
+                # consecutive failures is a capability problem; one is a bad
+                # moment, and the retry on the next hop is free.
+                stream_failures += 1
+                if stream_failures >= 2:
+                    chat_stream_fn = None
                 reply = await chat_fn(messages)
+            else:
+                stream_failures = 0
         else:
             reply = await chat_fn(messages)
+        _batched_once = False
         last_reply = reply
         _absorb(reply)
         tool_calls = reply.get("tool_calls") or []
@@ -476,7 +690,13 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             if empty_retries < 1:
                 empty_retries += 1
                 hop -= 1
-                chat_stream_fn = None
+                # The retry goes out on the batched path — a different request
+                # shape is the only thing that makes a retry worth spending —
+                # but streaming is NOT switched off. Disabling it here is what
+                # turned one bad completion into a silent console for the rest
+                # of the turn, and the user's own question is usually several
+                # hops later.
+                _batched_once = True
                 continue
             return _finish({"text": "", "tool_calls": [],
                     "provider": reply.get("provider", ""),
@@ -542,6 +762,16 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                              "id": (tc.get("id") or
                                     f"t{hop}_{len(prepared)}")})
 
+        # A Stop that lands after the model has asked for tools must not fire
+        # them: these are side-effecting calls — file writes, renders,
+        # third-party API posts — on a run the operator has already called off.
+        # Checked BEFORE the assistant turn is appended, so a cancelled loop
+        # never leaves a tool call with no result behind it; the chat path hands
+        # the same `messages` list back on the next turn, and an unanswered
+        # tool_call there is a malformed request.
+        if cancel_requested():
+            return _stopped()
+
         # Carry the assistant's tool-call turn back through, then announce every
         # call BEFORE any runs, so a parallel batch reads as a batch in the
         # transcript rather than trickling in.
@@ -590,12 +820,20 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 # exception from approve_fn refuses the call.
                 if approve_fn is not None:
                     try:
-                        if not await approve_fn(p["name"], p["args"]):
-                            return (p, False,
-                                    "refused: the user declined this change, so "
-                                    "nothing was written. Do not retry it "
-                                    "unchanged - ask what they want instead, or "
-                                    "propose a different edit.",
+                        decision = await approve_fn(p["name"], p["args"])
+                        if decision is not True:
+                            # An approval callback may return a string to state
+                            # WHY the call was refused (for example, "read the
+                            # file before editing it"). A plain False keeps the
+                            # old user-declined message.
+                            if isinstance(decision, str) and decision.strip():
+                                reason = decision.strip()
+                            else:
+                                reason = ("the user declined this change, so "
+                                          "nothing was written. Do not retry it "
+                                          "unchanged - ask what they want "
+                                          "instead, or propose a different edit.")
+                            return (p, False, f"refused: {reason}",
                                     time.perf_counter() - _t0)
                     except Exception as exc:           # noqa: BLE001
                         return (p, False,
@@ -662,11 +900,21 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                         "Ask for less: search_files for the exact text, or "
                         "read_file(path, offset, limit) for a line range. Do "
                         "not repeat the same call.]")
+            # `tc` is read with .get() everywhere else because it is a plain dict
+            # in production and a .get()-only object in the outcome tests. The
+            # first version of this line used `p["tc"]["id"]` and raised
+            # TypeError for four of them.
+            _tc_id = str(p["tc"].get("id") or "")
             messages.append({
                 "role": "tool",
-                "tool_call_id": p["tc"].get("id", ""),
+                "tool_call_id": _tc_id,
                 "content": body,
             })
+            # Which tool this result came from. Folding needs it: the decision
+            # is about the KIND of payload, and a `tool` message carries only an
+            # id. Recorded at append so it survives a replay of the transcript.
+            if _tc_id:
+                tool_names_by_id[_tc_id] = p["name"]
 
         # Progress guard for the uncapped loop. `succeeded` only grows on a NEW
         # successful call, so a hop that merely re-reads (even at a fresh
@@ -700,6 +948,21 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     return _finish(last_reply)
 
 
+def _context_node_affinity():
+    """The affinity the running DAG node bound, if any.
+
+    Imported lazily: `gateway` pulls in the client and the auto-start path, and
+    mcp_runner is imported by the MCP child process, where that work is neither
+    wanted nor cheap. A failure to read it is not fatal — it only means this
+    loop falls back to its own `agent:session` group.
+    """
+    try:
+        from gateway import current_node_affinity
+        return current_node_affinity()
+    except Exception:
+        return None
+
+
 async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          agent: str, session_id: str,
                          provider_pin: str | None = None,
@@ -708,16 +971,22 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          max_tokens: int = 2048,
                          temperature: float = 0.3,
                          messages: list[dict] | None = None,
+                         route_affinity: str | None = None,
+                         cache_system: bool | None = None,
                          on_event=None, on_outcome=None,
                          prepare_fn=None, approve_fn=None,
                          extra_dispatch=None,
                          doc_ids: set[str] | None = None,
                          sandbox_root: str | None = None,
+                         extra_roots: list[str] | None = None,
+                         browser_sid: str = "",
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
                          max_tool_result_chars: int | None = None,
                          capture_transcript: bool = False,
-                         stream: bool = False) -> dict:
+                         stream: bool = False,
+                         max_seconds: float = 0,
+                         max_total_tokens: int = 0) -> dict:
     """Multi-turn chat: dispatch tool_calls via MCP, keep going until the
     model returns text. Returns the FINAL gateway reply dict (so callers
     can read `text`, `provider`, etc. the same way they would for a
@@ -764,7 +1033,48 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
         # SANDBOX); point that sandbox at the user's project so read_file /
         # list_dir / search_files see the repo rather than a scratch dir.
         _doc_env["ARIA_SANDBOX"] = str(sandbox_root)
+    if extra_roots:
+        # A studio session may hold several folders. `ARIA_SANDBOX` is only ever
+        # one of them — it decides where a BARE relative path lands — and this is
+        # the rest of the allow-list. Without it the human's routes confine a
+        # session to two projects and the agent is quietly confined to one, and
+        # the asymmetry shows up as a tool write outside the folder the user
+        # opened. Delimited by the path separator rather than a comma because
+        # Windows paths contain commas legally.
+        _doc_env["ARIA_ROOTS"] = ";".join(str(p) for p in extra_roots if p)
+    # Which run this child belongs to. A fetched page is filed into Documents
+    # with its provenance, and without the session id the library can say a row
+    # came from the web but not which run pulled it — so a later "what did we
+    # find for this question" has nothing to group by.
+    if session_id:
+        _doc_env["ARIA_SESSION"] = str(session_id)[:80]
+    # Which STUDIO SESSION this child's browser belongs to — not which run.
+    # A browser that dies with the run cannot hold a login, so the persistent
+    # context in `browser_session.py` is keyed on this instead of on
+    # `ARIA_SESSION`, which is now per-run so that one run's cost is readable.
+    if browser_sid:
+        _doc_env["ARIA_BROWSER_SID"] = str(browser_sid)[:80]
     last_reply: dict = {}
+    # Affinity, decided here so the chat and code-agent paths get it without
+    # each having to remember to ask. Inside a DAG node the executor already
+    # bound the more specific "<session>:<node>" id, and that wins — deriving
+    # `agent:session` there would collapse a run's nodes into one cache group
+    # and pin them all to a single provider, which is the opposite of the
+    # spread-across-the-key-pool behaviour the authoring batch cap relied on.
+    # Outside a node there is no finer scope than the conversation, so
+    # `agent:session` is the right group: a chat thread's history is a growing
+    # prefix over the same system turn, which is the best cache case here.
+    route_affinity = route_affinity or _context_node_affinity() or (
+        f"{agent}:{session_id}" if session_id else None)
+    # Explicit system-prompt caching, decided here rather than by the caller.
+    # `cache_system` asks the gateway to mint a cached-content resource for this
+    # node's system turn. Minting costs a call and storage, so it only pays when
+    # the SAME prompt is sent again — and a tool loop is by construction that
+    # case: the skill contract plus the tool grants are re-sent on every hop
+    # while only the tail grows. `max_hops=1` is the one shape where it cannot
+    # pay back, so it is excluded. An explicit True/False from the caller wins.
+    if cache_system is None:
+        cache_system = bool(tools_payload) and max_hops != 1
     # The tool loop's answer, kept OUTSIDE the client's async-with blocks.
     # Closing an anyio task group (the stdio session) can raise after the loop
     # has already produced its result; see the except clause below.
@@ -801,7 +1111,9 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                         messages=messages, tools=tools_payload,
                         agent=agent, session_id=session_id,
                         provider_pin=provider_pin, model=model,
-                        max_tokens=max_tokens, temperature=temperature)
+                        max_tokens=max_tokens, temperature=temperature,
+                        route_affinity=route_affinity,
+                        cache_system=cache_system)
 
                 async def _dispatch(name: str, args: dict) -> str:
                     # Some tools are handled by the CALLER rather than the MCP
@@ -834,7 +1146,14 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                             messages=messages, tools=tools_payload,
                             agent=agent, session=session_id,
                             provider=provider_pin, model=model,
-                            max_tokens=max_tokens, temperature=temperature):
+                            max_tokens=max_tokens, temperature=temperature,
+                            # The streamed branch is the same loop's hops, so it
+                            # must carry the same affinity. Without it the code
+                            # agent — the longest, most repetitive prompt in the
+                            # system, and the one path that always streams —
+                            # would keep bouncing across providers and cache on
+                            # none of them.
+                            route_affinity=route_affinity):
                         kind = ev.get("type")
                         if kind == "text":
                             chunk = ev.get("text") or ""
@@ -880,7 +1199,9 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                     allowed_tools=allowed_tools,
                     max_context_chars=max_context_chars,
                     max_tool_result_chars=max_tool_result_chars,
-                    capture_transcript=capture_transcript)
+                    capture_transcript=capture_transcript,
+                    max_seconds=max_seconds,
+                    max_total_tokens=max_total_tokens)
     except McpUnavailable:
         raise
     except BaseException as e:
@@ -916,34 +1237,28 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
 
 
 async def _gateway_chat(*, messages, tools, agent, session_id, provider_pin,
-                        model=None, max_tokens, temperature) -> dict:
+                        model=None, max_tokens, temperature,
+                        route_affinity=None, cache_system=None) -> dict:
     import asyncio as _a
+    # Every hop of one node carries the same `route_affinity`, so the gateway
+    # keeps the node on the provider it first chose instead of re-picking by
+    # load. Provider caches are per provider, so a node that bounced between
+    # providers paid its full (large, tool-heavy) prompt again on every hop.
+    # `cache_system` is the caller's call, not this function's: explicit
+    # caching costs a mint on the first call, so only a caller that KNOWS it
+    # will make several hops should ask for it.
+    _kw = dict(messages=messages, tools=tools, tool_choice="auto",
+               agent=agent, session=session_id, provider=provider_pin,
+               model=model, max_tokens=max_tokens, temperature=temperature,
+               route_affinity=route_affinity)
+    if cache_system:
+        _kw["cache_system"] = True
+
+    def _go():
+        return LLM().chat(**_kw)
+
     # Python 3.8 compat: asyncio.to_thread was added in 3.9.
     if hasattr(_a, "to_thread"):
-        return await _a.to_thread(
-            LLM().chat,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            agent=agent,
-            session=session_id,
-            provider=provider_pin,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        return await _a.to_thread(_go)
     loop = _a.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: LLM().chat(
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            agent=agent,
-            session=session_id,
-            provider=provider_pin,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        ),
-    )
+    return await loop.run_in_executor(None, _go)

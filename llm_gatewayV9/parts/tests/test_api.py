@@ -284,3 +284,25 @@ async def test_the_cap_reads_in_chunks_rather_than_asking_for_everything():
     await _read_capped(Chunky(b"x" * 40), 100)
     assert seen == [1 << 20] * 2
     assert 40 not in seen
+
+def test_weld_only_analysis_does_not_report_the_stl_duplicate_vertices_as_a_defect(client):
+    """Binary STL is non-indexed. Measuring it raw makes a good export look
+    unusable; weld_only normalises the format artefact before measuring."""
+    from parts.export import to_binary_stl
+    from parts.mesh import Mesh
+    from parts.tests import primitives as prim
+    v, f = prim.cube()
+    binary = to_binary_stl(Mesh.create(v, f, source_format="stl"))
+    raw = client.post("/v1/parts/analyse",
+                      files=upload("cube.stl", binary),
+                      params={"repair": "false", "weld_only": "false"}).json()
+    welded = client.post("/v1/parts/analyse",
+                         files=upload("cube.stl", binary),
+                         params={"repair": "false", "weld_only": "true"}).json()
+    raw_codes = {i["code"] for i in raw.get("issues") or []}
+    welded_codes = {i["code"] for i in welded.get("issues") or []}
+    assert "not_watertight" in raw_codes
+    assert "not_watertight" not in welded_codes
+    assert welded["verdict"]["status"] in ("ok", "warn")
+    assert any(s.get("name") == "weld_vertices"
+               for s in (welded.get("repair") or {}).get("steps") or [])

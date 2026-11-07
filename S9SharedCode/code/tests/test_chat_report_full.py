@@ -261,7 +261,13 @@ class _Resp:
 
 
 class _Recorder:
-    """Stands in for httpx.AsyncClient; keeps every post for assertions."""
+    """Stands in for httpx.AsyncClient; keeps every post for assertions.
+
+    `post` takes `**kw` because the gateway clients are pooled now, so
+    authorization travels on the request rather than on the client. Real httpx
+    accepts `headers=` either way; a fake that refused it turned a correct
+    production call into "the Documents store is unreachable: TypeError".
+    """
 
     posts: list = []
 
@@ -274,7 +280,7 @@ class _Recorder:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, json=None, files=None):  # noqa: A002
+    async def post(self, url, json=None, files=None, **kw):  # noqa: A002
         _Recorder.posts.append({"url": url, "json": json, "files": files})
         if url.endswith("/v1/documents"):
             return _Resp(200, {"ok": True, "document": {"id": "doc-77"}})
@@ -340,7 +346,7 @@ def test_send_channel_message_names_a_source_it_cannot_find(wired):
 
 def test_send_channel_message_reports_a_pending_approval(wired, monkeypatch):
     class _Pending(_Recorder):
-        async def post(self, url, json=None, files=None):  # noqa: A002
+        async def post(self, url, json=None, files=None, **kw):  # noqa: A002
             return _Resp(200, {"ok": False, "status": "pending"})
 
     monkeypatch.setattr(httpx, "AsyncClient", _Pending)
@@ -473,7 +479,7 @@ def test_save_to_documents_needs_an_exact_enough_name(wired_save):
 
 def test_save_to_documents_reports_a_store_refusal(wired_save, monkeypatch):
     class _Refusing(_Recorder):
-        async def post(self, url, json=None, files=None):  # noqa: A002
+        async def post(self, url, json=None, files=None, **kw):  # noqa: A002
             return _Resp(400, {"error": "unsupported format"})
 
     monkeypatch.setattr(httpx, "AsyncClient", _Refusing)

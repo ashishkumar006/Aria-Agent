@@ -16,9 +16,27 @@ exercise the real behaviour, including the rejection paths.
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 TEST_TOKEN = "test-gateway-token"
 os.environ["GATEWAY_V9_TOKEN"] = TEST_TOKEN
+
+# ── state isolation ───────────────────────────────────────────────────────
+# Both seams already exist in production code (`memory_api._state_dir` reads
+# GATEWAY_MEMORY_STATE, `documents.registry.UPLOAD_DIR` reads DOCUMENT_STORE);
+# the suite simply had never set them, so `_state_dir()` fell back to the real
+# `llm_gatewayV9/state` and every in-process test that wrote a document chunk
+# wrote it into the user's live library. Observed 2026-11-04: a full suite run
+# left 21 orphan records — fixture documents titled "Title" and "First section"
+# — with chunks in the retrieval plane and no registry row to own or delete
+# them, so they can only ever answer as phantom sources.
+#
+# Set before the app modules import, because `UPLOAD_DIR` is read at import
+# time. `setdefault`, so a developer can still point the suite somewhere else.
+_SUITE_STATE = Path(tempfile.gettempdir()) / f"aria-gw-suite-{os.getpid()}"
+os.environ.setdefault("GATEWAY_MEMORY_STATE", str(_SUITE_STATE / "memory"))
+os.environ.setdefault("DOCUMENT_STORE", str(_SUITE_STATE / "documents"))
 
 import httpx  # noqa: E402
 import pytest  # noqa: E402

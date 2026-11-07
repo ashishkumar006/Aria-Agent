@@ -38,6 +38,14 @@ _OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 _lock = threading.Lock()
 _stop = threading.Event()
 _worker_thread: threading.Thread | None = None
+# Set by agent_server at startup. A2UI refreshes need the model/tool loop,
+# which lives in the agent process; apps.py owns the schedule and storage.
+_a2ui_refresher = None
+
+
+def set_a2ui_refresher(fn) -> None:
+    global _a2ui_refresher
+    _a2ui_refresher = fn
 
 
 # â”€â”€ specs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -53,8 +61,8 @@ def validate_spec(raw: dict) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("spec must be a JSON object")
     kind = (raw.get("kind") or "").strip()
-    if kind not in ("openrouter_free", "json_feed"):
-        raise ValueError("kind must be 'openrouter_free' or 'json_feed'")
+    if kind not in ("openrouter_free", "json_feed", "a2ui"):
+        raise ValueError("kind must be 'openrouter_free', 'json_feed' or 'a2ui'")
     name = (raw.get("name") or "").strip()
     if not name:
         raise ValueError("name required")
@@ -77,6 +85,41 @@ def validate_spec(raw: dict) -> dict:
             _secs = int(_im.group(1)) * {"s": 1, "m": 60, "h": 3600}[_im.group(2) or "m"]
             if _secs < 60:
                 raise ValueError("app schedule interval must be >= 60s")
+    if kind == "a2ui":
+        """Agent-authored app: a validated A2UI surface + optional refresh
+        instructions. It stores no feed URL and no field allowlist; the
+        surface is the app, and a scheduled refresh rebuilds it."""
+        raw_surface = raw.get("surface")
+        if not isinstance(raw_surface, dict):
+            raise ValueError("surface is required for an a2ui app")
+        surface = dict(raw_surface)
+        surface.setdefault("catalogId", "aria/catalog/v1")
+        surface.setdefault("surfaceId", "app")
+        try:
+            import a2ui_catalog as _catalog
+            surface = _catalog.validate_surface(surface)
+        except Exception as e:
+            raise ValueError(f"surface rejected: {e}") from None
+        state = raw.get("state") or {}
+        if not isinstance(state, dict):
+            raise ValueError("state must be an object")
+        try:
+            state_json = json.dumps(state)
+        except (TypeError, ValueError):
+            raise ValueError("state is not JSON-serialisable") from None
+        if len(state_json.encode("utf-8")) > 64 * 1024:
+            raise ValueError("state is larger than 64 KB")
+        return {
+            "id": app_id,
+            "name": name[:80],
+            "kind": "a2ui",
+            "schedule": schedule,
+            "description": str(raw.get("description") or "")[:1000],
+            "refresh_prompt": str(raw.get("refresh_prompt") or "")[:4000],
+            "surface": surface,
+            "state": state,
+            "history": max(1, min(int(raw.get("history") or 30), 200)),
+        }
     spec: dict = {
         "id": app_id,
         "name": name[:80],
@@ -368,6 +411,87 @@ def _fetch_items(spec: dict) -> list[dict]:
     return items
 
 
+def _refresh_a2ui_app(spec: dict) -> dict:
+    now = time.time()
+    prev = _read_json(_data_path(spec["id"]), {}) or {}
+    hist = prev.get("history", []) or []
+    try:
+        if _a2ui_refresher is None:
+            raise RuntimeError("app builder is not connected")
+        result = _a2ui_refresher(spec)
+        if not isinstance(result, dict):
+            raise ValueError("app builder returned no update")
+        import a2ui_catalog as _catalog
+        surface = _catalog.validate_surface(result.get("surface") or {})
+        state = result.get("state") or {}
+        if not isinstance(state, dict):
+            raise ValueError("app state must be an object")
+        with _lock:
+            cur = get_spec(spec["id"]) or spec
+            cur["surface"] = surface
+            cur["state"] = state
+            cur["updated"] = now
+            try:
+                cur["next_refresh"] = _next_fire(cur.get("schedule", "manual"), now)
+            except Exception:
+                cur["next_refresh"] = None
+            _write_json(_spec_path(spec["id"]), cur)
+        hist.append({"ts": now, "count": 0, "added": [], "removed": []})
+        hist = hist[-max(1, int(spec.get("history") or 30)):]
+        payload = {"refreshed_at": now, "items": [], "count": 0,
+                   "added": [], "removed": [], "error": None,
+                   "state": state, "history": hist}
+    except Exception as e:
+        payload = {"refreshed_at": now,
+                   "items": prev.get("items", []),
+                   "count": prev.get("count", 0),
+                   "added": [], "removed": [],
+                   "error": f"{type(e).__name__}: {e}"[:300],
+                   "state": prev.get("state", {}),
+                   "history": hist}
+        with _lock:
+            cur = get_spec(spec["id"]) or spec
+            try:
+                cur["next_refresh"] = _next_fire(cur.get("schedule", "manual"), now)
+            except Exception:
+                cur["next_refresh"] = None
+            cur["updated"] = now
+            _write_json(_spec_path(spec["id"]), cur)
+    with _lock:
+        _write_json(_data_path(spec["id"]), payload)
+    return {"id": spec["id"], "count": payload["count"],
+            "added": 0, "removed": 0, "error": payload["error"],
+            "refreshed_at": payload["refreshed_at"]}
+
+
+def save_a2ui_surface(app_id: str, surface: dict, state: dict | None = None,
+                      event: dict | None = None) -> dict | None:
+    """Persist the result of an app interaction. The surface is validated
+    against the closed catalog again at this boundary; the model is never
+    trusted just because it was trusted one call earlier."""
+    import a2ui_catalog as _catalog
+    try:
+        clean = _catalog.validate_surface(surface)
+    except Exception as e:
+        raise ValueError(f"surface rejected: {e}") from None
+    state = state if isinstance(state, dict) else {}
+    with _lock:
+        spec = get_spec(app_id)
+        if spec is None or spec.get("kind") != "a2ui":
+            return None
+        now = time.time()
+        spec["surface"] = clean
+        spec["state"] = state
+        spec["updated"] = now
+        _write_json(_spec_path(app_id), spec)
+        data = _read_json(_data_path(app_id), {}) or {}
+        data.update({"state": state, "refreshed_at": now})
+        if event is not None:
+            data["last_event"] = event
+        _write_json(_data_path(app_id), data)
+        return spec
+
+
 def refresh_app(app_id: str) -> dict:
     """Run one refresh now. Returns a summary; persists snapshot + history.
     Failures are recorded in the data file, never raised out of the worker
@@ -375,6 +499,8 @@ def refresh_app(app_id: str) -> dict:
     spec = get_spec(app_id)
     if spec is None:
         raise ValueError(f"unknown app '{app_id}'")
+    if spec.get("kind") == "a2ui":
+        return _refresh_a2ui_app(spec)
     now = time.time()
     prev = _read_json(_data_path(app_id), {}) or {}
     prev_ids = {str(i.get(spec.get("id_field") or "id")) for i in prev.get("items", [])
@@ -416,6 +542,7 @@ def refresh_app(app_id: str) -> dict:
 def app_status(spec: dict) -> dict:
     data = _read_json(_data_path(spec["id"]), {}) or {}
     return {"id": spec["id"], "name": spec["name"], "kind": spec["kind"],
+            "description": spec.get("description", ""),
             "schedule": spec.get("schedule", "manual"),
             "next_refresh": spec.get("next_refresh"),
             "refreshed_at": data.get("refreshed_at"),
@@ -434,6 +561,10 @@ def get_app(app_id: str) -> dict | None:
         return None
     data = _read_json(_data_path(app_id), {}) or {}
     return {**app_status(spec), "spec": spec,
+            "surface": spec.get("surface") if spec.get("kind") == "a2ui" else None,
+            "state": data.get("state", spec.get("state", {}))
+            if spec.get("kind") == "a2ui" else None,
+            "last_event": data.get("last_event"),
             "items": data.get("items", []),
             "added_items": data.get("added", []),
             "removed_ids": data.get("removed", []),

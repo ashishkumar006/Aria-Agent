@@ -1,0 +1,105 @@
+/* pdf.js page rendering. The text layer and highlight overlay are built with
+   direct DOM calls (a page holds hundreds of fragments), so their styles live
+   here rather than in Tailwind class strings React never applies. */
+
+.pdfv-scroll {
+  position: relative;
+  overflow: auto;
+  background: #0b0b0f;
+  scrollbar-gutter: stable;
+}
+
+.pdfv-block {
+  position: relative;
+  margin: 0 auto 10px;
+  min-height: 120px;
+}
+
+.pdfv-page {
+  position: relative;
+  background: #fff;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, .55);
+}
+
+.pdfv-page.paged {
+  outline: 1px solid rgba(255, 255, 255, .07);
+}
+
+.pdfv-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Invisible words sitting exactly over the drawn glyphs: this is what makes
+   the page selectable, searchable and — the reason it exists — matchable
+   against a quote Aria just copied out of it. */
+.pdfv-text {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  color: transparent;
+  -webkit-user-select: text;
+  user-select: text;
+  transform-origin: 0 0;
+}
+
+.pdfv-text span {
+  position: absolute;
+  white-space: pre;
+  color: transparent;
+  cursor: text;
+  transform-origin: 0 0;
+  font-synthesis: none;
+}
+
+.pdfv-text ::selection {
+  background: rgba(124, 158, 255, .38);
+}
+
+.pdfv-text ::-moz-selection {
+  background: rgba(124, 158, 255, .38);
+}
+
+/* The citation overlay. `pointer-events: none` so it never eats a click or a
+   text selection on the words underneath it. */
+.pdfv-hl {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.pdfv-hl i {
+  position: absolute;
+  border-radius: 2px;
+  background: rgba(250, 204, 21, .32);
+  mix-blend-mode: multiply;
+}
+
+.pdfv-hl i.soft {
+  background: rgba(250, 204, 21, .18);
+}
+
+.pdfv-hl i.focus {
+  background: rgba(250, 204, 21, .48);
+  animation: pdfv-focus 1.5s ease-out 1;
+}
+
+@keyframes pdfv-focus {
+  0%   { box-shadow: 0 0 0 2px rgba(250, 204, 21, .95); }
+  100% { box-shadow: 0 0 0 9px rgba(250, 204, 21, 0); }
+}
+
+.pdfv-num {
+  font-size: 10px;
+  color: #52525b;
+  text-align: right;
+  margin: 0 auto 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pdfv-num b {
+  color: #facc15;
+  font-weight: 700;
+}

@@ -51,6 +51,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _enable_when_ready(row: dict) -> None:
+    """Honour the auto-enable intent on a row that has just reached READY.
+
+    Two places drive a document to READY — `set_status`, and `mark_embedded`
+    when the last batch lands — so the rule lives in one helper both call.
+    Putting it in only one of them is how an "auto-enable" document stays off:
+    the normal indexing path never calls `set_status(READY)` at all.
+
+    The partial-embed guard is the reason enable was manual in the first place:
+    a document with 17 of 50 chunks embedded answers questions in pieces and
+    reports nothing, so intent alone is not enough.
+
+    `is False`, not falsy: a row written before this field existed has no key at
+    all, and absence means "nobody ever declined" — the truth for every document
+    already in the library when this landed. Reading a missing key as
+    `not auto_enable` is what kept 21 finished, embedded documents switched off
+    with no switch anyone had touched."""
+    if str(row.get("status") or "") != READY or row.get("auto_enable") is False:
+        return
+    chunks = int(row.get("chunk_count") or 0)
+    done = int(row.get("embedded_count") or 0)
+    if chunks == 0 or done >= chunks:
+        row["enabled"] = True
+
+
 @dataclass
 class Document:
     id: str
@@ -73,6 +98,32 @@ class Document:
     # "unknown/legacy" and forces a re-index.
     index_version: int = 0
     title: str = ""
+    # Empty means the virtual "unfiled" bucket shown as the root of the
+    # Documents tree. A document can be moved between folders without
+    # re-indexing: chunks are keyed by the stable document id.
+    folder_id: str = ""
+    # Where this document came from, so the agent and the user can tell a
+    # generated report from a hand-uploaded file: "upload", "authoring",
+    # "research", "chat", "web", "telegram", "persona". "" is treated as
+    # "upload" — the pre-provenance rows in an existing registry.
+    origin: str = ""
+    # The thing it came from: an artifact handle (`art:...`), a URL, or a
+    # document it was derived from. This is the link that lets the agent go
+    # from a produced document back to the stored bytes, instead of
+    # re-fetching the web or re-rendering the file.
+    origin_ref: str = ""
+    session_id: str = ""
+    # A new document joins retrieval as soon as it is fully embedded. The
+    # switch is deliberately not "at upload": enabling a half-embedded
+    # document answers questions partially and reports nothing, so the intent
+    # is recorded here and honoured by `set_status` when READY arrives.
+    auto_enable: bool = True
+    # Content hash of the stored bytes. Artifacts are content-addressed and the
+    # agent re-derives the same file repeatedly — a re-render, a re-fetch, the
+    # same finding spilled from two runs — and each upload used to create
+    # another document with another copy of every chunk. Retrieval then answers
+    # the same source twice, and the library grows rows nobody asked for.
+    sha256: str = ""
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -92,6 +143,31 @@ class Document:
         return d
 
 
+@dataclass
+class Folder:
+    """A logical document folder. parent_id="" is a top-level folder.
+
+    Folders are metadata only: a document's chunks never depend on them, so
+    moving a file between folders costs one registry write, not a re-index.
+    """
+
+    id: str
+    name: str
+    parent_id: str = ""
+    # A system folder is one Aria files its own output into (Authoring,
+    # Research, Web sources...). It is created on demand and recreated if
+    # deleted, so marking it is about telling the user "this one is ours",
+    # not about protecting it.
+    system: bool = False
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+FOLDER_MAX_DEPTH = 5
+
+
 class Registry:
     """Thread-safe, atomically persisted document table."""
 
@@ -99,6 +175,7 @@ class Registry:
         self.root = Path(root or UPLOAD_DIR)
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "documents.json"
+        self.folders_path = self.root / "folders.json"
         self._lock = threading.RLock()
 
     # ── persistence ─────────────────────────────────────────────────────────
@@ -119,8 +196,7 @@ class Registry:
                 pass
             return []
 
-    def _save(self, docs: list[dict]) -> None:
-        payload = json.dumps(docs, indent=2)
+    def _write_json(self, path: Path, payload: str) -> None:
         # On Windows the atomic replace is racy: any reader
         # holding the destination open — even for
         # microseconds — turns `os.replace` into
@@ -130,28 +206,75 @@ class Registry:
         # never clobber another writer's in-flight file.
         last: Exception | None = None
         for attempt in range(5):
-            tmp = self.path.with_name(
-                f"{self.path.stem}.{os.getpid()}.{attempt}.tmp")
+            tmp = path.with_name(
+                f"{path.stem}.{os.getpid()}.{attempt}.tmp")
             try:
                 tmp.write_text(payload, encoding="utf-8")
-                os.replace(tmp, self.path)
+                os.replace(tmp, path)
                 return
             except OSError as e:
                 last = e
                 time.sleep(0.05 * (attempt + 1))
         raise last
 
+    def _save(self, docs: list[dict]) -> None:
+        self._write_json(self.path, json.dumps(docs, indent=2))
+
+    def _load_folders(self) -> list[dict]:
+        if not self.folders_path.exists():
+            return []
+        try:
+            data = json.loads(self.folders_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            try:
+                (self.root / "folders.corrupt.json").write_text(
+                    self.folders_path.read_text(encoding="utf-8",
+                                                errors="replace"),
+                    encoding="utf-8")
+            except Exception:
+                pass
+            return []
+
+    def _save_folders(self, folders: list[dict]) -> None:
+        self._write_json(self.folders_path, json.dumps(folders, indent=2))
+
     # ── CRUD ────────────────────────────────────────────────────────────────
     def add(self, *, filename: str, doc_type: str, size_bytes: int,
-            title: str = "") -> Document:
+            title: str = "", folder_id: str = "", origin: str = "",
+            origin_ref: str = "", session_id: str = "",
+            auto_enable: bool = True, sha256: str = "") -> Document:
+        if folder_id and not self.folder_exists(folder_id):
+            raise ValueError("folder not found")
         doc = Document(id=f"doc-{uuid.uuid4().hex[:10]}",
                        filename=filename, doc_type=doc_type,
-                       size_bytes=size_bytes, title=title or filename)
+                       size_bytes=size_bytes, title=title or filename,
+                       folder_id=folder_id or "",
+                       origin=origin or "upload",
+                       origin_ref=origin_ref or "",
+                       session_id=session_id or "",
+                       auto_enable=bool(auto_enable),
+                       sha256=str(sha256 or ""))
         with self._lock:
             docs = self._load()
             docs.append(asdict(doc))
             self._save(docs)
         return doc
+
+    def find_by_sha(self, sha256: str) -> Document | None:
+        """The live document already holding these exact bytes, if any.
+
+        A FAILED row is not an answer: that upload did not produce chunks, and
+        the caller is trying again on purpose.
+        """
+        want = str(sha256 or "")
+        if not want:
+            return None
+        with self._lock:
+            for d in self._load():
+                if str(d.get("sha256") or "") == want and d.get("status") != FAILED:
+                    return Document(**_known(d, Document))
+        return None
 
     def get(self, doc_id: str) -> Document | None:
         with self._lock:
@@ -193,6 +316,12 @@ class Registry:
                     if d.get("id") == doc_id:
                         if status == READY:
                             d["error"] = ""
+                            # The helper reads the row's own status, and
+                            # `update()` below writes it again — set it here so
+                            # the enable decision sees the state it is deciding
+                            # for.
+                            d["status"] = READY
+                            _enable_when_ready(d)
                         else:
                             d["enabled"] = False
                 self._save(docs)
@@ -212,7 +341,43 @@ class Registry:
             if doc.chunk_count and doc.embedded_count < doc.chunk_count:
                 return doc, ("cannot enable a partially embedded document "
                               f"({doc.embedded_count}/{doc.chunk_count} chunks)")
-        return self.update(doc_id, enabled=enabled), ""
+        else:
+            # Switching a document off is a decision about that document, not
+            # a temporary state: the auto-enable intent has to go with it, or
+            # the next re-index would turn it back on against the user's wish.
+            return self.update(doc_id, enabled=False, auto_enable=False), ""
+        return self.update(doc_id, enabled=enabled, auto_enable=True), ""
+
+    def auto_enable_ready(self) -> int:
+        """Switch on every completed document that was never switched off.
+
+        Auto-enable is decided at READY, so a document that finished indexing
+        BEFORE the rule existed stays off forever — and the library then looks
+        like a pile of files the agent cannot see, which is the complaint this
+        replaces. This is the backfill for those rows: `enabled` follows the
+        same rule `_enable_when_ready` applies to a fresh one, and a document
+        the user turned off deliberately is skipped, because turning one off
+        also clears its `auto_enable` intent.
+
+        Returns how many rows were switched on.
+        """
+        with self._lock:
+            docs = self._load()
+            changed = 0
+            for d in docs:
+                if d.get("enabled") or d.get("auto_enable") is False:
+                    continue
+                before = d.get("enabled")
+                _enable_when_ready(d)
+                if d.get("enabled") and d.get("enabled") != before:
+                    # Record the intent the row was missing, so the ambiguity
+                    # cannot be inherited: from here a switch-off writes False
+                    # and means it.
+                    d["auto_enable"] = True
+                    changed += 1
+            if changed:
+                self._save(docs)
+            return changed
 
     def mark_embedded(self, doc_id: str, indices: list[int],
                       model: str = "", dim: int = 0) -> Document | None:
@@ -235,6 +400,10 @@ class Registry:
                         d["embedded_count"] >= d["chunk_count"]):
                     d["status"] = READY
                     d["error"] = ""
+                    # This is the path a normal index actually reaches READY
+                    # through, so the auto-enable decision has to be here as
+                    # well as in `set_status`.
+                    _enable_when_ready(d)
                 self._save(docs)
                 return Document(**_known(d, Document))
         return None
@@ -260,6 +429,179 @@ class Registry:
         except Exception:
             pass
         return True
+
+    # ── folders ─────────────────────────────────────────────────────────────
+    def list_folders(self) -> list[Folder]:
+        with self._lock:
+            return [Folder(**_known(d, Folder)) for d in self._load_folders()]
+
+    def folder_exists(self, folder_id: str) -> bool:
+        if not folder_id:
+            return False
+        with self._lock:
+            return any(f.get("id") == folder_id for f in self._load_folders())
+
+    def _folder_depth(self, folders: list[dict], parent_id: str) -> int:
+        depth = 0
+        seen: set[str] = set()
+        current = parent_id
+        while current:
+            if current in seen:
+                raise ValueError("folder tree contains a cycle")
+            seen.add(current)
+            row = next((f for f in folders if f.get("id") == current), None)
+            if row is None:
+                raise ValueError("parent folder not found")
+            depth += 1
+            current = str(row.get("parent_id") or "")
+        return depth
+
+    def folder_path(self, folder_id: str) -> str:
+        with self._lock:
+            folders = self._load_folders()
+            names: list[str] = []
+            seen: set[str] = set()
+            current = folder_id
+            while current:
+                if current in seen:
+                    break
+                seen.add(current)
+                row = next((f for f in folders if f.get("id") == current), None)
+                if row is None:
+                    break
+                names.append(str(row.get("name") or ""))
+                current = str(row.get("parent_id") or "")
+            return " / ".join(reversed([n for n in names if n]))
+
+    def create_folder(self, name: str, parent_id: str = "") -> Folder:
+        clean = self._clean_folder_name(name)
+        parent_id = str(parent_id or "")
+        with self._lock:
+            folders = self._load_folders()
+            if parent_id and not any(f.get("id") == parent_id for f in folders):
+                raise ValueError("parent folder not found")
+            if parent_id and self._folder_depth(folders, parent_id) >= FOLDER_MAX_DEPTH:
+                raise ValueError(f"folders can be nested at most {FOLDER_MAX_DEPTH} deep")
+            if any((f.get("parent_id") or "") == parent_id
+                   and str(f.get("name") or "").casefold() == clean.casefold()
+                   for f in folders):
+                raise ValueError("a folder with that name already exists here")
+            folder = Folder(id=f"folder-{uuid.uuid4().hex[:10]}", name=clean,
+                            parent_id=parent_id)
+            folders.append(asdict(folder))
+            self._save_folders(folders)
+        return folder
+
+    def ensure_folder(self, name: str, *, system: bool = False) -> Folder:
+        """The top-level folder called `name`, created on first use.
+
+        Generated documents are filed by the section that made them, so the
+        agent can tell a research report from a user's upload without reading
+        either. Idempotent by name, and a folder the user deleted is simply
+        recreated the next time something needs it."""
+        clean = self._clean_folder_name(name)
+        with self._lock:
+            folders = self._load_folders()
+            for f in folders:
+                if (str(f.get("parent_id") or "") == ""
+                        and str(f.get("name") or "").casefold() == clean.casefold()):
+                    return Folder(**_known(f, Folder))
+            folder = Folder(id=f"folder-{uuid.uuid4().hex[:10]}", name=clean,
+                            system=bool(system))
+            folders.append(asdict(folder))
+            self._save_folders(folders)
+        return folder
+
+    def rename_folder(self, folder_id: str, name: str) -> Folder:
+        clean = self._clean_folder_name(name)
+        with self._lock:
+            folders = self._load_folders()
+            row = next((f for f in folders if f.get("id") == folder_id), None)
+            if row is None:
+                raise ValueError("folder not found")
+            parent = str(row.get("parent_id") or "")
+            if any(f.get("id") != folder_id
+                   and (f.get("parent_id") or "") == parent
+                   and str(f.get("name") or "").casefold() == clean.casefold()
+                   for f in folders):
+                raise ValueError("a folder with that name already exists here")
+            row["name"] = clean
+            self._save_folders(folders)
+            return Folder(**_known(row, Folder))
+
+    def delete_folder(self, folder_id: str) -> bool:
+        """Delete an EMPTY folder. Moving/deleting its contents is explicit:
+        silently cascading into documents would destroy indexed chunks and
+        source bytes from one click on a tree row."""
+        with self._lock:
+            folders = self._load_folders()
+            if not any(f.get("id") == folder_id for f in folders):
+                return False
+            if any(str(f.get("parent_id") or "") == folder_id for f in folders):
+                raise ValueError("folder has subfolders; delete or move them first")
+            if any(str(d.get("folder_id") or "") == folder_id for d in self._load()):
+                raise ValueError("folder contains documents; move or delete them first")
+            self._save_folders([f for f in folders if f.get("id") != folder_id])
+        return True
+
+    def move_document(self, doc_id: str, folder_id: str) -> Document | None:
+        folder_id = str(folder_id or "")
+        if folder_id and not self.folder_exists(folder_id):
+            raise ValueError("folder not found")
+        with self._lock:
+            docs = self._load()
+            for d in docs:
+                if d.get("id") == doc_id:
+                    d["folder_id"] = folder_id
+                    d["updated_at"] = _now()
+                    self._save(docs)
+                    return Document(**_known(d, Document))
+        return None
+
+    def folder_subtree(self, folder_id: str) -> set[str]:
+        """The folder and every descendant id, cycle-safe."""
+        with self._lock:
+            folders = self._load_folders()
+            children: dict[str, list[str]] = {}
+            for f in folders:
+                children.setdefault(str(f.get("parent_id") or ""), []).append(
+                    str(f.get("id") or ""))
+            out: set[str] = set()
+            stack = [folder_id] if folder_id else []
+            while stack:
+                current = stack.pop()
+                if not current or current in out:
+                    continue
+                out.add(current)
+                stack.extend(children.get(current, []))
+            return out
+
+    def document_ids_in_folders(self, folder_ids: set[str],
+                                enabled_only: bool = True) -> set[str]:
+        wanted: set[str] = set()
+        for fid in folder_ids:
+            wanted |= self.folder_subtree(fid)
+        with self._lock:
+            return {
+                str(d.get("id") or "") for d in self._load()
+                if str(d.get("folder_id") or "") in wanted
+                and (not enabled_only
+                     or (d.get("enabled") and d.get("status") == READY))
+                and d.get("id")
+            }
+
+    @staticmethod
+    def _clean_folder_name(name: str) -> str:
+        clean = " ".join(str(name or "").split())
+        if not clean:
+            raise ValueError("folder name is required")
+        if len(clean) > 80:
+            raise ValueError("folder name is too long (max 80)")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in clean):
+            raise ValueError("folder name contains control characters")
+        if "/" in clean or "\\" in clean:
+            raise ValueError("folder name cannot contain slashes")
+        return clean
 
     # ── uploaded bytes ──────────────────────────────────────────────────────
     def source_path(self, doc_id: str) -> Path | None:
@@ -416,6 +758,20 @@ class Indexer:
                                       f"could not parse the file: {e}")
             reg.update(doc_id, warnings=parsed.warnings)
             if not parsed.blocks:
+                if doc.doc_type == "image":
+                    # An image is a figure source, not a text source: having no
+                    # blocks is what it means to succeed. Marking it failed made
+                    # the upload impossible to enable, which put the figure out
+                    # of reach of the one writer that could place it.
+                    #
+                    # The version stamp is not decoration. The reconcile treats
+                    # an unversioned document as "indexed under an old parser"
+                    # and re-queues it, so a READY image with index_version 0
+                    # was reset to PENDING on every documents request and could
+                    # never be enabled — observed live the minute this landed.
+                    reg.update(doc_id, chunk_count=0, embedded_count=0,
+                               index_version=INDEX_FORMAT_VERSION)
+                    return reg.set_status(doc_id, READY)
                 return reg.set_status(
                     doc_id, FAILED,
                     "no readable text found" +

@@ -92,7 +92,7 @@ def test_writing_the_render_as_data_is_recovered_not_trusted():
         seen.update(kw)
         return {"ok": True, "artifact": "art:0123456789abcdef",
                 "filename": "r.pdf", "format": "pdf", "bytes": 10,
-                "blocks": 2, "stats": {"words": 20, "sections": 1,
+                "blocks": 2, "stats": {"words": 160, "sections": 1,
                                        "format": "pdf"}}
 
     skill = skills.SkillRegistry().get("author")
@@ -101,7 +101,7 @@ def test_writing_the_render_as_data_is_recovered_not_trusted():
         return {"text": json.dumps({"render_document": {
             "format": "pdf", "title": "T",
             "blocks": [{"type": "heading", "level": 1, "text": "H"},
-                       {"type": "paragraph", "text": "P"}]}}),
+                       {"type": "paragraph", "text": "P " * 160}]}}),
             "provider": "test", "tool_calls": []}
 
     orig_render, orig_run = mcp_server.render_document, mcp_runner.run_with_tools
@@ -304,3 +304,62 @@ def test_a_real_tool_call_overwrites_the_models_handle():
     assert result.output["produced"][0]["artifact"] == real
     # And the delivered stats ride along for the receipt.
     assert result.output["produced"][0]["stats"]["words"] == 2700
+
+def test_a_failed_summary_keeps_one_file_and_still_expands_it(monkeypatch):
+    """Live: the author rendered three drafts, then returned an empty
+    summary. All three near-identical PDFs reached the console and the
+    sectioned rewrite never ran, so a 3,000-word request shipped 1,725 words.
+    One file is kept (the last) and it is expanded like any other render."""
+    import asyncio
+    import mcp_runner
+    import skills
+
+    seen = {}
+
+    async def fake_reply(**kw):
+        cb = kw.get("on_outcome")
+        for art in ("art:1111111111111111", "art:2222222222222222",
+                    "art:3333333333333333"):
+            cb("render_document", {"format": "pdf", "title": "T",
+                                   "blocks": [{"type": "paragraph",
+                                               "text": "x " * 160}]},
+               True, json.dumps({"ok": True, "artifact": art,
+                                 "filename": art[-4:] + ".pdf",
+                                 "format": "pdf",
+                                 "stats": {"words": 400}}), 0.2)
+        return {"text": "", "provider": "test", "tool_calls": []}
+
+    async def fake_expand(skill, rendered, blocks, resolved, graph_nodes,
+                          query, session_id, parsed, fmt, forced, _f, cur,
+                          *, pre_rendered, figures=""):
+        seen["cur"] = cur["artifact"]
+        seen["figures"] = figures
+        return [{"artifact": "art:aaaaaaaaaaaaaaaa", "filename": "final.pdf",
+                 "format": "pdf", "bytes": 1, "stats": {"words": 3000}}]
+
+    skill = skills.SkillRegistry().get("author")
+    monkeypatch.setattr(mcp_runner, "run_with_tools", fake_reply)
+    monkeypatch.setattr(skills, "_expand_document_sections", fake_expand)
+    nodes = {"n:1": {"skill": "author", "inputs": {}, "status": "running"}}
+    result, _p = asyncio.run(skills.run_skill(
+        skill, "n:1", nodes, "s8-test", "make a pdf", None))
+
+    assert result.success is True, result.error
+    assert seen["cur"] == "art:3333333333333333", \
+        "the expansion did not run on the latest render"
+    assert len(result.output["produced"]) == 1, result.output
+    assert result.output["artifact"] == "art:aaaaaaaaaaaaaaaa"
+
+
+def test_the_author_retry_sends_the_complete_prompt_again():
+    """The empty-reply rescue used to shrink the INPUTS block to buy a reply,
+    which traded most of the research for one answer. It repeats the full
+    prompt instead; a document too big for a single call is handled by writing
+    it a section at a time."""
+    import inspect
+    import skills
+    assert not hasattr(skills, "_trim_prompt_inputs")
+    src = inspect.getsource(skills.run_skill)
+    assert "empty reply" in src
+    assert "_trim_prompt_inputs" not in src, (
+        "the retry is trimming evidence again")

@@ -149,21 +149,56 @@ def test_write_env_keys_removal(tmp_path, monkeypatch):
 
 
 def test_pool_members(monkeypatch):
+    """Pool size derives from how many key VALUES are in play, from either
+    source. `secret_vault` is now a real second source (startup scrubs the
+    provider keys out of `os.environ` and answers from memory), so clearing the
+    environment alone does not empty the pool - the assertion used to assume
+    env-only and passed only because no vault existed yet. Empty the vault too,
+    then restore it, so this still tests the counting rule and not the store."""
     import channels_api as C
-    for v in ["GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "GROQ_API_KEYS"]:
-        monkeypatch.delenv(v, raising=False)
-    assert C._pool_members("groq") == []
-    monkeypatch.setenv("GROQ_API_KEY", "a")
-    assert C._pool_members("groq") == ["groq"]
-    monkeypatch.setenv("GROQ_API_KEYS", "b")
-    assert C._pool_members("groq") == ["groq", "groq-2"]
-    monkeypatch.setenv("GEMINI_API_KEY", "a")
-    monkeypatch.setenv("GEMINI_API_KEYS", "b")
-    assert C._pool_members("gemini") == ["gemini", "gemini35lite", "gemini-2", "gemini35lite-2"]
-    assert C._pool_key_count("gemini") == 2
-    assert C._pool_key_count("groq") == 2
+    import secret_vault
+    vars_ = ["GEMINI_API_KEY", "GEMINI_API_KEYS", "GROQ_API_KEY", "GROQ_API_KEYS"]
+    saved = {v: secret_vault.value(v) for v in vars_}
+    monkeypatch.setattr(secret_vault, "_values",
+                        {k: v for k, v in dict(secret_vault._values).items()
+                         if k not in vars_})
+    try:
+        for v in vars_:
+            monkeypatch.delenv(v, raising=False)
+        assert C._pool_members("groq") == []
+        monkeypatch.setenv("GROQ_API_KEY", "a")
+        assert C._pool_members("groq") == ["groq"]
+        monkeypatch.setenv("GROQ_API_KEYS", "b")
+        assert C._pool_members("groq") == ["groq", "groq-2"]
+        monkeypatch.setenv("GEMINI_API_KEY", "a")
+        monkeypatch.setenv("GEMINI_API_KEYS", "b")
+        assert C._pool_members("gemini") == ["gemini", "gemini35lite", "gemini-2", "gemini35lite-2"]
+        assert C._pool_key_count("gemini") == 2
+        assert C._pool_key_count("groq") == 2
+        monkeypatch.delenv("GROQ_API_KEYS", raising=False)
+        assert C._pool_key_count("groq") == 1
+    finally:
+        secret_vault.remember(saved)
+
+
+def test_forget_drops_a_withdrawn_sibling(monkeypatch, tmp_path):
+    """Shrinking a pool to one key must remove the plural var from BOTH stores,
+    or the withdrawn credential still reads as present."""
+    import channels_api as C
+    import secret_vault
+    vars_ = ["GROQ_API_KEY", "GROQ_API_KEYS"]
+    saved = {v: secret_vault.value(v) for v in vars_}
+    monkeypatch.setattr(C, "_ENV_PATH", tmp_path / ".env")
     monkeypatch.delenv("GROQ_API_KEYS", raising=False)
-    assert C._pool_key_count("groq") == 1
+    try:
+        secret_vault.remember({"GROQ_API_KEY": "a", "GROQ_API_KEYS": "b"})
+        assert C._pool_members("groq") == ["groq", "groq-2"]
+        secret_vault.forget(("GROQ_API_KEYS",))
+        assert C._pool_members("groq") == ["groq"]
+        assert secret_vault.present("GROQ_API_KEYS") is False
+    finally:
+        secret_vault.remember(saved)
+        secret_vault.forget([v for v in vars_ if not saved.get(v)])
 
 
 def test_limits_and_expand():

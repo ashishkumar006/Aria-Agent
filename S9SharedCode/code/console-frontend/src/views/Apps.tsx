@@ -1,896 +1,468 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { LayoutGrid, Flag, Plus, ArrowLeft, RefreshCw, Trash2 } from 'lucide-react';
-import { Rail, TopBar, Empty, Stat, Pill, SkipLink } from '../components/ui';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  LayoutGrid, Loader2, Plus, RefreshCw, Sparkles, Trash2, X,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { Rail, TopBar, Empty, Pill, Skel, SkipLink } from '../components/ui';
 import { A2ui } from '../components/A2ui';
 import { useMainId, useActivePoll } from '../components/KeepAlive';
-import { api, CONF, type A2uiSurface, type FeedEvent, type FlagRow, type TrackerApp, type TrackerAppDetail, type FeedbackRollup, type McpStats } from '../api';
+import {
+  api, type A2uiSurface, type TrackerApp, type TrackerAppDetail,
+} from '../api';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
 const fmtTs = (ts: number | null | undefined) =>
-  !ts ? '—' : new Date(ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  !ts ? '—' : new Date(ts * 1000).toLocaleString([], {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
 
-type ItemView = 'table' | 'cards';
+function columnsOf(spec: Record<string, unknown>, items: Record<string, unknown>[]) {
+  const ui = (spec.ui || {}) as { columns?: { field: string; label: string }[] };
+  if (ui.columns?.length) return ui.columns;
+  const first = Object.keys(items[0] || {});
+  return (first.length ? first : ['id']).map((f) => ({ field: f, label: f }));
+}
 
-/** Per-app mini-UI config from the spec (with sane fallbacks for specs
- *  created before the ui block existed). */
-function uiConf(detail: TrackerAppDetail | null) {
-  const spec = (detail?.spec || {}) as Record<string, unknown>;
-  const ui = (spec.ui || {}) as { view?: string; columns?: { field: string; label: string }[]; sort?: string; highlight_new?: boolean };
-  const idField = (spec.id_field as string) || 'id';
-  const firstKeys = Object.keys(detail?.items?.[0] || {});
-  const columns = ui.columns?.length
-    ? ui.columns
-    : (firstKeys.length ? firstKeys : [idField]).map((f) => ({ field: f, label: f }));
-  return {
-    defaultView: (ui.view === 'cards' ? 'cards' : 'table') as ItemView,
-    columns,
-    sort: ui.sort || idField,
-    highlight: ui.highlight_new !== false,
-    idField,
-  };
+function cell(v: unknown): string {
+  if (v == null) return '—';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
 }
 
 export default function Apps() {
   const mainId = useMainId();
-  const [tiles, setTiles] = useState({ gw: false, sess: 0, jobs: 0, tools: '—', spend: '—' });
-  /* First paint. The tiles used to render their defaults as facts: "GATEWAY
-     down" in red and six zeroes while the board was still reading. */
+  const railMode = usePaneMode('apps.rail');
+  const [apps, setApps] = useState<TrackerApp[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [spend, setSpend] = useState<{ skill: string; dollars: number }[]>([]);
-  const [feed, setFeed] = useState<FeedEvent[]>([]);
-  const [flags, setFlags] = useState<FlagRow[]>([]);
-  const [prefab, setPrefab] = useState({ configured: false, live: false });
-  const [trackers, setTrackers] = useState<TrackerApp[]>([]);
+  const [loadError, setLoadError] = useState('');
   const [openId, setOpenId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TrackerAppDetail | null>(null);
-  const [detailErr, setDetailErr] = useState('');
-  const [itemFilter, setItemFilter] = useState('');
-  const [viewSel, setViewSel] = useState<'auto' | ItemView>('auto');
-  const [showPrefab, setShowPrefab] = useState(false);
-  const [showA2ui, setShowA2ui] = useState(false);
-  const [a2ui, setA2ui] = useState<{ surface: A2uiSurface; notes?: string[] } | null>(null);
-  const [a2uiErr, setA2uiErr] = useState('');
-  /* Live refresh progress, from the AG-UI stream. `steps` holds the phase names
-     currently open so the bar can be closed on STEP_FINISHED rather than left
-     spinning - the encoder had no step_finished at all, so a client had no way
-     to do this. */
-  const [steps, setSteps] = useState<string[]>([]);
-  const [stepNote, setStepNote] = useState('');
-  const refreshAbort = useRef<AbortController | null>(null);
-  const [showCreate, setShowCreate] = useState(false);
-  const [createErr, setCreateErr] = useState('');
-  const [form, setForm] = useState({ name: '', kind: 'openrouter_free', schedule: 'daily@09:00', url: '', items_path: 'data', id_field: 'id', match_field: '', match_equals: '', fields: 'id,name' });
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const [actionError, setActionError] = useState('');
   const [busy, setBusy] = useState(false);
-  // Monotonic guard for the detail panel; flag names currently mid-write.
+  const [itemFilter, setItemFilter] = useState('');
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState('');
+  const [createDescription, setCreateDescription] = useState('');
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState('');
+  /* A build runs on the server after the dialog closes. Keeping this outside
+     the modal is what lets the user switch sections while it works; the
+     keep-alive Apps view stays mounted and opens the app when it lands. */
+  const [building, setBuilding] = useState<{ name: string } | null>(null);
+  const [buildError, setBuildError] = useState('');
   const detailReq = useRef(0);
-  const flagBusy = useRef(new Set<string>());
-  // Distinguishes "the API is down" from "there is nothing to show". Nine
-  // parallel reads resolve independently, so track the board-level ones.
-  const [boardError, setBoardError] = useState('');
-  // A toggle that reverted because the write failed must say so; silently
-  // snapping back reads as the user's own mis-click.
-  const [toggleError, setToggleError] = useState('');
-  /* The two signals that were being collected and thrown away: thumbs
-     up/down per skill, and the fetch-cache hit rate behind research
-     latency. Both are here because they change what an operator does next. */
-  const [feedback, setFeedback] = useState<FeedbackRollup | null>(null);
-  const [mcp, setMcp] = useState<McpStats | null>(null);
+  const descriptionRef = useRef<HTMLTextAreaElement | null>(null);
 
   const load = useCallback(async () => {
-    const [h, sess, sch, tools, guard, sp, ev, fl, tr, fb, mst] = await Promise.all([
-      api.safe(api.health()),
-      api.safe(api.sessions(200)),
-      api.safe(api.scheduleList()),
-      api.safe(api.tools()),
-      api.safe(api.toolsGuard()),
-      api.safe(api.bySkill()),
-      api.safe(api.events(12)),
-      api.safe(api.flags()),
-      api.safe(api.trackerApps()),
-      api.safe(api.feedbackRollup(30, 3)),
-      api.safe(api.mcpStats()),
-    ]);
-    // If the three primary reads all failed, the board is down — not empty.
-    // (Individual tiles tolerate partial failure; the banner does not.)
-    if (!h && !sess && !tr) setBoardError('could not reach the agent (is it running on :8500?)');
-    else setBoardError('');
-    const gwUp = !!h && h.gateway_up !== false;
-    const nSess = sess ? (sess.sessions || []).length : 0;
-    const jl = sch?.schedules;
-    const jobs = jl ? (Array.isArray(jl) ? jl : Object.values(jl)) : [];
-    const nJobs = jobs.filter((j) => j.enabled).length;
-    const cat = tools ? (tools.tools || []).length : 0;
-    const nOff = guard ? (guard.disabled || []).length : 0;
-    const rows = sp ? (sp.rows || []) : [];
-    const dollars = rows.reduce((a, r) => a + Number(r.dollars || 0), 0);
-    setTiles({
-      gw: gwUp,
-      sess: nSess,
-      jobs: nJobs,
-      tools: `${cat - nOff}/${cat}`,
-      spend: `$${dollars.toFixed(4)}`,
-    });
-    setSpend(rows.slice(0, 8).map((r) => ({ skill: r.skill, dollars: Number(r.dollars || 0) })));
-    setFeed((ev && ev.events) || []);
-    if (fl) {
-      /* Never clobber a flag the user is mid-toggle on: a poll that started
-         before the write must not resolve over it. */
-      if (!flagBusy.current.size) {
-        setFlags(fl.flags || []);
-        setPrefab(fl.prefab || { configured: false, live: false });
-      }
+    try {
+      const d = await api.trackerApps();
+      setApps(d.apps || []);
+      setLoadError('');
+    } catch (e) {
+      setLoadError(String((e as Error)?.message || e));
+    } finally {
+      setLoaded(true);
     }
-    if (tr) setTrackers(tr.apps || []);
-    setFeedback(fb);
-    setMcp(mst);
-    setLoaded(true);
   }, []);
+
+  useActivePoll(load, 15000);
 
   const openApp = useCallback(async (id: string) => {
-    /* Sequence guard. With two or more boards, a slow source (a cold JSON
-       feed) meant board A's response could land after board B's and render
-       A's items under B's breadcrumb — after which "Delete app" and
-       "Refresh now" acted on the wrong id. */
     const req = ++detailReq.current;
-    // Abandon any in-flight refresh. It bumped detailReq, so its own
-    // `finally` no longer owns the busy flag and would leave `busy`
-    // true forever — Refresh now AND Delete app stayed disabled on every
-    // board until a full page reload. Clear the flag here, where the
-    // navigation actually happens.
-    refreshAbort.current?.abort();
-    refreshAbort.current = null;
-    setBusy(false);
-    setSteps([]);
-    setStepNote('');
     setOpenId(id);
     setDetail(null);
-    setDetailErr('');
+    setDetailError('');
+    setActionError('');
     setItemFilter('');
-    setViewSel('auto');
-    setShowPrefab(false);
-    // The A2UI toggle was not reset here, so one board's rows rendered under
-    // the next board's name: openApp nulls `detail` and refetches the app
-    // while the effect below refetches the *surface* in parallel, and the
-    // surface build is strictly the slower of the two — so app A's table was
-    // briefly on screen under app B's breadcrumb, with the Table component
-    // still holding its own search/sort/page state.
-    setShowA2ui(false);
+    setDetailLoading(true);
     try {
       const d = await api.trackerApp(id);
       if (detailReq.current !== req) return;
       setDetail(d);
     } catch (e) {
-      if (detailReq.current !== req) return;
-      setDetailErr(e instanceof Error ? e.message : String(e));
+      if (detailReq.current === req) {
+        setDetailError(String((e as Error)?.message || e));
+      }
+    } finally {
+      if (detailReq.current === req) setDetailLoading(false);
     }
   }, []);
 
-  const refreshDetail = useCallback(async () => {
-    if (!openId) return;
-    const req = ++detailReq.current;
-    const id = openId;
-    setBusy(true);
-    setDetailErr('');
-    setSteps([]);
-    setStepNote('starting');
-    refreshAbort.current?.abort();
-    const ac = new AbortController();
-    refreshAbort.current = ac;
-    try {
-      /* The AG-UI stream, not the blocking POST. A tracker refresh fetches a
-         third-party feed, so on a slow source the old single call left the
-         board looking frozen with no way to tell whether the click landed.
-         Steps are opened and closed from typed frames, so the phases are
-         visible and always end up closed. */
-      for await (const ev of api.trackerRefreshStream(id, ac.signal)) {
-        if (detailReq.current !== req) return;
-        if (ev.type === 'STEP_STARTED' && ev.stepName) {
-          setSteps((s) => [...s, ev.stepName as string]);
-        } else if (ev.type === 'STEP_FINISHED' && ev.stepName) {
-          setSteps((s) => s.filter((x) => x !== ev.stepName));
-        } else if (ev.type === 'ACTIVITY_SNAPSHOT') {
-          setStepNote(ev.content?.text || '');
-        } else if (ev.type === 'RUN_ERROR') {
-          throw new Error(ev.message || 'refresh failed');
-        } else if (ev.type === 'RUN_FINISHED') {
-          setStepNote(ev.result?.error
-            ? `source error: ${ev.result.error}`
-            : `${ev.result?.count ?? 0} items`);
-        }
-      }
-      const d = await api.trackerApp(id);
-      if (detailReq.current !== req) return;
-      setDetail(d);
-      /* Keep the A2UI view in step with the data it is rendering. Refetching
-         it only when it is visible keeps a board that has never been switched
-         to A2UI from making a request per refresh. */
-      if (showA2ui) {
-        const s = await api.safe(api.appSurface(id));
-        if (detailReq.current === req) {
-          if (s) setA2ui(s); else setA2uiErr('the server returned no surface');
-        }
-      }
-      const t = await api.safe(api.trackerApps());
-      if (t) setTrackers(t.apps || []);
-    } catch (e) {
-      if (detailReq.current !== req) return;
-      setDetailErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      if (detailReq.current === req) {
-        setBusy(false);
-        setSteps([]);
-      }
-      // Only clear the ref if THIS refresh still owns it: an
-      // aborted older refresh otherwise nulls a newer one's
-      // controller, and the next refresh could no longer
-      // abort it.
-      if (refreshAbort.current === ac) {
-        refreshAbort.current = null;
-      }
-    }
-  }, [openId, showA2ui]);
+  const selected = apps.find((a) => a.id === openId) || null;
+  const isA2ui = (detail?.kind || selected?.kind) === 'a2ui';
+  const surface = detail?.surface
+    || (detail?.spec?.surface as A2uiSurface | undefined)
+    || null;
 
-  /* Load the surface when the toggle turns on, so the panel is populated
-     before the user looks at it rather than after. */
-  useEffect(() => {
-    if (!showA2ui || !openId) return;
-    let live = true;
-    setA2uiErr('');
-    api.safe(api.appSurface(openId)).then((s) => {
-      if (!live) return;
-      if (s) setA2ui(s); else setA2uiErr('the server returned no surface');
-    });
-    return () => { live = false; };
-  }, [showA2ui, openId]);
-
-  const deleteApp = useCallback(async () => {
+  const refresh = useCallback(async () => {
     if (!openId || busy) return;
-    const name = detail?.name || openId;
-    /* Unguarded, a double-click on the TopBar delete fired two DELETEs and
-       destroyed the spec and every snapshot with no way back. */
-    if (!window.confirm(`Delete the board "${name}" and all its snapshots? This cannot be undone.`)) return;
     setBusy(true);
+    setActionError('');
     try {
-      const r = await api.safe(api.trackerDelete(openId));
-      // A failed delete used to clear the detail panel
-      // anyway — the board vanished from the UI while its
-      // spec and every snapshot were still on disk, with
-      // no error to say why.
-      if (!r) {
-        setDetailErr('delete failed — the board is still there');
-        return;
-      }
-      setTrackers(r.apps || []);
+      await api.trackerRefresh(openId);
+      await load();
+      await openApp(openId);
+    } catch (e) {
+      setActionError(String((e as Error)?.message || e));
+    } finally { setBusy(false); }
+  }, [busy, load, openApp, openId]);
+
+  const remove = useCallback(async () => {
+    if (!openId) return;
+    const name = selected?.name || openId;
+    if (!confirm(`Delete the app "${name}"? Its saved snapshots are removed too.`)) return;
+    try {
+      await api.trackerDelete(openId);
       setOpenId(null);
       setDetail(null);
-    } finally {
-      setBusy(false);
-    }
-  }, [openId, detail, busy]);
-
-  const createApp = useCallback(async () => {
-    setCreateErr('');
-    const spec: Record<string, unknown> = {
-      name: form.name.trim(),
-      kind: form.kind,
-      schedule: form.schedule.trim() || 'manual',
-    };
-    if (form.kind === 'json_feed') {
-      spec.url = form.url.trim();
-      spec.items_path = form.items_path.trim() || 'data';
-      spec.id_field = form.id_field.trim() || 'id';
-      if (form.match_field.trim()) {
-        let eq: unknown = form.match_equals;
-        try { eq = JSON.parse(form.match_equals); } catch { /* keep string */ }
-        spec.match = { field: form.match_field.trim(), equals: eq };
-      }
-      spec.fields = form.fields.split(',').map((s) => s.trim()).filter(Boolean);
-    }
-    setBusy(true);
-    try {
-      const r = await api.trackerCreate(spec);
-      if (r.error) { setCreateErr(r.error); return; }
-      if (r.apps) setTrackers(r.apps);
-      const nid = (r.spec as { id?: string } | undefined)?.id;
-      setShowCreate(false);
-      setForm({ name: '', kind: 'openrouter_free', schedule: 'daily@09:00', url: '', items_path: 'data', id_field: 'id', match_field: '', match_equals: '', fields: 'id,name' });
-      if (nid) await openApp(nid);
-    } catch (e) {
-      setCreateErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }, [form, openApp]);
-
-  /* Optimistic with rollback. Previously the toggle only adopted the POST
-     response, so a 15s poll that started before the write resolved
-     afterwards and snapped the switch back — the user then clicked again
-     and reversed their own change. The server was right; only the UI lied. */
-  const flip = async (f: FlagRow) => {
-    if (f.type !== 'bool' || flagBusy.current.has(f.name)) return;
-    const next = !(f.value === true);
-    const before = flags;
-    flagBusy.current.add(f.name);
-    setFlags((p) => p.map((x) => (x.name === f.name ? { ...x, value: next } : x)));
-    try {
-      const r = await api.setFlag(f.name, next);
-      setFlags(r.flags || before);
-      setToggleError('');
-    } catch (e) {
-      setFlags(before); // roll back to exactly what was on screen
-      // The switch snapping back with no message is indistinguishable from
-      // the user mis-clicking. Say what happened.
-      setToggleError(`${f.name}: ${(e as Error)?.message || e}`);
       await load();
-    } finally {
-      flagBusy.current.delete(f.name);
+    } catch (e) {
+      setActionError(String((e as Error)?.message || e));
     }
-  };
+  }, [load, openId, selected?.name]);
 
-  const revert = async (f: FlagRow) => {
-    if (flagBusy.current.has(f.name)) return;
-    const before = flags;
-    flagBusy.current.add(f.name);
+  const runAction = useCallback(async (action: string, args: Record<string, unknown>) => {
+    if (!openId || busy) return;
+    setBusy(true);
+    setActionError('');
     try {
-      const r = await api.setFlag(f.name, null);
-      if (r.flags) setFlags(r.flags);
-    } catch {
-      setFlags(before);
+      const raw = args.input;
+      const input: Record<string, string> = {};
+      if (raw && typeof raw === 'object') {
+        for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+          input[k] = String(v ?? '');
+        }
+      }
+      const res = await api.appAction(openId, action, input);
+      if (res.error) throw new Error(res.error);
+      if (res.app) setDetail(res.app);
+      else await openApp(openId);
+      await load();
+    } catch (e) {
+      setActionError(String((e as Error)?.message || e));
+    } finally { setBusy(false); }
+  }, [busy, load, openApp, openId]);
+
+  const closeCreate = useCallback(() => {
+    setCreateOpen(false);
+    setCreateError('');
+  }, []);
+
+  useEffect(() => {
+    if (!createOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeCreate();
+    };
+    document.addEventListener('keydown', onKey);
+    const t = window.setTimeout(() => descriptionRef.current?.focus(), 30);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      window.clearTimeout(t);
+    };
+  }, [closeCreate, createOpen]);
+
+  const buildApp = useCallback(async () => {
+    const description = createDescription.trim();
+    if (!description || createBusy || building) return;
+    const requestedName = createName.trim() || 'New app';
+    // Dismiss the dialog BEFORE the request. The builder can take tens of
+    // seconds and used to hold the whole console behind a modal with no way
+    // to leave; the job is server-side and does not need the modal alive.
+    setCreateBusy(true);
+    setCreateError('');
+    setBuildError('');
+    setCreateOpen(false);
+    setCreateName('');
+    setCreateDescription('');
+    setBuilding({ name: requestedName });
+    try {
+      const res = await api.appBuild(description, requestedName === 'New app' ? undefined : requestedName);
+      if (res.error) throw new Error(res.error);
+      const id = res.app?.id;
+      await load();
+      if (id) await openApp(id);
+      toast.success(`App built${res.app?.name ? `: ${res.app.name}` : ''}`);
+    } catch (e) {
+      const msg = String((e as Error)?.message || e);
+      setBuildError(msg);
+      toast.error(`App build failed: ${msg}`);
     } finally {
-      flagBusy.current.delete(f.name);
+      setCreateBusy(false);
+      setBuilding(null);
     }
-  };
+  }, [building, createBusy, createDescription, createName, load, openApp]);
 
-  useActivePoll(load, CONF.pollSlowMs);
-
-  const max = Math.max(1e-9, ...spend.map((r) => r.dollars));
-
-  // Mini-UI: per-app view config + Prefab-gated view availability.
-  const tableOn = (flags.find((f) => f.name === 'apps.views.table')?.value ?? true) !== false;
-  const cardsOn = (flags.find((f) => f.name === 'apps.views.cards')?.value ?? true) !== false;
-  const prefabOn = (flags.find((f) => f.name === 'apps.views.prefab')?.value ?? true) !== false;
-  const ui = uiConf(detail);
-  const wantView: ItemView = viewSel === 'auto' ? ui.defaultView : viewSel;
-  const effView: ItemView = (wantView === 'cards' ? cardsOn : tableOn)
-    ? wantView
-    : (tableOn || !cardsOn ? 'table' : 'cards');
-  const visibleItems = (detail?.items || [])
-    .filter((it) => !itemFilter || JSON.stringify(it).toLowerCase().includes(itemFilter.toLowerCase()))
-    .sort((a, b) => String(a[ui.sort] ?? '').localeCompare(String(b[ui.sort] ?? '')))
-    .slice(0, 200);
-  const isNewId = (id: string) =>
-    ui.highlight && (detail?.added_items || []).some(
-      (a) => String(a[ui.idField] ?? a.id) === id,
-    );
-  const idOf = (it: Record<string, unknown>, i: number) =>
-    String(it[ui.idField] ?? it.id ?? `#${i}`);
+  const items = detail?.items || [];
+  const spec = detail?.spec || {};
+  const columns = useMemo(() => columnsOf(spec, items), [spec, items]);
+  const filteredItems = useMemo(() => {
+    const q = itemFilter.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter((it) => JSON.stringify(it).toLowerCase().includes(q));
+  }, [itemFilter, items]);
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
-      <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
-        <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
-          Boards
-          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{1 + trackers.length}</span>
-        </div>
-        {/* min-h: the board list starts as the single "System overview" card and
-            grows to one card per tracker once /api/apps lands, which pushed the
-            whole main column down - 0.17 CLS on tablet, the last shift over
-            0.1 anywhere. Three cards is a realistic floor for a real install. */}
-        <div className="min-h-[220px] flex-1 space-y-2 overflow-y-auto px-2.5 pb-3 lg:min-h-0">
+      {railMode === 'collapsed'
+        ? <PaneStrip id="apps.rail" label="Apps list" />
+        : (
+      <aside className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:h-full lg:max-h-none lg:w-[272px] lg:border-b-0 lg:border-r"
+             aria-label="Apps">
+        <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5">
+          <h2 className="text-xs font-bold tracking-wide">Apps</h2>
           <button
-            onClick={() => { setOpenId(null); setDetail(null); }}
-            className={`block w-full rounded-[10px] border p-2.5 text-left ${openId === null ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
-          >
-            <div className="flex items-center gap-2">
-              <span className="flex-1 text-[12.5px] font-semibold">System overview</span>
-              {/* "live" is info-blue everywhere else (Research, Runs); the
-                  green here was the same word in a different color. */}
-              <Pill tone="info">live</Pill>
-            </div>
-            <div className="mt-1 text-[11px] text-zinc-muted">agent + gateway</div>
+            type="button"
+            onClick={() => { setCreateOpen(true); setCreateError(''); }}
+            disabled={!!building}
+            title={building ? `Building ${building.name}…` : undefined}
+            className="flex items-center gap-1 rounded-md bg-violet-400 px-2 py-1 text-[11px] font-bold text-[#0b0b0e] hover:brightness-110 disabled:opacity-50">
+            {building ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+            {building ? 'Building…' : 'New app'}
           </button>
-          {trackers.map((t) => (
+        </div>
+        {building && (
+          <div role="status" aria-live="polite"
+               className="mx-2.5 mb-2 flex items-center gap-2 rounded-lg border border-violet-400/30 bg-violet-400/5 px-2.5 py-2 text-[11px] leading-snug text-violet-200">
+            <Loader2 size={12} className="flex-none animate-spin" />
+            <span className="min-w-0">Building <b className="font-semibold">{building.name}</b>… you can leave this section.</span>
+          </div>
+        )}
+        <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto px-2.5 pb-3">
+          {!loaded && <Skel />}
+          {loaded && loadError && (
+            <div className="rounded-lg border border-red-400/30 bg-red-400/5 p-2.5 text-[11px] text-red-200">
+              couldn't load apps ({loadError}).
+              <button onClick={() => void load()} className="ml-1 underline">retry</button>
+            </div>
+          )}
+          {loaded && !loadError && !apps.length && (
+            <Empty icon={<LayoutGrid size={26} />} title="No apps yet"
+              sub="Describe an app and Aria builds it." />
+          )}
+          {apps.map((a) => (
             <button
-              key={t.id}
-              onClick={() => openApp(t.id)}
-              className={`block w-full rounded-[10px] border p-2.5 text-left ${openId === t.id ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
-            >
-              <div className="flex items-center gap-2">
-                <span className="flex-1 truncate text-[12.5px] font-semibold">{t.name}</span>
-                {t.error
-                  ? <Pill tone="err">error</Pill>
-                  : (t.added > 0 || t.removed > 0)
-                    ? <Pill tone="warn">changed</Pill>
-                    : <Pill tone="ok">{t.count}</Pill>}
+              key={a.id}
+              type="button"
+              onClick={() => void openApp(a.id)}
+              className={`block w-full rounded-lg border p-2.5 text-left ${
+                openId === a.id
+                  ? 'border-violet-400/60 bg-violet-400/5'
+                  : 'border-white/10 bg-[#0e0e12] hover:border-white/25'
+              }`}>
+              <div className="flex items-center gap-1.5">
+                <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">
+                  {a.name}
+                </span>
+                <Pill tone={a.kind === 'a2ui' ? 'info' : 'muted'}>
+                  {a.kind === 'a2ui' ? 'agent' : a.kind === 'json_feed' ? 'feed' : 'tracker'}
+                </Pill>
+                {a.error ? <Pill tone="err">error</Pill> : null}
               </div>
-              <div className="mt-1 text-[11px] text-zinc-muted">{t.count} items · {t.schedule}</div>
+              <div className="mt-1 truncate text-[10.5px] text-zinc-muted">
+                {a.schedule} · {a.next_refresh ? `next ${fmtTs(a.next_refresh)}` : 'manual'}
+              </div>
             </button>
           ))}
-          <button
-            onClick={() => setShowCreate((v) => !v)}
-            className="flex w-full items-center justify-center gap-1.5 rounded-[10px] border border-dashed border-white/15 p-2.5 text-[12px] text-zinc-400 hover:border-violet-400/60 hover:text-zinc-200"
-          >
-            <Plus size={13} /> New app
-          </button>
         </div>
-      </div>
+      </aside>
+        )}
+
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb={openId && detail ? `Apps / ${detail.name}` : 'Apps'}>
-          {openId ? (
+        <TopBar crumb={selected ? `Apps / ${selected.name}` : 'Apps'} panes="apps">
+          {openId && (
             <>
-              <button onClick={() => { setOpenId(null); setDetail(null); }} className="flex items-center gap-1 rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs hover:border-violet-400">
-                <ArrowLeft size={13} /> Boards
+              <button type="button" onClick={() => void refresh()} disabled={busy}
+                aria-label="Refresh app now"
+                className="flex items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400 disabled:opacity-50">
+                {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                Refresh
               </button>
-              <button onClick={refreshDetail} disabled={busy} aria-label="Refresh app now" className="flex items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-3.5 py-1.5 text-xs hover:border-violet-400 disabled:opacity-45">
-                <RefreshCw size={13} className={busy ? 'animate-spin' : ''} /> Refresh now
-              </button>
-              {busy ? (
-                /* Real progress, from the stream's own frames. The open phase
-                   names come from STEP_STARTED and are removed on
-                   STEP_FINISHED, so this cannot be left spinning - which is
-                   exactly what a client could not do before, because the
-                   encoder emitted STEP_STARTED with no way to close it. */
-                <span className="flex items-center gap-1.5 text-[11px] text-zinc-400"
-                  role="status" aria-live="polite">
-                  {steps.length
-                    ? `fetching: ${steps.join(', ')}`
-                    : (stepNote || 'working…')}
-                </span>
-              ) : null}
-              <button onClick={deleteApp} disabled={busy} aria-label="Delete app" className="flex items-center gap-1.5 rounded-md border border-red-400/40 bg-red-400/5 px-3 py-1.5 text-xs text-red-200 hover:bg-red-400/15 disabled:opacity-45">
-                <Trash2 size={13} />
+              <button type="button" onClick={() => void remove()}
+                aria-label="Delete app"
+                className="flex items-center gap-1.5 rounded-md border border-red-400/40 bg-red-400/5 px-2.5 py-1 text-[11px] text-red-200 hover:bg-red-400/15">
+                <Trash2 size={12} />
               </button>
             </>
-          ) : (
-            <Pill tone={tiles.gw ? 'ok' : 'warn'}>{tiles.gw ? '● all systems live' : '● agent only'}</Pill>
           )}
         </TopBar>
-        {boardError && (
-          <div className="mx-3.5 mt-3 rounded-lg border border-red-400/30 bg-red-400/5 p-3 text-center text-xs text-red-200">
-            {boardError} <button onClick={load} className="underline">retry</button>
-          </div>
-        )}
-        {toggleError && (
-          <p role="alert" className="mx-3.5 mt-3 rounded-lg border border-amber-400/40 bg-amber-400/5 p-3 text-center text-xs text-amber-200">
-            toggle reverted: {toggleError}
-          </p>
-        )}
-        {showCreate && !openId && (
-          <div className="mx-3.5 mt-3 rounded-[10px] border border-violet-400/40 bg-[#0e0e12] p-3.5">
-            <div className="mb-2.5 text-xs font-bold tracking-wide">NEW TRACKER APP</div>
-            <div className="grid grid-cols-2 gap-2.5">
-              <label className="col-span-2 block text-[11px] text-zinc-400">Name
-                <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Free OpenRouter models" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs text-zinc-100 outline-none focus:border-violet-400" />
-              </label>
-              <label className="block text-[11px] text-zinc-400">Kind
-                <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })} className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs text-zinc-100 outline-none focus:border-violet-400">
-                  <option value="openrouter_free">OpenRouter free models (preset)</option>
-                  <option value="json_feed">Generic JSON feed</option>
-                </select>
-              </label>
-              <label className="block text-[11px] text-zinc-400">Schedule
-                <input value={form.schedule} onChange={(e) => setForm({ ...form, schedule: e.target.value })} placeholder="daily@09:00 · every 12h · manual" title="Also accepts: every 45s, in 30m, tomorrow 9am, ISO datetime, epoch" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-              </label>
-              {form.kind === 'json_feed' && (
-                <>
-                  <label className="col-span-2 block text-[11px] text-zinc-400">JSON URL
-                    <input value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} placeholder="https://…" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-                  </label>
-                  <label className="block text-[11px] text-zinc-400">Items path (dot)
-                    <input value={form.items_path} onChange={(e) => setForm({ ...form, items_path: e.target.value })} placeholder="data" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-                  </label>
-                  <label className="block text-[11px] text-zinc-400">ID field
-                    <input value={form.id_field} onChange={(e) => setForm({ ...form, id_field: e.target.value })} placeholder="id" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-                  </label>
-                  <label className="block text-[11px] text-zinc-400">Match field (optional)
-                    <input value={form.match_field} onChange={(e) => setForm({ ...form, match_field: e.target.value })} placeholder="pricing.prompt" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-                  </label>
-                  <label className="block text-[11px] text-zinc-400">Match equals (JSON)
-                    <input value={form.match_equals} onChange={(e) => setForm({ ...form, match_equals: e.target.value })} placeholder='"0"' className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-                  </label>
-                  <label className="col-span-2 block text-[11px] text-zinc-400">Fields (comma-separated)
-                    <input value={form.fields} onChange={(e) => setForm({ ...form, fields: e.target.value })} placeholder="id,name" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 font-mono text-xs text-zinc-100 outline-none focus:border-violet-400" />
-                  </label>
-                </>
-              )}
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
+          {buildError && (
+            <div role="alert" className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-rose-400/30 bg-rose-400/5 px-3 py-2 text-[11.5px] text-rose-200">
+              <span className="min-w-0 flex-1">App build failed: {buildError}</span>
+              <button type="button" onClick={() => setBuildError('')}
+                className="rounded border border-rose-400/40 px-2 py-0.5 text-[10.5px] font-bold">
+                dismiss
+              </button>
             </div>
-                  {createErr && <div role="status" className="mt-2 text-xs text-red-300">{createErr}</div>}
-            <div className="mt-2.5 flex gap-2">
-              <button onClick={createApp} disabled={busy || !form.name.trim()} className="rounded-md bg-violet-400 px-4 py-2 text-xs font-bold text-[#0b0b0e] hover:brightness-110 disabled:opacity-50">Create app</button>
-              <button onClick={() => setShowCreate(false)} className="rounded-md border border-white/15 bg-white/5 px-4 py-2 text-xs hover:border-violet-400">Cancel</button>
+          )}
+          {!openId && (
+            <div className="flex h-full items-center justify-center">
+              <div className="max-w-[440px] text-center">
+                <LayoutGrid size={34} className="mx-auto mb-3 text-violet-300/80" />
+                <h2 className="text-[15px] font-semibold text-zinc-100">Build an app by describing it</h2>
+                <p className="mt-1.5 text-[12px] leading-relaxed text-zinc-500">
+                  Aria designs the interface and, when it needs live data or a
+                  recurring update, wires the refresh into the backend. Pick an
+                  app on the left or create a new one.
+                </p>
+                <button type="button" onClick={() => setCreateOpen(true)}
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-violet-400 px-3.5 py-2 text-xs font-bold text-[#0b0b0e] hover:brightness-110">
+                  <Sparkles size={13} /> New app
+                </button>
+              </div>
             </div>
-          </div>
-        )}
-        {openId ? (
-          <div className="min-h-0 flex-1 overflow-y-auto p-3.5">
-                {detailErr && <div role="status" className="rounded-lg border border-red-400/30 bg-red-400/5 p-3 text-xs text-red-200">{detailErr}</div>}
-            {!detail && !detailErr && <div className="py-10 text-center text-sm text-zinc-muted">loading…</div>}
-            {detail && (
-              <>
-                <div className="flex flex-wrap gap-2.5">
-                  <Stat k="ITEMS" v={String(detail.count)} s={detail.kind} />
-                  <Stat k="ADDED" v={`+${detail.added}`} s="since last refresh" tone={detail.added ? 'warn' : 'ok'} />
-                  <Stat k="REMOVED" v={`−${detail.removed}`} s="since last refresh" tone={detail.removed ? 'bad' : 'ok'} />
-                  <Stat k="REFRESHED" v={fmtTs(detail.refreshed_at)} s={`next: ${fmtTs(detail.next_refresh)}`} />
+          )}
+
+          {openId && detailLoading && <Skel n={5} />}
+          {openId && detailError && (
+            <div role="alert" className="rounded-lg border border-red-400/30 bg-red-400/5 p-3 text-xs text-red-200">
+              couldn't open this app — {detailError}
+              <button onClick={() => void openApp(openId)} className="ml-1 underline">retry</button>
+            </div>
+          )}
+          {openId && detail && (
+            <>
+              <Pane id="apps.header">
+              <div className="mb-3 flex flex-wrap items-start gap-2 rounded-[10px] border border-white/10 bg-[#0e0e12] px-3.5 py-3">
+                <div className="min-w-0 flex-1">
+                  <h1 className="truncate text-[15px] font-semibold text-zinc-100">{detail.name}</h1>
+                  <p className="mt-0.5 text-[11.5px] leading-snug text-zinc-500">
+                    {detail.description
+                      || (detail.kind === 'a2ui'
+                        ? 'Agent-built interactive app.'
+                        : `${detail.kind} tracker`)}
+                  </p>
                 </div>
-                {detail.error && <div className="mt-2.5 rounded-lg border border-red-400/30 bg-red-400/5 p-2.5 text-xs text-red-200">last refresh failed: {detail.error}</div>}
-                <div className="flex items-center justify-between px-0.5 pb-1 pt-4">
-                  <div className="text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">ITEMS</div>
-                  <div className="flex items-center gap-2">
-                    {/* The item list was filterable in code (`itemFilter`)
-                        but no input ever wrote to it, so a 200-row board
-                        could not be narrowed. */}
+                <Pill tone={detail.kind === 'a2ui' ? 'info' : 'muted'}>
+                  {detail.kind === 'a2ui' ? 'agent-built' : detail.kind}
+                </Pill>
+                <span className="text-[10.5px] text-zinc-500">
+                  {detail.schedule} · {detail.next_refresh ? `next ${fmtTs(detail.next_refresh)}` : 'manual'}
+                </span>
+              </div>
+              </Pane>
+
+              {actionError && (
+                <p role="alert" className="mb-3 rounded-lg border border-rose-400/30 bg-rose-400/5 px-3 py-2 text-[11.5px] text-rose-200">
+                  {actionError}
+                </p>
+              )}
+              {detail.error && (
+                <p role="status" className="mb-3 rounded-lg border border-amber-400/30 bg-amber-400/5 px-3 py-2 text-[11.5px] text-amber-200">
+                  last refresh: {detail.error}
+                </p>
+              )}
+
+              {isA2ui ? (
+                <div className="rounded-[10px] border border-white/10 bg-[#08080a] p-3.5">
+                  {surface ? (
+                    <A2ui surface={surface} onAction={(a, args) => void runAction(a, args)} />
+                  ) : (
+                    <Empty icon={<Sparkles size={28} />} title="No surface yet"
+                      sub="Refresh this app to rebuild its interface." />
+                  )}
+                </div>
+              ) : (
+                <div className="rounded-[10px] border border-white/10 bg-[#0e0e12]">
+                  <div className="flex flex-wrap items-center gap-2 border-b border-white/10 px-3 py-2">
+                    <span className="text-[10.5px] font-bold tracking-[0.12em] text-zinc-500">
+                      {detail.count} ITEMS
+                    </span>
+                    <Pane id="apps.filter">
                     <input
                       value={itemFilter}
                       onChange={(e) => setItemFilter(e.target.value)}
                       placeholder="Filter items…"
                       aria-label="Filter items"
-                      className="w-40 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400"
+                      className="ml-auto h-7 w-40 rounded border border-white/10 bg-black/40 px-2 text-[11px] outline-none focus:border-violet-400"
                     />
-                    {prefabOn && detail && (
-                      <button
-                        onClick={() => setShowPrefab((v) => { if (!v) setShowA2ui(false); return !v; })}
-                        aria-pressed={showPrefab}
-                        title="Bundled render of the app's own layout"
-                        className={`rounded-lg border px-3 py-1 text-[11px] ${showPrefab ? 'border-violet-400/60 bg-violet-400/20 font-bold text-zinc-100' : 'border-white/10 bg-white/5 text-zinc-400 hover:text-zinc-200'}`}
-                      >
-                        Prefab
-                      </button>
-                    )}
-                    {detail && (
-                      <button
-                        onClick={() => setShowA2ui((v) => { if (!v) setShowPrefab(false); return !v; })}
-                        aria-pressed={showA2ui}
-                        title="Same app rendered as a validated A2UI surface"
-                        className={`rounded-lg border px-3 py-1 text-[11px] ${showA2ui ? 'border-accent/60 bg-accent/20 font-bold text-zinc-100' : 'border-white/10 bg-white/5 text-zinc-400 hover:text-zinc-200'}`}
-                      >
-                        A2UI
-                      </button>
-                    )}
-                    {tableOn && cardsOn && !showPrefab && !showA2ui && (
-                      <div className="flex gap-1 rounded-lg border border-white/10 bg-white/5 p-[3px]" role="group" aria-label="Item view">
-                      {(['table', 'cards'] as const).map((v) => (
-                        <button
-                          key={v}
-                          onClick={() => setViewSel(v)}
-                          aria-pressed={effView === v}
-                          className={`rounded px-3 py-1 text-[11px] capitalize ${effView === v ? 'bg-violet-400/20 font-bold text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`}
-                        >
-                          {v}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                </div>
-                {showPrefab && detail ? (
-                  <PrefabFrame id={detail.id} name={detail.name} />
-                ) : showA2ui && detail ? (
-                  a2uiErr ? (
-                    <p className="rounded-[10px] border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
-                      A2UI surface unavailable: {a2uiErr}
-                    </p>
-                  ) : !a2ui ? (
-                    <p className="text-xs text-zinc-muted">Building surface…</p>
-                  ) : (
-                    <section className="rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
-                      <A2ui surface={a2ui.surface} notes={a2ui.notes} />
-                    </section>
-                  )
-                ) : (
-                <section className="rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
-                  {/* A filter with no matches used to render a bare empty box
-                      with no message, while the stat card still read
-                      "ITEMS 20" -- so "no matches" and "data lost" were
-                      indistinguishable. */}
-                  {!!detail.items.length && !visibleItems.length && (
-                    <div className="py-6 text-center text-xs text-amber-200">
-                      No items match {itemFilter ? <>&ldquo;{itemFilter}&rdquo;</> : 'this view'}
-                      {' '}({detail.items.length} item{detail.items.length === 1 ? '' : 's'} loaded).{' '}
-                      <button onClick={() => setItemFilter('')} className="underline">clear filter</button>
-                    </div>
-                  )}
-                  {!detail.items.length && <Empty icon={<LayoutGrid size={30} />} title="No items yet — hit Refresh now" />}
-                  {effView === 'cards' ? (
-                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-                      {visibleItems.map((it, i) => {
-                        const id = idOf(it, i);
-                        return (
-                          <div key={`${id}-${i}`} className={`rounded-lg border p-3 ${isNewId(id) ? 'border-amber-300/40 bg-amber-300/[0.04]' : 'border-white/10 bg-black/30'}`}>
-                            <div className="flex items-center gap-2">
-                              <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] font-semibold text-zinc-100">{id}</span>
-                              {isNewId(id) && <Pill tone="warn">new</Pill>}
-                            </div>
-                            <div className="mt-1.5 space-y-1">
-                              {ui.columns.filter((c) => c.field !== ui.idField && c.field !== 'id').slice(0, 4).map((c) => (
-                                <div key={c.field} className="flex justify-between gap-2 text-[11.5px]">
-                                  <span className="flex-none text-zinc-muted">{c.label}</span>
-                                  <span className="truncate text-right text-zinc-200">{String(it[c.field] ?? '—').slice(0, 60)}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                  visibleItems.map((it, i) => {
-                    const id = idOf(it, i);
-                    return (
-                      <div key={`${id}-${i}`} className="flex items-center gap-2.5 border-b border-white/5 py-2 text-xs last:border-0">
-                        <span className="min-w-0 flex-1 truncate font-mono text-zinc-100">{id}</span>
-                        {ui.columns.filter((c) => c.field !== ui.idField && c.field !== 'id').slice(0, 3).map((c) => (
-                          <span key={c.field} className="hidden flex-none text-zinc-muted md:inline">{c.label}: <span className="text-zinc-300">{String(it[c.field] ?? '—').slice(0, 40)}</span></span>
-                        ))}
-                        {isNewId(id) && <Pill tone="warn">new</Pill>}
-                      </div>
-                    );
-                  }))}
-                </section>
-                )}
-                {!!detail.history.length && (
-                  <>
-                    <div className="px-0.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">HISTORY</div>
-                    <section className="mb-3.5 rounded-[10px] border border-white/10 bg-[#0e0e12] py-2 font-mono text-xs leading-relaxed">
-                      {detail.history.slice().reverse().slice(0, 10).map((h, i) => (
-                        <div key={`${h.ts}-${i}`} className="flex gap-2.5 px-3 py-[3px]">
-                          <span className="flex-none tabular-nums text-zinc-muted">{fmtTs(h.ts)}</span>
-                          <span className="text-zinc-400">{h.count} items{(h.added?.length || h.removed?.length) ? ` · +${(h.added || []).length} −${(h.removed || []).length}` : ''}</span>
-                        </div>
-                      ))}
-                    </section>
-                  </>
-                )}
-              </>
-            )}
-          </div>
-        ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
-            <Stat k="AGENT" v="up" s={`:${CONF.agentPort}`} tone="ok" loading={!loaded} />
-            <Stat k="GATEWAY" v={tiles.gw ? 'up' : 'down'} s={`:${CONF.gatewayPort}`}
-              tone={tiles.gw ? 'ok' : 'bad'} loading={!loaded} />
-            <Stat k="SESSIONS" v={String(tiles.sess)} s="first 200 listed" loading={!loaded} />
-            <Stat k="JOBS ARMED" v={String(tiles.jobs)} s="scheduler" loading={!loaded} />
-            <Stat k="TOOLS LIVE" v={tiles.tools} s="of catalog" loading={!loaded} />
-            <Stat k="SPEND" v={tiles.spend} s="lifetime USD" loading={!loaded} />
-          </div>
-          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">
-            FLAGS & CONFIG
-            <span className="ml-2 font-mono normal-case tracking-normal text-zinc-muted">
-              {prefab.live ? 'prefab cloud live' : prefab.configured ? 'prefab cloud configured (offline)' : 'local only'}
-            </span>
-          </div>
-          {/* Reserved: the flag list is the tallest thing on the page and it
-              arrives after first paint. Growing from a one-line empty state to
-              seven multi-line flag rows pushed the spend section and everything
-              under it down - 0.34 CLS on tablet, the worst on the site. */}
-          <section className="mx-3.5 min-h-[420px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
-            {!flags.length && <Empty icon={<Flag size={30} />} title="No flags defined" />}
-            {flags.map((f) => (
-              <div key={f.name} className="flex items-center gap-3 border-b border-white/5 py-2.5 text-xs last:border-0">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate font-mono text-zinc-100">{f.name}</span>
-                    <Pill tone={f.source === 'prefab' ? 'info' : f.source === 'override' ? 'warn' : 'muted'}>
-                      {f.source}
-                    </Pill>
+                    </Pane>
                   </div>
-                  {!!f.description && <div className="mt-0.5 break-words text-[11px] leading-relaxed text-zinc-muted">{f.description}</div>}
-                </div>
-                {f.type === 'bool' ? (
-                  <button
-                    onClick={() => flip(f)}
-                    role="switch"
-                    aria-checked={f.value === true}
-                    aria-label={`Toggle ${f.name}`}
-                    /* Writes are tracked in flagBusy; a clickable-looking
-                       switch during the write invited the double-toggle
-                       that reversed the user's own change. */
-                    aria-disabled={flagBusy.current.has(f.name)}
-                    className={`relative h-6 w-12 flex-none rounded-full transition-colors lg:h-5.5 lg:w-10 ${f.value === true ? 'bg-violet-400' : 'bg-white/15'} ${flagBusy.current.has(f.name) ? 'opacity-50' : ''}`}
-                  >
-                    <span className={`absolute top-0.5 h-4.5 w-4.5 rounded-full bg-white transition-all ${f.value === true ? 'left-[18px]' : 'left-0.5'}`} />
-                  </button>
-                ) : (
-                  <span className="flex-none font-mono text-zinc-300">{String(f.value)}</span>
-                )}
-                {f.source === 'override' && (
-                  <button onClick={() => revert(f)} className="flex-none py-1 text-[11px] leading-4 text-zinc-muted underline hover:text-zinc-300">
-                    revert
-                  </button>
-                )}
-              </div>
-            ))}
-          </section>
-          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">SPEND BY SKILL</div>
-          {/* Reserved height: this section went from the "No spend yet" empty
-              state to eight bar rows once the cost fetch landed, and the shift
-              was 0.34 CLS on tablet. `spend` is capped at 8 rows, so eight rows
-              is its real size - reserving exactly that costs nothing and holds
-              the page still. */}
-          <section className="mx-3.5 min-h-[190px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
-            {!spend.length && <Empty icon={<LayoutGrid size={30} />} title="No spend yet" />}
-            {spend.map((r, i) => (
-              <div key={`${r.skill || 'unknown'}-${i}`} className="my-1.5 flex items-center gap-2.5 text-xs">
-                <span className="w-[110px] flex-none truncate sm:w-[150px]">{r.skill}</span>
-                <span className="h-2 flex-1 overflow-hidden rounded bg-white/10">
-                  {/* `0/0` is NaN, and an invalid `width: NaN%` makes the
-                      browser fall back to width:auto — a block-level span
-                      then fills the track, so every $0.0000 row drew a
-                      *full* bar. Floor the denominator instead. */}
-                  <span
-                    className={`block h-full rounded ${r.dollars > 0 ? 'bg-violet-400' : 'bg-transparent'}`}
-                    style={{ width: max > 0 ? `${Math.min(100, (r.dollars / max) * 100)}%` : '0%' }}
-                  />
-                </span>
-                <span className="w-[74px] flex-none text-right tabular-nums sm:w-[90px]">${r.dollars.toFixed(4)}</span>
-              </div>
-            ))}
-          </section>
-          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">OUTPUT RATINGS · last 30 days</div>
-          <section className="mx-3.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
-            {!feedback || !feedback.totals.total ? (
-              <div className="text-xs text-zinc-muted">
-                No ratings yet. Use the thumbs on a node in Runs — they are the
-                only signal that says whether a prompt edit helped.
-              </div>
-            ) : (
-              <>
-                <div className="mb-2 text-xs text-zinc-400">
-                  <span className="font-bold text-ok">{feedback.totals.up} good</span>
-                  {' · '}
-                  <span className="font-bold text-danger">{feedback.totals.down} bad</span>
-                  {feedback.unlabelled ? (
-                    <span className="ml-1.5 text-zinc-muted">({feedback.unlabelled} from an older console)</span>
-                  ) : null}
-                </div>
-                {feedback.by_skill.filter((r) => r.total > 0).map((r) => {
-                  // Worst first: the thing to fix is at the top. The bar is
-                  // the share of DOWN votes — a bar that is full should mean
-                  // "bad", not the smoothed prior the first version drew.
-                  const pct = r.total > 0 ? Math.round((r.down / r.total) * 100) : 0;
-                  return (
-                    <div key={r.name} className="my-1.5 flex items-center gap-2.5 text-xs">
-                      <span className="w-[110px] flex-none truncate sm:w-[150px]" title={r.name}>
-                        {r.name.startsWith('(unlabelled') ? 'older runs' : r.name}
-                      </span>
-                      <span className="h-2 flex-1 overflow-hidden rounded bg-white/10">
-                        <span
-                          className={`block h-full rounded ${pct >= 50 ? 'bg-red-400/70' : pct > 0 ? 'bg-amber-300/70' : 'bg-emerald-400/60'}`}
-                          style={{ width: `${Math.max(pct, r.total > 0 ? 4 : 0)}%` }}
-                        />
-                      </span>
-                      <span className="w-[74px] flex-none text-right tabular-nums sm:w-[110px]">
-                        {r.up}↑ {r.down}↓
-                        {r.confidence === 'low' ? <span className="ml-1 text-zinc-muted" title="too few votes to read as a rate">*</span> : null}
-                      </span>
+                  {!items.length ? (
+                    <Empty icon={<LayoutGrid size={28} />} title="No items yet"
+                      sub="Hit Refresh to fetch the source." />
+                  ) : (
+                    <div className="max-h-[60vh] overflow-auto">
+                      <table className="w-full text-left text-[11.5px]">
+                        <thead className="sticky top-0 bg-[#0e0e12] text-[10px] uppercase tracking-wide text-zinc-500">
+                          <tr>{columns.map((c) => <th key={c.field} className="px-2.5 py-2">{c.label}</th>)}</tr>
+                        </thead>
+                        <tbody>
+                          {filteredItems.map((it, i) => (
+                            <tr key={String(it.id ?? it[columns[0]?.field] ?? i)}
+                                className="border-t border-white/5 hover:bg-white/[0.02]">
+                              {columns.map((c) => (
+                                <td key={c.field} className="max-w-[320px] truncate px-2.5 py-1.5 text-zinc-300"
+                                    title={cell(it[c.field])}>{cell(it[c.field])}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
-                  );
-                })}
-                <div className="mt-1 text-[10.5px] text-zinc-muted">
-                  bar = share of bad votes · * fewer than 3 votes — not a rate
+                  )}
                 </div>
-              </>
-            )}
-          </section>
-          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">PIPELINE HEALTH</div>
-          <section className="mx-3.5 mb-3.5 grid grid-cols-2 gap-2.5 sm:grid-cols-3">
-            <Stat
-              k="FETCH CACHE"
-              v={mcp ? `${Math.round((mcp.cache?.hit_rate ?? 0) * 100)}%` : '—'}
-              s={mcp ? `${mcp.cache?.hits ?? 0} hits / ${mcp.cache?.entries ?? 0} cached` : 'stats unavailable'}
-              tone={(mcp?.cache?.hit_rate ?? 0) >= 0.3 ? 'ok' : 'warn'}
-            />
-            <Stat
-              k="OUTCOMES LOGGED"
-              v={mcp?.tool_outcomes ? String(mcp.tool_outcomes.written) : '—'}
-              s={mcp?.tool_outcomes ? `${mcp.tool_outcomes.queued} queued · ${mcp.tool_outcomes.errors} failed` : 'tool outcomes'}
-            />
-            <Stat
-              k="MCP BREAKER"
-              v={!mcp?.mcp_breaker ? '—' : mcp.mcp_breaker.open ? 'open' : 'closed'}
-              s={mcp?.mcp_breaker ? `${mcp.mcp_breaker.trips} trips` : 'tool subprocess'}
-              tone={mcp?.mcp_breaker?.open ? 'bad' : 'ok'}
-            />
-          </section>
-          <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">LATEST ACTIVITY · refreshes every 15s</div>
-          <section className="mx-3.5 mb-3.5 rounded-[10px] border border-white/10 bg-[#0e0e12] py-2 font-mono text-xs leading-relaxed">
-            {!feed.length && <div className="px-3 py-2 text-zinc-muted">no recent activity</div>}
-            {feed.map((e, i) => (
-              <div key={`${e.t}-${e.src}-${i}`} className="flex gap-2.5 px-3 py-[3px] hover:bg-white/[0.03]">
-                <span className="flex-none tabular-nums text-zinc-muted">{e.iso}</span>
-                <span className="min-w-[86px] flex-none text-violet-300">{e.src}</span>
-                <span className="break-words text-zinc-400">{e.msg}</span>
-              </div>
-            ))}
-          </section>
+              )}
+            </>
+          )}
         </div>
-        )}
       </main>
+
+      {createOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4"
+             role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) closeCreate(); }}>
+          <div role="dialog" aria-modal="true" aria-label="New app"
+               className="w-full max-w-[560px] rounded-xl border border-white/15 bg-[#0e0e12] shadow-2xl">
+            <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
+              <Sparkles size={14} className="text-violet-300" />
+              <span className="flex-1 text-[13px] font-semibold">New app</span>
+              <button type="button" onClick={closeCreate} aria-label="Close new app"
+                className="rounded p-1 text-zinc-500 hover:text-zinc-200"><X size={14} /></button>
+            </div>
+            <div className="p-4">
+              <label className="block text-[11px] text-zinc-400">Name <span className="text-zinc-600">(optional)</span>
+                <input value={createName} onChange={(e) => setCreateName(e.target.value)}
+                  placeholder="Aria can name it"
+                  className="mt-1 h-8 w-full rounded border border-white/10 bg-black/40 px-2.5 text-xs outline-none focus:border-violet-400" />
+              </label>
+              <label className="mt-3 block text-[11px] text-zinc-400">What should it do?
+                <textarea ref={descriptionRef} value={createDescription}
+                  onChange={(e) => setCreateDescription(e.target.value)}
+                  rows={5}
+                  placeholder="Describe what the app should show, what the user can do in it, and whether it should update itself."
+                  className="mt-1 w-full resize-y rounded border border-white/10 bg-black/40 p-2.5 text-[12.5px] leading-relaxed outline-none focus:border-violet-400" />
+              </label>
+              {createError && (
+                <p role="alert" className="mt-2 rounded border border-rose-400/30 bg-rose-400/5 px-2.5 py-2 text-[11.5px] text-rose-200">
+                  {createError}
+                </p>
+              )}
+              <div className="mt-3 flex items-center justify-end gap-2">
+                <button type="button" onClick={closeCreate} disabled={createBusy}
+                  className="rounded border border-white/15 px-3 py-1.5 text-[11px] text-zinc-300 hover:border-white/30 disabled:opacity-40">
+                  Cancel
+                </button>
+                <button type="button" onClick={() => void buildApp()}
+                  disabled={createBusy || !createDescription.trim()}
+                  className="flex items-center gap-1.5 rounded bg-violet-400 px-3.5 py-1.5 text-[11.5px] font-bold text-[#0b0b0e] hover:brightness-110 disabled:opacity-40">
+                  {createBusy ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                  {createBusy ? 'Building…' : 'Build app'}
+                </button>
+              </div>
+              {createBusy && (
+                <p className="mt-2 text-[10.5px] text-zinc-500">
+                  Aria is designing the surface and, if needed, checking live data.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
-  );
-}
-
-/** The Prefab view, isolated.
-    The endpoint returns a server-rendered HTML document, so mounting it
-    unsandboxed gave that document the console's own origin and full access
-    to every `/api/*` route — while its content comes from an arbitrary
-    user-supplied JSON feed URL. `sandbox="allow-scripts"` WITHOUT
-    `allow-same-origin` puts it in an opaque origin, so even if the bundled
-    renderer ever emitted a cell value unescaped, the blast radius is the
-    frame. The bundled renderer is offline-capable, so it needs no
-    same-origin access. Failures are also surfaced instead of appearing as a
-    blank white box. */
-function PrefabFrame({ id, name }: { id: string; name: string }) {
-  const [err, setErr] = useState('');
-  /* The iframe is a browser navigation and cannot send the
-     X-Aria-Token header, so with auth enforced its view
-     403'd inside the frame (the authed pre-flight below
-     passed precisely because a fetch CAN send the header,
-     which masked this). Fetch a short-lived signed pass
-     through the authenticated API and mount the iframe
-     with it; the server re-verifies the HMAC inside the
-     auth middleware. No token = auth disabled, load bare. */
-  const [pass, setPass] = useState<{ token: string; exp: number } | null>(null);
-  /* 'pending' until we know whether auth is enforced. The old code
-     mounted the iframe BARE on first paint and only added `t=`/`exp=`
-     once the mint resolved; the bare navigation 403'd inside the frame
-     and a later src change did not reliably re-navigate it, so ~40% of
-     opens were permanently stuck showing the raw auth-error JSON (the
-     pre-flight passed, because it sends the header, so the error branch
-     never fired). Resolve the pass FIRST, then mount once. */
-  const [phase, setPhase] = useState<'pending' | 'ready'>('pending');
-  useEffect(() => {
-    let live = true;
-    setErr('');
-    setPass(null);
-    setPhase('pending');
-    api.prefabCheck(id)
-      .then((r) => {
-        if (!live) return;
-        if (!r.ok) setErr(`${r.status} ${r.text || 'render failed'}`);
-      })
-      .catch((e) => { if (live) setErr(String(e?.message || e)); });
-    api.prefabToken(id)
-      .then((p) => {
-        if (!live) return;
-        // An empty token means auth is disabled server-side: a bare
-        // mount is correct in that case, so proceed either way.
-        if (p.token) setPass(p);
-        setPhase('ready');
-      })
-      .catch(() => { if (live) setPhase('ready'); }); // mint failed: bare src
-    return () => { live = false; };
-  }, [id]);
-
-  if (err) {
-    return (
-      <div className="rounded-[10px] border border-red-400/30 bg-red-400/5 p-3.5 text-xs text-red-200">
-        <div className="mb-1 font-bold">prefab render failed</div>
-        <div className="break-words font-mono text-[11px] text-red-200/80">{err}</div>
-      </div>
-    );
-  }
-  if (phase === 'pending') {
-    return (
-      <div className="h-[640px] w-full rounded-[10px] border border-white/10 bg-white/5 p-4 text-xs text-zinc-400">
-        preparing the signed view…
-      </div>
-    );
-  }
-  const src = pass
-    ? `/api/apps/${encodeURIComponent(id)}/prefab?t=${encodeURIComponent(pass.token)}&exp=${pass.exp}`
-    : `/api/apps/${encodeURIComponent(id)}/prefab`;
-  return (
-    <iframe
-      title={`Prefab view of ${name}`}
-      src={src}
-      sandbox="allow-scripts"
-      referrerPolicy="no-referrer"
-      loading="lazy"
-      className="h-[640px] w-full rounded-[10px] border border-white/10 bg-white"
-    />
   );
 }

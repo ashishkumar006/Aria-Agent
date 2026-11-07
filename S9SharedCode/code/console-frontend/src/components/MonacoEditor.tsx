@@ -9,11 +9,34 @@ import type { DiffMarks } from '../lib/diffMarks';
    the right specifier Vite's worker plugin bundles it and hands back a
    hashed asset URL. */
 import EditorWorker from 'monaco-editor/editor/editor.worker?worker';
+import HtmlWorker from 'monaco-editor/language/html/html.worker?worker';
+import CssWorker from 'monaco-editor/language/css/css.worker?worker';
+import JsonWorker from 'monaco-editor/language/json/json.worker?worker';
+import TsWorker from 'monaco-editor/language/typescript/ts.worker?worker';
 
 /* Monaco runs its diff/link/suggest work off the main thread. Without this the
-   editor degrades to a broken state the first time a worker is needed. */
+   editor degrades to a broken state the first time a worker is needed.
+
+   The label is the LANGUAGE ID in monaco 0.57 (`workerManager.js` passes
+   `label: this._defaults.languageId`), not the old `htmlWorker` name.
+   `import * as monaco from 'monaco-editor'` registers every bundled language,
+   so html/css/json/ts each ask for THEIR worker — and handing them the base
+   editor worker made that worker answer `findDocumentLinks` /
+   `findDocumentSymbols`, which it does not implement: opening an HTML or
+   TypeScript file threw an uncaught "Missing requestHandler or method" per
+   request, with links and symbols silently dead in the files that need them. */
+const WORKERS: Record<string, () => Worker> = {
+  html: () => new HtmlWorker(),
+  json: () => new JsonWorker(),
+  css: () => new CssWorker(),
+  scss: () => new CssWorker(),
+  less: () => new CssWorker(),
+  typescript: () => new TsWorker(),
+  javascript: () => new TsWorker(),
+};
 (globalThis as { MonacoEnvironment?: unknown }).MonacoEnvironment = {
-  getWorker: () => new EditorWorker(),
+  getWorker: (_workerId: string, label: string) =>
+    (WORKERS[label] || (() => new EditorWorker()))(),
 };
 /* ── language ids ────────────────────────────────────────────────────── */
 

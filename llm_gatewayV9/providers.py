@@ -20,7 +20,7 @@ The returned dict is normalised:
 each adapter translates them to its native shape.
 """
 from __future__ import annotations
-import os, json, uuid, hashlib, re, base64
+import os, json, uuid, hashlib, re, base64, weakref
 from typing import AsyncIterator, Optional, Any
 import httpx
 
@@ -35,6 +35,103 @@ import httpx
 # streaming. Connect gets 10s (a TCP+TLS handshake slower than that is
 # never going to be the fast path).
 _UPSTREAM_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+
+# Gemini measures the explicit-cache minimum in TOKENS, not characters, and it
+# rejects the mint outright below it: the live answer for a 4k-character system
+# block was "Cached content is too small. total_token_count=851,
+# min_total_token_count=1024". The gate used to be `len(...) > 1000` CHARACTERS
+# (~250 tokens), so almost every chat call asked for a cache it was certain to
+# be refused, and the refusal was swallowed. 4 chars/token is the same estimate
+# the ledger uses; requiring 1.5x the floor keeps token-dense text (numbers,
+# identifiers, JSON) from sliding under it.
+_EXPLICIT_CACHE_MIN_CHARS = 1024 * 6
+
+# ── one pooled client per event loop, instead of one per call ───────────────
+# Constructing an httpx client is not free here: measured on the deployment
+# host, `httpx.AsyncClient(timeout=...)` costs 230-590 ms and `httpx.Client`
+# 230-590 ms, because it builds a fresh SSL context and connection pool every
+# time. It used to happen on EVERY upstream LLM call, so every single gateway
+# request paid roughly half a second of pure local overhead before it had sent
+# a byte - and the same on the agent's side, twice, for a proxied call. That
+# local tax is the reason almost every `/v1/*` latency reads as "over a
+# thousand ms" even when the model answers in 200 ms.
+#
+# A client is safe to share, so share one. The cache is keyed by the *running
+# loop* as well as the timeout because an httpx client is bound to the loop it
+# was created on; the test suite runs several lifespans in one process, and a
+# client reused across loops raises "Event loop is closed".
+#
+# The key is the loop OBJECT, held weakly — never `id(loop)`. An id is a memory
+# address and CPython gives a finished loop's address to the next one, so an
+# `(id(loop), timeout)` key collided and a client bound to a dead loop could be
+# handed to a live loop. The agent side of this pool hit that as a real failure
+# (`test_async_pool_is_scoped_to_the_running_loop`); this is the same shape.
+# Weak keys also mean a loop that goes away drops its clients instead of
+# leaking them.
+_CLIENTS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _timeout_key(timeout) -> str:
+    # `httpx.Timeout` has connect/read/write/pool and NO `.timeout` attribute,
+    # so it must not be introspected - repr() distinguishes a float from any
+    # Timeout shape, which is all a cache key needs.
+    return repr(timeout)
+
+
+def upstream_client(timeout=_UPSTREAM_TIMEOUT) -> httpx.AsyncClient:
+    """A shared `httpx.AsyncClient` for upstream calls on this event loop.
+
+    Callers must NOT close it. Semantics are unchanged from the old
+    `async with httpx.AsyncClient(timeout=...)`: no default headers, and
+    redirects are not followed (that was never enabled here, and silently
+    turning it on would change provider error behaviour).
+    """
+    import asyncio
+    loop = asyncio.get_running_loop()
+    by_timeout = _CLIENTS.setdefault(loop, {})
+    key = _timeout_key(timeout)
+    c = by_timeout.get(key)
+    # getattr: a duck-typed stand-in that does not implement `is_closed` is
+    # treated as usable, so pooling cannot raise an AttributeError on the hot path.
+    if c is None or getattr(c, "is_closed", False):
+        c = httpx.AsyncClient(timeout=timeout)
+        by_timeout[key] = c
+    return c
+
+
+def close_upstream_clients() -> None:
+    """Drop the pooled clients (used by shutdown and by tests that swap loops)."""
+    for key in list(_CLIENTS):
+        c = _CLIENTS.pop(key, None)
+        if c is not None:
+            try:
+                import asyncio as _aio
+                _aio.get_running_loop().create_task(c.aclose())
+            except RuntimeError:
+                pass
+
+
+def reset_upstream_pool() -> None:
+    """Forget the pooled clients without closing them. For tests only.
+
+    A pool entry outlives the monkeypatch that produced it, so a later test
+    would assert against a client built under an earlier test's stubs.
+    """
+    _CLIENTS.clear()
+
+
+from contextlib import asynccontextmanager as _asynccontextmanager
+
+
+@_asynccontextmanager
+async def upstream_session(timeout=_UPSTREAM_TIMEOUT):
+    """`async with upstream_session() as c` over a pooled client.
+
+    Shaped as a context manager so the call sites keep their exact structure,
+    including `async with c.stream(...)`. Unlike `httpx.AsyncClient`, exiting
+    this does NOT close the client - that is the whole point.
+    """
+    yield upstream_client(timeout)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -457,7 +554,7 @@ class OpenAICompatProvider(BaseProvider):
         self._apply_response_format(body, response_format)
         self._apply_reasoning(body, reasoning, m)
 
-        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as c:
+        async with upstream_session(_UPSTREAM_TIMEOUT) as c:
             r = await self._post_with_fallbacks(c, body)
             if r.status_code != 200:
                 raise ProviderError(
@@ -537,7 +634,7 @@ class OpenAICompatProvider(BaseProvider):
                 body["tool_choice"] = tool_choice if isinstance(tool_choice, (str, dict)) else "auto"
         self._apply_response_format(body, response_format)
         self._apply_reasoning(body, reasoning, m)
-        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as c:
+        async with upstream_session(_UPSTREAM_TIMEOUT) as c:
             async with c.stream("POST", f"{self.base_url}/chat/completions",
                                 headers=self._headers(), json=body) as r:
                 if r.status_code != 200:
@@ -826,9 +923,20 @@ class GeminiProvider(BaseProvider):
             return r, reasoning_applied, cache_kept
         return r, reasoning_applied, True
 
-    async def chat(self, messages, *, max_tokens=2048, temperature=0.7, model=None,
-                   tools=None, tool_choice=None, reasoning=None, response_format=None,
-                   system_blocks=None, cache_system=False):
+    async def _build_request(self, messages, *, max_tokens=2048, temperature=0.7,
+                             model=None, tools=None, tool_choice=None,
+                             reasoning=None, response_format=None,
+                             system_blocks=None, cache_system=False) -> dict:
+        """Everything the batched call and the streamed call BOTH need.
+
+        Extracted from `chat` rather than duplicated, because a stream that
+        builds its own request drifts from it: it would drop the inline-system
+        fold and the explicit cache, and those two were each won against a live
+        failure (a persona and a retrieved document silently discarded; a
+        second billing for a prompt already cached). Answering differently
+        because the client asked for tokens as they arrive is the worst kind of
+        difference to discover.
+        """
         m = model or self.model
         system_text, blocks, has_cache_marker = _flatten_system(system_blocks)
         cacheable_text = None
@@ -841,7 +949,7 @@ class GeminiProvider(BaseProvider):
         cache_name = None
         cache_create_tokens = 0
         cache_read_tokens = 0
-        if cacheable_text and len(cacheable_text) > 1000:
+        if cacheable_text and len(cacheable_text) >= _EXPLICIT_CACHE_MIN_CHARS:
             cache_name, cache_create_tokens = await self.cache_store.get_or_create(
                 self.api_key, m, cacheable_text, self.base_url
             )
@@ -892,21 +1000,43 @@ class GeminiProvider(BaseProvider):
                 body["generationConfig"]["responseMimeType"] = "application/json"
 
         reasoning_applied = False
-        if reasoning and reasoning != "off":
-            knob = _gemini_thinking_knob(m)
-            if knob == "level":
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": reasoning}
-                reasoning_applied = True
-            elif knob == "budget":
-                body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": _GEMINI_BUDGETS[reasoning]}
-                reasoning_applied = True
+        # The old guard was `if reasoning and reasoning != "off"`, which made
+        # "off" a no-op: asking to stop thinking sent nothing, and Google's
+        # default then ran the call anyway. Gemini 3 cannot switch thinking
+        # fully off, so `minimal` is the honest floor rather than a promise.
+        cfg = _gemini_thinking_config(m, reasoning)
+        if cfg:
+            body["generationConfig"]["thinkingConfig"] = cfg
+            reasoning_applied = True
+
+        return {"model": m, "body": body, "system_text": system_text,
+                "instr_parts": instr_parts or None,
+                "reasoning_applied": reasoning_applied,
+                "cache_name": cache_name,
+                "cache_create_tokens": cache_create_tokens,
+                "cache_read_tokens": cache_read_tokens}
+
+    async def chat(self, messages, *, max_tokens=2048, temperature=0.7, model=None,
+                   tools=None, tool_choice=None, reasoning=None, response_format=None,
+                   system_blocks=None, cache_system=False):
+        req = await self._build_request(
+            messages, max_tokens=max_tokens, temperature=temperature,
+            model=model, tools=tools, tool_choice=tool_choice,
+            reasoning=reasoning, response_format=response_format,
+            system_blocks=system_blocks, cache_system=cache_system)
+        m = req["model"]
+        body = req["body"]
+        system_text = req["system_text"]
+        cache_name = req["cache_name"]
+        cache_create_tokens = req["cache_create_tokens"]
+        cache_read_tokens = req["cache_read_tokens"]
 
         url = f"{self.base_url}/models/{m}:generateContent?key={self.api_key}"
-        async with httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT) as c:
+        async with upstream_session(_UPSTREAM_TIMEOUT) as c:
             r, reasoning_applied, cache_kept = await self._post_with_fallbacks(
                 c, url, body, system_text,
-                reasoning_applied=reasoning_applied,
-                instr_parts=(instr_parts or None) or None)
+                reasoning_applied=req["reasoning_applied"],
+                instr_parts=req["instr_parts"])
             if not cache_kept:
                 cache_name = None
                 cache_read_tokens = 0
@@ -939,6 +1069,14 @@ class GeminiProvider(BaseProvider):
             in_tok = usage.get("promptTokenCount", 0) or 0
             out_tok = usage.get("candidatesTokenCount", 0) or 0
             cached_tok = usage.get("cachedContentTokenCount", 0) or 0
+            # `candidatesTokenCount` deliberately EXCLUDES thinking. Reading
+            # only it is why a call that spent 80 s thinking and emitted one
+            # token looks like 0.01 tok/s and why no one could tell thinking
+            # from a stall: the number that would prove it was in the response
+            # and was dropped. Keep it, and keep the total, so latency can be
+            # divided by the tokens the model actually generated.
+            think_tok = usage.get("thoughtsTokenCount", 0) or 0
+            total_tok = usage.get("totalTokenCount", 0) or 0
             if cached_tok and not cache_read_tokens:
                 cache_read_tokens = cached_tok
             stop = (cands[0].get("finishReason") or "STOP").upper()
@@ -950,6 +1088,8 @@ class GeminiProvider(BaseProvider):
                 "tool_calls": tool_calls_out,
                 "input_tokens": in_tok,
                 "output_tokens": out_tok,
+                "thinking_tokens": think_tok,
+                "total_tokens": total_tok,
                 "cache_creation_input_tokens": cache_create_tokens,
                 "cache_read_input_tokens": cache_read_tokens,
                 "stop_reason": stop_norm,
@@ -958,19 +1098,212 @@ class GeminiProvider(BaseProvider):
                 "reasoning_applied": reasoning_applied,
             }
 
+    async def stream(self, messages, *, max_tokens=2048, temperature=0.7,
+                     model=None, tools=None, tool_choice=None, reasoning=None,
+                     response_format=None, system_blocks=None,
+                     cache_system=False) -> AsyncIterator[str]:
+        """Real token streaming, via `streamGenerateContent?alt=sse`.
+
+        This class used to inherit `BaseProvider.stream`, which is a buffered
+        fallback: it runs the whole batched call and yields the answer ONCE.
+        Every streamed turn therefore went dark until the model had finished —
+        measured at 11.8 s for a one-sentence question and 24.2 s for a
+        two-hop one, with exactly one `delta` frame at the end. That is the
+        whole of the "Discuss isn't streaming smoothly" complaint, and it is
+        why a slow turn looks like a stuck one: the OpenAI-compatible providers
+        already stream properly, so only the Gemini-backed surface felt dead.
+
+        The contract is the route's existing one: a bare string is answer text,
+        `[[REASONING_DELTA]] <json>` is chain of thought, and
+        `[[TOOL_CALL_DELTA]] <json>` is an OpenAI-shaped fragment.
+
+        Tool calls are BUFFERED and emitted after the text, whole. Gemini sends
+        a `functionCall` as a complete part rather than as argument fragments
+        like OpenAI does, and the thought signature that rides with it is
+        mandatory on the next hop — emitting a half-built call, or one without
+        its signature, 400s the following turn and loses the run. What must not
+        wait for that is the answer text, which is what the reader is watching.
+        """
+        if not _gemini_stream_enabled():
+            # The kill switch: fall back to exactly the inherited behaviour.
+            async for chunk in BaseProvider.stream(
+                    self, messages, max_tokens=max_tokens,
+                    temperature=temperature, model=model, tools=tools,
+                    tool_choice=tool_choice, reasoning=reasoning,
+                    response_format=response_format,
+                    system_blocks=system_blocks, cache_system=cache_system):
+                yield chunk
+            return
+
+        req = await self._build_request(
+            messages, max_tokens=max_tokens, temperature=temperature,
+            model=model, tools=tools, tool_choice=tool_choice,
+            reasoning=reasoning, response_format=response_format,
+            system_blocks=system_blocks, cache_system=cache_system)
+        m = req["model"]
+        body = req["body"]
+        url = (f"{self.base_url}/models/{m}:streamGenerateContent"
+               f"?alt=sse&key={self.api_key}")
+        calls: list[dict] = []
+        got_any = False
+
+        async with upstream_session(_UPSTREAM_TIMEOUT) as c:
+            retried = False
+            cm = None
+            r = None
+            try:
+                while True:
+                    cm = c.stream("POST", url, json=body)
+                    r = await cm.__aenter__()
+                    if r.status_code == 200:
+                        break
+                    await r.aread()
+                    await cm.__aexit__(None, None, None)
+                    cm = None
+                    # The same two one-shot simplifications the batched call
+                    # makes, for the same reasons: a model that rejects the
+                    # thinking config, and a cache name it will not accept.
+                    if (not retried and r.status_code == 400):
+                        retried = True
+                        if req["reasoning_applied"]:
+                            body["generationConfig"].pop("thinkingConfig", None)
+                        if "cachedContent" in body and "cache" in r.text.lower():
+                            body.pop("cachedContent", None)
+                            if req["instr_parts"]:
+                                body["systemInstruction"] = {
+                                    "parts": req["instr_parts"]}
+                            else:
+                                body.pop("systemInstruction", None)
+                        continue
+                    raise ProviderError(
+                        f"gemini HTTP {r.status_code}: {r.text[:400]}",
+                        status=r.status_code,
+                        retryable=(r.status_code not in (400, 401)))
+
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        d = json.loads(line[6:])
+                    except Exception:
+                        continue
+                    for cand in (d.get("candidates") or []):
+                        content = cand.get("content") or {}
+                        for p in (content.get("parts") or []):
+                            if not isinstance(p, dict):
+                                continue
+                            sig = (p.get("thoughtSignature")
+                                   or p.get("thought_signature"))
+                            fc = p.get("functionCall") or p.get("function_call")
+                            if fc:
+                                tc = {
+                                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                                    "name": fc.get("name", ""),
+                                    "arguments": fc.get("args")
+                                    or fc.get("arguments") or {},
+                                }
+                                if sig:
+                                    tc["thought_signature"] = sig
+                                calls.append(tc)
+                                continue
+                            txt = p.get("text")
+                            if not txt:
+                                continue
+                            got_any = True
+                            # Thinking text is not the answer. Left on the
+                            # answer channel it would be spoken, quoted and
+                            # counted as the reply.
+                            if p.get("thought"):
+                                yield ("[[REASONING_DELTA]] "
+                                       + json.dumps(txt))
+                            else:
+                                yield txt
+            finally:
+                if cm is not None:
+                    await cm.__aexit__(None, None, None)
+                elif r is not None:
+                    await r.aclose()
+
+        if not got_any and not calls:
+            # An empty stream is not a completed one. The route retries this
+            # once and then fails over, which is the only path that knows how
+            # to change provider.
+            raise ProviderError("gemini returned an empty stream",
+                                status=200, retryable=True)
+
+        for i, tc in enumerate(calls):
+            frag = {"index": i, "id": tc["id"], "type": "function",
+                    "function": {"name": tc["name"],
+                                 "arguments": json.dumps(tc["arguments"])}}
+            if tc.get("thought_signature"):
+                # The one field with nowhere to go in OpenAI's fragment shape,
+                # and the one Gemini 3 demands back on the next turn. It rides
+                # as a sibling key; the client puts it under `provider_meta`,
+                # which is where `_translate_messages` already looks for it.
+                frag["thought_signature"] = tc["thought_signature"]
+            yield ("[[TOOL_CALL_DELTA]] " + json.dumps([frag]))
+
+
+def _gemini_stream_enabled() -> bool:
+    """One switch for the whole streamed path; off restores the buffered call.
+
+    Read per call rather than at import so a test can flip it, and so an
+    operator can disable streaming with an env var on the next start without
+    the answer for a streamed turn ever differing from a batched one by
+    accident.
+    """
+    return (os.getenv("GATEWAY_GEMINI_STREAM", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
 
 def _gemini_supports_thinking(model: str) -> bool:
     return _gemini_thinking_knob(model) is not None
 
 
+def _gemini_thinking_config(model: str,
+                             reasoning: str | None) -> Optional[dict]:
+    """The `thinkingConfig` to put on the wire, or None to send nothing.
+
+    Pulled out of `chat` so it can be asserted. Nothing in this repository
+    ever checked what Gemini was actually sent, which is how the two live
+    models came to be excluded from `_gemini_thinking_knob`, so no config was
+    built, so Google's own default ran every call and the gateway could
+    neither ask for less thinking nor tell whether it had thought at all.
+    """
+    knob = _gemini_thinking_knob(model)
+    if knob is None:
+        return None
+    if reasoning == "off":
+        # 2.5-flash has a budget knob and can spend zero. Gemini 3 replaced it
+        # with `thinkingLevel` and has no off switch, so `minimal` is the floor
+        # — stated as the floor rather than a promise, because a caller that
+        # asks for "off" on a 3.x model still gets some thinking.
+        return {"thinkingBudget": 0} if knob == "budget" else {"thinkingLevel": "minimal"}
+    if reasoning:
+        if knob == "level":
+            return {"thinkingLevel": reasoning}
+        return {"thinkingBudget": _GEMINI_BUDGETS[reasoning]}
+    return None
+
+
 def _gemini_thinking_knob(model: str) -> Optional[str]:
     """Returns 'level' for thinkingLevel-capable models (2.5-pro, 3.x non-lite),
-    'budget' for thinkingBudget-only models (2.5-flash), or None for non-thinking."""
+    'budget' for thinkingBudget-only models (2.5-flash), or None for non-thinking.
+
+    The `flash-lite` exclusion was wrong and it is why nobody could answer the
+    question "is thinking on": both live models are flash-lite, so this
+    returned None, so a thinkingConfig was never built, so Google's own default
+    ran the call — and the gateway had no way to ask, and no way to tell.
+    Gemini 3 flash-lite accepts thinkingLevel (down to `minimal`), so it is a
+    'level' model like the rest of the 3.x family.
+    """
     m = (model or "").lower()
     if "gemini" not in m:
         return None
+    if "3-flash-lite" in m or "3.1-flash-lite" in m or "3.5-flash-lite" in m:
+        return "level"      # the models actually configured here
     if "flash-lite" in m:
-        return None
+        return None         # 1.x / 2.x flash-lite genuinely has no knob
     if "2.5-pro" in m or "3-pro" in m or "3.1-pro" in m:
         return "level"
     if "3-flash" in m or "3.1-flash" in m:
@@ -1164,7 +1497,7 @@ class OllamaProvider(BaseProvider):
         # Local model loads can take minutes on first touch (weights paging
         # in); the 600s ceiling here is deliberate, unlike the 180s used
         # for hosted providers.
-        async with httpx.AsyncClient(timeout=600) as c:
+        async with upstream_session(600.0) as c:
             r = await c.post(f"{self.base_url}/api/chat", json=body)
             if r.status_code != 200:
                 raise ProviderError(f"ollama HTTP {r.status_code}: {r.text[:300]}", status=r.status_code)
@@ -1397,6 +1730,27 @@ def _key_list(single: str, plural: str) -> list[str]:
     return out
 
 
+def _keys_for(keys: dict[str, list[str]] | None, name: str,
+              single: str, plural: str) -> list[str]:
+    """Provider keys from an explicit per-user pool, else from the operator env.
+
+    `keys is not None` is the multi-user signal: an empty list means this user
+    has no key for the provider, and the provider must NOT be constructed from
+    the operator's environment. Falling back on an empty list would silently
+    spend the operator's quota for a user who never configured anything.
+    """
+    if keys is None:
+        return _key_list(single, plural)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (keys.get(name) or []):
+        v = str(raw).strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def _base_provider(name: str) -> str:
     """Pool-member name → canonical provider (`gemini-2` → `gemini`).
     Only strips a trailing -N suffix; plain names pass through."""
@@ -1427,8 +1781,11 @@ def _fan_out(out: dict, base: str, keys: list[str], make) -> None:
         out[base if i == 1 else f"{base}-{i}"] = make(k)
 
 
-def build_providers(cache_store):
+def build_providers(cache_store, keys: dict[str, list[str]] | None = None):
     """Worker pool — the LLMs that do real work for the agent.
+
+    `keys` is a per-user pool (canonical provider → keys). None keeps the
+    single-operator behaviour and reads the environment.
 
     V3 changes vs V2:
     - groq worker default: openai/gpt-oss-120b (was llama-3.3-70b-versatile,
@@ -1437,7 +1794,7 @@ def build_providers(cache_store):
     current default gpt-oss-120b — see note at the cerebras entry below.)
     """
     out = {}
-    _gemini_keys = _key_list("GEMINI_API_KEY", "GEMINI_API_KEYS")
+    _gemini_keys = _keys_for(keys, "gemini", "GEMINI_API_KEY", "GEMINI_API_KEYS")
     if _gemini_keys:
         # Each Gemini key yields a gemini + gemini35lite pair sharing the
         # same suffix, so key rotation covers both models together.
@@ -1450,10 +1807,10 @@ def build_providers(cache_store):
             # name or the `gemini35lite` shortcut.
             out["gemini35lite" + suf] = GeminiProvider(k, os.getenv("GEMINI_35_LITE_MODEL", "gemini-3.5-flash-lite"), cache_store)
     _fan_out(out, "nvidia",
-             _key_list("NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
+             _keys_for(keys, "nvidia", "NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
              lambda k: NvidiaProvider(k, os.getenv("NVIDIA_MODEL", "deepseek-ai/deepseek-v3.2")))
     _fan_out(out, "groq",
-             _key_list("GROQ_API_KEY", "GROQ_API_KEYS"),
+             _keys_for(keys, "groq", "GROQ_API_KEY", "GROQ_API_KEYS"),
              lambda k: GroqProvider(k, os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")))
     # 2026-09-08: zai-glm-4.7 is ARCHIVED (verified 404). gpt-oss-120b
     # is a valid catalogue id, but THIS account currently 402s on every
@@ -1462,13 +1819,13 @@ def build_providers(cache_store):
     # and this entry works with no code change. CEREBRAS_MODEL override
     # still wins when set.
     _fan_out(out, "cerebras",
-             _key_list("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
+             _keys_for(keys, "cerebras", "CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
              lambda k: CerebrasProvider(k, os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")))
     _fan_out(out, "openrouter",
-             _key_list("OPEN_ROUTER_API_KEY", "OPEN_ROUTER_API_KEYS"),
+             _keys_for(keys, "openrouter", "OPEN_ROUTER_API_KEY", "OPEN_ROUTER_API_KEYS"),
              lambda k: OpenRouterProvider(k, os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")))
     _fan_out(out, "github",
-             _key_list("GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
+             _keys_for(keys, "github", "GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
              lambda k: GitHubProvider(k, os.getenv("GITHUB_MODEL", "openai/gpt-4.1-mini")))
     if om := os.getenv("OLLAMA_MODEL"):
         # V9: Ollama is still used for embeddings (see embedders.py), but it is
@@ -1492,7 +1849,7 @@ def build_providers(cache_store):
     _kilo_base = os.getenv("KILO_BASE_URL", "https://api.kilo.ai/api/gateway")
     _kilo_model = os.getenv("KILO_MODEL", "") or _KILO_SAFE_DEFAULT
     _fan_out(out, "kilo",
-             _key_list("KILO_API_KEY", "KILO_API_KEYS"),
+             _keys_for(keys, "kilo", "KILO_API_KEY", "KILO_API_KEYS"),
              lambda k: KiloProvider(k, _kilo_model, _kilo_base))
     # V9: bake per-model capability overrides (vision/reasoning) into each
     # instance, so Router.pick() — which reads provider.capabilities directly —
@@ -1525,7 +1882,7 @@ ROUTER_DEFAULTS = {
 }
 
 
-def build_router_providers():
+def build_router_providers(keys: dict[str, list[str]] | None = None):
     """Router pool - same provider classes as workers, but separate instances
     with router-specific (smaller/faster) model defaults. Uses the same API keys
     as workers; per-provider rate budgets are independent because the providers
@@ -1550,19 +1907,19 @@ def build_router_providers():
     out = {}
     if "cerebras" in allowed:
         _fan_out(out, "cerebras",
-                 _key_list("CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
+                 _keys_for(keys, "cerebras", "CEREBRAS_API_KEY", "CEREBRAS_API_KEYS"),
                  lambda k: CerebrasProvider(k, os.getenv("ROUTER_CEREBRAS_MODEL", ROUTER_DEFAULTS["cerebras"])))
     if "groq" in allowed:
         _fan_out(out, "groq",
-                 _key_list("GROQ_API_KEY", "GROQ_API_KEYS"),
+                 _keys_for(keys, "groq", "GROQ_API_KEY", "GROQ_API_KEYS"),
                  lambda k: GroqProvider(k, os.getenv("ROUTER_GROQ_MODEL", ROUTER_DEFAULTS["groq"])))
     if "nvidia" in allowed:
         _fan_out(out, "nvidia",
-                 _key_list("NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
+                 _keys_for(keys, "nvidia", "NVIDIA_API_KEY", "NVIDIA_API_KEYS"),
                  lambda k: NvidiaProvider(k, os.getenv("ROUTER_NVIDIA_MODEL", ROUTER_DEFAULTS["nvidia"])))
     if "github" in allowed:
         _fan_out(out, "github",
-                 _key_list("GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
+                 _keys_for(keys, "github", "GITHUB_ACCESS_TOKEN", "GITHUB_ACCESS_TOKENS"),
                  lambda k: GitHubProvider(k, os.getenv("ROUTER_GITHUB_MODEL", ROUTER_DEFAULTS["github"])))
     # Kilo joins the router pool so it is a visible, managed member rather than
     # something only reachable by knowing the provider name. Its model default
@@ -1571,7 +1928,7 @@ def build_router_providers():
     # retires ids and a baked-in name rots into a 404.
     if "kilo" in allowed:
         _fan_out(out, "kilo",
-                 _key_list("KILO_API_KEY", "KILO_API_KEYS"),
+                 _keys_for(keys, "kilo", "KILO_API_KEY", "KILO_API_KEYS"),
                  lambda k: KiloProvider(
                      k, os.getenv("ROUTER_KILO_MODEL",
                                   os.getenv("KILO_MODEL", "")) or _KILO_SAFE_DEFAULT,

@@ -70,7 +70,11 @@ def test_deferral_preserves_every_node():
 
 def test_the_planner_prompt_tells_it_the_decision_is_its_own():
     low = PROMPT.read_text(encoding="utf-8").lower()
-    assert "entirely your decision" in low
+    # The wording moved when the prompt stopped claiming there were no limits
+    # at all (see test_planner_promise_and_operator_note_agree). The decision
+    # being the planner's is still the assertion; the invented absolutes are not.
+    assert "is your decision" in low, "the fleet decision must be the planner's"
+    assert "nothing trims your plan" in low, "no silent trim, by name"
     assert "will not" in low and "drop" in low, (
         "the prompt must say nothing it emits will be dropped")
 

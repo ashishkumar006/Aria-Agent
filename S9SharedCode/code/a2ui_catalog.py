@@ -177,25 +177,155 @@ CATALOG: dict[str, dict[str, Any]] = {
     },
 
     # ── interaction ─────────────────────────────────────────────────────────
-    # Read-only catalog. There is no text input and no submit button, and that
-    # is a decision rather than an omission: a generated form whose submission
-    # performs an action is an approval flow wearing a disguise, and approval
-    # flows are not something an agent should be able to synthesise.
+    # Inputs are data collection for an app, not an approval gate. The value
+    # is only sent when the user presses an Action; no input can execute a
+    # tool, navigate, or change anything on its own.
+    "Input": {
+        "aria_widget": "text-field",
+        "doc": ("A labelled text field. On submit, all input values in the "
+                "surface are sent with the Action event under `input`, keyed "
+                "by this component's `name`."),
+        "props": {"name": "text|literal", "label": "text|literal",
+                  "placeholder": "text|literal", "multiline": "bool",
+                  "kind": "enum:text|number|textarea",
+                  "value": "text|literal"},
+    },
+    "Select": {
+        "aria_widget": "select-field",
+        "doc": ("A labelled dropdown. The chosen option value is submitted "
+                "with the Action under `input[name]`."),
+        "props": {"name": "text|literal", "label": "text|literal",
+                  "options": "list<{value,label}>", "value": "text|literal"},
+    },
+    "Checkbox": {
+        "aria_widget": "checkbox-field",
+        "doc": ("A labelled checkbox. The submitted value is \"true\" or "
+                "\"false\" under `input[name]`."),
+        "props": {"name": "text|literal", "label": "text|literal",
+                  "checked": "bool"},
+    },
+    "Slider": {
+        "aria_widget": "range-field",
+        "doc": "A labelled numeric slider; the selected number is submitted.",
+        "props": {"name": "text|literal", "label": "text|literal",
+                  "min": "number", "max": "number", "step": "number",
+                  "value": "number"},
+    },
+    "RadioGroup": {
+        "aria_widget": "radio-group",
+        "doc": "A labelled single-choice group; the selected option value is submitted.",
+        "props": {"name": "text|literal", "label": "text|literal",
+                  "options": "list<{value,label}>", "value": "text|literal"},
+    },
+    "Toggle": {
+        "aria_widget": "switch-field",
+        "doc": "A labelled on/off switch; the value is submitted as true/false.",
+        "props": {"name": "text|literal", "label": "text|literal",
+                  "checked": "bool"},
+    },
     "Action": {
         "aria_widget": "button",
-        "doc": "A button that emits ONE event. No form submission.",
+        "doc": ("A button that emits ONE event and submits every input value "
+                "in the surface under `input`."),
         "props": {"label": "text|literal", "variant": "enum:primary|secondary",
-                  "action": "event", "args": "object"},
+                  "action": "event", "args": "object", "tooltip": "text|literal"},
     },
     "FilterChips": {
         "aria_widget": "chip-row",
-        "doc": "Single-select filter. Emits an event; does not mutate state.",
+        "doc": ("Single-select filter. Emits its action with the chosen option "
+                "id under `input.filter`; does not mutate state on its own."),
         "props": {"options": "list<{id,label,selected}>", "action": "event"},
     },
     "Link": {
         "aria_widget": "link",
         "doc": "Navigates within the console. External URLs are rejected.",
         "props": {"label": "text|literal", "target": "enum:console"},
+    },
+
+    # ── layout extras ───────────────────────────────────────────────────────
+    "Section": {
+        "aria_widget": "section-card",
+        "doc": "A titled group of content. Use it to break a long app into parts.",
+        "props": {"title": "text|literal", "subtitle": "text|literal",
+                  "children": "ids", "gap": "enum:tight|normal|loose"},
+    },
+    "Grid": {
+        "aria_widget": "responsive-grid",
+        "doc": "A responsive grid of child components.",
+        "props": {"children": "ids", "columns": "enum:2|3|4|auto",
+                  "gap": "enum:tight|normal|loose"},
+    },
+    "Accordion": {
+        "aria_widget": "disclosure",
+        "doc": "A collapsible titled group, closed by default.",
+        "props": {"title": "text|literal", "children": "ids"},
+    },
+    "Toolbar": {
+        "aria_widget": "toolbar",
+        "doc": "A compact horizontal strip for actions and filters.",
+        "props": {"children": "ids", "align": "enum:start|center|end"},
+    },
+    "Footer": {
+        "aria_widget": "footer-note",
+        "doc": "A subdued closing note.",
+        "props": {"text": "text|literal"},
+    },
+
+    # ── text and display ────────────────────────────────────────────────────
+    "BulletList": {
+        "aria_widget": "bullet-list",
+        "doc": "An unordered list of short strings.",
+        "props": {"items": "list<string>"},
+    },
+    "NumberedList": {
+        "aria_widget": "numbered-list",
+        "doc": "An ordered list of short strings.",
+        "props": {"items": "list<string>"},
+    },
+    "Quote": {
+        "aria_widget": "blockquote",
+        "doc": "A quoted passage, optionally with attribution.",
+        "props": {"text": "text|literal", "cite": "text|literal"},
+    },
+    "Callout": {
+        "aria_widget": "callout",
+        "doc": "A highlighted note with a tone.",
+        "props": {"title": "text|literal", "text": "text|literal",
+                  "tone": "enum:neutral|info|good|warn|bad"},
+    },
+    "TagList": {
+        "aria_widget": "tag-row",
+        "doc": "A row of small tags.",
+        "props": {"tags": "list<string>",
+                  "tone": "enum:neutral|info|good|warn|bad"},
+    },
+    "Avatar": {
+        "aria_widget": "avatar",
+        "doc": "Initials and an optional label.",
+        "props": {"name": "text|literal", "label": "text|literal"},
+    },
+    "Timeline": {
+        "aria_widget": "timeline",
+        "doc": "A vertical sequence of events.",
+        "props": {"items": "list<{title,detail,time}>"},
+    },
+
+    # ── charts ──────────────────────────────────────────────────────────────
+    "BarChart": {
+        "aria_widget": "bar-chart",
+        "doc": "Horizontal bars with labels and numeric values.",
+        "props": {"items": "list<{label,value}>", "max": "number"},
+    },
+    "DonutChart": {
+        "aria_widget": "donut-chart",
+        "doc": "A compact donut with a centre label.",
+        "props": {"segments": "list<{label,value}>", "center": "text|literal"},
+    },
+    "Gauge": {
+        "aria_widget": "gauge",
+        "doc": "A single value rendered as a progress meter.",
+        "props": {"label": "text|literal", "value": "number",
+                  "min": "number", "max": "number"},
     },
 }
 
@@ -274,10 +404,41 @@ def catalog_prompt() -> str:
         f"  * Text longer than {MAX_TEXT_LEN} characters is rejected.",
         "  * Using a property a component does not list is rejected. Check the "
         "parenthesised list before writing a component out.",
-        "  * There is no text input and no form submit. Use Action for a "
-        "single event.",
+        "  * Collect user input with Input, Select, Checkbox, Slider, "
+        "RadioGroup or Toggle, and submit it with Action. The client sends "
+        "every control value under the Action's `input` key.",
+        "  * Every Action must include a non-empty `action` string. Without "
+        "it the button cannot send anything.",
         "  * Never emit HTML, styles, class names, URLs, or event handler "
         "names. They are rejected.",
+        "",
+        # Composition guidance, in the one block both prompt paths append
+        # (`prompts/app_builder.md` and `a2ui_surfaces.generation_prompt`).
+        # Kept here rather than duplicated there, and it is here at all because
+        # the catalog was a list of parts with no word about how to assemble
+        # them: the model had every component available and still emitted a
+        # flat Column of body-size Text, which is the whole reason a generated
+        # app looked like a dump of lines rather than a built view.
+        "LAYOUT — what makes a view look built instead of dumped:",
+        "  * One Text with variant:\"heading\" is the title. Never a plain body "
+        "Text for a heading: body and heading render at different sizes, and a "
+        "dashboard whose title is body text reads as a wall of equal paragraphs.",
+        "  * A subtitle, a timestamp or a source line is variant:\"caption\".",
+        "  * Group with Section (its own title and optional subtitle) instead of "
+        "stacking leaves directly in the root Column. Metrics, a table and a "
+        "note are three sections, not six siblings.",
+        "  * Several KeyValue go in ONE MetricRow. Never scatter them between "
+        "other components.",
+        "  * Cards, tiles and repeated records go in a Grid. columns:\"auto\" "
+        "fills whatever width it is given; 2/3/4 fix the count and collapse to "
+        "one column on a narrow pane. Never emulate a grid with Row.",
+        "  * Rows of data with columns are a Table (columns + rows). DataList is "
+        "a flat label/value list and is NOT a table.",
+        "  * Divider between unrelated halves, Spacer for breathing room, "
+        "Callout for a warning or a state worth noticing, Footer for "
+        "provenance, Accordion for detail that should start folded.",
+        "  * Every component must be reachable from root. A component root does "
+        "not list is not hidden — it is dropped, and the view loses data.",
     ]
     return "\n".join(lines)
 
@@ -421,6 +582,10 @@ def validate_components(components: Any) -> list[dict[str, Any]]:
         actions = [k for k in ("action",) if k in raw]
         if len(actions) > MAX_ACTIONS_PER_COMPONENT:
             raise CatalogError(f"{cid} declares too many actions")
+        if name in ("Action", "FilterChips", "Button"):
+            if not str(raw.get("action") or "").strip():
+                raise CatalogError(
+                    f"{cid} ({name}) needs a non-empty `action` string")
 
         if name == "Table":
             normalised_rows = _validate_table(
@@ -771,6 +936,13 @@ def validate_surface(payload: Any) -> dict[str, Any]:
 
     components = validate_components(payload.get("components"))
     components = _resolve_scalar_bindings(components, data or {})
+    root = payload.get("rootComponent") or "root"
+    if not isinstance(root, str) or not root:
+        raise CatalogError("rootComponent must be a component id")
+    # Preserve the declared root. Chat's normaliser may repair a non-root id
+    # later; the app builder always emits "root", and the renderer needs the
+    # field to survive validation or it shows "no root component".
     return {"surfaceId": surface_id, "catalogId": catalog_id,
+            "rootComponent": root,
             "data": data or {}, "components": components,
             "text": render_to_text(components, data or {})}

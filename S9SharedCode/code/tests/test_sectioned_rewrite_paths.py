@@ -85,7 +85,10 @@ def test_the_document_is_rendered_once_at_the_end():
     src = inspect.getsource(skills._expand_document_sections)
     assert src.count("render_document(") == 1, (
         "N sections must be merged and rendered ONCE, not one file per section")
-    assert "merged[:400]" in src
+    # The whole merged list, not a slice of it: this line used to read
+    # `merged[:400]`, which quietly dropped every section past the 400th block.
+    assert "blocks=merged)" in src, (
+        "the merged sections are being clipped before the single render call")
 
 
 def test_the_outline_can_come_from_the_request_alone():

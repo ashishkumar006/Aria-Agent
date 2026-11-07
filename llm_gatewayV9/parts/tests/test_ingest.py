@@ -273,3 +273,33 @@ def test_the_probe_caches_and_can_be_reset():
     assert backends_mod.probe() is first
     backends_mod.reset()
     assert backends_mod.probe(force=True) is not first
+
+def test_the_vertex_ceiling_covers_a_nonindexed_stl():
+    """Binary STL has 3 vertices per triangle. A 1.11M-face part therefore
+    has 3.34M raw vertices; the old 2M vertex cap rejected it before the weld
+    that would have made the count meaningful. The cap must cover 3x faces."""
+    from parts.mesh import DEFAULT_MAX_FACES, DEFAULT_MAX_VERTICES
+    assert DEFAULT_MAX_VERTICES >= 3 * DEFAULT_MAX_FACES
+
+
+def test_a_large_nonindexed_stl_loads_past_the_old_vertex_cap():
+    """A 720k-face binary STL has 2.16M raw vertices and must load."""
+    from parts.export import to_binary_stl
+    from parts.mesh import Mesh
+
+    n = 600
+    xs, ys = np.meshgrid(np.linspace(0, 1, n + 1), np.linspace(0, 1, n + 1))
+    vertices = np.stack([xs.ravel(), ys.ravel(), np.zeros((n + 1) ** 2)],
+                        axis=1)
+    grid = np.arange((n + 1) ** 2).reshape(n + 1, n + 1)
+    a = grid[:-1, :-1].ravel()
+    b = grid[:-1, 1:].ravel()
+    c = grid[1:, 1:].ravel()
+    d = grid[1:, :-1].ravel()
+    faces = np.stack([np.stack([a, b, c], axis=1),
+                      np.stack([a, c, d], axis=1)], axis=1).reshape(-1, 3)
+    mesh = Mesh.create(vertices, faces, source_format="stl")
+    data = to_binary_stl(mesh)
+    loaded = load(data, filename="sheet.stl", backends=NONE)
+    assert loaded.mesh.face_count == n * n * 2
+    assert loaded.mesh.vertex_count == n * n * 6   # 3 per triangle

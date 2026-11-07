@@ -12,6 +12,7 @@ import importlib
 import inspect
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -142,21 +143,32 @@ def test_inflight_key_is_released_on_disconnect():
     client does. So the disconnect branch must NOT release it - that would
     free the key while the run is still going and let a second, identical
     run start and bill (C5).
+
+    Matched as a prefix because every release is owner-scoped
+    (`_inflight_run_release(idem_key, owner=…)`): Stop hands the key back up
+    front so a re-ask is not refused, and the stopped run's own release must
+    then leave whatever newer run holds it.
     """
     src = inspect.getsource(agent_server._stream_run)
-    assert "_inflight_run_release(idem_key)" in src
+    call = "_inflight_run_release(idem_key"
+    assert call in src
     # The worker's finally releases the claim: it sits BEFORE the disconnect
     # branch in the source, inside the worker's own try/finally.
-    worker_release = src.find("_inflight_run_release(idem_key)")
+    worker_release = src.find(call)
     disconnect_at = src.find("if disconnected:")
     assert disconnect_at != -1, "disconnect branch missing"
     assert worker_release < disconnect_at, (
         "the claim must be released by the worker, before the disconnect "
         "branch can return")
     branch = src[disconnect_at:disconnect_at + 1400]
-    assert "_inflight_run_release(idem_key)" not in branch, (
+    assert call not in branch, (
         "the disconnect branch must not release the claim: the worker is "
         "still running and a second identical run would start and bill")
+    # And the release is scoped to the run that owns it, not unconditional.
+    scoped = src[src.index(call):src.index("\n", src.index(call))]
+    assert "owner=" in scoped, (
+        "an unscoped release lets a stopped run free the claim a newer run "
+        "legitimately holds")
 
 
 def test_chat_stream_sends_an_idempotency_key():
@@ -420,3 +432,128 @@ def test_gateway_4xx_is_not_flattened_to_502():
     assert agent_server._gw_status({"status_code": 500}) == 502
     assert agent_server._gw_status({}) == 502
     assert agent_server._gw_status({"status_code": "junk"}) == 502
+
+
+# --- persona + generalized feedback (msg_id / free-text note) ---------------
+# Feedback now keys chat turns by msg_id (no DAG node) and carries a free-text
+# note that the persona cross-check reads. Persona is a render of the memory
+# drawers, so these tests pin the seam without touching the live gateway.
+
+
+def test_feedback_msg_id_scope_and_note(tmp_path, monkeypatch, client):
+    """Thumbs on a chat turn (msg_id, no node_id) round-trip and read back
+    scoped to that id + session."""
+    monkeypatch.setattr(agent_server, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(agent_server, "_queue_feedback_learning", lambda: None)
+    log = tmp_path / "feedback.jsonl"
+    log.write_text(json.dumps(
+        {"t": 1.0, "session_id": "sess-x", "node_id": "",
+         "msg_id": "turn-sig-1", "vote": 1, "skill": "",
+         "note": "prefer publication dates"}) + "\n", encoding="utf-8")
+
+    r = client.post("/api/feedback",
+                    json={"session_id": "sess-x", "msg_id": "turn-sig-1",
+                          "vote": 1, "note": "prefer publication dates"})
+    assert r.status_code == 200, r.text
+
+    got = client.get("/api/feedback", params={"msg_id": "turn-sig-1",
+                                              "session_id": "sess-x"})
+    assert got.status_code == 200, got.text
+    assert got.json()["vote"] == 1
+
+    # A different turn's id must not inherit this vote.
+    other = client.get("/api/feedback", params={"msg_id": "turn-sig-2"})
+    assert other.json()["vote"] == 0
+
+    # node_id path still authenticates for run nodes.
+    client.post("/api/feedback", json={"session_id": "sess-x", "node_id": "n:1",
+                                       "vote": -1})
+    assert client.get("/api/feedback", params={"node_id": "n:1",
+                "session_id": "sess-x"}).json()["vote"] == -1
+
+    # Reject a vote with neither id.
+    bad = client.post("/api/feedback", json={"session_id": "s", "vote": 1})
+    assert bad.status_code == 400, bad.text
+
+
+def test_persona_endpoints_serve_the_generated_portrait(tmp_path, monkeypatch,
+                                                        client):
+    """Persona is its own AI-written file, not a render of memory drawers."""
+    monkeypatch.setattr(agent_server, "STATE_DIR", tmp_path)
+
+    r = client.get("/api/profile/persona")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["generated"] is False
+    assert "not enough interactions yet" in body["markdown"]
+
+    pdir = tmp_path / "persona"
+    pdir.mkdir()
+    (pdir / "current.md").write_text(
+        "# Persona — 30 October 2026\n\nThey seem to think in systems.\n",
+        encoding="utf-8")
+    (pdir / "evolution.md").write_text(
+        "## Version 1 — 2026-10-30 02:00 UTC — manual\n\n"
+        "# Persona — 30 October 2026\n\nThey seem to think in systems.\n",
+        encoding="utf-8")
+    (pdir / "meta.json").write_text(json.dumps({
+        "version": 1, "updated_iso": "2026-10-30 02:00 UTC",
+        "total_turns": 7, "based_on": {"interactions": 5},
+    }), encoding="utf-8")
+
+    r = client.get("/api/profile/persona")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["generated"] is True
+    assert "think in systems" in body["markdown"]
+    assert body["meta"]["version"] == 1
+
+    e = client.get("/api/profile/persona/evolution")
+    assert e.status_code == 200, e.text
+    assert "Version 1" in e.json()["markdown"]
+
+
+def test_persona_sync_dry_run_classifies_a_note(tmp_path, monkeypatch):
+    """Default sync is a dry run and classifies a feedback note through the
+    same detect_preference gate a live turn uses."""
+    import memory as memmod
+    monkeypatch.setattr(agent_server, "STATE_DIR", tmp_path)
+    (tmp_path / "feedback.jsonl").write_text(
+        json.dumps({"t": 1.0, "session_id": "s", "node_id": "", "msg_id": "m",
+                    "vote": 1, "note": "I prefer metric units"}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setattr(memmod, "list_recent", lambda **kw: [])
+    monkeypatch.setattr(memmod, "add_fact", lambda *a, **k: None)
+    monkeypatch.setattr(memmod, "remember_preference", lambda *a, **k: None)
+    # The interpreter seam is a gateway call; force the deterministic path.
+    monkeypatch.setattr(agent_server, "_feedback_llm_chat",
+                        lambda *a, **k: None)
+
+    res = agent_server._sync_feedback_to_persona(dry_run=True)
+    assert res["dry_run"] is True
+    assert res["proposed"], "a note was not proposed"
+    # The note text is carried verbatim as the raw value, source-tagged.
+    assert all(p["value"]["source"] == "feedback_note" for p in res["proposed"])
+    assert any("metric" in p["text"].lower() for p in res["proposed"])
+
+
+def test_persona_sync_dry_run_does_not_write(tmp_path, monkeypatch):
+    """`dry_run=True` must never call the memory writers, even on a vote
+    that WOULD lift."""
+    import memory as memmod
+    monkeypatch.setattr(agent_server, "STATE_DIR", tmp_path)
+    (tmp_path / "feedback.jsonl").write_text(
+        json.dumps({"t": 1.0, "session_id": "s", "node_id": "", "msg_id": "m",
+                    "vote": -1, "note": "too verbose, keep it short"}) + "\n",
+        encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(memmod, "list_recent", lambda **kw: [])
+    monkeypatch.setattr(memmod, "add_fact", lambda *a, **k: calls.append(("fact", a)))
+    monkeypatch.setattr(memmod, "remember_preference",
+                        lambda *a, **k: calls.append(("preference", a)))
+    monkeypatch.setattr(agent_server, "_feedback_llm_chat",
+                        lambda *a, **k: None)
+
+    res = agent_server._sync_feedback_to_persona(dry_run=True)
+    assert res["dry_run"] is True and res["applied"] == []
+    assert calls == [], "dry run wrote to memory"

@@ -73,3 +73,65 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_live)
         if item.get_closest_marker("stress"):
             item.add_marker(skip_stress)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_document_uploads(monkeypatch):
+    """No test may write into the real Documents library.
+
+    `S9_STATE_DIR` isolates every file the agent owns, but the gateway is a
+    separate process on :8109 with its OWN state, and artifact filing posts to
+    it. So the suites that exercise the filing path — a produced PDF, a spilled
+    finding, a fetched page, a stored search list — uploaded their fixtures into
+    the user's live library: `a.txt`, `b.txt`, `Path.txt`, and several
+    "Findings with figures." documents, each with real chunks and embeddings.
+
+    Returning None is exactly what `gateway.post_multipart` does when the
+    gateway is away, and registration is fail-soft by contract, so this is not a
+    special test mode: it is the offline branch. A test that wants to assert
+    filing patches `gateway.post_multipart` itself, which overrides this.
+    """
+    try:
+        import gateway
+
+        def _away(*_a, **_k):
+            return None
+
+        monkeypatch.setattr(gateway, "post_multipart", _away, raising=False)
+        # `None` means "could not ask", which is the answer that keeps an
+        # existing link instead of re-filing — the safe branch, and the one that
+        # keeps a test from probing the live plane for a document's status.
+        monkeypatch.setattr(gateway, "document_exists", _away, raising=False)
+        # The delete verb, or the guard only held the write half of a replace.
+        # `_persist_persona_documents` lists the library, DELETEs the previous
+        # "Persona — current.md" / "Persona — evolution.md" and then uploads the
+        # new ones. With only the upload patched, a chat-turn persona worker
+        # inside the suite removed both live copies and re-uploaded nothing: the
+        # user's Documents section lost a 322-chunk evolution document to a test
+        # run that "could not have written anything".
+        monkeypatch.setattr(gateway, "delete_json", _away, raising=False)
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _fresh_gateway_client_pools():
+    """Empty the pooled gateway httpx clients for every test.
+
+    `gateway.sync_pool` / `gateway.async_client` reuse one client per
+    (loop, timeout) because building an httpx client costs 230-590 ms here.
+    That is the point in production and a hazard in tests: the suites that
+    patch `httpx.Client`/`httpx.AsyncClient` with a fake — to assert a proxy
+    call carries the gateway token, or to simulate a dead gateway — only have
+    an effect while the call site still constructs a client. A cached client
+    would survive the patch, so `test_a_401_is_retried...` would be testing a
+    connection made before it started.
+    """
+    try:
+        import gateway
+        gateway.reset_client_pools()
+    except Exception:
+        pass
+    yield
+

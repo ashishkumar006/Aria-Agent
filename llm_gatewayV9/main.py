@@ -21,7 +21,11 @@ for _s in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
 del _s
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+import logging
+
+from fastapi import FastAPI, HTTPException, Request
+
+log = logging.getLogger("gateway")
 from fastapi.responses import (HTMLResponse, StreamingResponse, FileResponse,
                                JSONResponse)
 from fastapi.staticfiles import StaticFiles
@@ -55,6 +59,9 @@ from voice_api import router as voice_router
 from integrations_api import router as integrations_router
 from memory_api import router as memory_router
 from docgen_api import router as docgen_router
+from users_api import router as users_router
+from user_store import UserStore
+from user_pools import UserPoolManager
 
 # The failover ladder. nvidia/groq/cerebras/openrouter/github were removed at
 # the operator's request (see providers.DISABLED_PROVIDERS), so the ladder is
@@ -194,6 +201,15 @@ def _explicit_provider_for(model: str, agent, providers) -> str | None:
     return routed if routed in providers else None
 
 
+def _red(value) -> str:
+    """Redact provider keys/tokens from anything leaving over HTTP."""
+    try:
+        import redact
+        return redact.redact(value)
+    except Exception:
+        return str(value)
+
+
 def _bench_router(router_pool, name: str) -> None:
     """Bench a router that answered with something unparseable.
 
@@ -216,7 +232,7 @@ def _bench_router(router_pool, name: str) -> None:
             pass
 
 
-async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, prompt_text: str):
+async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, prompt_text: str, user_id: str | None = None):
     """Run a router-LLM classification. Returns a RouterDecision (without
     chosen_worker_* fields, which are filled in by the caller after worker pick).
 
@@ -294,7 +310,7 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
                             error=f"unparseable tier reply: {result.get('text','')[:100]}",
                             prompt_chars=len(envelope),
                             call_role=call_role, router_decision="unparseable",
-                            agent=req.agent, session=req.session)
+                            agent=req.agent, session=req.session, user_id=user_id)
                 # A router that cannot follow the instruction must not be
                 # asked again on the NEXT request: it was tried first (and
                 # answered wrongly) on every single memory operation - 217
@@ -309,7 +325,7 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
                         latency_ms=latency, status="ok",
                         prompt_chars=len(envelope), response_chars=len(result.get("text", "")),
                         call_role=call_role, router_decision=tier,
-                        agent=req.agent, session=req.session)
+                        agent=req.agent, session=req.session, user_id=user_id)
             return RouterDecision(
                 role=role, tier=tier, estimated_tokens=estimated,
                 router_provider=name, router_model=result.get("model", provider.model),
@@ -322,7 +338,7 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
                         status="error", error=str(e)[:500],
                         latency_ms=latency, call_role=call_role,
                         router_decision="error",
-                        agent=req.agent, session=req.session)
+                        agent=req.agent, session=req.session, user_id=user_id)
             # Back off hard-failing routers (dead model, dead account):
             # without this a permanently-broken router is retried first on
             # EVERY classify (it's first in pool order). Transient blips
@@ -352,6 +368,11 @@ async def lifespan(app: FastAPI):
         _MA.set_loop(asyncio.get_running_loop())
     except Exception:
         pass
+    try:
+        import security_audit as _audit
+        _audit.init()
+    except Exception:
+        pass
     app.state.cache = GeminiCache(ttl_seconds=300)
     app.state.providers = P.build_providers(app.state.cache)
     # Gemini-only mode (GATEWAY_GEMINI_ONLY=true): the gateway touches
@@ -368,6 +389,20 @@ async def lifespan(app: FastAPI):
     app.state.router = Router(app.state.providers, expand_order(ORDER, app.state.providers))
     app.state.router_pool = RouterPool(app.state.router_providers,
                                        expand_order(ROUTER_ORDER, app.state.router_providers))
+    # Multi-user credentials: the operator pool above remains the default;
+    # a request carrying a valid user token gets a lazily-built pool from that
+    # user's own keys.
+    app.state.user_store = UserStore()
+    app.state.user_pools = UserPoolManager(
+        ORDER, ROUTER_ORDER, gemini_only=app.state.gemini_only)
+    # Warm Kokoro/Whisper off the request path. The first TTS call otherwise
+    # pays the model load (measured 16.9s for the first chunk).
+    try:
+        import voice_api as _voice
+        __import__("threading").Thread(
+            target=_voice.warm_up, daemon=True, name="voice-warmup").start()
+    except Exception:
+        pass
     # Kilo model discovery. Registers every upstream model id so a caller can
     # pass `model="vendor/name"` and land on kilo without naming the provider.
     # Needs no key, so it runs even when kilo is unwired. Guarded and bounded:
@@ -403,6 +438,18 @@ async def lifespan(app: FastAPI):
     except Exception as _e:  # noqa: BLE001 - discovery is strictly optional
         log.warning("kilo model discovery unavailable at startup: %s", _e)
     app.state.embedders, app.state.embed_order = E.build_embedders()
+    # Provider keys are no longer needed in the process environment once the
+    # pools and embedders are built. Keeping them there lets any in-process
+    # adapter read os.environ["GEMINI_API_KEY"] — the glc_v1 attack. Capture
+    # them for the dashboard and the redactor, then remove them.
+    try:
+        import secret_vault as _vault
+        _scrubbed = _vault.capture_and_scrub()
+        if _scrubbed:
+            log.info("provider secrets moved out of the environment (%d vars)",
+                     _scrubbed)
+    except Exception as _e:  # noqa: BLE001 - must not block startup
+        log.warning("provider-key env scrub failed: %s", _e)
     # Inbound Telegram. Long-polls in-process because a webhook needs a public
     # HTTPS URL (Telegram cannot reach 127.0.0.1) and no `setWebhook` call
     # exists anywhere in this repo — which left the inbound path, and therefore
@@ -423,10 +470,33 @@ async def lifespan(app: FastAPI):
     task = getattr(app.state, "kilo_roster_task", None)
     if task is not None and not task.done():
         task.cancel()
+    try:
+        import secret_vault as _vault
+        _vault.restore()
+    except Exception:
+        pass
 
 
+# Swagger/OpenAPI describe the whole attack surface and require no token in
+# the default configuration. Off unless explicitly enabled for development.
+_DOCS_PUBLIC = (os.getenv("GATEWAY_DOCS", "").strip().lower()
+                in ("1", "true", "yes"))
 app = FastAPI(title="LLM Gateway V9", lifespan=lifespan,
-              redirect_slashes=False)
+              redirect_slashes=False,
+              docs_url="/docs" if _DOCS_PUBLIC else None,
+              redoc_url="/redoc" if _DOCS_PUBLIC else None,
+              openapi_url="/openapi.json" if _DOCS_PUBLIC else None)
+
+@app.get("/v1/security/audit")
+async def security_audit_view(request: Request, limit: int = 100):
+    """Operator-only view of the tamper-evident security log."""
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not auth.admin:
+        raise HTTPException(403, "the security audit requires the operator token")
+    import security_audit
+    return {"verify": security_audit.verify(),
+            "events": security_audit.recent(limit)}
+
 
 # ── the gateway's own console pages ───────────────────────────────────────────
 # StaticFiles served the HTML raw, so the pages had no way to present the token
@@ -436,8 +506,19 @@ app = FastAPI(title="LLM Gateway V9", lifespan=lifespan,
 _STATIC_DIR = ROOT / "static"
 
 
-def _console_asset(name: str):
+def _console_asset(name: str, request: Request | None = None):
     import gateway_auth as _ga
+    # The console pages carry the operator token in a meta tag. Serving that
+    # page to a remote peer would hand it the admin credential, making the
+    # /v1 token gate decorative on a LAN or public bind. The pages are for
+    # the local operator; remote operators should use a tunnel or reverse
+    # proxy that authenticates first.
+    if request is not None and not _ga.host_is_loopback(
+            getattr(request.client, "host", None)):
+        from fastapi.responses import JSONResponse as _JR
+        return _JR(status_code=403, content={
+            "error": "gateway console pages are loopback-only; use a tunnel "
+                     "or an authenticating reverse proxy"})
     from fastapi.responses import FileResponse as _FR
     base = _STATIC_DIR.resolve()
     target = (_STATIC_DIR / name).resolve()
@@ -460,8 +541,8 @@ def _console_asset(name: str):
 
 
 @app.get("/static/{name:path}", include_in_schema=False)
-async def console_static(name: str):
-    return _console_asset(name)
+async def console_static(name: str, request: Request):
+    return _console_asset(name, request)
 
 # ── auth on every /v1 route ───────────────────────────────────────────────────
 # The agent console is token-protected; the gateway's own surface was not, so
@@ -488,12 +569,81 @@ async def _gateway_token_guard(request, call_next):
     # broken" actually looked like: unstyled panels full of failed requests.
     if not path.startswith("/v1/") or path in _OPEN_PATHS:
         return await call_next(request)
-    if _auth.check_header_value(request.headers.get(_auth.TOKEN_HEADER)):
+    store = getattr(request.app.state, "user_store", None)
+    ctx = _auth.authenticate(request.headers.get(_auth.TOKEN_HEADER),
+                             request.headers.get(_auth.USER_TOKEN_HEADER),
+                             store)
+    if ctx is not None:
+        # Route handlers read `auth` for key selection and admin checks.
+        request.state.auth = ctx
+        request.state.user_id = ctx.user_id
+        if (ctx.user_id and not ctx.admin
+                and not _auth.user_route_allowed(path)):
+            try:
+                import security_audit
+                security_audit.record(
+                    "authz_denied", user_id=ctx.user_id, path=path[:200],
+                    ip=str(getattr(request.client, "host", "") or "")[:80],
+                    reason="user token is inference-only")
+            except Exception:
+                pass
+            from fastapi.responses import JSONResponse as _JR
+            return _JR(status_code=403, content={
+                "error": "this route requires the operator gateway token"})
+        try:
+            _max_body = max(1, int(os.getenv("GATEWAY_MAX_BODY_MB", "32"))) * 1024 * 1024
+            _declared = request.headers.get("content-length")
+            if _declared and _declared.isdigit() and int(_declared) > _max_body:
+                try:
+                    import security_audit
+                    security_audit.record(
+                        "body_too_large", path=path[:200],
+                        ip=str(getattr(request.client, "host", "") or "")[:80],
+                        reason=f"content-length {_declared} > {_max_body}")
+                except Exception:
+                    pass
+                from fastapi.responses import JSONResponse as _JR
+                return _JR(status_code=413, content={
+                    "error": "request body too large",
+                    "limit_bytes": _max_body})
+        except (TypeError, ValueError):
+            pass
+        if (ctx.user_id and not ctx.admin and path != "/v1/users/me"):
+            try:
+                from budget import budget as _budget
+                ok, retry, why = _budget.check(ctx.user_id)
+            except Exception:
+                ok, retry, why = True, 0, ""
+            if not ok:
+                try:
+                    import security_audit
+                    security_audit.record(
+                        "rate_limited", user_id=ctx.user_id, path=path[:200],
+                        ip=str(getattr(request.client, "host", "") or "")[:80],
+                        reason=why)
+                except Exception:
+                    pass
+                from fastapi.responses import JSONResponse as _JR
+                return _JR(status_code=429,
+                           headers={"Retry-After": str(retry)},
+                           content={"error": why,
+                                    "code": "user_budget_exceeded",
+                                    "retry_after": retry})
         return await call_next(request)
+    try:
+        import security_audit
+        security_audit.record(
+            "auth_denied", path=path[:200],
+            ip=str(getattr(request.client, "host", "") or "")[:80],
+            reason="missing or invalid credential")
+    except Exception:
+        pass
     from fastapi.responses import JSONResponse as _JR
     return _JR(
         status_code=401,
-        content={"error": f"missing or invalid {_auth.TOKEN_HEADER} header"},
+        content={"error": (
+            f"missing or invalid {_auth.TOKEN_HEADER} header, and no valid "
+            f"{_auth.USER_TOKEN_HEADER}")},
         headers={"WWW-Authenticate": _auth.TOKEN_HEADER},
     )
 # V10 adaptor plane (channels/hooks/policy/spend/control) + voice services
@@ -503,6 +653,7 @@ app.include_router(voice_router)
 app.include_router(integrations_router)
 app.include_router(memory_router)
 app.include_router(docgen_router)
+app.include_router(users_router)
 from deploy_api import router as deploy_router
 app.include_router(deploy_router)
 # Mesh validation / repair / analysis. `parts.api` imports only fastapi and its
@@ -564,7 +715,14 @@ def _system_blocks(req: ChatRequest):
     return [b.model_dump() if hasattr(b, "model_dump") else b for b in req.system]
 
 
-def _est_tokens(messages, system_blocks, max_tokens):
+def _est_input_tokens(messages, system_blocks, tools=None) -> int:
+    """Rough prompt size in tokens. Deliberately coarse: it is used to keep a
+    call inside a provider's window, and the safety margin below covers the
+    drift between this estimate and a real tokenizer.
+
+    Tool definitions are part of the prompt. Upstream spells this out when it
+    refuses: "259371 tokens (194119 of text input, 1252 of tool input, 64000 in
+    the output)" - an estimate that reads only the messages under-counts."""
     chars = 0
     for m in messages:
         c = m.get("content", "")
@@ -581,7 +739,65 @@ def _est_tokens(messages, system_blocks, max_tokens):
     elif isinstance(system_blocks, list):
         for b in system_blocks:
             chars += len(b.get("text", "") if isinstance(b, dict) else "")
-    return chars // 4 + min(max_tokens, 8192)
+    if tools:
+        try:
+            chars += len(json.dumps(tools))
+        except (TypeError, ValueError):
+            chars += len(str(tools))
+    return chars // 4
+
+
+def _est_tokens(messages, system_blocks, max_tokens):
+    return _est_input_tokens(messages, system_blocks) + min(max_tokens, 8192)
+
+
+_CTX_SAFETY_TOKENS = 2048
+_MIN_USEFUL_OUTPUT_TOKENS = 512
+SLOT_WAIT_MAX_S = 20.0
+SLOT_WAITS = 3
+
+
+def _clamp_max_tokens(provider_name, est_in, requested):
+    """Fit the call inside the provider's window by shrinking the OUTPUT.
+
+    `max_ctx` has sat in router.LIMITS unread since it was written, while
+    router.py's own docstring still claimed a context-window check happens. It
+    did not: a ~194k-token prompt against a 256k provider went out with 64k
+    reserved for the answer, upstream answered 400 "maximum context length is
+    256000 tokens", and the node lost the minutes of research it had already
+    paid for. Nothing here trims the prompt - the reservation gives way."""
+    try:
+        max_ctx = int(limits_for(provider_name).get("max_ctx") or 0)
+    except Exception:
+        max_ctx = 0
+    req_mt = int(requested or 0)
+    if not max_ctx or not req_mt:
+        return req_mt, ""
+    room = max_ctx - int(est_in) - _CTX_SAFETY_TOKENS
+    if room < _MIN_USEFUL_OUTPUT_TOKENS:
+        return None, (f"prompt of ~{int(est_in)} tokens leaves {room} in this "
+                      f"provider's {max_ctx} window")
+    if room < req_mt:
+        return room, f"output clamped {req_mt}->{room} for {max_ctx} window"
+    return req_mt, ""
+
+
+def _soonest_wait(router, candidates):
+    """Seconds until the first candidate could be usable, or None if nothing
+    time-bounded is blocking it."""
+    best = None
+    for c in candidates:
+        try:
+            snap = router.state[c].snapshot(limits_for(c))
+        except Exception:
+            continue
+        rem = max(float(snap.get("backoff_remaining") or 0.0),
+                  float(snap.get("cooldown_remaining") or 0.0))
+        if rem <= 0:
+            return 0.0
+        if best is None or rem < best:
+            best = rem
+    return best
 
 
 def _backoff_for(err: Exception, has_model_override: bool = False,
@@ -654,29 +870,42 @@ def _required_caps(req: ChatRequest):
     return caps
 
 
+def _host_only(url: str) -> str:
+    try:
+        from urllib.parse import urlsplit
+        return (urlsplit(str(url or "")).hostname or "")[:120]
+    except Exception:
+        return ""
+
+
 async def _resolve_image_urls(messages: list[dict]) -> list[dict]:
     """V9: fetch any http(s) image URLs in message content and inline them as
     data: URLs. Providers downstream only ever see data: URLs, which keeps
     Gemini/Ollama translation paths simple. Mutates a copy; original is intact.
     """
     import base64
-    import httpx as _httpx
 
     async def _fetch_to_data_url(url: str) -> str:
-        # A real-browser UA — Wikimedia and many CDNs refuse python-default UAs.
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; LLMGatewayV9/0.1; +image-resolver)",
-            "Accept": "image/*,*/*;q=0.8",
-        }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
+        # SSRF boundary: http(s) only, public addresses only, every redirect
+        # revalidated, body and time capped. The URL is never echoed in an
+        # error, because query strings can carry credentials.
+        from safe_fetch import UnsafeURLError, fetch_bytes
+        try:
+            body, mt, _final = await fetch_bytes(url, image_only=True,
+                                                 max_bytes=8 * 1024 * 1024,
+                                                 timeout=15.0)
+        except UnsafeURLError as e:
             try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+                import security_audit
+                security_audit.record("ssrf_blocked", target=_host_only(url),
+                                      reason=str(e)[:200])
+            except Exception:
+                pass
+            raise HTTPException(400, f"image URL rejected: {e}")
+        except Exception:
+            raise HTTPException(400, "failed to fetch image URL")
+        b64 = base64.b64encode(body).decode()
+        return f"data:{mt or 'image/png'};base64,{b64}"
 
     out = []
     for m in messages:
@@ -715,9 +944,31 @@ def _validate_structured(text: str, schema: dict):
 
 
 @app.post("/v1/chat")
-async def chat(req: ChatRequest):
-    router = app.state.router
-    router_pool = app.state.router_pool
+async def chat(req: ChatRequest, request: Request):
+    auth = getattr(request.state, "auth", None)
+    user_id = getattr(auth, "user_id", None)
+    _is_admin = bool(getattr(auth, "admin", False))
+
+    def _client_error(exc) -> str:
+        """Detailed provider errors are operator-only; a user token gets a
+        generic failure so it cannot read the provider roster/attempt chain."""
+        return _red(str(exc)) if _is_admin else "the model provider failed"
+    if user_id:
+        pools = request.app.state.user_pools.get(
+            request.app.state.user_store, user_id)
+        if pools is None:
+            raise HTTPException(
+                503, detail={
+                    "code": "user_has_no_keys",
+                    "message": ("this user has no provider keys configured; "
+                                "add one in the gateway's Users page"),
+                    "user_id": user_id,
+                })
+        router = pools.router
+        router_pool = pools.router_pool
+    else:
+        router = app.state.router
+        router_pool = app.state.router_pool
     messages = _normalize_messages(req)
     if not _has_real_turn(messages):
         raise HTTPException(400, "no user message to answer")
@@ -732,6 +983,7 @@ async def chat(req: ChatRequest):
         for m in messages
     )
     est = _est_tokens(messages, system_blocks, req.max_tokens)
+    est_in = _est_input_tokens(messages, system_blocks, req.tools)
     explicit_override = bool(req.provider)
     required_caps = _required_caps(req)
 
@@ -787,7 +1039,7 @@ async def chat(req: ChatRequest):
     # failover order. Explicit `provider` overrides routing (caller knows best).
     router_decision: Optional[RouterDecision] = None
     if req.auto_route and not req.provider:
-        router_decision = await _classify_tier(req, req.auto_route, router_pool, prompt_text)
+        router_decision = await _classify_tier(req, req.auto_route, router_pool, prompt_text, user_id)
         if router_decision.tier == "HUGE":
             raise HTTPException(
                 503,
@@ -813,6 +1065,14 @@ async def chat(req: ChatRequest):
     all_attempts = []
     last_err = None
 
+    # Prompt-cache affinity: if this caller is mid-conversation on a provider
+    # (one DAG node's next hop), start there instead of re-picking by load and
+    # throwing away the provider's cache of the node's system prompt. A caller
+    # that pinned `req.provider` already knows what it wants, and `candidates`
+    # is a single entry there, so affinity is only consulted for routed calls.
+    _preferred = (None if explicit_override
+                  else router.provider_for(req.route_affinity))
+
     # When explicit provider is requested and the only blocker is cooldown,
     # wait briefly rather than 503-ing — this is what users intuitively expect.
     if explicit_override and len(candidates) == 1:
@@ -827,23 +1087,59 @@ async def chat(req: ChatRequest):
                 break
             await _asyncio.sleep(min(cd + 0.05, 5))
 
-    for _ in range(len(candidates) + 1):
-        name, atts = router.pick(est, candidates, required_caps=required_caps)
+    _waits_left = SLOT_WAITS
+    for _ in range(len(candidates) + 1 + SLOT_WAITS):
+        name, atts = router.pick(est, candidates, required_caps=required_caps,
+                                 preferred=_preferred)
+        # Once the affinity provider has been tried (successfully or not), stop
+        # preferring it: the next pass must fall back to the load-based pick so
+        # a wedged provider cannot pin a node into an outage.
+        _preferred = None
         all_attempts.extend(atts)
         if name is None:
+            # Every worker was blocked. A wide fan-out burns the whole pool's
+            # RPM in one wave, and the soonest slot is usually under a minute
+            # away - so wait for it rather than 503. This node has already
+            # spent minutes gathering what it is about to send; failing here
+            # throws that away and hands the recovery planner the same hop to
+            # redo, which then burns the same quota again.
+            if _waits_left > 0 and candidates:
+                wait = _soonest_wait(router, candidates)
+                if wait is not None and 0 < wait <= SLOT_WAIT_MAX_S:
+                    _waits_left -= 1
+                    all_attempts.append({
+                        "provider": "ladder",
+                        "reason": f"waiting {wait:.1f}s for the next slot"})
+                    import asyncio as _aio_wait
+                    await _aio_wait.sleep(min(wait + 0.15, SLOT_WAIT_MAX_S))
+                    continue
             break
 
         provider = router.providers[name]
+        # Per-provider context window: shrink the output reservation so the
+        # call fits, or move on to a provider that can take it.
+        _mt, _clamp_why = _clamp_max_tokens(name, est_in, req.max_tokens)
+        if _mt is None:
+            all_attempts.append({"provider": name, "reason": f"too large: {_clamp_why}"})
+            candidates = [c for c in candidates if c != name]
+            continue
+        if _clamp_why:
+            all_attempts.append({"provider": name, "reason": _clamp_why})
         t0 = time.time()
         router.state[name].record(0)
+        empty_retries = 0
 
         try:
             if req.stream:
                 async def gen():
                     try:
                         agg = []
+                        # Whether the stream produced anything that counts as
+                        # an answer. A tool call is an answer; zero text and
+                        # zero tool calls is not.
+                        saw_tool_delta = False
                         async for chunk in provider.stream(messages,
-                                                          max_tokens=req.max_tokens,
+                                                          max_tokens=_mt,
                                                           temperature=req.temperature,
                                                           model=req.model,
                                                           tools=req.tools,
@@ -854,6 +1150,7 @@ async def chat(req: ChatRequest):
                                                           cache_system=bool(req.cache_system)):
                             agg.append(chunk)
                             if chunk.startswith("[[TOOL_CALL_DELTA]]"):
+                                saw_tool_delta = True
                                 yield f"data: {json.dumps({'provider': name, 'tool_call_delta': chunk[len('[[TOOL_CALL_DELTA]] '):]})}\n\n"
                             elif chunk.startswith("[[REASONING_DELTA]]"):
                                 yield f"data: {json.dumps({'provider': name, 'reasoning_delta': json.loads(chunk[len('[[REASONING_DELTA]] '):])})}\n\n"
@@ -861,17 +1158,80 @@ async def chat(req: ChatRequest):
                                 yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
                         text = "".join(agg)
                         latency = int((time.time() - t0) * 1000)
+                        # An empty stream is NOT a successful call, and this
+                        # branch had no guard for it while the batched branch
+                        # below does. Measured: 57 worker calls in seven days
+                        # logged `ok` with zero output tokens, every one of them
+                        # followed by a later non-empty call in the same session
+                        # — i.e. the agent paid twice. It costs Discuss
+                        # specifically because Discuss always streams: the
+                        # gateway finished, returned 200 with nothing in it, the
+                        # runner saw zero text and zero tool calls, switched
+                        # itself off streaming for the rest of the turn, and
+                        # re-asked. The user waits ~13 s and sees no tokens.
+                        #
+                        # Nothing has been yielded to the client if we get here
+                        # with an empty `agg` and no tool deltas, so a retry is
+                        # invisible to the caller: it just gets a slower first
+                        # byte instead of a fake answer.
+                        if not text.strip() and not saw_tool_delta:
+                            agg = []
+                            async for chunk in provider.stream(
+                                    messages, max_tokens=_mt,
+                                    temperature=req.temperature,
+                                    model=req.model, tools=req.tools,
+                                    tool_choice=req.tool_choice,
+                                    reasoning=req.reasoning,
+                                    response_format=req.response_format,
+                                    system_blocks=system_blocks,
+                                    cache_system=bool(req.cache_system)):
+                                agg.append(chunk)
+                                if chunk.startswith("[[TOOL_CALL_DELTA]]"):
+                                    saw_tool_delta = True
+                                    yield (f"data: {json.dumps({'provider': name, 'tool_call_delta': chunk[len('[[TOOL_CALL_DELTA]] '):]})}\n\n")
+                                elif chunk.startswith("[[REASONING_DELTA]]"):
+                                    yield (f"data: {json.dumps({'provider': name, 'reasoning_delta': json.loads(chunk[len('[[REASONING_DELTA]] '):])})}\n\n")
+                                elif chunk:
+                                    yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
+                            text = "".join(agg)
+                            latency = int((time.time() - t0) * 1000)
+                            if not text.strip() and not saw_tool_delta:
+                                # Say so, and log it as the failure it is. The
+                                # runner's batched fallback then goes through the
+                                # failover ladder, which is the path that knows
+                                # how to change provider.
+                                db.log_call(provider=name,
+                                            model=req.model or provider.model,
+                                            input_tokens=est_in, output_tokens=0,
+                                            latency_ms=latency, status="error",
+                                            error="empty completion (0 text, 0 tool calls) "
+                                                  "on the streaming path",
+                                            prompt_chars=len(prompt_text),
+                                            response_chars=0,
+                                            override=req.provider,
+                                            attempted=_attempts_str(all_attempts),
+                                            agent=req.agent, session=req.session,
+                                            retries=retries, user_id=user_id)
+                                yield f"data: {json.dumps({'error': f'{name} returned an empty completion (0 text, 0 tool calls)'})}\n\n"
+                                return
                         # Streaming providers return text only (no usage block),
                         # so estimate tokens the same way the pre-flight does
-                        # (chars//4) instead of logging zeros that undercount
-                        # cost in by_agent.
+                        # instead of logging zeros that undercount cost in
+                        # by_agent. `len(prompt_text) // 4` counted MESSAGES
+                        # only and left `req.tools` out, while the pre-flight
+                        # and the provider both bill them: a chat turn logged
+                        # 5,076 input tokens and actually sent ~9,300, because
+                        # 27 tool schemas are 4,232 tokens of prompt that no
+                        # row ever mentioned. Use the same estimate the router
+                        # used, so the ledger and the invoice agree.
                         db.log_call(provider=name, model=req.model or provider.model,
-                                    input_tokens=len(prompt_text) // 4,
+                                    input_tokens=est_in,
                                     output_tokens=len(text) // 4,
                                     latency_ms=latency, status="ok",
                                     prompt_chars=len(prompt_text), response_chars=len(text),
                                     override=req.provider, attempted=_attempts_str(all_attempts),
-                                    agent=req.agent, session=req.session, retries=retries)
+                                    agent=req.agent, session=req.session, retries=retries,
+                                    user_id=user_id)
                         yield f"data: {json.dumps({'done': True, 'provider': name, 'model': req.model or provider.model})}\n\n"
                     except Exception as e:
                         db.log_call(provider=name, model=req.model or provider.model,
@@ -879,8 +1239,9 @@ async def chat(req: ChatRequest):
                                     latency_ms=int((time.time() - t0) * 1000),
                                     prompt_chars=len(prompt_text),
                                     override=req.provider, attempted=_attempts_str(all_attempts),
-                                    agent=req.agent, session=req.session, retries=retries)
-                        yield f"data: {json.dumps({'error': str(e)[:300]})}\n\n"
+                                    agent=req.agent, session=req.session, retries=retries,
+                                    user_id=user_id)
+                        yield f"data: {json.dumps({'error': _client_error(e)[:300]})}\n\n"
                 return StreamingResponse(gen(), media_type="text/event-stream")
 
             # V8: one same-provider retry on transient 5xx / timeout before
@@ -889,7 +1250,7 @@ async def chat(req: ChatRequest):
             # response so the orchestrator's replay can show it.
             try:
                 result = await provider.chat(messages,
-                                             max_tokens=req.max_tokens,
+                                             max_tokens=_mt,
                                              temperature=req.temperature,
                                              model=req.model,
                                              tools=req.tools,
@@ -912,7 +1273,7 @@ async def chat(req: ChatRequest):
                 await _a.sleep(min(2.0, 0.5 * (2 ** retries)))
                 retries += 1
                 result = await provider.chat(messages,
-                                             max_tokens=req.max_tokens,
+                                             max_tokens=_mt,
                                              temperature=req.temperature,
                                              model=req.model,
                                              tools=req.tools,
@@ -921,6 +1282,30 @@ async def chat(req: ChatRequest):
                                              response_format=req.response_format,
                                              system_blocks=system_blocks,
                                              cache_system=bool(req.cache_system))
+            # An empty completion is NOT a successful call. Gemini's worker
+            # occasionally finishes with zero text and zero tool calls (seen
+            # live at ~50s, output_tokens=0); returning 200 made every skill
+            # retry the same context and the recovery planner write a thinner
+            # document. Retry once on the SAME provider - that is the retry
+            # the agent used to perform - then treat it as a provider failure
+            # so the failover ladder tries the next model.
+            while not str(result.get("text") or "").strip() \
+                    and not (result.get("tool_calls") or []):
+                if empty_retries >= 1:
+                    raise P.ProviderError(
+                        f"{name} returned an empty completion "
+                        f"(0 text, 0 tool calls)", retryable=True)
+                empty_retries += 1
+                import asyncio as _a
+                await _a.sleep(0.4)
+                result = await provider.chat(
+                    messages, max_tokens=_mt,
+                    temperature=req.temperature, model=req.model,
+                    tools=req.tools, tool_choice=req.tool_choice,
+                    reasoning=req.reasoning,
+                    response_format=req.response_format,
+                    system_blocks=system_blocks,
+                    cache_system=bool(req.cache_system))
             latency = int((time.time() - t0) * 1000)
 
             # Optional: validate structured output and (single) retry on failure.
@@ -935,7 +1320,7 @@ async def chat(req: ChatRequest):
                         {"role": "user", "content": f"Your previous reply did not match the required JSON schema: {ve}. Reply ONLY with valid JSON conforming to the schema."},
                     ]
                     result = await provider.chat(fix_msgs,
-                                                 max_tokens=req.max_tokens,
+                                                 max_tokens=_mt,
                                                  temperature=0,
                                                  model=req.model,
                                                  response_format=req.response_format,
@@ -949,11 +1334,16 @@ async def chat(req: ChatRequest):
             tokens = (result["input_tokens"] or 0) + (result["output_tokens"] or 0)
             router.state[name].tokens_today += tokens
             router.state[name].tokens_minute.append((time.time(), tokens))
+            # Affinity is recorded only on a SUCCESSFUL call. Recording the
+            # attempt would pin a node to the provider that just failed it, and
+            # the next hop would start from the outage instead of the load pick.
+            router.note_affinity(req.route_affinity, name)
             if router_decision is not None:
                 router_decision.chosen_worker_provider = name
                 router_decision.chosen_worker_model = result["model"]
             db.log_call(provider=name, model=result["model"],
                         input_tokens=result["input_tokens"], output_tokens=result["output_tokens"],
+                        thinking_tokens=result.get("thinking_tokens", 0),
                         cache_create_tokens=result["cache_creation_input_tokens"],
                         cache_read_tokens=result["cache_read_input_tokens"],
                         latency_ms=latency, status="ok",
@@ -964,7 +1354,8 @@ async def chat(req: ChatRequest):
                         tool_dialect=result["tool_call_dialect"],
                         call_role="worker",
                         router_decision=router_decision.tier if router_decision else None,
-                        agent=req.agent, session=req.session, retries=retries)
+                        agent=req.agent, session=req.session, retries=retries,
+                                    user_id=user_id)
             # Tool ledger: name every completed model tool call (batch and
             # vision funnel through here too). Names only — never arguments.
             for tc in (result["tool_calls"] or []):
@@ -1003,12 +1394,13 @@ async def chat(req: ChatRequest):
                         latency_ms=int((time.time() - t0) * 1000),
                         prompt_chars=len(prompt_text),
                         override=req.provider, attempted=_attempts_str(all_attempts),
-                        agent=req.agent, session=req.session, retries=retries)
+                        agent=req.agent, session=req.session, retries=retries,
+                                    user_id=user_id)
             tag = f"failed: {str(e)[:100]}"
             if secs > 0: tag += f" → backoff {secs:.0f}s ({reason})"
             all_attempts.append({"provider": name, "reason": tag})
             if explicit_override or not getattr(e, "retryable", True):
-                raise HTTPException(502, f"{name} failed: {e}")
+                raise HTTPException(502, _client_error(f"{name} failed: {e}"))
             candidates = [c for c in candidates if c != name]
             continue
         except HTTPException:
@@ -1024,20 +1416,21 @@ async def chat(req: ChatRequest):
                         latency_ms=int((time.time() - t0) * 1000),
                         prompt_chars=len(prompt_text),
                         override=req.provider, attempted=_attempts_str(all_attempts),
-                        agent=req.agent, session=req.session, retries=retries)
+                        agent=req.agent, session=req.session, retries=retries,
+                                    user_id=user_id)
             all_attempts.append({"provider": name, "reason": f"exception: {str(e)[:120]}"})
             if explicit_override:
-                raise HTTPException(502, f"{name} failed: {e}")
+                raise HTTPException(502, _client_error(f"{name} failed: {e}"))
             candidates = [c for c in candidates if c != name]
             continue
 
-    raise HTTPException(503, f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}")
+    raise HTTPException(503, _client_error(f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}"))
 
 
 # ── V8 additions: batch endpoint and cost-by-agent ────────────────────────────
 
 @app.post("/v1/chat/batch")
-async def chat_batch(req: BatchChatRequest):
+async def chat_batch(req: BatchChatRequest, request: Request):
     """Run N chat requests concurrently with bounded parallelism. The gateway
     manages the rate-limit ladder centrally so callers do not need to open
     their own connection pools. Results are returned IN INPUT ORDER. Each
@@ -1049,7 +1442,7 @@ async def chat_batch(req: BatchChatRequest):
     async def _one(call: ChatRequest):
         async with sem:
             try:
-                return await chat(call)
+                return await chat(call, request)
             except HTTPException as he:
                 return {"error": str(he.detail), "status_code": he.status_code}
             except Exception as e:
@@ -1060,7 +1453,7 @@ async def chat_batch(req: BatchChatRequest):
 
 
 @app.post("/v1/vision")
-async def vision(req: VisionRequest):
+async def vision(req: VisionRequest, request: Request):
     """V9: single-image vision call. Thin shim over /v1/chat that:
       - packs `image` + `prompt` into a multimodal user message
       - forces routing to a vision-capable provider (via `vision` cap)
@@ -1086,7 +1479,7 @@ async def vision(req: VisionRequest):
         agent=req.agent,
         session=req.session,
     )
-    return await chat(inner)
+    return await chat(inner, request)
 
 
 @app.get("/v1/cost/by_agent")
@@ -1117,13 +1510,14 @@ async def cost_by_agent(session: Optional[str] = None, agent: Optional[str] = No
 
 
 @app.post("/v1/embed")
-async def embed(req: EmbedRequest):
+async def embed(req: EmbedRequest, request: Request):
     """Single embed endpoint. Failover ring runs Ollama → configured fallback.
     `provider` pins the choice (returns 502 on failure with no fallback).
     Rejects inputs over MAX_INPUT_CHARS with 413 — caller must chunk."""
     embedders = app.state.embedders
     if not embedders:
         raise HTTPException(503, "no embedding providers configured")
+    _uid = getattr(getattr(request.state, "auth", None), "user_id", None)
 
     if len(req.text) > E.MAX_INPUT_CHARS:
         raise HTTPException(
@@ -1157,7 +1551,7 @@ async def embed(req: EmbedRequest):
                 raise HTTPException(429, f"{req.provider} rate-limited: {e}")
             if e.status == 400:
                 raise HTTPException(400, str(e))
-            raise HTTPException(502, f"{req.provider} embed failed: {e}")
+            raise HTTPException(502, _red(f"{req.provider} embed failed: {e}"))
         raise HTTPException(503, str(e))
 
     db.log_call(
@@ -1170,7 +1564,7 @@ async def embed(req: EmbedRequest):
         attempted=_attempts_str(attempts),
         call_role="embed",
         embed_dim=result["dim"],
-        agent=req.agent, session=req.session,
+        agent=req.agent, session=req.session, user_id=_uid,
     )
     return EmbedResponse(
         provider=name,
@@ -1183,7 +1577,7 @@ async def embed(req: EmbedRequest):
 
 
 @app.post("/v1/embed/batch")
-async def embed_batch(req: EmbedBatchRequest):
+async def embed_batch(req: EmbedBatchRequest, request: Request):
     """Batch embedding for document chunks.
 
     `/v1/embed` takes a single string, so indexing a document meant one HTTP
@@ -1201,6 +1595,7 @@ async def embed_batch(req: EmbedBatchRequest):
     embedders = app.state.embedders
     if not embedders:
         raise HTTPException(503, "no embedding providers configured")
+    _uid = getattr(getattr(request.state, "auth", None), "user_id", None)
     texts = req.texts
     if not texts:
         return {"embeddings": [], "model": "", "dim": 0, "latency_ms": 0,
@@ -1234,8 +1629,8 @@ async def embed_batch(req: EmbedBatchRequest):
             dim = result.get("dim") or dim or (len(vecs[0]) if vecs else 0)
         except E.EmbedderError as e:
             if req.provider:
-                raise HTTPException(502, f"{req.provider} batch embed "
-                                          f"failed: {e}")
+                raise HTTPException(
+                    502, _red(f"{req.provider} batch embed failed: {e}"))
             # Fall back to per-chunk so a single bad input costs one chunk
             # rather than the whole window. Report which index failed.
             vecs = []
@@ -1260,7 +1655,7 @@ async def embed_batch(req: EmbedBatchRequest):
         prompt_chars=sum(len(t) for t in texts),
         call_role="embed",
         embed_dim=dim,
-        agent=req.agent, session=req.session,
+        agent=req.agent, session=req.session, user_id=_uid,
     )
     failed = [o["index"] for o in out if o["embedding"] is None]
     return {
@@ -1398,6 +1793,41 @@ async def routers():
     }
 
 
+@app.get("/v1/cache")
+async def cache_health():
+    """Are the two cache mechanisms actually running, or only configured?
+
+    Added because `cache_read_tokens` was 0 in the ledger for 97.5% of calls and
+    `cache_create_tokens` was 0 for ALL ~100k of them, and the only reason the
+    second is not ambiguous is that nothing else could explain it: an unused
+    explicit cache and a silently failing one produce identical numbers. This
+    reports the mint failures the call path swallows, and how many nodes are
+    currently pinned.
+    """
+    import cache as _cache_mod
+    from router import AFFINITY_TTL_S
+    store = getattr(app.state, "cache", None)
+    routers = [app.state.router]
+    rp = getattr(app.state, "router_pool", None)
+    if rp is not None:
+        routers.extend(getattr(rp, "routers", []) or [])
+    affinity = sum(len(getattr(r, "affinity", {}) or {}) for r in routers)
+    return {
+        "explicit": {
+            "enabled": store is not None,
+            "ttl_seconds": getattr(store, "ttl", None),
+            "live_entries": len(getattr(store, "_store", {}) or {}),
+            "mint_failures": _cache_mod.failure_report(),
+        },
+        "implicit_prefix": {
+            "note": "provider-side; only reports above the model's minimum "
+                    "prompt size. Ledger floor for the gemini family is "
+                    "~4.1k input tokens.",
+        },
+        "route_affinity": {"pinned_nodes": affinity, "ttl_seconds": AFFINITY_TTL_S},
+    }
+
+
 @app.get("/v1/calls")
 async def calls(limit: int = 100, provider: Optional[str] = None, status: Optional[str] = None):
     # A negative or absurd limit used to mean unbounded: `?limit=-1` served
@@ -1424,13 +1854,13 @@ async def tools_usage():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return _console_asset("dashboard.html")
+async def index(request: Request):
+    return _console_asset("dashboard.html", request)
 
 
 @app.get("/help", response_class=HTMLResponse)
-async def help_page():
-    return _console_asset("help.html")
+async def help_page(request: Request):
+    return _console_asset("help.html", request)
 
 
 @app.get("/health")
@@ -1469,4 +1899,7 @@ if __name__ == "__main__":
     _ga.publish_token_file()
     print(f"[gateway] auth enabled on /v1/* ({_why}); "
           f"token published to {_ga.token_file()}")
-    uvicorn.run("main:app", host=_host, port=PORT, reload=False)
+    # The app OBJECT, not the import string: the string made uvicorn re-import
+    # this module while it was already running as __main__, so the module body
+    # ran twice per boot. See the same fix in agent_server.py.
+    uvicorn.run(app, host=_host, port=PORT, reload=False)

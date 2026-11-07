@@ -27,6 +27,7 @@ Nothing here blocks the scheduler: a dead channel must not stop the task.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -95,7 +96,7 @@ _REAUTH_HINTS = (
 
 def _gw_base() -> str:
     return os.environ.get("LLM_GATEWAY_V9_URL",
-                          "http://localhost:8109").rstrip("/")
+                          "http://127.0.0.1:8109").rstrip("/")
 
 
 def _gw_headers() -> dict:
@@ -114,6 +115,24 @@ def _gw_headers() -> dict:
     return {"X-Gateway-Token": tok} if tok else {}
 
 
+@contextlib.contextmanager
+def sync_pool(timeout: float = 30.0):
+    """A shared gateway client for this module's blocking calls.
+
+    Same lazy-import rule as `_gw_headers`: this runs inside a scheduler worker
+    and inside MCP subprocesses, so pulling in `agent_server` is out of the
+    question, and `gateway.sync_pool` would import the whole module for one
+    helper — fine, that module is already the token's home. What matters is that
+    the client is *reused*. `resolve_target` is called once per configured
+    channel, and building an `httpx.Client` costs 230-590 ms here, so sixteen
+    channels meant 9.6 s — spent inside an `async def` route, which stalled the
+    agent's entire event loop for the duration.
+    """
+    from gateway import sync_pool as _pool
+    with _pool(timeout) as c:
+        yield c
+
+
 def _gw_get(path: str, timeout: float = 15.0) -> dict:
     """Synchronous gateway GET.
 
@@ -124,8 +143,9 @@ def _gw_get(path: str, timeout: float = 15.0) -> dict:
     opposite decisions, and must not look the same."""
     import httpx
     try:
-        with httpx.Client(timeout=timeout, headers=_gw_headers()) as c:
-            r = c.get(f"{_gw_base()}{path}")
+        with sync_pool(timeout) as c:
+            r = c.get(f"{_gw_base()}{path}", headers=_gw_headers())
+
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
     try:
@@ -255,8 +275,9 @@ def send_channel_message(channel: str, text: str, *,
             # every caller passing a file had it silently dropped and the user
             # received a caption with no attachment.
             body["media"] = media[:4]
-        with httpx.Client(timeout=timeout, headers=_gw_headers()) as c:
-            r = c.post(f"{_gw_base()}/v1/channels/{channel}/send", json=body)
+        with sync_pool(timeout) as c:
+            r = c.post(f"{_gw_base()}/v1/channels/{channel}/send", json=body,
+                       headers=_gw_headers())
         res["status"] = r.status_code
         if r.status_code == 200:
             payload = r.json() or {}

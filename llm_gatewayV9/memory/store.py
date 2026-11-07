@@ -156,6 +156,26 @@ class MemoryStore:
             self._save_locked(items)
             return item
 
+    def append_many(self, items: list[MemoryRecord]) -> list[MemoryRecord]:
+        """Append several records with ONE rewrite of the whole store.
+
+        `append` re-serialises the drawer every time, and the document drawer
+        is 86 MB / 4,824 records: measured 3.2-6.0 s per write, all of it held
+        inside `_lock`. The indexer called `append` once per chunk, so a
+        16-chunk batch owned the lock for about 72 s, and a search — which
+        reads this store ten-plus times — queued behind every one of them and
+        then re-parsed the just-invalidated cache. That is the 35-second
+        document search; the identical query is 320 ms when nothing is
+        indexing. Batching makes one batch cost one rewrite.
+        """
+        if not items:
+            return []
+        with self._lock:
+            all_items = list(self._load_locked())
+            all_items.extend(items)
+            self._save_locked(all_items)
+        return list(items)
+
     def replace(self, items: list[MemoryRecord]) -> None:
         """Overwrite the whole store atomically (sweeps, retention trims)."""
         with self._lock:

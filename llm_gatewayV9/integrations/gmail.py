@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from adaptors.http import shared as pooled_http
+
 
 from . import _MissingKey, _fail, _need
 
@@ -35,7 +37,7 @@ def send_email(*, to: str, subject: str, body: str,
     if thread_id:
         payload["threadId"] = thread_id
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with pooled_http(20.0) as client:
             r = client.post(url, headers={"Authorization": f"Bearer {token}"},
                             json=payload)
             if r.status_code == 401:
@@ -65,7 +67,7 @@ def query(*, api_method: str, query: str = "", max_results: int = 5) -> dict[str
         return _fail("GMAIL_TOKEN not set")
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with pooled_http(20.0) as client:
             if api_method == "list":
                 r = client.get("https://gmail.googleapis.com/gmail/v1/users/me/messages",
                                headers=headers, params={"q": query, "maxResults": max_results})
@@ -112,7 +114,7 @@ def refresh(*, write_env: bool = True) -> dict[str, Any]:
     if not all(vals.values()):
         return {"ok": False, "error": "GMAIL_REFRESH_TOKEN / GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET not set"}
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with pooled_http(20.0) as client:
             r = client.post("https://oauth2.googleapis.com/token", data={
                 "client_id": vals["GMAIL_CLIENT_ID"],
                 "client_secret": vals["GMAIL_CLIENT_SECRET"],

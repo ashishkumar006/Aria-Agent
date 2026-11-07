@@ -57,7 +57,12 @@ async def _run(service: str, op: str, args: dict[str, Any]):
         fn = {"history": s.history, "refresh": s.refresh}.get(op)
     elif service == "websearch":
         from integrations import websearch as ws
-        fn = {"search": ws.search, "usage": lambda: ws.usage()}.get(op)
+        fn = {"search": ws.search, "usage": lambda: ws.usage(),
+              # Licensed pictures. Separate ops, because `search` returns a bare
+              # list and these return a dict carrying a licence field the caller
+              # must not lose on its way into a caption.
+              "search_images": ws.search_images,
+              "image_usage": ws.image_usage}.get(op)
     else:
         fn = None
     if fn is None:

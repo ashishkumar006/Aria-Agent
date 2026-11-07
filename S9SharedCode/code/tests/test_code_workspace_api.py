@@ -353,6 +353,12 @@ def test_there_is_no_write_or_delete_route():
         # first-snapshot-wins rule that makes Revert trustworthy.
         "/api/code/agent/changes", "/api/code/agent/keep",
         "/api/code/agent/revert",
+        # `revert-hunk` is Revert's finer grain and the same trust boundary:
+        # it reverse-applies ONE hunk of the diff the SERVER snapshotted, by
+        # searching for that hunk's own lines in the file. It takes no content
+        # from the caller, and when the block is no longer there it refuses
+        # rather than guessing. tests/test_code_hunk_revert.py pins both.
+        "/api/code/agent/revert-hunk",
         # `/api/code/write` is the HUMAN apply route, not an AI surface: it
         # refuses anything without `confirm: true` and re-checks the file's
         # mtime against the buffer the user actually reviewed, then writes via

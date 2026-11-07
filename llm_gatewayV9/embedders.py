@@ -19,6 +19,7 @@ from collections import deque
 from typing import Literal
 
 import httpx
+from providers import upstream_session
 
 
 TaskType = Literal["retrieval_document", "retrieval_query"]
@@ -137,7 +138,7 @@ class OllamaEmbedder(EmbeddingProvider):
         # a run blocks the whole agent for tens of seconds before any worker
         # LLM call — the dominant source of the "silent gap" on the dashboard.
         body = {"model": self.model, "prompt": prefix + text, "keep_alive": -1}
-        async with httpx.AsyncClient(timeout=60) as c:
+        async with upstream_session(60.0) as c:
             r = await c.post(f"{self.base_url}/api/embeddings", json=body)
         if r.status_code != 200:
             raise EmbedderError(f"ollama HTTP {r.status_code}: {r.text[:200]}", status=r.status_code)
@@ -160,7 +161,7 @@ class OllamaEmbedder(EmbeddingProvider):
         body = {"model": self.model,
                 "input": [prefix + t for t in texts],
                 "keep_alive": -1}
-        async with httpx.AsyncClient(timeout=180) as c:
+        async with upstream_session(180.0) as c:
             r = await c.post(f"{self.base_url}/api/embed", json=body)
         if r.status_code != 200:
             raise EmbedderError(f"ollama HTTP {r.status_code}: {r.text[:200]}",

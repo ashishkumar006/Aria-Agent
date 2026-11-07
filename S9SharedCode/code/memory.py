@@ -8,7 +8,8 @@ module keeps only what belongs to the agent:
   retrieval strategy — prompt wording, not infrastructure);
 - the deterministic keyword extractor used when the classifier is down;
 - typed forwarding of ``read`` / ``remember`` / ``record_outcome`` /
-  ``add_fact`` / ``clear`` / ``list_recent`` to ``/v1/memory/*``.
+  ``add_fact`` / ``remember_fact`` / ``clear`` / ``list_recent`` to
+  ``/v1/memory/*``.
 
 Phase 1 (seven drawers): every write declares its principal role and the
 call path sets it honestly — ``remember`` (classified) → ``agent``,
@@ -284,6 +285,7 @@ def remember_preference(
     run_id: str = "chat",
     session_id: str | None = None,
     supersedes: str | None = None,
+    confidence: float = 1.0,
 ) -> MemoryItem:
     """Explicit-kind preference write — no LLM classifier.
 
@@ -312,6 +314,7 @@ def remember_preference(
         "goal_id": None,
         "session_id": session_id,
         "supersedes": supersedes,
+        "confidence": max(0.0, min(1.0, float(confidence))),
     }
     return MemoryItem.model_validate(_post("/v1/memory/remember", payload)["item"])
 
@@ -1356,6 +1359,39 @@ def add_fact(
         "source": source, "run_id": run_id, "goal_id": goal_id,
         "session_id": session_id, "principal_role": "indexer",
         "doc": doc,
+    })
+    return MemoryItem.model_validate(data["item"])
+
+
+def remember_fact(
+    descriptor: str,
+    *,
+    keywords: list[str] | None = None,
+    value: dict | None = None,
+    source: str,
+    run_id: str,
+    session_id: str | None = None,
+    supersedes: str | None = None,
+    confidence: float = 1.0,
+) -> MemoryItem:
+    """Explicit fact write for content the caller has already interpreted.
+
+    Unlike ``add_fact`` (the document-indexer path), this declares the agent
+    as the writer: a user's correction is not a document span, and filing it
+    as one made the provenance lie about where it came from.
+    """
+    data = _post("/v1/memory/remember", {
+        "kind": "fact",
+        "descriptor": (descriptor or "").strip()[:400],
+        "keywords": [str(k)[:60] for k in (keywords or [])][:12],
+        "value": value or {},
+        "source": source,
+        "run_id": run_id,
+        "goal_id": None,
+        "session_id": session_id,
+        "principal_role": "agent",
+        "supersedes": supersedes,
+        "confidence": max(0.0, min(1.0, float(confidence))),
     })
     return MemoryItem.model_validate(data["item"])
 

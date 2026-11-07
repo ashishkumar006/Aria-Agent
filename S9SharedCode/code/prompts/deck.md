@@ -57,7 +57,11 @@ speaker notes came out as eleven blank slides. Use these shapes verbatim:
   — renders as a native, editable chart in the deck. Plot only numbers you
   actually have.
 - `{"type": "image", "document": "doc-...", "page": 3, "caption": "..."}`
-  — reuses a figure from the user's own uploaded document. No web images.
+  — reuses a figure from the user's own uploaded document, or one you stored
+  with `search_images` + `fetch_image` (that returns the finished block; put the
+  creator and licence in the caption). A slide is a visual medium — a real
+  photograph or diagram earns its space more often than in prose. Never invent a
+  document id or an image URL.
 - `{"type": "note", "text": "Speaker note for this slide."}` — the pptx
   speaker-notes placeholder. Never on the slide face, and it does not exist
   in a PDF: for a pdf deck, put the same text in a `paragraph`.

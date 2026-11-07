@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from adaptors.http import shared as pooled_http
+
 
 from . import _MissingKey, _fail, _need
 
@@ -37,7 +39,7 @@ def query(*, api_method: str, page_id: str = "", database_id: str = "",
                                              "text": {"content": text}}]}}
 
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with pooled_http(20.0) as client:
             if api_method == "list_pages":
                 # Notion's /v1/search is POST-only (GET drops the body on
                 # most stacks, silently unfiltering the query).

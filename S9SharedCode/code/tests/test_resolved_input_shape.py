@@ -54,10 +54,27 @@ def test_a_useless_entry_still_falls_back_to_a_positional_title():
 
 
 def test_the_outline_uses_wrapped_questions():
+    """Two DIFFERENT researchers become two sections.
+
+    Identical questions are deduplicated on purpose: live, three researchers
+    echoed the brief as their question and the report got three sections all
+    titled with the request.
+    """
+    second = {"id": "n:4", "kind": "upstream",
+              "output": {**UPSTREAM["output"],
+                         "question": "Gradients and hydraulics"}}
+    got = skills._derive_document_outline(
+        [], [dict(UPSTREAM, id="n:3"), second], [], "make a report")
+    assert got and "Construction materials" in got[0], got
+    assert "Gradients and hydraulics" in got, got
+
+
+def test_identical_researcher_questions_do_not_duplicate_sections():
     got = skills._derive_document_outline(
         [], [dict(UPSTREAM, id="n:3"), dict(UPSTREAM, id="n:4")], [],
         "make a report")
-    assert got and "Construction materials" in got[0], got
+    assert got.count("Construction materials in Roman aqueducts") <= 1, got
+    assert len(got) >= 2, got
 
 
 def test_the_expansion_does_not_skip_when_research_is_wrapped():

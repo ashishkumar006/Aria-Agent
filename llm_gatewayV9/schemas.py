@@ -67,6 +67,22 @@ class ChatRequest(BaseModel):
     agent: Optional[str] = None
     session: Optional[str] = None
 
+    # New in V9: prompt-cache affinity. A DAG node makes several LLM calls in a
+    # row (the tool loop's hops, an author retry). `Router.pick` chooses the
+    # LEAST-LOADED provider, so each hop could land on a different one — and
+    # every provider caches separately (Gemini's cachedContent is minted under
+    # one API key and cannot be read by another; the implicit prefix cache is
+    # per provider too). So a node that bounces pays its full system prompt on
+    # every hop and gets nothing back.
+    #
+    # The caller sends the SAME short id for every call of one node — the agent
+    # uses "<session>:<node>" — and the gateway keeps that node on the provider
+    # it first chose. Different nodes still spread, because a node with no
+    # history is picked by load exactly as before. The value is a cache-grouping
+    # hint only: it never authorises anything, and it must not carry user text,
+    # because provider attempts and rate state are logged against it.
+    route_affinity: Optional[str] = None
+
 
 class RouterDecision(BaseModel):
     """What the router agent decided. Echoed back on the worker response so the

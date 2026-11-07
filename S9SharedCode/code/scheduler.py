@@ -480,6 +480,314 @@ def schedule(query: str, when: str, *,
     return sid
 
 
+# ── self-wake ─────────────────────────────────────────────────────────────
+# A wake is a scheduled row with a REASON instead of a QUERY. It is a poll with a
+# predicate: the tick asks `delta.compute` whether anything it is watching has
+# changed, and only a match costs a model turn. Everything below exists to keep
+# those two facts separable from the console, from schedules.json and from the
+# ledger — a wake that fired and found nothing must be invisible in the cost
+# columns and visible in the job's own history.
+
+# Shortest interval a wake may ask for, whatever it proposes. The floor is on the
+# POLL, not the turn: "check every minute" is 1,440 external reads a day against
+# someone else's API, and that is a rate-limit problem rather than a token one.
+WAKE_FLOOR_S = 600
+# How long an unmatched watch keeps re-arming itself before it gives up and says
+# so. Without it, a wake armed on a condition that never arrives ("watch for the
+# reply") re-ticks forever — the boring loop the empty-delta rule does not cover,
+# because an empty delta is free but not finite.
+WAKE_HORIZON_S = 24 * 3600
+# Turns a chain may take. The agent cannot extend that number; only a fresh arm
+# from a human turn can start a new chain.
+WAKES_LEFT_DEFAULT = 3
+WAKES_LEFT_MAX = 10
+WAKE_REASON_MAX = 400
+
+
+def flags_self_wake_on() -> bool:
+    """The one switch for the whole capability, read the same way everywhere."""
+    try:
+        import flags as _flags
+        return bool(_flags.is_enabled("agent.self_wake", False))
+    except Exception:
+        return False
+
+
+def wake_chain_budget(conversation_id: str) -> tuple[str, int]:
+    """The chain already running for this conversation, and what is left of it.
+
+    Read from the store rather than from process memory, because the tool that
+    re-arms can be the MCP child — a different process from the agent server
+    that armed the first wake. Returns ("", WAKES_LEFT_DEFAULT) when nothing is
+    in flight, which is a fresh chain started from a human turn.
+    """
+    cid = str(conversation_id or "")
+    if not cid:
+        return "", WAKES_LEFT_DEFAULT
+    with _SCHED_LOCK:
+        _load()
+        rows = [v for v in _SCHEDULES.values()
+                if isinstance(v, dict) and v.get("kind") == "wake"
+                and str(v.get("conversation_id") or "") == cid]
+    if not rows:
+        return "", WAKES_LEFT_DEFAULT
+    newest = max(rows, key=lambda v: float(v.get("created") or 0))
+    left = int(newest.get("wakes_left") or 0) - 1
+    return str(newest.get("id") or ""), max(1, min(left, WAKES_LEFT_MAX))
+
+
+def _wake_interval(every: str) -> int:
+    """Seconds between polls, with the floor applied.
+
+    Reuses the schedule parser rather than a second duration grammar: a wake that
+    accepts "15m" and one that accepts "15 minutes" would be two features, and
+    the model would find the difference.
+    """
+    now = time.time()
+    secs = _next_fire_from_cron(f"every {str(every or '').strip()}", now) - now
+    if secs <= 0:
+        raise ValueError(f"wake interval {every!r} is not in the future")
+    return max(int(secs), WAKE_FLOOR_S)
+
+
+def schedule_wake(reason: str, every: str = "1h", *, conversation_id: str,
+                  watch: dict | None = None,
+                  wakes_left: int = WAKES_LEFT_DEFAULT,
+                  armed_by: str = "agent", parent: str = "") -> str:
+    """Arm one wake: look again in `every`, and only spend a turn if `watch` matched.
+
+    Returns the schedule id. Raises ValueError with a message the model can act
+    on, because every one of these refusals is a guardrail doing its job, and a
+    generic error would only teach the caller to retry it.
+    """
+    if not flags_self_wake_on():
+        raise ValueError("self-wake is switched off (flag agent.self_wake). "
+                         "Tell the user to enable it in Settings rather than "
+                         "retrying.")
+    text = str(reason or "").strip()
+    if not text:
+        # The reason is the loop rule. A wake that must state why it will wake
+        # again cannot spin on an unspecified impulse, and the sentence is also
+        # what the Scheduler page shows the user, so it doubles as the audit.
+        raise ValueError("a wake needs a non-empty reason: what it is waiting "
+                         "for, and what it should do when that arrives.")
+    if not str(conversation_id or "").strip():
+        raise ValueError("a wake must name the conversation it reports back to.")
+    left = int(wakes_left or 0)
+    if left < 1 or left > WAKES_LEFT_MAX:
+        raise ValueError(f"wakes_left must be between 1 and {WAKES_LEFT_MAX}")
+    step = _wake_interval(every)
+    now = time.time()
+    sid = f"wake-{uuid.uuid4().hex[:8]}"
+    with _SCHED_LOCK:
+        _load()
+        _SCHEDULES[sid] = {
+            # No query, on purpose: `_fire` runs `spec["query"]` through the
+            # Executor, and a wake must never reach that path.
+            "kind": "wake",
+            "query": "",
+            "reason": text[:WAKE_REASON_MAX],
+            "watch": watch if isinstance(watch, dict) else None,
+            "every": str(every or "1h"),
+            "step_s": step,
+            "when": f"every {step}s",
+            "next_fire": now + step,
+            # Not `recurring`: the worker's recurring branch re-arms BEFORE
+            # firing and would skip the predicate entirely. A wake re-arms
+            # itself, deliberately, only when it found nothing.
+            "recurring": None,
+            "conversation_id": str(conversation_id),
+            "notify": False,
+            "enabled": True,
+            "created": now,
+            "wakes_left": left,
+            "wakes_fired": 0,
+            "armed_by": armed_by if armed_by in ("agent", "user") else "agent",
+            "parent": str(parent or ""),
+            "watch_until": now + WAKE_HORIZON_S,
+        }
+        heapq.heappush(_HEAP, (now + step, sid))
+        _save()
+    _ensure_worker()
+    _log(f"[{sid}] wake armed: {text[:80]!r} every {step}s, {left} turn(s) left, "
+         f"watch={'yes' if watch else 'delta-non-empty'}")
+    return sid
+
+
+def _wake_predicate(spec: dict) -> tuple[bool, dict]:
+    """Model-free: has anything this wake is watching changed since it last looked?
+
+    Returns (matched, delta). No LLM call, no gateway call, nothing a tick could
+    bill — the delta is stat-first and bounded, so an unmatched tick costs about
+    what a cache read costs.
+    """
+    import delta
+    cid = str(spec.get("conversation_id") or "")
+    since = delta.read_cursor(cid) if cid else 0.0
+    # A wake can only see what happened WHILE it was armed. Without this floor,
+    # a freshly armed "watch for the reply" starts with no watermark, so
+    # `since=0` means the whole history — and its first tick matches something
+    # from last Tuesday, spends a turn, and reports news the user has already
+    # read. After a delivery the advanced cursor is always later than `created`,
+    # so this only ever binds the first tick, which is exactly the one that was
+    # wrong.
+    since = max(float(since or 0.0), float(spec.get("created") or 0.0))
+    watch = spec.get("watch") or {}
+    surfaces = None
+    surface = str(watch.get("surface") or "").strip().lower()
+    if surface:
+        surfaces = [surface if surface in delta.SURFACES else "documents"]
+    out = delta.compute(since=since, surfaces=surfaces, limit=delta.PER_SURFACE)
+    changed = out.get("changed") or {}
+    if surfaces:
+        # Scope enforced here as well as requested above. A wake armed on
+        # `documents` must not match a memory entry because a collector returned
+        # an extra surface — the predicate's scope is the watch's whole contract.
+        changed = {k: v for k, v in changed.items() if k in surfaces}
+    entries = [e for group in changed.values() for e in (group or [])]
+    if not entries:
+        return False, out
+    match = watch.get("match") or {}
+    if not isinstance(match, dict) or not match:
+        # A time-only wake: the predicate IS "the delta is non-empty".
+        return True, out
+    terms = [str(v).strip().lower() for v in match.values() if str(v).strip()]
+    if not terms:
+        return True, out
+    for e in entries:
+        hay = " ".join(str(e.get(k) or "") for k in
+                       ("id", "session", "filename", "what", "detail",
+                        "path")).lower()
+        if all(t in hay for t in terms):
+            return True, out
+    return False, out
+
+
+def _wake_rearm(sid: str, spec: dict) -> bool:
+    """Re-arm an unmatched wake. False when the watch horizon has run out."""
+    horizon = float(spec.get("watch_until") or 0)
+    if time.time() >= horizon:
+        with _SCHED_LOCK:
+            _load()
+            row = _SCHEDULES.get(sid)
+            if isinstance(row, dict):
+                row["enabled"] = False
+                row["last_error"] = (
+                    "stopped watching: nothing matched within "
+                    f"{int(WAKE_HORIZON_S / 3600)}h of being armed")
+                _save()
+        _log(f"[{sid}] watch expired unmatched; disabled")
+        return False
+    step = int(spec.get("step_s") or WAKE_FLOOR_S)
+    nxt = time.time() + step
+    with _SCHED_LOCK:
+        _load()
+        row = _SCHEDULES.get(sid)
+        if not isinstance(row, dict):
+            return False
+        row["next_fire"] = nxt
+        row["enabled"] = True
+        _save()
+        heapq.heappush(_HEAP, (nxt, sid))
+    return True
+
+
+def _fire_wake(sid: str, spec: dict) -> None:
+    """One wake tick. Nothing matched → no turn, no cost, still armed.
+    Something matched → one read-only turn in the bound conversation."""
+    if not flags_self_wake_on():
+        # The kill switch means "never fire", not "cannot be created": rows armed
+        # before it was switched off stay stored and stay silent, so switching it
+        # back on resumes exactly what was there. Stated on the row, because a
+        # watch that is dark and a watch that is armed look identical otherwise.
+        _record(sid, "not firing: agent.self_wake is off")
+        _log(f"[{sid}] wake skipped — agent.self_wake is off")
+        # Pushed forward rather than left past-due: a row the switch is holding
+        # would otherwise be re-heaped by the next _load() and skipped again on
+        # every scheduler operation, which is churn that proves nothing.
+        _wake_rearm(sid, spec)
+        return
+    t0 = time.time()
+    try:
+        matched, out = _wake_predicate(spec)
+    except Exception as e:  # noqa: BLE001
+        _log(f"[{sid}] wake predicate failed: {e!r}")
+        _record(sid, f"predicate failed: {e}"[:400])
+        _wake_rearm(sid, spec)
+        return
+    if not matched:
+        _record(sid)
+        _log(f"[{sid}] nothing new (empty delta) — no turn, no spend "
+             f"in {time.time() - t0:.2f}s")
+        _wake_rearm(sid, spec)
+        return
+
+    left = int(spec.get("wakes_left") or 0)
+    if left < 1:
+        # Belt and braces: arming past zero is refused by the tool, so reaching
+        # here means a hand-edited row. Say so rather than fire it.
+        with _SCHED_LOCK:
+            _load()
+            row = _SCHEDULES.get(sid)
+            if isinstance(row, dict):
+                row["enabled"] = False
+                row["last_error"] = "no wakes left in this chain"
+                _save()
+        _log(f"[{sid}] chain exhausted; disabled")
+        return
+
+    cid = str(spec.get("conversation_id") or "")
+    before = None
+    try:
+        from agent_server import _session_cost_breakdown
+        before = _session_cost_breakdown(cid)
+    except Exception as e:  # noqa: BLE001
+        _log(f"[{sid}] cost snapshot failed (non-fatal): {e}")
+    answer, error = "", None
+    try:
+        from agent_server import _run_wake_turn
+        answer = _run_wake_turn(conversation_id=cid, spec=spec, delta=out,
+                               schedule_id=sid)
+    except Exception as e:  # noqa: BLE001
+        error = f"{type(e).__name__}: {e}"[:400]
+        _log(f"[{sid}] wake turn failed: {traceback.format_exc()}")
+    _record(sid, error)
+    if error:
+        # A FAILED turn does not consume the chain. The change it was armed for
+        # is still unseen because the cursor only moves on delivery, so burning
+        # a step here would let a transient failure — a busy conversation, a
+        # dead gateway — silently eat the watch and drop the finding. Re-arm and
+        # try again on the next tick; the horizon is what bounds that, and the
+        # reason is visible on the row.
+        _log(f"[{sid}] wake turn failed, re-armed without spending a step")
+        _wake_rearm(sid, spec)
+        return
+    try:
+        if before is not None and cid:
+            from agent_server import _session_cost_delta, _record_turn_cost
+            cost = _session_cost_delta(cid, before)
+            if cost:
+                _record_turn_cost(cid, f"[wake] {str(spec.get('reason'))[:120]}",
+                                  cost)
+                _log(f"[{sid}] cost recorded: {cost}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"[{sid}] cost record failed (non-fatal): {e}")
+    # Consume the chain step, and do NOT re-arm: a wake continues only by calling
+    # schedule_wake itself, with a reason. The default is that the chain ends
+    # here, which is what keeps "watch this forever" something only the user can
+    # ask for.
+    with _SCHED_LOCK:
+        _load()
+        row = _SCHEDULES.get(sid)
+        if isinstance(row, dict):
+            row["enabled"] = False
+            row["wakes_left"] = left - 1
+            row["wakes_fired"] = int(row.get("wakes_fired") or 0) + 1
+            _save()
+    _log(f"[{sid}] wake ran in {round(time.time() - t0, 1)}s -> "
+         f"{str(answer or '')[:140]!r}")
+
+
 # â”€â”€ notification policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _coerce_seconds(v, field: str, *, minimum: float = 0.0,
@@ -781,6 +1089,25 @@ def purge_disabled(max_age_days: float = 7) -> int:
 # slow and wrong. A job with no authored message still runs the DAG, because
 # then the task genuinely is "go and do/find something".
 def _is_nudge_only(spec: dict) -> bool:
+    """A row that exists only to deliver text the agent already wrote.
+
+    The message is the discriminator, and that is the documented contract of
+    `schedule_task` (see its NUDGE paragraph) — not an accident of this
+    function. An earlier revision of this docstring argued the opposite from
+    live row `sch-1d2034f0` (query `whats_new surfaces=documents`, message
+    "Checking for new documents..."): the message went out, the query never
+    ran, and the user was told a check had happened. That row is real, but the
+    fix chosen here was wrong. Every pure nudge also carries a query —
+    "take a break and refocus" is stored as one — so "a non-empty query means
+    do work" sends every reminder through planner -> researcher -> formatter
+    and bills four or five model calls to be told to stretch, which is the
+    exact cost this branch exists to avoid. `tests/test_reminder_routing.py`
+    caught it.
+
+    So the ambiguity stays where it belongs: at the moment the model chooses.
+    `prompts/action.md` and the tool doc both tell it that setting `message`
+    means nothing runs, and a job that must produce something leaves it empty.
+    """
     pol = spec.get("notify_policy") or {}
     return bool(str(pol.get("message") or "").strip())
 
@@ -882,10 +1209,18 @@ def _fire(sid: str, spec: dict | None = None) -> None:
         custom = str(pol.get("message") or "").strip()
         if channel:
             # An agent-authored fire-time message, delivered on the channel the
-            # agent chose.
-            text = custom or (
-                f"{spec['query'][:160]}\n\n"
-                f"{(answer or '').strip()[:900] or '(no answer)'}")
+            # agent chose. When the job also had a query, the answer is part of
+            # the delivery — the message alone is a promise, and sending only
+            # the promise is what made "checking for new documents" arrive with
+            # no check in it.
+            #
+            # Composed by the channel formatter: the run's answer is console
+            # markdown (headings, `[page](url)` links, a Sources list), and a
+            # phone renders all of it literally. The old line pasted the raw
+            # query in as the headline.
+            import channelformat as _cf
+            text = _cf.channel_text(answer=answer or "", query=spec["query"],
+                                    message=custom)
             _deliver(sid, channel, text, derived_sid,
                      str(pol.get("follow_up") or ""))
         else:
@@ -1003,8 +1338,19 @@ def _worker_tick() -> None:
             # any later _load() re-heaped them and they fired AGAIN.
             # Disable + persist BEFORE executing so a crash mid-fire
             # (or any reload) can never resurrect the schedule.
-            spec["enabled"] = False
-            _save()
+            #
+            # Wakes are exempt, because the decision to consume the row is
+            # theirs: `_fire_wake` disables it after a DELIVERED turn, re-arms on
+            # a no-match tick, and re-arms without spending a step when the turn
+            # fails. Disarming here would also mean a wake blocked by
+            # `agent.self_wake` being off was destroyed by the switch rather than
+            # paused — observed: three armed watches read as finished after one
+            # restart, with no way to resume them. A crash mid-delivery instead
+            # re-fires, which is the intended at-least-once: the cursor has not
+            # moved, so the finding is not lost.
+            if snap.get("kind") != "wake":
+                spec["enabled"] = False
+                _save()
     if skip_missed:
         _log(f"[{sid}] skipped a missed {spec['recurring']!r} slot "
              f"({int(now - fire)}s before startup); next "
@@ -1025,6 +1371,12 @@ def _worker_tick() -> None:
         # a reminder", and would record a run in Runs for a message that was
         # never a task.
         _fire_lead(sid, snap)
+        return
+    if snap.get("kind") == "wake":
+        # Routed here rather than inside _fire so the reminder path never sees a
+        # row with an empty query. _fire would have handed that empty string to
+        # the Executor and billed a turn to ask it nothing.
+        _fire_wake(sid, snap)
         return
     try:
         _fire(sid, snap)

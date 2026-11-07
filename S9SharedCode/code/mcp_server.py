@@ -92,17 +92,90 @@ mcp = FastMCP("eagv3-s9-server")
 SANDBOX = Path(os.environ.get("ARIA_SANDBOX") or (Path(__file__).parent / "sandbox"))
 SANDBOX.mkdir(parents=True, exist_ok=True)
 
+
+def _extra_roots() -> tuple[Path, ...]:
+    """The session's other declared folders, when it holds more than one.
+
+    `ARIA_SANDBOX` is a single path by design and cannot express a set, so the
+    rest arrives here. Empty for every non-studio caller, which is what keeps
+    this from changing the confinement of any run that exists today.
+    """
+    raw = (os.environ.get("ARIA_ROOTS") or "").strip()
+    if not raw:
+        return ()
+    out: list[Path] = []
+    for piece in raw.split(";"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            p = Path(piece).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if p.is_dir() and p not in out:
+            out.append(p)
+    return tuple(out)
+
+
+def _roots() -> tuple[Path, ...]:
+    base = SANDBOX.resolve()
+    extra = tuple(p for p in _extra_roots() if p != base)
+    return (base, *extra)
+
+
+def _within(base: Path, rel: str) -> Path:
+    p = (base / rel).resolve()
+    for allowed in _roots():
+        if p == allowed or allowed in p.parents:
+            return p
+    raise ValueError(f"Path '{rel}' escapes the sandbox")
+
 # NOTE: web-search usage accounting (Tavily monthly cap) moved to the
 # gateway with the search logic (integrations/websearch.py). Nothing here
 # touches TAVILY_API_KEY anymore.
 
 
 def _safe(path: str) -> Path:
-    p = (SANDBOX / path).resolve()
+    """The child's one confinement check. Everything that reads or writes a
+    file goes through here, which is why it must never grow a second copy.
+
+    Single-root behaviour — every run that exists today — is unchanged: the
+    path resolves under SANDBOX and must stay inside it.
+
+    A multi-root session has a second vocabulary, and the rule has to be one
+    the server agrees with or the two halves of the product disagree about
+    which file a path names. So: when more than one root is declared, a leading
+    segment that matches a declared root's name IS the root selector, and it
+    wins over the literal reading. `s4demo/app.py` means the file in the folder
+    called s4demo — never `<sandbox>/s4demo/app.py`, which is a different
+    project's directory that happens to share the name.
+
+    The earlier version of this function tried the literal path first and only
+    re-anchored when it did not exist. That ordering is the bug: whether a path
+    exists is not a fact about what the caller MEANT, and it made the answer
+    depend on what was already on disk. `agent_server._code_agent_abs` applies
+    the selector rule, this applies the same one, and a review snapshot taken
+    against one now describes the file the other wrote.
+
+    A rooted path (`/etc/passwd`, `/windows/system32/cmd.exe`) is passed to the
+    join untouched, because joining an absolute path REPLACES the sandbox and
+    the containment check then refuses it. Normalising the leading slash away
+    here would rewrite that escape into a path that genuinely sits inside the
+    sandbox, which is what `tests/test_e2e_phase3_safety.py::test_es02` exists
+    to catch.
+    """
+    rel = (path or "").strip().replace("\\", "/")
     base = SANDBOX.resolve()
-    if p != base and base not in p.parents:
-        raise ValueError(f"Path '{path}' escapes the sandbox")
-    return p
+    if not rel or rel == ".":
+        return base
+    roots = _roots()
+    if len(roots) > 1:
+        head, sep, rest = rel.lstrip("/").partition("/")
+        if sep and rest:
+            for root in roots:
+                if root != base and root.name == head:
+                    return _within(root, rest)
+    return _within(base, rel)
 
 
 #: Vendored / build directories pruned from a walk, in place, so a repo-wide
@@ -372,6 +445,106 @@ def _cache_key(url: str) -> str:
     return hashlib.sha256(url.strip().lower().encode("utf-8")).hexdigest()[:32]
 
 
+def _document_stem(value: str, fallback: str = "page", maxlen: int = 72) -> str:
+    """A filesystem-safe, readable stem from a title or a phrase."""
+    cleaned = re.sub(r"[^\w\s.-]", " ", str(value or "")).strip()
+    cleaned = re.sub(r"\s+", "-", cleaned)
+    return cleaned[:maxlen].strip("-.") or fallback
+
+
+def _strip_untrusted_envelope(text: str) -> str:
+    """The page's own text, without the security envelope around it.
+
+    The envelope is a frame for a model reading the text right now; it is not
+    the page. Storing it inside the filed document made it the document's first
+    chunk — 70 words of boilerplate that every fetched page carries, that
+    matches any query, and that the user correctly read as "these files just
+    have metadata in them". The name was worse: the banner line came first, so
+    every stored page was named
+    `UNTRUSTED_WEB_CONTENT-url-https-www-example-com-fo.txt`.
+
+    The frame is not lost: `read_artifact` re-applies it to any web-sourced
+    artifact it hands back, so a later turn still sees the warning, and
+    `_doc_context` says once, in the prompt it builds, that retrieved web text
+    is data."""
+    body = str(text or "")
+    lines = body.split("\n")
+    if lines and lines[0].lstrip().startswith("<<<UNTRUSTED_WEB_CONTENT"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "<<<END_UNTRUSTED_WEB_CONTENT>>>":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _page_document_name(url: str, text: str = "") -> str:
+    """Name a stored web page after what the page IS.
+
+    The URL tail alone gave `a.txt`, `b.txt`, `Path.txt` — useless in a library
+    the user and the agent both read, and two fetches of the same URL with
+    different content produced two indistinguishable rows. A page's own first
+    heading is the name a person would recognise, so try that, then the
+    host+path, then `page`.
+    """
+    for line in str(text or "").splitlines():
+        s = line.strip().lstrip("#").strip()
+        # Skip rules, table rows, list items and our own failure markers: the
+        # first real line of prose is the title, and trafilatura puts it there.
+        if len(s) >= 4 and not s.startswith(("[", "*", "-", "|", "=", ">")):
+            return _document_stem(s, fallback="page") + ".txt"
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        host = (parts.netloc or "").replace("www.", "")
+        tail = re.split(r"[?#]", parts.path or "")[-1].strip("/")
+        return _document_stem(f"{host} {tail}".strip(), fallback="page") + ".txt"
+    except Exception:
+        return "page.txt"
+
+
+def _store_page_as_document(url: str, out: dict) -> str:
+    """Keep a fetched page as a searchable document, not only a 7-day cache.
+
+    A researcher that quotes a figure today cannot re-open that page next week:
+    the cache expires, the URL may 404, and the only way back is another search
+    that returns something else. Stored as an artifact and indexed into the
+    Documents plane under "Web sources", with the URL as its provenance, the
+    page stays quotable and cross-checkable — and a repeat fetch is answered
+    from disk instead of the network.
+
+    The bytes are the page text and nothing else. The three-line `URL:/Fetched:/
+    Length:` block used to be prepended to it, and the chunker made that block
+    the document's FIRST chunk — so a search for the topic could return a chunk
+    containing a URL and a timestamp and no content, which is what made these
+    rows look like "just metadata". The URL is the document's title and its
+    `origin_ref`, and `created_at` is the fetch time, so nothing is lost.
+
+    Returns the artifact handle (so the tool result can name what was saved).
+    """
+    text = str(out.get("text") or "")
+    if not text.strip():
+        return ""
+    page = _strip_untrusted_envelope(text)
+    if not page.strip():
+        return ""
+    try:
+        import artifacts as _arts
+        art = _arts.put(page.encode("utf-8"), content_type="text/plain",
+                        source=f"web:{url}"[:200], descriptor=url[:200])
+        folder, origin = _arts.filing_for("web")
+        _arts.register_with_documents(art, origin=origin, folder_name=folder,
+                                      title=url[:200],
+                                      # The page's own text, not the header block
+                                      # prepended to it — the first line of
+                                      # `head` is "URL: …", which would name
+                                      # every file after the metadata line.
+                                      filename=_page_document_name(url, page),
+                                      origin_ref=url,
+                                      session_id=_run_session())
+        return art
+    except Exception:
+        return ""
+
+
 def _cache_read(url: str) -> dict | None:
     if not _CACHE_ENABLED:
         return None
@@ -549,6 +722,63 @@ async def _extract_page(url: str, timeout_s: int = 20,
                 "text": f"[fetch timed out after {timeout_s + 15}s: {url}]"}
 
 
+def _search_document_name(query: str) -> str:
+    """A readable filename for a stored search result set."""
+    tail = re.sub(r"[^\w.\-]+", "-", str(query or "")).strip("-")[:70]
+    return f"search-{tail or 'results'}.txt"
+
+
+def _store_hits_as_document(tool: str, query: str, hits: list) -> str:
+    """Keep what a search returned, so the next turn reads it instead of paying
+    for the search again.
+
+    A hit list is the half of research that used to vanish: the pages
+    themselves are cached and now filed, but "what did you find for X?" had no
+    answer except a second query that returns a different list. The saved text
+    keeps each hit's title, URL and snippet, and its provenance is the query.
+    """
+    if not isinstance(hits, list) or not hits:
+        return ""
+    # One header line, not a block of them. A fetched page learned the lesson
+    # the hard way: the chunker turns each blank-separated block into its own
+    # chunk, so a four-line preamble became the document's first chunk and a
+    # search for the topic could return provenance with no content in it. This
+    # line is worth indexing — it is what makes the list findable again by the
+    # question it answered — so it rides with the first hit instead of standing
+    # alone.
+    header = (f"Results for the search \"{str(query or '').strip()}\" "
+              f"({len(hits)} hits, {time.strftime('%Y-%m-%d', time.gmtime())}):")
+    blocks = []
+    for i, h in enumerate(hits, start=1):
+        if not isinstance(h, dict):
+            continue
+        title = str(h.get("title") or "").strip() or "(untitled)"
+        url = str(h.get("url") or h.get("link") or "").strip()
+        body = str(h.get("content") or h.get("snippet")
+                   or h.get("summary") or "").strip()
+        blocks.append(f"[{i}] {title}\n     {url}\n     {body}")
+    if not blocks:
+        return ""
+    blocks[0] = f"{header}\n{blocks[0]}"
+    text = "\n\n".join(blocks)
+    if not text.strip():
+        return ""
+    try:
+        import artifacts as _arts
+        art = _arts.put(text.encode("utf-8"), content_type="text/plain",
+                        source=f"web:{tool}:{query}"[:200],
+                        descriptor=f"{tool} search: {query}"[:200])
+        _arts.register_with_documents(art, origin="web",
+                                      folder_name="Web sources",
+                                      title=f"{tool} search: {query}"[:200],
+                                      filename=_search_document_name(query),
+                                      origin_ref=f"{tool}:{query}",
+                                      session_id=_run_session())
+        return art
+    except Exception:
+        return ""
+
+
 @mcp.tool()
 def web_search(query: str, max_results: int = 5) -> list[dict]:
     """Search the web (gateway: Tavily primary, DDG fallback).
@@ -556,11 +786,19 @@ def web_search(query: str, max_results: int = 5) -> list[dict]:
     Example: web_search("python asyncio tutorial", 3)."""
     d = _gw_integration("websearch", "search",
                         {"query": query, "max_results": max_results})
+    results: list = []
     if isinstance(d.get("results"), list):
-        return d["results"]
-    if isinstance(d.get("ok"), bool) and not d["ok"]:
+        results = d["results"]
+    elif isinstance(d.get("ok"), bool) and not d["ok"]:
         return d  # fail-soft dict (gateway down / misconfigured)
-    return d if isinstance(d, list) else []
+    elif isinstance(d, list):
+        results = d
+    if results:
+        # Filed before returning, so the hit list survives the turn: a later
+        # "what did we find?" reads it from disk instead of paying for the
+        # search a second time.
+        _store_hits_as_document("web_search", query, results)
+    return results
 
 
 @mcp.tool()
@@ -618,6 +856,15 @@ async def _fetch_uncached(url: str, timeout: int) -> dict:
     # Only a real body is worth keeping for a week; a timeout or a dead host
     # gets a short negative TTL.
     if out.get("status") == 200:
+        # Store first, then cache: the cache body then carries the artifact
+        # handle, so a fetch answered from the 7-day cache still names the
+        # document the page lives in. Off the loop — filing uploads the whole
+        # page to the gateway and waits, and on this coroutine every other
+        # tool call in the process would wait with it.
+        art = await asyncio.to_thread(_store_page_as_document, url, out)
+        if art:
+            out = dict(out)
+            out["artifact"] = art
         _cache_write(url, out)
     elif out.get("status") in (404, 502, 504):
         _cache_write(url, {}, negative=True)
@@ -1147,6 +1394,187 @@ async def fetch_pdf(url: str, timeout: int = 30) -> dict:
                 "error": f"fetch_pdf failed: {type(e).__name__}: {e}"}
 
 
+IMAGE_MAX_BYTES = 12 * 1024 * 1024
+# Same ceiling docgen imposes when it lifts a figure out of a stored document,
+# so a fetch that succeeds cannot then be silently dropped at render time.
+IMAGE_HOPS_MAX = 3
+# Sent on every image download. Hosts that police bots answer 403 to the
+# default `python-httpx`, which reads as "this picture is unfetchable" rather
+# than "you didn't say who you are". Overridable so an operator can put a real
+# contact address in it; an image search with no way to reach the requester is
+# the kind of traffic that gets an whole host blocklisted.
+IMAGE_USER_AGENT = (
+    os.getenv("ARIA_IMAGE_USER_AGENT")
+    or "Aria/1.0 (local document assistant; +http://127.0.0.1:8500)")
+
+
+@mcp.tool()
+def search_images(query: str, max_results: int = 8,
+                  commercial_only: bool = False) -> dict:
+    """Find CC-licensed pictures for a document, with the licence attached.
+
+    Returns candidates only — nothing is stored until `fetch_image`. Each result
+    carries `image_url`, `page_url`, `creator`, `license`, `license_url`,
+    `width`/`height` and `source`, because a figure in a document the user might
+    publish needs attribution, and an unattributed one is worse than none.
+    Openverse specifically, not a general image engine, for that reason.
+
+    `commercial_only=True` narrows to licences that allow commercial use.
+
+    Example: search_images("Roman aqueduct Pont du Gard", 5)
+    """
+    from flags import is_enabled as _flag_on
+    if not _flag_on("documents.image_search", True):
+        return {"ok": False, "status": "disabled",
+                "message": "image search is switched off "
+                           "(`documents.image_search`); nothing will be "
+                           "fetched. Use figures the user already uploaded."}
+    d = _gw_integration("websearch", "search_images",
+                        {"query": str(query or ""),
+                         "max_results": int(max_results or 8),
+                         "commercial_only": bool(commercial_only)})
+    if not d.get("ok", True) and d.get("error"):
+        return {"ok": False, "error": str(d["error"])[:300]}
+    results = d.get("results")
+    if not isinstance(results, list):
+        results = d if isinstance(d, list) else []
+    # Filed like web_search files its hits, so "what images did you find?" later
+    # reads the list from disk instead of paying for the search again.
+    if results:
+        _store_hits_as_document("search_images", query, results)
+    return {"ok": True, "results": results, "count": len(results),
+            "note": "Pick one and call fetch_image(image_url, credit=...) to "
+                    "store it and get a document id you can use in an `image` "
+                    "block. A non-square image usually wants width_mm."}
+
+
+@mcp.tool()
+def fetch_image(url: str, credit: str = "", filename: str = "") -> dict:
+    """Fetch one licensed image and file it so a document can embed it.
+
+    This is the supply half. `render_document`'s `image` block has always worked
+    — docgen lifts an embedded raster out of any stored document, and the author
+    is shown every `(page, index)` handle — but the only source was a file the
+    USER uploaded. So a report researched from the web could not contain a
+    picture no matter what the model wanted. This closes that gap: the bytes are
+    downloaded, checked, and registered as a document, and the reply is the exact
+    block to paste.
+
+    `url` must come from `search_images`. Guarded the way `fetch_pdf` is: only
+    http(s), and the host AND every address it resolves to must be publicly
+    routable, so a model cannot point the agent at the cloud metadata endpoint or
+    at the gateway on :8109. Redirects are followed manually and re-guarded at
+    each hop, because the guard on the original URL is worthless if the server
+    answers with a 302 to 127.0.0.1. Content type and magic bytes both have to
+    say PNG or JPEG, and the download aborts past `IMAGE_MAX_BYTES`.
+
+    `credit` is the attribution line for the caption — usually `"<creator> —
+    <license>"`. It is stored with the file, not appended to the image.
+
+    Returns {"ok": true, "document": "...", "page": 1, "index": 0, "block": {...}}
+    — copy `block` into `render_document`'s blocks unchanged.
+    """
+    import io as _io
+
+    from flags import is_enabled as _flag_on
+    if not _flag_on("documents.image_search", True):
+        return {"ok": False, "status": "disabled",
+                "message": "image fetching is switched off "
+                           "(`documents.image_search`). Figures already stored "
+                           "from the user's own uploads still work; nothing new "
+                           "can be fetched. Say so plainly rather than "
+                           "describing a picture you did not add."}
+    src = str(url or "").strip()
+    refused = _guard_url(src)
+    if refused:
+        return {"ok": False, "error": f"refused: {refused}"}
+
+    def _download() -> tuple[bytes, str]:
+        # follow_redirects=False on purpose: httpx would chase a 302 to a
+        # private address after the guard had already signed off on the
+        # original host. Each hop is re-guarded here instead.
+        # A identifying User-Agent is not politeness here: Wikimedia's CDN
+        # answers 403 to a request without one, so the default `python-httpx`
+        # UA made a perfectly good CC-licensed photograph unfetchable.
+        _hdrs = {"Accept": "image/png, image/jpeg",
+                 "User-Agent": IMAGE_USER_AGENT}
+        current = src
+        for _hop in range(IMAGE_HOPS_MAX + 1):
+            with httpx.Client(timeout=40, follow_redirects=False) as c:
+                with c.stream("GET", current, headers=_hdrs) as r:
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        loc = r.headers.get("location") or ""
+                        if not loc:
+                            raise ValueError("redirect with no Location")
+                        current = httpx.URL(current).join(loc)
+                        again = _guard_url(str(current))
+                        if again:
+                            raise ValueError(f"redirect refused: {again}")
+                        continue
+                    if r.status_code != 200:
+                        raise ValueError(f"HTTP {r.status_code}")
+                    ctype = (r.headers.get("content-type") or "").lower()
+                    if "image/" not in ctype:
+                        raise ValueError(f"not an image: {ctype[:60]!r}")
+                    buf = _io.BytesIO()
+                    for chunk in r.iter_bytes(65536):
+                        buf.write(chunk)
+                        if buf.tell() > IMAGE_MAX_BYTES:
+                            raise ValueError(
+                                f"image larger than {IMAGE_MAX_BYTES} bytes")
+                    return buf.getvalue(), ctype
+        raise ValueError(f"too many redirects (>{IMAGE_HOPS_MAX})")
+
+    try:
+        blob, ctype = _download()
+    except Exception as e:
+        return {"ok": False, "error": f"fetch failed: {str(e)[:240]}"}
+    if not blob:
+        return {"ok": False, "error": "downloaded an empty file"}
+    # Magic bytes, not just the header: a server that labels a HTML error page
+    # `image/png` would otherwise be stored, indexed, and render as nothing.
+    is_png = blob[:8] == b"\x89PNG\r\n\x1a\n"
+    is_jpeg = blob[:2] == b"\xff\xd8"
+    if not (is_png or is_jpeg):
+        return {"ok": False,
+                "error": "bytes are not a PNG or JPEG despite the content type"}
+    ext = "png" if is_png else "jpg"
+    name = str(filename or "").strip() or "image"
+    if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+        name = f"{name.rsplit('.', 1)[0]}.{ext}"
+    fields = {"origin": "image_search", "origin_ref": src[:300],
+              "folder_name": "Images", "title": name[:200]}
+    if credit:
+        fields["attribution"] = str(credit)[:400]
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True,
+                          headers=_gw_headers()) as c:
+            r = c.post(f"{_GW}/v1/documents",
+                       files={"file": (name, blob)}, data=fields)
+    except Exception as e:
+        return {"ok": False, "error": f"gateway unreachable: {type(e).__name__}"}
+    if r.status_code >= 400:
+        try:
+            detail = (r.json() or {}).get("error") or r.text[:200]
+        except Exception:
+            detail = r.text[:200]
+        return {"ok": False, "status": r.status_code, "error": str(detail)[:300]}
+    try:
+        doc = (r.json() or {}).get("document") or {}
+    except Exception:
+        doc = {}
+    doc_id = str(doc.get("id") or "")
+    if not doc_id:
+        return {"ok": False, "error": "stored but no document id came back"}
+    block = {"type": "image", "document": doc_id, "page": 1, "index": 0,
+             "caption": str(credit or "")[:300]}
+    return {"ok": True, "document": doc_id, "page": 1, "index": 0,
+            "filename": name, "bytes": len(blob), "block": block,
+            "note": "Filed in the user's Documents under Images. Use `block` in "
+                   "the `image` block of render_document as-is; put the creator "
+                   "and licence in the caption."}
+
+
 @mcp.tool()
 def extract_tables(url: str, max_tables: int = 5, max_rows: int = 50) -> dict:
     """Pull HTML tables from a URL as structured rows (no browser — fast).
@@ -1383,23 +1811,59 @@ def read_artifact(artifact_id: str, offset: int = 0,
         meta = _artifacts.get_meta(artifact_id)
     except Exception:
         pass
-    total = len(raw)
+    raw_bytes = len(raw)
     # `offset` is a CHARACTER offset, so the slice must be taken on the
     # decoded text. Slicing the BYTES and decoding with errors="replace"
     # (the previous behaviour) split multi-byte characters at every page
     # boundary and turned them into U+FFFD permanently — the model was served
     # corrupted research text on any artifact over one page. Verified: a
     # 2520-byte / 2040-char artifact did not reassemble across pages.
-    full = raw.decode("utf-8", errors="replace")
+    # A stored PDF is a real file, and decoding its bytes as UTF-8 produced
+    # mojibake — so the agent could never read the document it had just written,
+    # only the chunks similarity search happened to return. Extract the text
+    # instead, with page markers, and paginate over that.
+    ctype = (getattr(meta, "content_type", "") or "").lower()
+    if ctype == "application/pdf":
+        try:
+            import docpreview as _dp
+            pv = _dp._pdf(raw)
+            pages = pv.get("pages") or []
+            full = "\n\n".join(
+                f"--- page {p.get('n')} ---\n{p.get('text') or ''}"
+                for p in pages)
+            if not full.strip():
+                return {"ok": False, "artifact_id": artifact_id,
+                        "error": "this PDF has no extractable text "
+                                 "(it is images only). Its chunks were "
+                                 "indexed by the vision pass, so use "
+                                 "search_knowledge instead."}
+        except Exception as e:
+            return {"ok": False, "artifact_id": artifact_id,
+                    "error": f"could not extract the PDF text: {e}"[:200]}
+    else:
+        full = raw.decode("utf-8", errors="replace")
     start = max(0, min(int(offset or 0), len(full)))
     cap = max(200, min(int(limit or 20000), 200_000))
     text = full[start:start + cap]
     end = start + len(text)
+    # A stored web page is filed as the page's own text — the security envelope
+    # is not content to index or name a file after. So put the frame back here,
+    # at the point a model reads it again, or the defense would exist only on
+    # the turn that first fetched it.
+    if str(getattr(meta, "source", "") or "").startswith("web:") \
+            and "<<<UNTRUSTED_WEB_CONTENT" not in text:
+        text = (UNTRUSTED_BANNER.format(
+            url=(getattr(meta, "descriptor", "") or "(unknown url)"))
+                + "\n" + text + "\n<<<END_UNTRUSTED_WEB_CONTENT>>>")
     return {
         "ok": True,
         "artifact_id": artifact_id,
         "title": (getattr(meta, "descriptor", "") or ""),
-        "size_bytes": total,
+        # The FILE's size, never the extracted text's — they differ by an order
+        # of magnitude for a PDF, and a caller comparing the artifact against the
+        # download needs the real one.
+        "size_bytes": raw_bytes,
+        "content_type": ctype or "application/octet-stream",
         "total_chars": len(full),
         "offset": start,
         "returned_chars": len(text),
@@ -1845,6 +2309,61 @@ def git_inspect(path: str = ".", target: str = "status",
 
 
 @mcp.tool()
+def git_action(action: str, paths: list[str] | None = None, message: str = "",
+               name: str = "", path: str = ".") -> dict:
+    """Run ONE curated git verb in this session's repository, so committing and
+    branching are things you can do, not buttons you must ask the human to press.
+
+    action: status, diff, log, branches (read); stage, unstage, branch_create
+    (write the index/a branch); commit, stash, stash_pop, branch_switch, restore
+    (move HEAD or discard work - these park for the human's approval before they
+    run). push, force_push, reset, clean, checkout, rebase, merge, init and amend
+    are REFUSED with a reason; do not retry them through run_command.
+
+    paths: repo-relative files for stage/unstage/commit/restore. message: the
+    commit message. name: the branch for branch_create/branch_switch. Returns
+    ok, summary, exit_code and the real git output."""
+    import subprocess
+    import shutil
+    import studio_files as _sf
+
+    root = _safe(path or ".")
+    plan = _sf.git_argv(action, {"paths": paths, "message": message,
+                                "name": name})
+    if not plan.get("ok"):
+        return {"ok": False, "error": plan.get("error"),
+                "refused": bool(plan.get("refused"))}
+    exe = shutil.which("git")
+    if not exe:
+        return {"ok": False, "error": "git is not installed"}
+    if not (root / ".git").exists() and not (root.parent / ".git").exists():
+        return {"ok": False, "error": f"'{path}' is not inside a git repository"}
+    argv = [exe, "--no-pager", "-C", str(root)] + list(plan["argv"])
+    try:
+        # Scrubbed env: a commit runs the repo's own hooks, and a hook must not
+        # inherit the operator's loaded keys (same reason run_command scrubs).
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL, env=_check_env())
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    ok = proc.returncode == 0
+    sid = _browser_sid()
+    state_dir = Path(os.environ.get("S9_STATE_DIR")
+                     or (Path(__file__).parent / "state"))
+    _sf.journal_write(state_dir, sid, "git",
+                      {"action": action, "repo": str(root), "argv": plan["argv"],
+                       "summary": plan["summary"], "ok": ok,
+                       "exit_code": proc.returncode, "via": "agent",
+                       "stderr": (proc.stderr or "")[:400]})
+    _audit_exec({"tool": "git_action", "action": action, "repo": str(root),
+                 "ok": ok, "exit_code": proc.returncode})
+    return {"ok": ok, "action": action, "summary": plan["summary"],
+            "moves_head": plan["moves_head"], "exit_code": proc.returncode,
+            "output": (proc.stdout or "")[:20_000],
+            "stderr": (proc.stderr or "")[:2_000]}
+
+
+@mcp.tool()
 def find_symbol(name: str, path: str = ".", max_hits: int = 40) -> dict:
     """Find where a function/class is DEFINED and every place it is USED.
 
@@ -2169,7 +2688,7 @@ def index_document(path: str, chunk_size: int = 400, overlap: int = 80,
 # it). These helpers forward tool calls there, preserving the exact same
 # fail-soft shapes ({ok: ...}) the skills and tests expect. Gateway down →
 # fail-soft dict, never an exception (the MCP stdio stream must survive).
-_GW = os.environ.get("LLM_GATEWAY_V9_URL", "http://localhost:8109").rstrip("/")
+_GW = os.environ.get("LLM_GATEWAY_V9_URL", "http://127.0.0.1:8109").rstrip("/")
 
 
 def _gw_headers() -> dict:
@@ -2437,6 +2956,68 @@ def _doc_allowlist():
         return {p for p in raw.split(",") if p}
     except Exception:
         return set()
+
+
+def _run_session() -> str:
+    """The run this tool process belongs to.
+
+    `mcp_runner` sets ARIA_SESSION when it spawns the child, alongside the
+    document allowlist. A fetched page is filed with its provenance, and
+    without the session the library can say a row came from the web but not
+    which run pulled it — so nothing groups a run's sources back together."""
+    return (os.environ.get("ARIA_SESSION") or "").strip()[:80]
+
+
+@mcp.tool()
+def read_document(doc_id: str, start_chunk: int = 0, count: int = 24) -> dict:
+    """Read an indexed document in order, from the chunk you name.
+
+    `search_knowledge` ranks chunks by similarity to a phrase, which answers
+    "what does it say about X" and cannot answer "read this document": on a
+    51-chunk source it returns the handful of chunks that resemble the wording,
+    and the rest is never seen. Use this for anything that treats the document
+    as the subject — summarising it, walking its sections, checking whether an
+    early claim survives to the end, or answering "what is in section 4".
+
+    Returns the chunks' FULL text in document order with page and heading
+    context, and `next_start` to continue from. Nothing is truncated inside a
+    chunk. Call it again with `next_start` until it comes back without one.
+
+    Only documents the conversation is allowed to read are returned: one that
+    is switched off, or still indexing, is refused rather than answered from
+    memory. Example: read_document("doc-1a2b3c4d5e")."""
+    allowed = _doc_allowlist()
+    if allowed is not None and doc_id not in allowed:
+        return {"ok": False,
+                "error": ("this document is not available to this conversation "
+                          "— it is switched off for search, or documents are "
+                          "off for this thread. Say so rather than guessing "
+                          "what it contains."),
+                "doc_id": doc_id}
+    data = _memory._get(f"/v1/documents/{doc_id}/text",
+                        {"start": max(0, int(start_chunk or 0)),
+                         "count": max(1, min(int(count or 24), 200))}) or {}
+    if data.get("error") or not data.get("chunks") and not data.get("total_chunks"):
+        return {"ok": False, "doc_id": doc_id,
+                "error": str(data.get("error")
+                             or "the document could not be read (it may not "
+                                "exist or its bytes are gone)")[:200]}
+    chunks = data.get("chunks") or []
+    body = "\n\n".join(
+        "### chunk {} · {} · page {}{}".format(
+            c.get("index"), c.get("kind"), c.get("page") or "?",
+            (" · " + " > ".join(str(h) for h in (c.get("heading_path") or [])
+                               if h)) if c.get("heading_path") else "")
+        + "\n" + str(c.get("text") or "")
+        for c in chunks)
+    return {"ok": True, "doc_id": data.get("document_id") or doc_id,
+            "filename": data.get("filename") or "",
+            "status": data.get("status") or "",
+            "total_chunks": data.get("total_chunks") or 0,
+            "start": data.get("start") or 0,
+            "returned_chunks": len(chunks),
+            "next_start": data.get("next_start"),
+            "text": body}
 
 
 @mcp.tool()
@@ -2747,6 +3328,120 @@ def list_scheduled() -> dict:
 
 
 @mcp.tool()
+def whats_new(since: str = "", surfaces: str = "", conversation_id: str = "",
+              limit: int = 25) -> dict:
+    """What has changed since a moment ago. Returns a bounded index of changes —
+    documents, memory, runs, apps, produced artifacts — as pointers plus a
+    one-line description, never contents.
+
+    Use it when the question is about *change* rather than about a fact: "what
+    did I add since this morning", "did anything arrive for that task I am
+    waiting on", "has that document been re-indexed". Pass `since` from the
+    `cursor` the previous answer gave you; with `conversation_id` it uses and
+    advances that conversation's own watermark, so repeated calls do not show
+    you the same changes again.
+
+    `surfaces` is a comma-separated subset of documents,memory,runs,apps,artifacts
+    — narrow it after a broad first look instead of paging through everything.
+    An entry's `truncated`/`counts` say how many were left out, so a large change
+    set is visible as large rather than quietly short.
+    """
+    try:
+        import delta
+        cursor = since or (delta.read_cursor(conversation_id)
+                           if conversation_id else 0.0)
+        want = [s.strip() for s in surfaces.split(",") if s.strip()] or None
+        out = delta.compute(since=cursor, surfaces=want,
+                            limit=max(1, min(int(limit or 25), 100)))
+        if conversation_id:
+            # Only a stored conversation gets a watermark; an ad-hoc `since`
+            # must not move one behind the caller's back.
+            delta.advance_cursor(conversation_id, out["cursor"])
+        return {"ok": True, **out}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def schedule_wake(reason: str, every: str = "1h", surface: str = "",
+                  match: str = "", conversation_id: str = "") -> dict:
+    """Arm your own next wake-up: a cheap repeated look that reports back here
+    only when the thing you named has actually changed.
+
+    Use it when the work depends on something that has not happened yet — "watch
+    for the reply from reviews@journal.org then tell me what it means", "keep an
+    eye on the solar briefing until the numbers land". Each tick asks the change
+    index a model-free question; a tick that matches nothing spends nothing and
+    quietly re-arms, for up to 24 hours. A tick that matches gets a real turn in
+    this conversation.
+
+    `reason` is required and must say both what you are waiting for and what to
+    do when it arrives — the user reads that line on the Scheduler page, and a
+    wake without a stated reason is refused. `every` is how often to look and is
+    clamped to a 10-minute floor, because this is a POLL: the cost of a watch is
+    the polling, not the turn. `surface` narrows the search to documents, memory,
+    runs, apps or artifacts; `match` is a small set of terms as JSON, e.g.
+    {"filename": "solar"} or {"detail": "reviews@journal.org"}, and all of them
+    must appear in the same change entry.
+
+    This is behind the operator switch `agent.self_wake`. If it refuses, tell
+    the user the switch is off rather than retrying with different wording.
+    """
+    try:
+        import scheduler
+        # Checked here as well as in `scheduler.schedule_wake`, which already
+        # refuses. Not a security fix — a signal-quality one: going through the
+        # scheduler alone surfaces a ValueError as a generic `refused`, which
+        # reads to a model like a rejected argument. The operator turned this
+        # feature off, and `disabled` plus the plain words below is what stops
+        # the action skill narrating a watch it did not arm.
+        from flags import is_enabled as _flag_on
+        if not _flag_on("agent.self_wake", False):
+            return {"ok": False, "status": "disabled",
+                    "message": "self-wake is switched off (`agent.self_wake`). "
+                               "Tell the user plainly that watching is disabled "
+                               "rather than describing a watch you did not arm; "
+                               "a one-off reminder via schedule_task still works."}
+        if not str(reason or "").strip():
+            return {"ok": False, "status": "bad_request",
+                    "message": "a wake needs a non-empty reason: what you are "
+                               "waiting for, and what to do when it arrives."}
+        if not str(conversation_id or "").strip():
+            return {"ok": False, "status": "bad_request",
+                    "message": "a wake must name the conversation it reports "
+                               "back to (conversation_id)."}
+        watch: dict = {}
+        if str(surface or "").strip():
+            watch["surface"] = str(surface).strip().lower()
+        text = str(match or "").strip()
+        if text:
+            try:
+                parsed = json.loads(text) if text.startswith("{") else None
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and parsed:
+                watch["match"] = {str(k)[:40]: str(v)[:120]
+                                  for k, v in parsed.items() if str(v).strip()}
+            else:
+                # A bare word is the common case and should not be refused.
+                watch["match"] = {"detail": text[:120]}
+        parent, left = scheduler.wake_chain_budget(conversation_id)
+        sid = scheduler.schedule_wake(str(reason).strip(), str(every or "1h"),
+                                      conversation_id=str(conversation_id),
+                                      watch=watch or None, wakes_left=left,
+                                      armed_by="agent", parent=parent)
+        return {"ok": True, "status": "armed", "schedule_id": sid,
+                "wakes_left": left, "parent": parent,
+                "message": "watching; it will report into this conversation "
+                           "when the change you named appears."}
+    except ValueError as e:
+        return {"ok": False, "status": "refused", "message": str(e)[:400]}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "status": "failed",
+                "message": f"{type(e).__name__}: {e}"[:300]}
+
+
+@mcp.tool()
 def cancel_scheduled(schedule_id: str) -> dict:
     """Cancel a previously scheduled task by its id (from list_scheduled).
     Example: cancel_scheduled("sch-1d666791")"""
@@ -3013,11 +3708,34 @@ def save_as_document(path: str, filename: str = "") -> dict:
     if err:
         return {"ok": False, "error": err}
     name = (filename or "").strip() or name or "document"
+    # Provenance, so a saved file is not indistinguishable from an upload: an
+    # `art:` handle already knows which section produced it, and that is the
+    # folder it belongs in.
+    fields = {"origin": "saved", "origin_ref": src[:300],
+              "folder_name": "Saved", "title": name[:200]}
+    art_id = src if src.startswith("art:") else ""
+    try:
+        import artifacts as _arts
+        if art_id:
+            meta = _arts.get_meta(art_id)
+            if getattr(meta, "origin", ""):
+                folder, origin = _arts.filing_for(meta.origin)
+                fields["origin"], fields["folder_name"] = origin, folder
+            if getattr(meta, "document_id", ""):
+                # Already indexed. A second copy would carry the same chunks
+                # twice into retrieval and give the agent two answers to one
+                # source.
+                return {"ok": True, "document_id": meta.document_id,
+                        "filename": name, "already_indexed": True,
+                        "note": "this artifact is already in your Documents "
+                                "and searchable"}
+    except Exception:
+        pass
     try:
         with httpx.Client(timeout=120, follow_redirects=True,
                           headers=_gw_headers()) as client:
             r = client.post(f"{_GW}/v1/documents",
-                            files={"file": (name, blob)})
+                            files={"file": (name, blob)}, data=fields)
     except Exception as e:
         return {"ok": False,
                 "error": f"gateway unreachable: {type(e).__name__}: {e}"}
@@ -3031,6 +3749,13 @@ def save_as_document(path: str, filename: str = "") -> dict:
         doc = (r.json() or {}).get("document") or {}
     except Exception:
         doc = {}
+    if art_id and doc.get("id"):
+        try:
+            import artifacts as _arts
+            _arts.link_document(art_id, str(doc["id"]),
+                                origin=fields["origin"])
+        except Exception:
+            pass
     return {"ok": True, "document_id": doc.get("id", ""), "filename": name,
             "bytes": len(blob),
             "note": "Saved to the user's Documents and indexed for search. "
@@ -3064,6 +3789,469 @@ def _read_blob(src: str) -> tuple[bytes, str, str]:
         return p.read_bytes(), p.name, ""
     except Exception as e:
         return b"", "", f"{type(e).__name__}: {e}"
+
+
+# ── Blender bridge tools ────────────────────────────────────────────────────
+# These call the live Blender addon through blender_service. The agent gets a
+# generic capability surface instead of a hand-written wrapper per Blender
+# feature: catalog discovers operators/RNA, op invokes one, and part_op saves
+# the measured result as a new Parts version.
+
+def _blender():
+    import blender_service as _bs
+    return _bs
+
+
+def _resolve_part_ref(ref: str) -> dict:
+    import parts_store as store
+    text = (ref or "").strip()
+    rows = store.list_parts()
+    hit = next((p for p in rows if p.get("id") == text), None)
+    if hit:
+        return hit
+    exact = [p for p in rows if str(p.get("name", "")).lower() == text.lower()]
+    if len(exact) == 1:
+        return exact[0]
+    matches = [p for p in rows if text.lower() in str(p.get("name", "")).lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"no saved part matches {ref!r}")
+    raise ValueError("part name is ambiguous: " + ", ".join(
+        f"{p['name']} ({p['id']})" for p in matches[:6]))
+
+
+@mcp.tool()
+def blender_status() -> dict:
+    """Report whether the Blender executable, live GUI session and headless
+    worker are available, with their versions and workspace paths."""
+    try:
+        return {"ok": True, **_blender().status()}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def blender_catalog(query: str = "", limit: int = 30) -> dict:
+    """Discover Blender operators and their parameters from Blender's own RNA.
+
+    Call this before guessing an operator or parameter. A query such as
+    "boolean", "remesh", "uv" or "sculpt" narrows the result; without a query
+    the response returns group counts and a sample.
+    """
+    try:
+        return {"ok": True, **_blender().catalog(query, max(1, min(limit, 100)))}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def blender_part_op(part: str, operator: str, version: str = "",
+                    params: dict | None = None) -> dict:
+    """Run one Blender operator on a saved part version and save the result as
+    a new immutable version. `operator` is a bpy.ops id such as
+    `object.modifier_add`; `params` are its parameters. Modifier stacks are
+    applied before the result is measured. This is the versioned mutation tool;
+    use blender_catalog to discover the operator and parameter names."""
+    try:
+        import parts_store as store
+        row = _resolve_part_ref(part)
+        out = _blender().run_mesh_op(row["id"], version or None, operator,
+                                     params or {})
+        p = out.get("part") or {}
+        return {"ok": True, "part_id": p.get("id"),
+                "version": p.get("current_version"), "faces": p.get("faces"),
+                "operator": operator,
+                "versions": [v.get("id") for v in p.get("versions", [])],
+                "note": "Saved as a new version; the previous version is untouched."}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:800]}
+
+
+@mcp.tool()
+def blender_part_render(part: str, version: str = "", width: int = 1024,
+                        height: int = 1024, samples: int = 32) -> dict:
+    """Render a saved part version with headless Blender (EEVEE) and return
+    the PNG path and size. This does not create a geometry version."""
+    try:
+        row = _resolve_part_ref(part)
+        out = _blender().render(row["id"], version or None,
+                                width=max(64, min(width, 4096)),
+                                height=max(64, min(height, 4096)),
+                                samples=max(1, min(samples, 256)))
+        out.pop("image_base64", None)
+        return {"ok": True, **out}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:800]}
+
+
+@mcp.tool()
+def blender_rna_get(path: str) -> dict:
+    """Read a Blender RNA path, e.g. bpy.data.objects['Cube'].modifiers[0].name
+    or bpy.context.scene.render.engine. The live worker must be available."""
+    try:
+        return {"ok": True, **_blender().WORKER.call("rna_get", {"path": path})}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:800]}
+
+
+@mcp.tool()
+def blender_rna_set(path: str, value: object) -> dict:
+    """Set a Blender RNA path on the live worker. This is a direct data edit;
+    pair it with a subsequent blender_part_op or export to persist a version."""
+    try:
+        return {"ok": True, **_blender().WORKER.call(
+            "rna_set", {"path": path, "value": value})}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:800]}
+
+
+@mcp.tool()
+def blender_python(code: str) -> dict:
+    """Execute Python inside the Blender worker for operations not covered by
+    the operator/RNA tools. Disabled unless the agent host starts with
+    ARIA_BLENDER_ALLOW_PYTHON=1; this is a powerful, unrestricted escape hatch
+    and should only be enabled with explicit user approval."""
+    import os
+    if os.environ.get("ARIA_BLENDER_ALLOW_PYTHON") != "1":
+        return {"ok": False, "error": "Blender Python execution is disabled; "
+                                      "set ARIA_BLENDER_ALLOW_PYTHON=1 on the agent host."}
+    try:
+        return {"ok": True, **_blender().WORKER.call("python", {"code": code},
+                                                     timeout=300.0)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:800]}
+
+
+# ── the browser, as tools ─────────────────────────────────────────────
+# Aria has had a browser for a long time — as a DAG node. It has never had a
+# browser as something an agent can *use*: zero `@mcp.tool()` verbs, no
+# catalog entry, so no interactive surface could reach one, and the dev loop
+# the studio exists for was impossible on principle. These are those tools,
+# over the session-scoped context in `browser_session.py`.
+#
+# Three properties they must keep, because they are the widest door in the
+# product:
+#
+#   * **One browser per studio session, not per run.** A login that dies with
+#     the run is not a session. `ARIA_BROWSER_SID` carries the session id;
+#     `ARIA_SESSION` is per-run so that one run's cost reads correctly.
+#   * **It can see the machine's own services.** Reaching
+#     `http://localhost:5173` is the point, not an oversight, so there is no
+#     SSRF block here — which is exactly why these tools are granted per
+#     surface and listed in the transcript rather than assumed.
+#   * **Every claim about a page is evidence.** Each action returns the URL
+#     and title it actually saw, snapshots carry an epoch so a stale mark is
+#     refused instead of clicking whatever moved into its place, and
+#     `browser_verify` answers with console errors, failed requests and a
+#     screenshot rather than with the model's memory of what it typed.
+def _browser_sid() -> str:
+    sid = (os.environ.get("ARIA_BROWSER_SID") or "").strip()
+    if sid:
+        return sid
+    # A CLI or skill-path call has no studio session. `ARIA_SESSION` is then
+    # the only identity there is, and a browser keyed on it is per-run —
+    # correct for a one-shot call, and `browser_status` says which it got.
+    return (os.environ.get("ARIA_SESSION") or "default").strip()[:80] or "default"
+
+
+def _brow():
+    import browser_session as B
+    return B, _browser_sid()
+
+
+def _berr(e: Exception) -> dict:
+    return {"ok": False, "error": f"{type(e).__name__}: {e}"[:600]}
+
+
+@mcp.tool()
+def browser_open(url: str, headed: bool = False) -> dict:
+    """Open a URL in THIS SESSION's browser, reusing the one already running.
+
+    A login, a form state and an open dev server survive to the next call —
+    which is the difference between a browser an agent uses and a screenshot
+    service. `headed=True` asks for a visible window; it does not restart a
+    running invisible one, because that would throw away the page in front of
+    the person, so `browser_status` reports `need_restart` instead.
+
+    Reaches anything this machine can, including `http://localhost:*` — that
+    is the point, and the reason the capability is granted per surface."""
+    B, sid = _brow()
+    try:
+        out = B.open_url(sid, url, headed=headed if headed else None)
+        out["session"] = sid
+        return out
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_status() -> dict:
+    """Is a browser running for this session, and what is in it."""
+    B, sid = _brow()
+    try:
+        return {"ok": True, **B.status(sid), "session": sid}
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_snapshot(max_elements: int = 120) -> dict:
+    """The interactive elements of the current page, as addressable marks.
+
+    `[3]<button role="submit">Save</button>` — and `mark: 3` is what
+    `browser_click` takes. The marks belong to the snapshot's `epoch`: a click
+    addressed to an old epoch is refused rather than aimed at whatever has
+    since moved into those pixels."""
+    B, sid = _brow()
+    try:
+        out = B.snapshot(sid, max_elements=max_elements)
+        if out.get("ok"):
+            out["tab_url_note"] = "marks are valid until the page changes"
+        return out
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_read(kind: str = "text", limit: int = 6000) -> dict:
+    """Read the page: `text` (what a person sees), `html`, or `links`.
+
+    `truncated` and `chars` come back with it, so a long page is known to be
+    long rather than looked at as if it were complete."""
+    B, sid = _brow()
+    try:
+        return B.read(sid, kind=kind, limit=limit)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_screenshot(full_page: bool = False) -> dict:
+    """A picture of the page, filed as a session artifact with a served URL."""
+    B, sid = _brow()
+    try:
+        return B.screenshot(sid, full=full_page)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_click(mark: int = 0, selector: str = "", epoch: int = -1,
+                  double: bool = False) -> dict:
+    """Click a snapshot mark or a CSS selector, then report the page after.
+
+    The result is the URL and title the click ACTUALLY produced plus any
+    console error it raised, because "I clicked Save" and "the record saved"
+    are different claims and only the second one is worth acting on."""
+    B, sid = _brow()
+    try:
+        return B.act(sid, "double" if double else "click", mark=mark,
+                     selector=selector, epoch=epoch)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_fill(text: str, mark: int = 0, selector: str = "", epoch: int = -1,
+                 clear_first: bool = False) -> dict:
+    """Type into a field (mark or selector). `clear_first` uses fill();
+    otherwise the keys are typed into whatever the click focused."""
+    B, sid = _brow()
+    try:
+        return B.act(sid, "fill" if clear_first else "type", mark=mark,
+                     selector=selector, text=text, epoch=epoch)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_press(key: str = "Enter") -> dict:
+    """One keystroke to the focused element (Enter, Tab, Escape, …)."""
+    B, sid = _brow()
+    try:
+        return B.act(sid, "press", key=key or "Enter")
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_scroll(dx: int = 0, dy: int = 600) -> dict:
+    """Scroll the page by a pixel amount, in the main frame."""
+    B, sid = _brow()
+    try:
+        return B.act(sid, "scroll", x=dx, y=dy)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_history(back: bool = True) -> dict:
+    """Go back or forward in this tab's own history."""
+    B, sid = _brow()
+    try:
+        return B.act(sid, "back" if back else "forward")
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_wait(selector: str = "", state: str = "visible", ms: int = 5000) -> dict:
+    """Wait for a real condition instead of sleeping.
+
+    `selector` empty means "wait for the network to go idle". The skill's
+    browser could only `asyncio.sleep`, so a slow page looked like a broken one
+    and a fast page was still waited on. Says which condition, and for how
+    long, when it does not happen."""
+    B, sid = _brow()
+    try:
+        return B.wait(sid, selector=selector, state=state, ms=ms)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_console(errors_only: bool = True) -> dict:
+    """What the page's JavaScript said — console output and uncaught errors.
+
+    This listener did not exist anywhere in Aria before, which is the single
+    reason a coding agent could not verify its own front-end change: the page
+    throws, the agent sees nothing, and edits the file again on a guess.
+    `dropped` says how many the ring overflowed, so an overflowing app is not
+    silently read as a quiet one."""
+    B, sid = _brow()
+    try:
+        return B.events(sid, "console", errors_only=errors_only)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_network(errors_only: bool = False) -> dict:
+    """Every request this page made and the status it got back."""
+    B, sid = _brow()
+    try:
+        return B.events(sid, "network", errors_only=errors_only)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_tab(action: str = "list", url: str = "", index: int = 0) -> dict:
+    """Tabs: `list`, `new`, `select`, `close`. Up to 8 per session.
+
+    The last tab is not closable — close the browser for that — so a session
+    cannot end up with a context holding no page that every later call then
+    has to re-create."""
+    B, sid = _brow()
+    try:
+        a = (action or "list").strip().lower()
+        if a == "list":
+            return B.tabs(sid)
+        if a == "new":
+            return B.tab_new(sid, url)
+        if a == "select":
+            return B.tab_select(sid, index)
+        if a == "close":
+            return B.tab_close(sid, index)
+        return {"ok": False, "error": f"unknown tab action {a!r}"}
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_evaluate(script: str) -> dict:
+    """Run JavaScript in the page and return the value. Capped, and the cap
+    is stated.
+
+    An escape hatch with a purpose: read a computed style, check whether the
+    app's store really updated. It is also the one browser tool that can loop
+    forever, which is why it is bounded and why a page that will not answer is
+    reported rather than retried."""
+    B, sid = _brow()
+    try:
+        return B.evaluate(sid, script)
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_verify(url: str = "", expect_text: str = "", expect_selector: str = "",
+                   wait_ms: int = 6000, screenshot: bool = True) -> dict:
+    """Did the page actually work? One call, with the evidence.
+
+    This is the dev loop's answer question: navigate, wait for a real
+    condition, assert the text or element the change was supposed to produce,
+    then collect the console errors, the failed requests and a screenshot.
+
+    The verdict is built from what the page said, not from what the caller
+    hoped: `passed` is only true when every assertion held AND no page error
+    appeared after the navigation. An empty run is reported as
+    `nothing_checked` rather than a pass, because a verification that asserts
+    nothing is how a broken page gets signed off."""
+    B, sid = _brow()
+    try:
+        before = B.events(sid, "console", errors_only=True)
+        nav = {}
+        if url:
+            nav = B.open_url(sid, url)
+            if not nav.get("ok"):
+                return {**nav, "passed": False,
+                        "reason": "the navigation itself failed"}
+        page = ""
+        if expect_selector:
+            page = B.wait(sid, selector=expect_selector, state="visible",
+                          ms=wait_ms)
+            if not page.get("ok"):
+                return {"ok": True, "passed": False, "url": nav.get("url", ""),
+                        "reason": page.get("error"),
+                        "assertions": [{"kind": "selector",
+                                         "expect": expect_selector, "ok": False}]}
+        read = B.read(sid, "text", 20_000)
+        errors = B.events(sid, "console", errors_only=True)
+        net = B.events(sid, "network", errors_only=True)
+        checks: list = []
+        if expect_selector:
+            checks.append({"kind": "selector", "expect": expect_selector,
+                           "ok": bool(page.get("ok"))})
+        if expect_text:
+            checks.append({"kind": "text", "expect": expect_text[:120],
+                           "ok": expect_text in (read.get("text") or "")})
+        shot = B.screenshot(sid) if screenshot else {}
+        new_errors = len(errors.get("events") or []) - len(before.get("events") or [])
+        verdict = {
+            "ok": True,
+            "passed": bool(checks) and all(c["ok"] for c in checks)
+            and new_errors <= 0,
+            "nothing_checked": not checks,
+            "url": (nav.get("url") or errors.get("url") or ""),
+            "title": nav.get("title") or "",
+            "assertions": checks,
+            "console_errors": [e.get("text") for e in (errors.get("events") or [])
+                               if e.get("level") == "error"][-10:],
+            "new_console_errors": max(0, new_errors),
+            "failed_requests": [f"{r.get('status')} {r.get('url')}"
+                                for r in (net.get("events") or [])
+                                if (r.get("status") or 0) >= 400][-10:],
+            "screenshot": shot.get("url") or "",
+            "text_excerpt": (read.get("text") or "")[:1200],
+        }
+        if verdict["nothing_checked"]:
+            verdict["reason"] = ("no assertion was given, so nothing was "
+                                 "checked — this is not a pass")
+        return verdict
+    except Exception as e:
+        return _berr(e)
+
+
+@mcp.tool()
+def browser_close() -> dict:
+    """Close this session's browser. Frees the Chromium process."""
+    B, sid = _brow()
+    try:
+        return B.close(sid)
+    except Exception as e:
+        return _berr(e)
 
 
 if __name__ == "__main__":

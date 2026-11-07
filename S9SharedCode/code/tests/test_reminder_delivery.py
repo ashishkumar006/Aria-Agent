@@ -188,7 +188,10 @@ def test_with_no_authored_message_the_fallback_is_plain_prose(sent, monkeypatch)
                                   1.0, "s8-x", scheduled=True)
 
     body = sent[0]["json"]["text"]
-    assert "stretch" in body and "an hour" in body
+    # Case-insensitive: the formatter capitalises the subject into a sentence,
+    # which is the improvement, not the thing under test.
+    low = body.lower()
+    assert "stretch" in low and "an hour" in low
     for junk in ("✅", "🎙", "time ±", "session s8-"):
         assert junk not in body, f"template debris {junk!r} leaked into the text"
 

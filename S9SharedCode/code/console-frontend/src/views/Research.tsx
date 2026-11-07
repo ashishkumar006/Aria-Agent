@@ -4,13 +4,31 @@ import { Search, FlaskConical } from 'lucide-react';
 import { isTerminal, isSuccess, renderMarkdown, runStatusFromNodes } from '../components/markdown';
 import { Rail, TopBar, Pill, useHealth, SkipLink } from '../components/ui';
 import { useMainId, useActivePoll } from '../components/KeepAlive';
-import { DocumentViewer } from './DocSetup';
-import { api, headers, displayTopic, ago, CONF, type GraphPayload, type GraphNode, type SessionSummary } from '../api';
+import { Feedback } from '../components/Feedback';
+import { FilePreview } from '../components/FilePreview';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
+import {
+  api, headers, displayTopic, ago, CONF, type DocFolder, type GraphPayload,
+  type GraphNode, type SessionSummary,
+} from '../api';
+import { flattenFolders } from '../lib/folders';
 
 type Depth = 'quick' | 'standard' | 'deep';
 type CanvasView = 'graph' | 'report' | 'log';
+
+/** Research owns one slice of the shared session store. Empty fixtures and
+ *  authoring/chat sessions are not topics; they would otherwise eat the
+ *  sidebar's page budget. */
+function isResearchTopic(s: SessionSummary): boolean {
+  if (s.run_kind === 'authoring' || s.run_kind === 'chat'
+    || s.run_kind === 'parts' || s.run_kind === 'app') return false;
+  return !!((s.query || '').trim() || (s.nodes || 0) > 0);
+}
 type ResearchTurn = {
   id: string; q: string; a: string; sid: string; done: boolean; ts: number;
+  /** The formatter node that produced this answer, when the graph is known.
+   *  Feedback on it is the same record the Runs Inspector shows. */
+  nodeId?: string; skill?: string;
 };
 
 /** A report parsed once per source string.
@@ -27,8 +45,8 @@ const ReportBody = memo(function ReportBody({ text }: { text: string }) {
 /** One question and its answer. Only the turn that is actually changing gets a
  *  new object from `setTurns`, so `memo` keeps every earlier answer out of the
  *  repaint path while a new turn streams in. */
-const TurnView = memo(function TurnView({ turn, index, running }: {
-  turn: ResearchTurn; index: number; running: boolean;
+const TurnView = memo(function TurnView({ turn, index, running, sessionId }: {
+  turn: ResearchTurn; index: number; running: boolean; sessionId: string;
 }) {
   return (
     <section aria-label={`Turn ${index + 1}`} className="flex flex-col gap-3">
@@ -55,9 +73,28 @@ const TurnView = memo(function TurnView({ turn, index, running }: {
         {turn.done ? `turn ${index + 1} · answered` : `turn ${index + 1} · running`}
         {turn.sid ? ` · ${turn.sid.slice(0, 12)}…` : ''}
       </div>
+      {turn.done && !!turn.a && (
+        <Feedback
+          msgId={turn.nodeId ? '' : `research:${turn.sid || sessionId}:${index + 1}`}
+          nodeId={turn.nodeId || ''}
+          sessionId={turn.sid || sessionId}
+          skill={turn.skill || ''}
+        />
+      )}
     </section>
   );
 });
+
+/** The answer-bearing node for a research run: the last terminal formatter,
+ *  else the last node. Feedback on it is shared with Runs' Inspector. */
+function reportNodeFrom(graph: GraphPayload | null): { id: string; skill: string } | null {
+  const nodes = graph?.nodes || [];
+  if (!nodes.length) return null;
+  const fmts = nodes.filter(
+    (n) => /format/i.test(n.skill || '') && isTerminal(n.status));
+  const n = fmts[fmts.length - 1] || nodes[nodes.length - 1];
+  return n?.id ? { id: n.id, skill: n.skill || '' } : null;
+}
 
 /** Pull readable markdown out of a formatter node's stored output
  *  ({final_answer} today; tolerant of older shapes). */
@@ -124,14 +161,33 @@ function unwrapAnswer(s: string): string {
 export default function Research() {
   const mainId = useMainId();
   const gwUp = useHealth();
+  const topicsMode = usePaneMode('research.topics');
+  const filesMode = usePaneMode('research.files');
   const [topics, setTopics] = useState<SessionSummary[]>([]);
   const [topicsError, setTopicsError] = useState('');
   /** false until the first topics read settles, so an in-flight load is not
    *  rendered as "No research yet" (a false empty). */
   const [topicsLoaded, setTopicsLoaded] = useState(false);
+  /* Sessions are paged, not silently capped: the API's limit is 50 sessions
+     and many of those are chat/authoring/test rows. These track how many
+     session rows have been read so the sidebar can offer the next page. */
+  const [topicsHasMore, setTopicsHasMore] = useState(false);
+  const [topicsMoreLoading, setTopicsMoreLoading] = useState(false);
+  const topicsFetchedRef = useRef(0);
   const [filter, setFilter] = useState('');
   const [brief, setBrief] = useState('');
   const [depth, setDepth] = useState<Depth>('standard');
+  /** '' = all enabled documents; a folder id scopes this run to its subtree. */
+  const [docFolder, setDocFolder] = useState('');
+  const [docFolders, setDocFolders] = useState<DocFolder[]>([]);
+  const folderOptions = useMemo(() => flattenFolders(docFolders), [docFolders]);
+  useEffect(() => {
+    let live = true;
+    api.documentFolders()
+      .then((d) => { if (live) setDocFolders(d.folders || []); })
+      .catch(() => { /* folders unavailable: default to all documents */ });
+    return () => { live = false; };
+  }, []);
   const [topic, setTopic] = useState('');
   const [sid, setSid] = useState('');
   const [graph, setGraph] = useState<GraphPayload | null>(null);
@@ -196,7 +252,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
 
   const refreshTopics = useCallback(async () => {
     try {
-        const d = await api.sessions(50);
+        const d = await api.sessions(50, 0);
         if (!aliveRef.current) return;
         /* Research runs only. An authoring run is in the same session store,
            so this list used to show documents being built on the Authoring
@@ -207,14 +263,17 @@ const [viewFile, setViewFile] = useState<string | null>(null);
            a run whose query was a plain topic (it looked for the words
            "research agent" that only the retired brief contained), so a
            just-started topic vanished from the sidebar. */
-        setTopics((d.sessions || []).filter((s) => {
-          if (s.run_kind === 'authoring' || s.run_kind === 'chat') return false;
-          /* A directory with neither a question nor a node is not a topic:
-             test fixtures and runs that died before their setup wrote only
-             `run_status.json`, and listing them put a screenful of
-             "(untitled) · 0 nodes" above the real topics. */
-          return !!((s.query || '').trim() || (s.nodes || 0) > 0);
-        }));
+        const page = d.sessions || [];
+        const fresh = page.filter(isResearchTopic);
+        setTopics((prev) => {
+          /* Keep older pages the user asked for. Replacing with page 0 was
+             the reason "load older" could never survive a refresh. */
+          const seen = new Set(fresh.map((s) => s.session_id));
+          return [...fresh, ...prev.filter((s) => !seen.has(s.session_id))];
+        });
+        topicsFetchedRef.current = Math.max(topicsFetchedRef.current, page.length);
+        const total = typeof d.total === 'number' ? d.total : page.length;
+        setTopicsHasMore(Boolean(d.has_more) && topicsFetchedRef.current < total);
       setTopicsError('');
     } catch (e) {
       if (!aliveRef.current) return;
@@ -223,6 +282,36 @@ const [viewFile, setViewFile] = useState<string | null>(null);
       if (aliveRef.current) setTopicsLoaded(true);
     }
   }, []);
+
+  /* Load the next page of sessions and append the research topics among them.
+     This may add zero rows when a page is mostly chat/authoring history, so
+     the button names the unit it pages (sessions), not an implied count of
+     hidden topics. */
+  const loadMoreTopics = useCallback(async () => {
+    if (topicsMoreLoading || !topicsHasMore) return;
+    setTopicsMoreLoading(true);
+    const from = topicsFetchedRef.current;
+    try {
+      const d = await api.sessions(50, from);
+      if (!aliveRef.current) return;
+      const page = d.sessions || [];
+      const extra = page.filter(isResearchTopic);
+      setTopics((prev) => {
+        const seen = new Set(prev.map((s) => s.session_id));
+        return [...prev, ...extra.filter((s) => !seen.has(s.session_id))];
+      });
+      topicsFetchedRef.current = from + page.length;
+      const total = typeof d.total === 'number' ? d.total : topicsFetchedRef.current;
+      setTopicsHasMore(topicsFetchedRef.current < total || Boolean(d.has_more));
+      setTopicsError('');
+    } catch (e) {
+      if (aliveRef.current) {
+        setTopicsError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (aliveRef.current) setTopicsMoreLoading(false);
+    }
+  }, [topicsHasMore, topicsMoreLoading]);
 
   useActivePoll(refreshTopics, CONF.pollSlowMs);
 
@@ -510,6 +599,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
          parameter. */
       for await (const ev of api.chat(q, cidRef.current, ctl.signal,
                                      { research: first, depth,
+                                       folderIds: docFolder ? [docFolder] : undefined,
                                        runKind: 'research',
                                        idempotencyKey: first ? `research:${depth}:${q}` : undefined })) {
         /* Detached: another topic was opened (or a new one started) while this
@@ -545,12 +635,14 @@ const [viewFile, setViewFile] = useState<string | null>(null);
         } else if (ev.type === 'done') {
           stopPoll();
           const id = ((ev as { session_id?: string }).session_id || sid) as string;
+          let answerNode: { id: string; skill: string } | null = null;
           if (id) {
             try {
               const g = await api.graph(id);
               // A Stop during that fetch must not resurrect "done"
               // over the "stopped." state stop() already set.
               if (!ctl.signal.aborted) setGraph(g);
+              answerNode = reportNodeFrom(g);
             } catch { /* keep */ }
           }
           if (ctl.signal.aborted) return; // stop() owns the final state now
@@ -578,7 +670,11 @@ const [viewFile, setViewFile] = useState<string | null>(null);
           // a follow-up no longer appears to replace the question above it.
           setTurns((prev) => prev.map((x) => (
             x.id === turnId
-              ? { ...x, a: finalText || x.a, done: true }
+              ? {
+                ...x, a: finalText || x.a, done: true,
+                nodeId: answerNode?.id || x.nodeId,
+                skill: answerNode?.skill || x.skill,
+              }
               : x)));
           setStatus('done');
           setView('report'); // the finished report is the readable thing
@@ -721,6 +817,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
      for both is what makes the page read like Chat instead of "a question box
      AND a follow-up box AND a canvas". */
   const threadActive = !!sid || turns.length > 0;
+  const reportTarget = useMemo(() => reportNodeFrom(graph), [graph]);
 
   const submit = () => {
     const q = brief.trim();
@@ -745,6 +842,9 @@ const [viewFile, setViewFile] = useState<string | null>(null);
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {topicsMode === 'collapsed'
+        ? <PaneStrip id="research.topics" label="Topics list" />
+        : (
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Topics
@@ -805,16 +905,29 @@ const [viewFile, setViewFile] = useState<string | null>(null);
               <div className="mt-1 text-[11px] text-zinc-muted">{s.nodes || 0} node{s.nodes === 1 ? '' : 's'} · {ago(s.updated_ago)}</div>
             </button>
           ))}
+          {topicsHasMore && (
+            <button
+              onClick={() => void loadMoreTopics()}
+              disabled={topicsMoreLoading}
+              title="Read the next 50 sessions from the shared store; any research topics among them are added here."
+              className="w-full rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] text-zinc-300 hover:border-violet-400 disabled:opacity-50"
+            >
+              {topicsMoreLoading ? 'loading…' : 'load older topics'}
+            </button>
+          )}
         </div>
+        <Pane id="research.session">
         <div className="hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">
           <div className="text-[10px] font-bold tracking-[0.12em] text-zinc-muted">SESSION</div>
           <div className="mt-0.5 truncate font-mono">{sid ? sid.slice(0, 12) + '…' : '—'}</div>
         </div>
+        </Pane>
       </div>
+        )}
 
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Research">
-          {statusPill}
+        <TopBar crumb="Research" panes="research">
+          <Pane id="research.status">{statusPill}</Pane>
           <div className="flex gap-1 rounded-lg border border-white/10 bg-white/5 p-[3px]" role="group" aria-label="Output view">
             {(['report', 'log'] as const).map((v) => (
               <button
@@ -848,8 +961,13 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                   Back to report
                 </button>
               </div>
-              <DocumentViewer
-                source={{
+              {/* Keyed per artifact so a PDF that fell back to raster on one
+                  file cannot force the next opened file to the pager too.
+                  `FilePreview` chooses pdf.js, the browser's own text/HTML view
+                  or the server pager — it used to send every non-PDF to the
+                  raster endpoint, which answers 415 for txt, md and html. */}
+              <FilePreview key={viewFile}
+                target={{
                   kind: 'artifact',
                   artifact: viewFile,
                   format: files.find((f) => f.artifact === viewFile)?.format || '',
@@ -873,7 +991,9 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                     created report.pdf" and offer only a markdown download - the file
                     was never reachable. Anything listed here came from the server's
                     produced-files record, not from the answer's prose. */}
-                {files.length > 0 && (
+                {files.length > 0 && (filesMode === 'collapsed'
+                  ? <PaneStrip id="research.files" label="Produced files row" />
+                  : (
                   <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-white/10 bg-[#0e0e12] p-2.5">
                     <span className="text-[11px] font-bold uppercase tracking-[0.12em] text-zinc-muted">
                       Files
@@ -903,7 +1023,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                       <span role="alert" className="text-[11px] text-red-300">{dlErr}</span>
                     )}
                   </div>
-                )}
+                ))}
                 {!turns.length && !answer ? (
                   <div className="flex min-h-[50vh] flex-col items-center justify-center text-center">
                     <Search size={30} className="mb-2.5 text-zinc-muted" />
@@ -932,10 +1052,19 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                         <div className="font-mono text-[10.5px] text-zinc-muted">
                           stored report{sid ? ` · ${sid.slice(0, 12)}…` : ''}
                         </div>
+                        {sid && (
+                          <Feedback
+                            msgId={reportTarget ? '' : `research:${sid}:stored`}
+                            nodeId={reportTarget?.id || ''}
+                            sessionId={sid}
+                            skill={reportTarget?.skill || ''}
+                          />
+                        )}
                       </section>
                     )}
                     {turns.map((t, i) => (
-                      <TurnView key={t.id} turn={t} index={i} running={running} />
+                      <TurnView key={t.id} turn={t} index={i} running={running}
+                                sessionId={t.sid || sid} />
                     ))}
                   </>
                 )}
@@ -991,6 +1120,18 @@ const [viewFile, setViewFile] = useState<string | null>(null);
                   </button>
                 ))}
               </div>
+              <select
+                value={docFolder}
+                onChange={(e) => setDocFolder(e.target.value)}
+                disabled={running}
+                aria-label="Document folder scope"
+                title="Which uploaded documents this research run may use"
+                className="max-w-[170px] rounded border border-white/15 bg-white/5 px-1.5 py-1 text-[10.5px] text-zinc-400 outline-none hover:border-violet-400 disabled:opacity-50">
+                <option value="">all documents</option>
+                {folderOptions.map((f) => (
+                  <option key={f.id} value={f.id}>{f.path}</option>
+                ))}
+              </select>
               <span className="min-w-0 truncate text-[11px] text-zinc-muted" role="status">{note}</span>
               <span className="flex-1" />
               {/* Both buttons stay mounted; the inactive one is
@@ -1019,6 +1160,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
               </button>
             </div>
           </form>
+          <Pane id="research.hints">
           <div className="mx-auto mt-2 flex max-w-[840px] flex-wrap items-center gap-x-3 text-[11px] text-zinc-muted">
             <span>pipeline runs on the agent DAG</span>
             <span aria-hidden="true">·</span>
@@ -1027,6 +1169,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
             <span>gateway {gwUp ? 'up' : 'down'}</span>
             {sid && <span className="ml-auto truncate font-mono" title={sid}>{sid.slice(0, 12)}…</span>}
           </div>
+          </Pane>
         </div>
       </main>
     </div>

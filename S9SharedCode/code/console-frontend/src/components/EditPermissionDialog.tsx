@@ -8,7 +8,15 @@ export interface PendingEdit {
   tool: string;
   summary: string;
   diff: string;
+  /** The server offers "always allow for this session" only when the run
+   *  carried a session id to bind the standing approval to. */
+  rememberable?: boolean;
 }
+
+/** The agent's exec tools — `_CODE_EXEC_TOOLS` in agent_server.py. They park
+ *  on the same route as a write, but what is being approved is a command line,
+ *  not a diff. */
+const EXEC_TOOLS = new Set(['run_command', 'run_checks']);
 
 /** The agent's write gate.
  *
@@ -25,10 +33,11 @@ export interface PendingEdit {
  *  backstop if the tab goes away entirely.) */
 export function EditPermissionDialog({ pending, onDecide, busy }: {
   pending: PendingEdit | null;
-  onDecide: (id: string, approve: boolean) => Promise<void>;
+  onDecide: (id: string, approve: boolean, remember?: boolean) => Promise<void>;
   busy: boolean;
 }) {
   const [deciding, setDeciding] = useState(false);
+  const isCommand = EXEC_TOOLS.has(pending?.tool || '');
   const panelRef = useRef<HTMLDivElement>(null);
   const acceptRef = useRef<HTMLButtonElement>(null);
 
@@ -57,11 +66,11 @@ export function EditPermissionDialog({ pending, onDecide, busy }: {
     return () => document.removeEventListener('keydown', onKey);
   }, [pending]);
 
-  const decide = async (approve: boolean) => {
+  const decide = async (approve: boolean, remember = false) => {
     if (!pending || deciding) return;
     setDeciding(true);
     try {
-      await onDecide(pending.id, approve);
+      await onDecide(pending.id, approve, remember);
     } finally {
       setDeciding(false);
     }
@@ -87,7 +96,11 @@ export function EditPermissionDialog({ pending, onDecide, busy }: {
             <div className="flex items-start gap-2.5 border-b border-glass-border px-3.5 py-3">
               <div className="min-w-0 flex-1">
                 <h2 className="text-[13px] font-semibold text-zinc-100">
-                  The agent wants to change a file
+                  {/* A command frame used to open under "change a file", which
+                      is a lie about what is being approved — and the summary
+                      already carries the command line. */}
+                  {isCommand ? 'The agent wants to run a command'
+                              : 'The agent wants to change a file'}
                 </h2>
                 <p className="mt-0.5 truncate text-[11.5px] text-zinc-muted">
                   {pending.summary || pending.tool}
@@ -104,9 +117,12 @@ export function EditPermissionDialog({ pending, onDecide, busy }: {
               </pre>
             ) : (
               <div className="border-b border-glass-border px-3.5 py-4 text-[12px] text-zinc-muted">
-                No preview could be built for this change. Review the tool call
-                ({pending.tool}) before you allow it — a missing diff is not a
-                reason to allow it blind.
+                {isCommand
+                  ? 'This runs in the workspace and executes repository code. '
+                    + 'Read the command above before you allow it.'
+                  : 'No preview could be built for this change. Review the tool '
+                    + 'call (' + pending.tool + ') before you allow it — a '
+                    + 'missing diff is not a reason to allow it blind.'}
               </div>
             )}
 
@@ -121,6 +137,20 @@ export function EditPermissionDialog({ pending, onDecide, busy }: {
                 >
                   <X size={13} /> Decline
                 </button>
+                {/* A build-fix loop re-asks for the same `npm run build` on
+                    every hop. One click here stands that exact command up for
+                    the rest of this session; the server keeps it per-session,
+                    so it is not a credential another session can spend. */}
+                {isCommand && pending.rememberable && (
+                  <button
+                    type="button" disabled={busy || deciding}
+                    onClick={() => decide(true, true)}
+                    title="Accept this one, and run this exact command without asking again in this session"
+                    className="flex items-center gap-1.5 rounded border border-violet-400/40 px-2.5 py-1.5 text-[12px] text-violet-200 hover:bg-violet-400/10 disabled:opacity-40"
+                  >
+                    <Check size={13} /> Always allow
+                  </button>
+                )}
                 <button
                   ref={acceptRef} type="button" disabled={busy || deciding}
                   onClick={() => decide(true)}

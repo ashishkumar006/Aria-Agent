@@ -29,7 +29,7 @@ from pydantic import ValidationError
 
 import artifacts as artifacts_svc
 import turnlog
-from gateway import LLM
+from gateway import LLM, cancel_requested
 from schemas import AgentResult, NodeSpec
 
 
@@ -277,34 +277,12 @@ class SkillRegistry:
 
 def _upstream_entry(inp: str, upstream: AgentResult) -> dict:
     """Serialise one completed upstream result for a prompt."""
-    out_obj = upstream.output
-    # Browser nodes serialise a huge `content` a11y dump BEFORE
-    # the compact `actions` summary in the JSON. render_prompt caps
-    # INPUTS at 20 KB, so `content` eats the whole budget and the
-    # `actions` list (the actual extracted titles/prices) gets
-    # truncated out. Downstream Distiller nodes then see no
-    # structured data, emit `{}`, and the auto-Critic fails —
-    # triggering a recovery replan that re-runs the same
-    # browser→distiller chain and loops. Truncate `content` here
-    # so the `actions` summary survives within the budget.
-    if isinstance(out_obj, dict) and upstream.agent_name == "browser":
-        content = out_obj.get("content")
-        if isinstance(content, str) and len(content) > 1500:
-            # Preserve STRUCTURED CARD DATA (appended at end by
-            # skill.py) which was previously truncated first.
-            # Keep head prose + full structured block when present.
-            marker = "--- STRUCTURED CARD DATA"
-            if marker in content:
-                head, _, struct = content.partition(marker)
-                # Budget: 800 head + full struct (capped 4k).
-                head_keep = head[:800]
-                struct_keep = (marker + struct)[:4000]
-                new_content = head_keep + "\n\n" + struct_keep + " …[truncated]"
-            else:
-                new_content = content[:1500] + " …[truncated]"
-            out_obj = {**out_obj, "content": new_content}
+    # This used to shorten a browser node's `content` a11y dump to 1,500
+    # characters so the compact `actions` summary would survive the INPUTS
+    # budget. There is no INPUTS budget to fit any more, and the dump is the
+    # node's result — it travels whole.
     return {"id": inp, "kind": "upstream",
-            "skill": upstream.agent_name, "output": out_obj}
+            "skill": upstream.agent_name, "output": upstream.output}
 
 
 # How far back a skipped node's lineage is searched for usable results, and
@@ -375,10 +353,10 @@ def resolve_inputs(node_inputs: list[str], graph_nodes, query: str) -> list[dict
     """Materialise each input id into a dict the prompt can serialise.
 
     Recognised input forms:
-      - "USER_QUERY"  → the original user query text
-      - "n:<i>"       → the AgentResult.output of that completed node
-      - "art:<sha>"   → the bytes of an artifact, decoded as utf-8 best-effort
-      - any other     → passed through as a free-form string
+      - "USER_QUERY"  -> the original user query text
+      - "n:<i>"       -> the AgentResult.output of that completed node
+      - "art:<sha>"   -> the bytes of an artifact, decoded as utf-8 best-effort
+      - any other     -> passed through as a free-form string
 
     `graph_nodes` is the nx node-view dict from flow.Graph; we read each
     upstream node's `result` attribute (set when the orchestrator marks
@@ -426,10 +404,19 @@ UNTRUSTED_TOOLS = (
     "wikipedia_search", "openalex_search", "arxiv_search", "extract_tables",
     "search_knowledge", "github_query", "notion_query", "gmail_query",
     "slack_history", "index_document", "read_file", "list_dir",
+    # A stored web page IS third-party text. Reading a document in order returns
+    # exactly what was filed, so it carries the same exposure as fetch_url —
+    # naming it here is what puts the untrusted-content contract in the prompt.
+    "read_document",
     # Code intelligence reads whatever is in the workspace, which is the same
     # exposure as reading a file: it must be untrusted-guarded too.
     "document_symbols", "find_references", "blast_radius",
     "preview_edit", "apply_symbol_edit",
+    # An image search returns third-party titles, creator strings and URLs, and
+    # `fetch_image` reports back what the remote served. Both were missing here,
+    # which left the one tool pair whose text the AUTHOR writes straight into a
+    # caption outside the envelope every other prompt depends on.
+    "search_images", "fetch_image",
 )
 
 
@@ -451,6 +438,21 @@ def _skill_touches_untrusted(skill) -> bool:
     return any(t in UNTRUSTED_TOOLS for t in allowed)
 
 
+def _preview(text: str, limit: int = 400) -> str:
+    """The 400-char preview this module's own docstring promised, on a word
+    boundary. It was never implemented: the full chunk went in verbatim, and
+    document chunks run to 32,870 characters (mean 999 across 4,774 of them).
+    Six recalled hits could therefore add a quarter of a megabyte of prompt to
+    a turn that needed none of it — the uncapped half of why a 'hi' cost 5k
+    tokens. A truncation marker keeps that visible rather than silent."""
+    t = (text or "").strip()
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    space = cut.rfind(" ")
+    return (cut[:space] if space > limit // 2 else cut).rstrip() + " …"
+
+
 def _format_memory_hits(hits: list) -> str:
     """Compact rendering of FAISS-ranked MemoryItem hits for the prompt.
 
@@ -464,9 +466,9 @@ def _format_memory_hits(hits: list) -> str:
     if not hits:
         return ""
     lines = []
-    for h in hits[:8]:  # cap to keep the prompt bounded
+    for h in hits:
         kind = getattr(h, "kind", "?")
-        desc = (getattr(h, "descriptor", "") or "")[:200]
+        desc = getattr(h, "descriptor", "") or ""
         source = getattr(h, "source", "")
         val = getattr(h, "value", {}) or {}
         chunk = val.get("chunk")
@@ -482,16 +484,13 @@ def _format_memory_hits(hits: list) -> str:
             # with it, exactly as it does in the chat path.
             ev = (val.get("evidence") or "").strip()
             if ev:
-                line += f"\n      they said: \"{ev[:240]}\""
+                line += f"\n      they said: \"{ev}\""
             line += ("\n      (a pattern inferred from past chats, not a "
                      "stated rule — weigh it, don't obey it)")
         elif isinstance(chunk, str) and chunk.strip():
-            preview = chunk[:2000].replace("\n", " ")
-            more = " …" if len(chunk) > 2000 else ""
-            line += f"\n      chunk: {preview}{more}"
+            line += f"\n      chunk: {_preview(chunk)}"
         elif isinstance(raw, str) and raw.strip():
-            raw_more = " …" if len(raw) > 2000 else ""
-            line += f"\n      raw: {raw[:2000]}{raw_more}"
+            line += f"\n      raw: {_preview(raw)}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -505,8 +504,8 @@ def _format_policy_notes(notes: list) -> str:
     if not notes:
         return ""
     lines = []
-    for n in notes[:20]:  # cap to keep the prompt bounded
-        desc = (getattr(n, "descriptor", "") or "")[:300]
+    for n in notes:
+        desc = getattr(n, "descriptor", "") or ""
         source = getattr(n, "source", "")
         line = f"  - {desc}"
         if source:
@@ -622,21 +621,32 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
                 f"output; they are never part of the requested task:",
                 hits_block,
             ]
-        # F10 FIX (cross-session memory contamination): inject the
-        # authoritative transcript of THIS conversation. When the user asks
-        # an episodic question ("what did I ask before?", "what was my first
-        # question?"), answer ONLY from this block — never from global
-        # memory hits, which mix in facts from other sessions.
-        turns_block = turnlog.format_for_prompt(prior_turns or [])
-        if turns_block:
-            parts += [
-                "",
-                "CONVERSATION HISTORY (this thread only — the authoritative "
-                "record of what the user asked and you answered earlier in "
-                "THIS conversation; when asked about past turns, use THIS "
-                "and ignore memory hits):",
-                turns_block,
-            ]
+    # F10 FIX (cross-session memory contamination): inject the
+    # authoritative transcript of THIS conversation. When the user asks
+    # an episodic question ("what did I ask before?", "what was my first
+    # question?"), answer ONLY from this block — never from global
+    # memory hits, which mix in other sessions' facts.
+    #
+    # HOISTED OUT of the memory-exclusion branch above, and it is not the same
+    # decision. That branch protects a scoped transformation from unrelated
+    # background facts. This is the thread itself. The `formatter` was inside
+    # the exclusion, so the skill that writes the sentence the user actually
+    # reads never saw the conversation: asked "what is this self wake
+    # capability?" two turns after describing it, it answered "I do not have
+    # access to any conversation history", and on the third turn invented
+    # Kubernetes CronJobs to cover the gap. The planner had the history the
+    # whole time and could not pass it on — it emits node goals, not the
+    # answer.
+    turns_block = turnlog.format_for_prompt(prior_turns or [])
+    if turns_block:
+        parts += [
+            "",
+            "CONVERSATION HISTORY (this thread only — the authoritative "
+            "record of what the user asked and you answered earlier in "
+            "THIS conversation; when asked about past turns, use THIS "
+            "and ignore memory hits):",
+            turns_block,
+        ]
     # Upstream output the node can actually read.
     #
     # This slice used to cut the serialised JSON mid-object at a fixed
@@ -663,11 +673,6 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
                                            skill_name=skill.name)]
     return "\n".join(parts)
 
-
-# Longest single text field kept intact before the whole INPUTS block
-# starts dropping whole entries. `findings` is the one field that
-# legitimately runs to many thousands of characters.
-_FIELD_BUDGET = 60_000
 
 # Above this size a text field is moved into the content-addressed artifact
 # store and replaced by a handle + preview, so it is paid for once instead of
@@ -708,6 +713,17 @@ def _spill_field_to_artifact(value: str, *, source: str,
         return {"text": value, "spill_failed": True,
                 "note": "could not be moved to the artifact store; the full "
                         "text is included here"}
+    # A spilled finding is the most re-read thing in a run: the author quotes
+    # it, a later turn questions it, the user asks what else the source said.
+    # Indexed into the Documents plane it becomes searchable and citable
+    # instead of a handle only this node can open.
+    try:
+        folder, origin = artifacts_svc.filing_for(source)
+        artifacts_svc.register_with_documents(art_id, origin=origin,
+                                              folder_name=folder,
+                                              title=title[:200])
+    except Exception as e:
+        print(f"[skills.spill] indexed as artifact only: {e!r}")
     return {
         "artifact": art_id,
         "title": title[:200],
@@ -837,10 +853,299 @@ def _lenient_json(raw: str):
         return None
 
 
+_SPEC_FENCE_R = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
+_SPEC_TEXT_R = re.compile(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _looks_like_block_spec(text: str) -> bool:
+    """Is this reply an unparsed block spec rather than prose?
+
+    The old test was `raw.startswith("{")`, and a reply fenced in ```json
+    starts with a backtick - so a section whose JSON could not be parsed fell
+    through to the prose branch and the WHOLE spec, braces and `"type":` keys
+    included, was printed as a paragraph. Strip the fence before asking.
+    """
+    t = _SPEC_FENCE_R.sub("", str(text or "").strip())
+    return t.startswith("{") or '"blocks"' in t
+
+
+def _salvage_spec_prose(heading: str, text: str) -> list[dict]:
+    """Keep the sentences out of an unparseable spec; drop the scaffolding.
+
+    Only `"text"` values are recovered, so list items and table cells in a
+    broken section are lost - which is still better than the alternative, and
+    the caller's length floor retries a section that comes back too short.
+    """
+    paras: list[str] = []
+    for m in _SPEC_TEXT_R.findall(text or ""):
+        try:
+            s = json.loads('"' + m + '"')
+        except Exception:
+            s = m
+        s = str(s or "").strip()
+        # A heading is not a paragraph; _section_blocks re-opens the section
+        # with the right one anyway.
+        if s and not s.startswith("References"):
+            paras.append(s)
+    if not paras:
+        return []
+    return _section_blocks(
+        heading, [{"type": "paragraph", "text": p} for p in paras])
+
+
+def _section_blocks(title: str, blocks: list) -> list[dict]:
+    """Enforce one section, one known heading.
+
+    The model was asked to start with the section title and instead wrote a
+    whole mini-document - twice with a different invented title, once with the
+    raw brief as the H1. Structure cannot depend on that: the first heading is
+    replaced with the requested title, later level-1 headings are demoted, and
+    a self-written reference list is dropped because the render call appends
+    the real one.
+    """
+    out: list[dict] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        kind = str(b.get("type") or "").lower()
+        if kind == "cover":
+            continue
+        if kind == "heading":
+            text = str(b.get("text") or "").strip()
+            norm = " ".join(_unnumber_heading(text).lower().split())
+            if norm in ("references", "sources", "bibliography",
+                        "works cited"):
+                break
+            if not out:
+                b = {**b, "type": "heading", "level": 1, "text": title}
+            elif int(b.get("level") or 1) == 1:
+                b = {**b, "level": 2}
+        out.append(b)
+    if not out or str(out[0].get("type")) != "heading":
+        out.insert(0, {"type": "heading", "level": 1, "text": title})
+    return out
+
+
+_FIGURES_CACHE: dict[str, dict] = {}
+# Prompt context, not a content limit: a run scoped to a hundred image-heavy
+# PDFs would otherwise paste thousands of handles into every section call.
+# When the listing is shortened the author is told, and which documents still
+# hold figures, so a missing handle is never mistaken for "there are none".
+_FIGURES_HANDLES_IN_PROMPT = 60
+
+
+def _figures_context(doc_ids: set[str] | None) -> str:
+    """The figures this run may place, written as the handles an image block
+    needs.
+
+    The renderer has always been able to lift an embedded raster out of a
+    document the user uploaded, but a model cannot invent the (page, index)
+    pair and the ids were never shown to it — so the `image` block was a
+    feature in name only. This is the missing listing.
+
+    `doc_ids` is the run's document scope: a set means exactly those documents,
+    None means the conversation has not narrowed it. Either way only ENABLED
+    documents are offered — the scope decides what a run may read, and a
+    listing that ignored the user's switches would hand out handles to material
+    they turned off.
+
+    Any failure returns "" — an unreadable listing must never cost the run its
+    document.
+    """
+    from gateway import get_json
+
+    try:
+        listing = get_json("/v1/documents") or {}
+        docs = {str(d.get("id")): d for d in (listing.get("documents") or [])
+                if d.get("id")}
+        wanted = sorted(str(d) for d in (doc_ids or [])) or sorted(docs)
+        ids = [d for d in wanted if (docs.get(d) or {}).get("enabled")]
+        if not ids:
+            return ""
+
+        rows: list[str] = []
+        held: list[str] = []
+        # One scan per document, and a ceiling on how long the whole listing
+        # may take: a library of large scanned PDFs must not cost an authoring
+        # run minutes of reading before it has written a word. What the
+        # deadline skips is named, so a missing figure is never mistaken for a
+        # document that has none.
+        deadline = time.monotonic() + 30.0
+        unchecked: list[str] = []
+        for did in ids:
+            got = _FIGURES_CACHE.get(did)
+            if got is None:
+                if time.monotonic() > deadline:
+                    unchecked.append(
+                        str((docs.get(did) or {}).get("filename") or did)[:40])
+                    continue
+                got = get_json(f"/v1/documents/{did}/figures", timeout=20.0) or {}
+                # Bounded: a long-lived agent process should not accumulate a
+                # listing for every document it has ever seen.
+                if len(_FIGURES_CACHE) > 256:
+                    _FIGURES_CACHE.clear()
+                _FIGURES_CACHE[did] = got
+            figs = got.get("figures") or []
+            if not figs:
+                continue
+            name = str(got.get("filename") or did)[:80]
+            for f in figs:
+                if len(rows) >= _FIGURES_HANDLES_IN_PROMPT:
+                    held.append(name)
+                    continue
+                size = ""
+                if f.get("width") and f.get("height"):
+                    size = f" {int(f['width'])}x{int(f['height'])}"
+                rows.append(f'  document="{did}" page={int(f.get("page") or 1)} '
+                            f'index={int(f.get("index") or 0)}'
+                            f'{size} {f.get("ext") or ""} in {name}'.rstrip())
+        if not rows:
+            # Said out loud rather than returning "". An empty listing is
+            # indistinguishable from "pictures are not a thing this document can
+            # have", which is exactly how a fully-working image block stayed
+            # unused for every web-researched report: no uploads meant no
+            # handles meant no mention, and the author never learned it could
+            # go and get one.
+            return ("\n\nFIGURES: nothing the user uploaded contains an "
+                    "embedded picture this run can place. "
+                    + "(a) IF search_images / fetch_image ARE IN YOUR TOOL LIST, "
+                    "use them: fetch the picture you need and paste the block "
+                    "they return. "
+                    + "(b) IF THEY ARE NOT — and a section writer asked to "
+                    "produce one slice of a long document usually has no tools "
+                    "at all — then there is no figure for you to place. Write "
+                    "the section as prose, a table or a chart. Do NOT invent a "
+                    "`document` id or an image URL to satisfy the request: an "
+                    "id that was not returned by a tool resolves to nothing and "
+                    "the block is dropped at render time. "
+                    "Never claim a picture was included when none was.")
+        out = ["", "FIGURES AVAILABLE — pictures you may place with an `image`",
+               "block. Copy a handle exactly; a document/page/index that is not",
+               "listed here cannot resolve and the figure is dropped.",
+               '  e.g. {"type": "image", "document": "...", "page": 2, "index": 0,',
+               '        "caption": "what the reader is looking at"}']
+        out.extend(rows)
+        if held:
+            out.append(f"  (the listing stops at {len(rows)} handles; "
+                       f"{', '.join(sorted(set(held))[:6])} still hold more)")
+        if unchecked:
+            out.append(f"  (not read this run, so not offered: "
+                       f"{', '.join(sorted(set(unchecked))[:6])})")
+        out.append("These are the figures ALREADY stored. To add a picture that")
+        out.append("is not here, `search_images` finds CC-licensed candidates and")
+        out.append("`fetch_image` files one — it returns the exact `image` block")
+        out.append("to paste, and the creator and licence belong in the caption.")
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
+_WANTS_FIGURES_R = re.compile(
+    r"\b(photo|photos|photograph|photographs|image|images|picture|pictures|"
+    r"illustration|illustrations|figure|figures|diagram|diagrams)\b", re.I)
+# One fetch per section is far too many. This bounds the whole pre-pass: eight
+# pictures is already one per ~8 pages of a long document, and each one is a
+# search plus a download plus an index write.
+_FIGURE_ACQUIRE_MAX = 8
+
+
+def _acquire_figures(query: str, outline: list[str]) -> str:
+    """Fetch figures BEFORE the sections are written, and describe them as handles.
+
+    The reason this exists: the per-section writer is a plain `LLM().chat()`
+    call with no tool loop. So on a long document the author could fetch a
+    picture — and did, on a two-page brief — while every section writer of a
+    big one had no such tool and silently produced a text-only chapter. The
+    user's complaint that a large document ignored an explicit request for
+    pictures is that asymmetry, not a model refusing.
+
+    So the fetching happens once, here, where Python can do it, and the result
+    is handed to each section as concrete handles it is allowed to cite. Topics
+    come from the outline the document already has, so the pictures match the
+    chapters rather than the title.
+
+    Returns "" when the request did not ask for figures, when the switch is off,
+    or when nothing could be fetched — the sections then behave exactly as
+    before.
+    """
+    q = str(query or "")
+    if not _WANTS_FIGURES_R.search(q):
+        return ""
+    try:
+        import flags as _f
+        if not _f.is_enabled("documents.image_search", True):
+            return ""
+    except Exception:
+        return ""
+    topics = [str(t or "").strip() for t in (outline or []) if str(t or "").strip()]
+    if not topics:
+        return ""
+    try:
+        import mcp_server
+    except Exception:
+        return ""
+    rows: list[str] = []
+    seen: set[str] = set()
+    # One topic may name several chapters; take the distinct leading words so a
+    # document with five "Roman army" chapters does not buy the same photo five
+    # times.
+    for topic in topics:
+        if len(rows) >= _FIGURE_ACQUIRE_MAX:
+            break
+        key = " ".join(topic.lower().split()[:4])
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            # commercial_only=True here, and not by the tool default. When a
+            # human picks a figure they can read the licence and decide; this
+            # path chooses with no human in the loop, and a live run pulled
+            # BY-NC-ND and BY-NC-SA images into a report the user may well
+            # distribute. Non-commercial and no-derivatives are exactly the
+            # terms that turn into a problem after the document has shipped, so
+            # the unattended fetch takes the narrower set. Explicit
+            # `search_images` calls still see everything, because there the
+            # author is choosing.
+            found = mcp_server.search_images(topic, 3,
+                                             commercial_only=True)
+            picks = [p for p in (found.get("results") or [])
+                     if (p.get("width") or 0) >= 400 and (p.get("height") or 0) >= 240]
+            if not picks:
+                continue
+            # Widest first: a 400x300 landscape photographs better across a text
+            # column than a portrait crop, and the caption sits under it.
+            pick = max(picks, key=lambda p: (p.get("width") or 0) * (p.get("height") or 0))
+            credit = " — ".join(x for x in (str(pick.get("creator") or "").strip(),
+                                            str(pick.get("license") or "").strip()) if x)
+            got = mcp_server.fetch_image(pick.get("image_url") or "",
+                                         credit=credit,
+                                         filename=key[:48] or "figure")
+            if not got.get("ok"):
+                continue
+            rows.append(
+                f'  document="{got["document"]}" page=1 index=0 in "{topic[:52]}"'
+                f'  caption="{credit[:90]}"')
+        except Exception:
+            continue
+    if not rows:
+        return ""
+    return ("\n\nFIGURES AVAILABLE (fetched for this document — place them with "
+            "an `image` block using these EXACT handles; you have no tools in "
+            "this call, so do not invent one):\n"
+            '  e.g. {"type": "image", "document": "...", "page": 1, "index": 0,\n'
+            '        "caption": "the credit line shown below"}\n'
+            + "\n".join(rows)
+            + "\nEach figure belongs in the section named after `in`. Copy its "
+              "caption with the creator and licence intact.")
+
+
 async def _sectioned_document_blocks(skill: "Skill", rendered: str,
                                      outline: list[str],
                                      resolved: list, query: str,
-                                     session_id: str) -> list[dict]:
+                                     session_id: str,
+                                     doc_title: str = "",
+                                     style: str = "",
+                                     figures: str = "") -> list[dict]:
     """One focused call PER SECTION, each returning BLOCKS, flattened here.
 
     The single-call shape cannot produce a long document: the model is asked
@@ -849,11 +1154,13 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
     returned 2,464, then 1,261. Raising max_tokens did not help; the output
     SHAPE is the constraint, not the budget.
 
-    This is the same split that works for the Formatter's prose (see
-    `_sectioned_final_answer`, where 3 per-section calls produced 779 words
-    against 248 for one combined call), applied to the author: N calls each
-    return one section's blocks, the harness concatenates them, and the
-    document is rendered ONCE so the user still gets a single file.
+    The section calls used to re-send the whole author prompt. That prompt
+    tells the model to write a DOCUMENT and call render_document - advice a
+    section writer cannot follow - and it cost ~4k tokens per section. Live
+    output showed the result: three sections, three different invented
+    document titles, and the raw request used as a heading. A dedicated
+    section prompt is shorter, unambiguous, and its heading is enforced here
+    rather than trusted to the model.
     """
     import asyncio as _aio
 
@@ -861,38 +1168,82 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
     titles = [str(t).strip() for t in outline if str(t).strip()]
     if not titles:
         return []
-    # Pair each section with the upstream material most likely to support it,
-    # so a section call is working from evidence rather than from memory.
-    n_ent = len(entries)
+    headings = [_short_section_heading(t) or t for t in titles]
+    try:
+        floor_words, _ = length_target(query, skill.name)
+    except Exception:
+        floor_words = 0
+    # Overshoot the fair share by a quarter. Asked for exactly floor/N, the
+    # model consistently delivered ~75% of it (live: 798/726/760 against
+    # 1,000), leaving a 3,000-word request at 2,291. A 1.25x target with a
+    # retry at 75% is what actually lands on the floor.
+    section_floor = (max(220, int(floor_words / max(1, len(titles)) * 1.25))
+                     if floor_words else 0)
 
-    async def _one(title: str, idx: int) -> list[dict]:
-        # Give this section the research, not the whole fleet: handing one
-        # call 400k chars of INPUTS is what compressed the output last time.
-        chunk = ""
-        if n_ent:
-            lo = (idx * n_ent) // len(titles)
-            hi = max(lo + 1, ((idx + 1) * n_ent) // len(titles))
-            picked = entries[lo:hi]
-            if not picked:
-                picked = [entries[idx % n_ent]]
-            chunk = json.dumps(picked, indent=2, default=str)[:90_000]
+    try:
+        base = (ROOT / "prompts" / "author_section.md").read_text(
+            encoding="utf-8")
+    except Exception:
+        base = ("=== WRITE ONE SECTION OF THE DOCUMENT ===\n"
+                "Write one section of a longer document. Return ONLY a JSON "
+                'object: {"blocks": [...]}. The first block must be a '
+                'level-1 heading with the exact section title you are given.')
+
+    def _count(v) -> int:
+        if isinstance(v, str):
+            return len(v.split())
+        if isinstance(v, (list, tuple)):
+            return sum(_count(x) for x in v)
+        if isinstance(v, dict):
+            return sum(_count(x) for x in v.values())
+        return 0
+
+    def _words(blocks: list[dict]) -> int:
+        total = 0
+        for b in blocks or []:
+            if not isinstance(b, dict):
+                continue
+            total += _count(b.get("text")) + _count(b.get("items"))
+            total += _count(b.get("header")) + _count(b.get("rows"))
+        return total
+
+    outline_line = " | ".join(headings)
+    doc_line = (f"The finished document is titled: {doc_title}\n"
+                if doc_title else "")
+    style_line = (f"Its typographic style is {style}; keep the prose "
+                  f"appropriate to it.\n" if style else "")
+
+    # Fetch this document's figures NOW, in Python, because no section writer
+    # below has a tool loop to fetch them with. Whatever the single-call author
+    # already listed stays; this adds handles on top.
+    #
+    # Skipped on a stopped run: it is up to eight outbound searches plus a fetch
+    # per hit, and nothing below it will read the result.
+    if headings and not cancel_requested():
+        try:
+            import asyncio as _aio2
+            got = await _aio2.to_thread(_acquire_figures, query, headings)
+            if got:
+                figures = (figures or "") + got
+                print(f"[skills] {skill.name}: fetched figures for "
+                      f"{got.count('document=')} section topic(s)")
+        except Exception as e:
+            print(f"[skills] {skill.name}: figure pre-pass skipped ({e!r})")
+
+    async def _call(chunk: str, title: str, heading: str,
+                    retry_note: str = "") -> list[dict]:
         prompt = (
-            f"{rendered}\n\n"
-            f"=== WRITE ONE SECTION OF THE DOCUMENT ===\n"
-            f"You are writing ONE section of a longer document. Your section "
-            f"is: {title}\n\n"
-            f"Return ONLY a JSON object: "
-            f'{{"blocks": [...]}}. The blocks are this section\'s content '
-            f"only. Use the block types from your instructions "
-            f'(paragraph, bullets, numbers, table, quote, heading). Start '
-            f"with a level-1 heading naming the section.\n\n"
-            f"Write the section IN FULL - this is the substance of the "
-            f"document, so develop every point the material supports with "
-            f"its figures, dates, names, units and attributions. Do not "
-            f"write an introduction or a conclusion; other sections do "
-            f"that. Do not pad with restatement of your own heading.\n\n"
-            + (f"RESEARCH MATERIAL FOR THIS SECTION (JSON):\n{chunk}\n\n"
-               if chunk else "")
+            f"{base}\n\n"
+            f"{doc_line}{style_line}"
+            f"Full outline (for context only - write ONLY your section): "
+            f"{outline_line}\n\n"
+            f"YOUR SECTION: {title}\n"
+            f"Heading to use (verbatim): {heading}\n"
+            + (f"Length target: at least {section_floor:,} words.\n\n"
+               if section_floor else "\n")
+            + retry_note
+            + (figures + "\n\n" if figures else "")
+            + chunk + "\n\n"
         )
         res = await _aio.to_thread(
             LLM().chat, prompt=prompt, agent=skill.name,
@@ -901,29 +1252,92 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
         spec = parse_skill_json(str((res or {}).get("text") or ""))
         blocks = spec.get("blocks")
         if isinstance(blocks, list):
-            return [b for b in blocks if isinstance(b, dict)]
+            return _section_blocks(heading, blocks)
         # The model wrote prose instead of JSON. Keep the words rather than
-        # discarding the call we already paid for.
+        # discarding the call we already paid for - but only the words.
         raw = _strip_answer_envelope(str((res or {}).get("text") or "")).strip()
-        if raw and raw.startswith("{"):
-            return []
+        if raw and _looks_like_block_spec(raw):
+            got = _salvage_spec_prose(heading, raw)
+            print(f"[skills] {skill.name}: section {title[:34]!r} returned an "
+                  f"unparseable block spec; salvaged {len(got)} paragraph "
+                  f"blocks from its text values")
+            return got
         if raw:
-            return [{"type": "heading", "level": 1, "text": title},
-                    {"type": "paragraph", "text": raw}]
+            return _section_blocks(
+                heading, [{"type": "paragraph", "text": raw}])
         return []
+
+    async def _one(title: str, heading: str, idx: int,
+                   previous_words: int = -1) -> list[dict]:
+        retry_note = ""
+        if previous_words == 0:
+            retry_note = ("Your previous attempt returned no usable blocks. "
+                          "Write the section now, starting with the exact "
+                          "heading above.\n\n")
+        elif previous_words > 0:
+            retry_note = (f"Your previous attempt wrote only {previous_words} "
+                          f"words for this section. Rewrite it in full, "
+                          f"reaching at least {section_floor:,} words.\n\n")
+        got = await _call(_section_evidence(entries, idx, titles), title,
+                          heading, retry_note)
+        if got:
+            return got
+        # The whole fleet did not fit into one answer. Give the section MORE
+        # calls, not less evidence: one call per researcher, merged into a
+        # single section. This is the seam where a size limit used to delete
+        # text.
+        windows = _section_evidence_windows(entries, idx, titles)
+        if len(windows) < 2:
+            return []
+        print(f"[skills] {skill.name}: section {title[:34]!r} wrote nothing "
+              f"from the complete pack; spanning {len(windows)} calls "
+              f"(one per researcher) instead of trimming", flush=True)
+        merged: list[dict] = []
+        for w in windows:
+            part = await _call(w, title, heading, retry_note)
+            if not part:
+                continue
+            if merged:
+                part = [b for b in part
+                        if not (str(b.get("type")) == "heading"
+                                and int(b.get("level") or 1) == 1)]
+            merged.extend(part)
+        return _section_blocks(heading, merged) if merged else []
 
     out: list[dict] = []
     for i, title in enumerate(titles):
+        if cancel_requested():
+            # Hand back what is written, not nothing. The caller renders these
+            # blocks locally, so a stopped run still produces the document the
+            # user already paid for instead of losing it, and the sections that
+            # were not written are the operator's decision rather than a cap
+            # this harness kept quiet about.
+            print(f"[skills] {skill.name}: stopped by the operator after "
+                  f"{i}/{len(titles)} section(s) — the rest were not written",
+                  flush=True)
+            return out
+        heading = headings[i] or title
+        got: list[dict] = []
         try:
-            got = await _one(title, i)
+            got = await _one(title, heading, i)
         except Exception as e:
             print(f"[skills] {skill.name}: section {i + 1} "
                   f"({title[:40]!r}) failed: {type(e).__name__}")
-            got = []
+        words = _words(got)
+        if section_floor and words < max(200, int(section_floor * 0.75)):
+            try:
+                again = await _one(title, heading, i, previous_words=words)
+            except Exception as e:
+                print(f"[skills] {skill.name}: section {i + 1} retry failed: "
+                      f"{type(e).__name__}")
+                again = []
+            if _words(again) > words:
+                got = again
+                words = _words(got)
         if got:
             out.extend(got)
         print(f"[skills] {skill.name}: section {i + 1}/{len(titles)} "
-              f"{title[:44]!r} -> {len(got)} blocks")
+              f"{title[:44]!r} -> {len(got)} blocks, {words} words")
     return out
 
 
@@ -946,6 +1360,81 @@ def _entry_has_research(entry) -> bool:
     return False
 
 
+def _short_section_heading(text: str, limit: int = 10) -> str:
+    """A heading-sized version of an outline title.
+
+    Planner facets are instructions to a researcher, not headings: "Major
+    players and architectural differences: Pinecone, Weaviate, Qdrant,
+    Milvus, pgvector - indexing strategies, storage, and distribution" set as
+    an H1 wraps three lines. Keep the leading clause; the full facet stays in
+    the prompt as the section's brief.
+    """
+    t = " ".join(str(text or "").split())
+    if not t:
+        return ""
+    head = re.split(r"\s*[:\u2013\u2014]\s*|\s+-\s+", t, maxsplit=1)[0].strip()
+    if len(head.split()) >= 2:
+        t = head
+    words = t.split()
+    if len(words) > limit:
+        t = " ".join(words[:limit]).rstrip(",;:")
+    return t[:120]
+
+
+def _strip_request_headings(blocks: list, query: str,
+                            title: str = "") -> list[dict]:
+    """Remove headings that are the request or the document title.
+
+    Live: a deep report's only level-1 heading was the raw brief - "Write a
+    comprehensive, highly detailed report on the state of vector databases in
+    2026. Cover the major players ..." - rendered at heading size for eight
+    pages, and the document counted as one section. The title is drawn by the
+    renderer; a body heading that repeats it or the instruction is noise.
+    """
+    q = " ".join(str(query or "").split()).lower()
+    t = " ".join(str(title or "").split()).lower()
+    out: list[dict] = []
+    for b in (blocks or []):
+        if isinstance(b, dict) and str(b.get("type") or "").lower() == "heading":
+            text = " ".join(str(b.get("text") or "").split())
+            norm = text.lower()
+            if norm and (
+                    _title_is_request(text)
+                    or (q and (norm == q or (len(norm) >= 24 and norm in q)))
+                    or (t and norm == t)):
+                continue
+        out.append(b)
+    return out
+
+
+def _title_is_request(text: str) -> bool:
+    """Does this "title" actually repeat the instruction?
+
+    A model that could not think of a title sometimes returns the brief it was
+    given. That was accepted verbatim, so a PDF's cover and running header read
+    "Write a comprehensive, highly detailed report on the state of vector
+    databases in 2026. Cover the major players ..." - the request, not a name.
+    """
+    t = " ".join(str(text or "").split())
+    if not t:
+        return False
+    # The verb list is deliberately not tied to an object. It used to be
+    # `^(create a document|write|...)`, which the model's own title
+    # "Create me an detailed pdf about working of llm's, make it big and nearky
+    # 25 pages long" slipped through - so that sentence became the cover
+    # heading and the running header of all 23 pages.
+    if re.match(r"(?i)^(?:please\s+)?(?:create|make|write|produce|generate|"
+                r"draft|compose|prepare|render|export)\b", t):
+        return True
+    # A title does not specify how long the document should be.
+    if re.search(r"(?i)\b\d+\s*(?:pages?|words?)\b", t):
+        return True
+    if re.search(r"(?i)\b(?:pdf|docx|pptx|xlsx|document|report|deck|file)\b"
+                 r".*\b(?:about|regarding|covering)\b", t):
+        return True
+    return len(t) > 140
+
+
 def _document_title(parsed: dict, query: str) -> str:
     """A real document title, never the prompt.
 
@@ -962,7 +1451,7 @@ def _document_title(parsed: dict, query: str) -> str:
     the model's own title, then its first heading, then the query with the UI
     boilerplate and any leading length instruction stripped."""
     t = str((parsed or {}).get("title") or "").strip()
-    if t and len(t) <= 200:
+    if t and len(t) <= 200 and not _title_is_request(t):
         return t
 
     for b in ((parsed or {}).get("blocks") or []):
@@ -986,20 +1475,36 @@ def _document_title(parsed: dict, query: str) -> str:
     q = q.strip().split("\n\n", 1)[0]
     q = " ".join(q.split())
     # "Write a comprehensive treatise of about 60 pages on ..." - keep the
-    # subject, drop the instruction and the length.
+    # subject, drop the instruction and the length. The qualifier list allows
+    # commas and several stacked adjectives: "comprehensive, highly detailed
+    # report on X" used to fall through unstripped, so the title was the
+    # request verbatim.
     q = re.sub(r"^\s*(?:please\s+)?(?:write|produce|create|generate|make|"
                r"draft|compose)\s+(?:me\s+)?(?:an?\s+|the\s+)?"
-               r"(?:comprehensive\s+|detailed\s+|extensive\s+|brief\s+|"
-               r"short\s+|in-depth\s+|full-length\s+|long-form\s+)*"
+               r"(?:(?:comprehensive|detailed|extensive|brief|short|concise|"
+               r"in-depth|in depth|full-length|long-form|highly|thorough|deep|"
+               r"quick)[\s,]+)*"
                r"(?:treatise|whitepaper|report|essay|paper|document|study|"
-               r"memo|article|summary|piece|draft|analysis)?\s*"
+               r"memo|article|summary|piece|draft|analysis|pdf|docx|pptx|xlsx|"
+               r"deck|slides|presentation|guide|manual|primer|handbook|"
+               r"walkthrough|notes|briefing)?[\s,]*"
                r"(?:of|on|about|covering|regarding)\s+(?:about\s+|approximately\s+|"
                r"roughly\s+|around\s+)?"
                r"(?:\d+\s*(?:pages?|words?)\s*(?:in|of|long)?\s*)?(?:on|of|about)?\s*",
                "", q, flags=re.I)
     q = re.sub(r"\s*[:;]\s*.*$", "", q).strip(" .")
-    if q:
-        return q[:200]
+    # A brief keeps talking after naming its subject: "... vector databases
+    # in 2026. Cover the major players (Pinecone, ...), how they differ ...".
+    # The title is that first sentence, not the whole instruction paragraph.
+    q = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\"'])", q, maxsplit=1)[0]
+    # A request also keeps talking after naming its subject, and the clause
+    # that resumes the instructions is not part of a title: "..., make it big
+    # and nearky 25 pages long".
+    q = re.split(r"(?i)[,;]\s*(?:make|keep|include|cover|ensure|use|add|"
+                 r"avoid|please|do\s+not|don't)\b", q)[0]
+    q = q.strip(" .,")
+    if q and not _title_is_request(q):
+        return (q[0].upper() + q[1:])[:200]
 
     # Last resort: the first heading, which at least names something.
     for b in ((parsed or {}).get("blocks") or []):
@@ -1013,7 +1518,8 @@ def _document_title(parsed: dict, query: str) -> str:
 async def _expand_document_sections(skill, rendered, blocks, resolved,
                                     graph_nodes, query, session_id, parsed,
                                     fmt, forced, _f, current, *,
-                                    pre_rendered: bool) -> list[dict]:
+                                    pre_rendered: bool,
+                                    figures: str = "") -> list[dict]:
     """Write the document one section per call, then render it ONCE.
 
     A single call renders whatever the model felt like writing: measured
@@ -1052,10 +1558,61 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
     if fmt not in ("pdf", "pptx", "docx", "xlsx"):
         fmt = "pptx" if skill.name == "deck" else "pdf"
 
+    expand, why = should_expand_document(
+        query, skill.name, cur_words, outline, resolved)
+    # Word count alone is not enough. A draft whose only heading is the
+    # request is one flat block, not a structured report - it cleared 95% of
+    # the floor once and skipped the rewrite, shipping eight pages with no
+    # sections. For a long document, real headings are part of the ask.
+    try:
+        _floor, _ = length_target(query, skill.name)
+    except Exception:
+        _floor = 0
+    _real_heads = [
+        b for b in (blocks or [])
+        if isinstance(b, dict)
+        and str(b.get("type") or "").lower() == "heading"
+        and int(b.get("level") or 1) == 1
+        and not _title_is_request(str(b.get("text") or ""))
+    ]
+    if _floor >= 1500 and len(_real_heads) < 2:
+        expand = True
+        why = "the draft has no usable section headings"
+    if not expand:
+        print(f"[skills] {skill.name}: keeping the single-call document "
+              f"({cur_words} words): {why}")
+        return [current] if pre_rendered else current
+
     print(f"[skills] {skill.name}: writing {len(outline)} sections "
-          f"(single call gave {cur_words} words)")
+          f"(single call gave {cur_words} words; {why})")
+    doc_title = _document_title(parsed, query)
+    style_name = (_f("style")
+                  or (str(parsed.get("style") or "")
+                      if str(parsed.get("style") or "").lower()
+                      not in ("", "report") else "")
+                  or _auto_document_style(query))
+    # The section ceiling is a cost brake, not a document shape. It used to be
+    # `outline[:40]` — a literal that silently deleted every chapter beyond the
+    # fortieth. A 500-page request plausibly plans 60-120 facets, so the
+    # document came out at roughly a fifth of what was asked and NOTHING SAID
+    # SO: the run reported success, the word count looked large, and the missing
+    # chapters existed only in a plan the user could not see.
+    #
+    # Kept bounded (each section is a model call, so an unbounded outline is an
+    # unbounded bill) but the cut is now stated, and the bound is large enough
+    # that ordinary documents never meet it.
+    _SECTIONS_MAX = int(os.getenv("ARIA_MAX_SECTIONS", "160") or 160)
+    planned = list(outline)
+    if len(planned) > _SECTIONS_MAX:
+        dropped = planned[_SECTIONS_MAX:]
+        planned = planned[:_SECTIONS_MAX]
+        print(f"[skills] {skill.name}: SECTION CEILING hit — asked for "
+              f"{len(outline)} sections, writing {_SECTIONS_MAX}, DROPPING "
+              f"{len(dropped)}. Raise ARIA_MAX_SECTIONS or ask for a shorter "
+              f"document. First dropped: {str(dropped[0])[:80]!r}")
     extra = await _sectioned_document_blocks(
-        skill, rendered, outline[:40], resolved, query, session_id)
+        skill, rendered, planned, resolved, query, session_id,
+        doc_title=doc_title, style=style_name, figures=figures)
     if not extra:
         print(f"[skills] {skill.name}: sectioned writer returned nothing; "
               f"keeping the single-call document")
@@ -1079,9 +1636,14 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
         return " ".join(_unnumber_heading(str(b.get("text") or ""))
                          .lower().split())
 
+    # The initial single call was a full draft. Keeping it AND appending the
+    # sectioned rewrite duplicated prose (and once shipped the model's JSON
+    # receipt as a code block). The section calls are now the body; only a
+    # deliberate cover survives from the draft.
+    front = [x for x in (blocks or [])
+             if isinstance(x, dict) and str(x.get("type")) == "cover"]
     merged, seen_h = [], set()
-    for b in ([x for x in (blocks or []) if isinstance(x, dict)]
-              + [x for x in extra if isinstance(x, dict)]):
+    for b in (front + [x for x in extra if isinstance(x, dict)]):
         if str(b.get("type") or "").lower() == "heading":
             k = _hkey(b)
             if not k or k in seen_h:
@@ -1092,7 +1654,7 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
         import mcp_server as _m
         got = _m.render_document(
             format=fmt,
-            title=_document_title(parsed, query),
+            title=doc_title,
             subtitle=str(parsed.get("subtitle") or "")[:300],
             author_name=str(parsed.get("author") or "")[:120],
             toc=bool(forced.get("toc")) or bool(parsed.get("toc")),
@@ -1100,11 +1662,15 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
                             if forced.get("running_header") else ""),
             page_size=_f("page_size"), orientation=_f("orientation"),
             margins=_f("margins"),
-            columns=int(forced.get("columns") or parsed.get("columns") or 0),
-            style=_f("style"), citation_style=_f("citation_style"),
-            references=parsed.get("references") if isinstance(
-                parsed.get("references"), list) else None,
-            slide_size=_f("slide_size"), blocks=merged[:400])
+            columns=_document_columns(style_name, forced.get("columns"),
+                                      parsed.get("columns")),
+            style=style_name,
+            citation_style=_f("citation_style"),
+            references=(parsed.get("references")
+                        if isinstance(parsed.get("references"), list)
+                        and parsed.get("references")
+                        else _references_from_resolved(resolved)),
+            slide_size=_f("slide_size"), blocks=merged)
     except Exception as e:
         print(f"[skills] {skill.name}: sectioned render raised "
               f"{type(e).__name__}: {e}"[:200])
@@ -1118,7 +1684,11 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
         return [current] if pre_rendered else current
 
     new_words = int((got.get("stats") or {}).get("words") or 0)
-    if new_words <= cur_words:
+    _new_sections = int((got.get("stats") or {}).get("sections") or 0)
+    _need_structure = _floor >= 1500 and len(_real_heads) < 2
+    if new_words <= cur_words and not (
+            _need_structure and _new_sections >= 2
+            and new_words >= int(cur_words * 0.85)):
         # The sectioned attempt was worse; keep the document we already have.
         print(f"[skills] {skill.name}: sectioned gave {new_words} words vs "
               f"{cur_words}; keeping the longer one")
@@ -1160,32 +1730,66 @@ def _derive_document_outline(blocks, resolved, graph_nodes, query) -> list[str]:
              if isinstance(b, dict) and b.get("type") == "heading"
              and int(b.get("level") or 1) == 1]
     heads = [_unnumber_heading(h) for h in heads if h]
-    if len(heads) >= 2:
-        return heads
+    # A heading that repeats the request is not a section. Keeping it made a
+    # flat eight-page draft look structured enough to skip expansion.
+    heads = [h for h in heads if not _title_is_request(h)]
 
     # 2. The planner's facet list. Structured, produced before the author ran,
-    #    and each facet is already scoped for one researcher.
+    #    and each facet is already scoped for one researcher. For a deep
+    #    document this is a better spine than a model that happened to emit
+    #    only two headings: a 3,000-word floor with two sections is structurally
+    #    thin even if the prose is good.
     try:
-        for n in (graph_nodes or []):
+        # `graph_nodes` is the networkx node-view MAPPING (keyed by node id),
+        # not a list and not a dict subclass - `isinstance(..., dict)` is
+        # false for a NodeView, so iterating it yielded node-id strings and
+        # the planner's facets were never read. The outline then fell through
+        # to the researchers' echoed questions or a generic frame.
+        from collections.abc import Mapping as _Mapping
+        _nodes = (graph_nodes.values() if isinstance(graph_nodes, _Mapping)
+                  else (graph_nodes or []))
+        for n in _nodes:
             if not isinstance(n, dict) or n.get("skill") != "planner":
                 continue
             res = n.get("result") or {}
-            out = res.get("output") if isinstance(res, dict) else None
+            if isinstance(res, AgentResult):
+                out = res.output if res.success else None
+            else:
+                out = res.get("output") if isinstance(res, dict) else None
             if not isinstance(out, dict):
                 continue
             rp = out.get("research_plan")
             facets = (rp.get("facets") if isinstance(rp, dict) else None) or []
             facets = [_unnumber_heading(str(f)) for f in facets if str(f).strip()]
             if len(facets) >= 2:
-                return facets
+                try:
+                    floor_words, _ = length_target(query, "author")
+                except Exception:
+                    floor_words = 0
+                if len(heads) < 2 or (floor_words >= 1500
+                                      and len(facets) > len(heads)):
+                    return facets
+                if len(heads) >= 2:
+                    return heads
     except Exception:
         pass
+    if len(heads) >= 2:
+        return heads
 
-    # 3. What the researchers were actually asked.
-    qs = [_unnumber_heading(str((e.get("output") or e).get("question") or ""))
-          for e in (resolved or [])
-          if isinstance(e, dict)
-          and str((e.get("output") or e).get("question") or "").strip()]
+    # 3. What the researchers were actually asked. Skip the ones that only
+    #    echo the request (live: three identical sections titled with the
+    #    brief) and deduplicate.
+    qs: list[str] = []
+    for e in (resolved or []):
+        if not isinstance(e, dict):
+            continue
+        out = e.get("output") if isinstance(e.get("output"), dict) else e
+        question = _unnumber_heading(str(out.get("question") or ""))
+        if not question.strip() or _title_is_request(question):
+            continue
+        if question.lower() in {q.lower() for q in qs}:
+            continue
+        qs.append(question)
     if len(qs) >= 2:
         return qs
 
@@ -1456,8 +2060,19 @@ def _tool_sources(transcript) -> list[dict]:
     return out
 
 
+# Skills whose contract is a JSON object, so a prose reply loses the answer.
+#
+# `formatter` is here because its `final_answer` IS the user-visible reply: a
+# run where it answered in good markdown that was not wrapped in the object
+# used to throw the whole answer away. `author` and `deck` are deliberately
+# NOT here — when nothing rendered, a repair call asking "give me the receipt
+# JSON" is asking for a receipt for a file that does not exist, and the
+# `_authoritative` override below already replaces any claimed filename with
+# the renderer's real record. The failure to recover from there is the missing
+# render, not the missing braces.
 _JSON_CONTRACT_SKILLS = frozenset({"planner", "researcher", "distiller",
-                                   "retriever", "critic", "summariser"})
+                                   "retriever", "critic", "summariser",
+                                   "formatter"})
 
 
 async def _repair_json_reply(skill: "Skill", rendered: str, previous: str,
@@ -1484,14 +2099,14 @@ async def _repair_json_reply(skill: "Skill", rendered: str, previous: str,
         tpl = skill.prompt_template()
         m = re.search(r"(?s)^##+\s*Output\s*$.*?(?=^##+\s|\Z)", tpl, _re.M)
         if m:
-            schema = m.group(0)[:3000]
+            schema = m.group(0)
     except Exception:
         schema = ""
     prompt = (
-        f"{str(rendered or '')[:24000]}\n\n"
+        f"{str(rendered or '')}\n\n"
         "=== REPLY WITH THE REQUIRED JSON ONLY ===\n"
         f"Your previous reply was rejected: {problem}\n\n"
-        + (f"The previous reply was:\n---\n{said[:1500]}\n---\n\n" if said else "")
+        + (f"The previous reply was:\n---\n{said}\n---\n\n" if said else "")
         + (f"Your output contract:\n{schema}\n\n" if schema else "")
         + "Reply now with ONE JSON object matching that contract. No prose, "
           "no code fences, no commentary. If you have nothing to report, "
@@ -1533,10 +2148,7 @@ async def _sectioned_findings(skill: "Skill", rendered: str, transcript,
     per = max(_FINDINGS_PAGES_PER_CALL,
               -(-len(sources) // max(1, _FINDINGS_MAX_CALLS)))
     groups = [sources[i:i + per] for i in range(0, len(sources), per)]
-    # Keep the instruction block short: `rendered` carries the skill contract
-    # and the node's question, but repeating a 400k-char INPUTS block on every
-    # call would pay for it eight times over.
-    head = str(rendered or "")[:24000]
+    head = str(rendered or "")
     gate = _aio.Semaphore(2)
 
     async def _one(group: list[dict], idx: int) -> tuple[str, int, int]:
@@ -1604,18 +2216,19 @@ async def _sectioned_findings(skill: "Skill", rendered: str, transcript,
     return merged, sources, tin, tout
 
 
-def _inputs_block(resolved: list, budget: int, *,
+def _inputs_block(resolved: list, _budget: int = 0, *,
                   skill_name: str = "") -> str:
     """Serialise resolved inputs, keeping citation-bearing fields whole.
 
-    Truncation order, so that what a node loses is the least useful:
-      1. a large text field moves into the artifact store and is replaced
-         by a handle + preview, so it is paid for once rather than by
-         every node that reads it (`read_artifact` expands it on demand)
-      2. over-long scalar text fields (e.g. a 70k-char `findings`)
-      3. whole trailing entries (the oldest upstream results)
-    A marker tells the node what happened, so it can say so rather than
-    silently presenting a partial picture as complete.
+    `_budget` is accepted and IGNORED. It used to be the point at which whole
+    upstream results were dropped from the end of the list — which is how a
+    research facet could disappear from a document — and the callers still pass
+    their old numbers. Keeping the parameter means the call sites read the same
+    while nothing is discarded; the name says what happened to it.
+
+    The only transformation left is the spill: a large text field on a node
+    that is not writing from it moves to the artifact store and is replaced by
+    a handle plus a preview. The text survives in full; nothing is deleted.
 
     The Formatter and the Author are exempt from step 1: they are the nodes
     that WRITE from this material, and handing them handles instead of text
@@ -1663,31 +2276,14 @@ def _inputs_block(resolved: list, budget: int, *,
                     val, source=f"skill:{skill_name or 'unknown'}",
                     title=f"{title} — {key}")
                 continue
-            if len(val) <= _FIELD_BUDGET:
-                continue
-                fields[key] = _spill_field_to_artifact(
-                    val, source=f"skill:{skill_name or 'unknown'}",
-                    title=f"{title} — {key}")
-                continue
-            fields[key] = (val[:_FIELD_BUDGET]
-                           + f"\n…[{len(val) - _FIELD_BUDGET} chars of this "
-                             f"field omitted — INPUTS size limit]")
+            # Nothing is cut any more. `_FIELD_BUDGET` used to replace the tail
+            # of a long field with "…chars omitted", and when the block was
+            # still over budget whole trailing upstream results were dropped —
+            # entire research facets vanishing from the document behind a
+            # one-line note. Size is handled by giving a node more calls, never
+            # by deleting what it was given.
         trimmed.append(item)
-
-    text = json.dumps(trimmed, indent=2, default=str)
-    if len(text) <= budget:
-        return text
-    dropped = 0
-    # Still too big: drop whole trailing entries, newest kept first, and
-    # say how many were dropped instead of slicing mid-object.
-    while len(trimmed) > 1:
-        trimmed = trimmed[:-1]
-        dropped = dropped + 1
-        text = json.dumps(trimmed, indent=2, default=str)
-        if len(text) <= budget:
-            break
-    return (text + f"\n…[{dropped} earlier upstream result(s) omitted — "
-                   f"INPUTS size limit]")
+    return json.dumps(trimmed, indent=2, default=str)
 
 
 # ── length contract ──────────────────────────────────────────────────────
@@ -1754,7 +2350,12 @@ _LENGTH_TIERS: tuple[tuple[int, str, re.Pattern[str]], ...] = (
      # phrasing and reads as a noun here far more often than a genre.
      re.compile(
          r"\b(report|analysis|study|paper|essay|white ?paper|case study|"
-         r"write[- ]?up|survey)\b", re.I)),
+         r"write[- ]?up|survey|manual|handbook|playbook|procedures?)\b", re.I)),
+    # A newsletter is a publication, not a headline: live, a four-page
+    # two-column newsletter shipped 354 words because no genre floor covered
+    # the word and the layout had almost nothing to place.
+    (700, "a newsletter - at least this substantial",
+     re.compile(r"\b(newsletter|bulletin|digest)\b", re.I)),
     # A request to PRODUCE A DOCUMENT is a request for body prose, even with no
     # genre word. The Authoring page prefixes every query with "Create a
     # document.", so "produce a pdf on the history of the Silk Road" reached
@@ -1896,6 +2497,97 @@ def _explicit_unit_cap(q: str) -> int:
     return max(1, n) * per
 
 
+def _findings_text(parsed) -> str:
+    """What a researcher actually delivered, across the shapes it may answer in.
+
+    Reading ONLY `findings` is wrong, and the integration tests caught it: the
+    envelope the researcher prompt asks for is `{"final_answer": "..."}`, so a
+    perfectly good facet with no `findings` key judged as empty, failed its node,
+    and made recovery replan all three siblings twenty-seven times before the cap
+    stopped it. A guard that fires on valid output is worse than no guard — it
+    converts a working run into a retry storm.
+
+    So, in order: the known answer keys, then any text the object carries under
+    whatever field names the model chose (`{"claim": …, "evidence": …}` is
+    normal structured output), then nothing. Never `json.dumps(x or "")`, which
+    turns None and {} into the non-blank strings '""' and '{}' and would call an
+    empty facet full.
+    """
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if not isinstance(parsed, dict):
+        return ""
+
+    def _from_value(v):
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            inner = _findings_text(v)
+            if inner:
+                return inner
+            # its own field names, not the ones we expected
+            return " ".join(s for s in (
+                str(x).strip() for x in v.values()
+                if isinstance(x, str) and x.strip()) if s).strip()
+        if isinstance(v, (list, tuple)):
+            return " ".join(s for s in (_from_value(x) for x in v) if s).strip()
+        return ""
+
+    for key in ("findings", "final_answer", "answer", "text", "result",
+                "summary", "report", "content", "body"):
+        got = _from_value(parsed.get(key))
+        if got:
+            return got
+    # Nothing under a known key: fall back to every string in the object.
+    parts = [s for s in (_from_value(v) for v in parsed.values()
+                         if not isinstance(v, (int, float, bool))) if s]
+    return " ".join(parts).strip()
+
+
+def empty_facet_error(skill_name: str, parsed: dict, reply: dict) -> str:
+    """Why a researcher that delivered nothing must not count as success.
+
+    Measured in the gateway ledger: of the researcher calls fed more than 150k
+    input tokens, a third answered with 29 to 263 output tokens in ~15 seconds,
+    and every one was logged `status = ok`. The node reported success, the facet
+    contributed nothing, the author wrote around the hole, and the run shipped a
+    thin document with no error for anyone to read.
+
+    Producing nothing in every shape a researcher may answer in is never
+    something a working researcher legitimately does — "I searched and the
+    material is not here" is a sentence. Failing the node makes recovery replan
+    the facet, so a saturated hop costs one retry instead of a chapter.
+    """
+    if skill_name != "researcher" or reply.get("error"):
+        return ""
+    if _findings_text(parsed):
+        return ""
+    # Last word to the raw text: a model that wrote prose the JSON parser could
+    # not read has still said something, and that is not this failure.
+    if str((reply or {}).get("text") or "").strip():
+        return ""
+    return ("the researcher returned no findings at all. This is the "
+            "saturated-context signature: the node read pages, ran out of room, "
+            "and answered nothing. Replan this facet with a narrower question "
+            "rather than treating it as covered.")
+
+
+def thin_facet_notice(skill_name: str, parsed: dict, question: str) -> str:
+    """A short finding is not always a failure, but it must be traceable.
+
+    Some facets genuinely are thin. This does not fail them — it prints, so a
+    document that reads as hollow can be traced to the chapter that came back
+    hollow instead of being guessed at afterwards.
+    """
+    if skill_name != "researcher":
+        return ""
+    text = _findings_text(parsed)
+    if not text or len(text) >= 600 or (parsed.get("sources") or []):
+        return ""
+    return (f"near-empty facet ({len(text)} chars, 0 sources) — question "
+            f"{str(question or '')[:70]!r}")
+
+
 def ceiling_for(query: str, skill_name: str = "") -> int:
     """A length the user explicitly asked you NOT to exceed. 0 if none.
 
@@ -2002,6 +2694,354 @@ def length_contract(query: str, skill_name: str = "") -> str:
     )
 
 
+_STYLE_RULES = (
+    ("memo", r"\b(memo|internal note|board note|decision note|policy note)\b"),
+    ("brief", r"\b(brief|one[- ]pager|executive summary|board briefing)\b"),
+    ("academic", r"\b(academic|scholarly|research paper|journal article|"
+                 r"literature review|thesis|dissertation)\b"),
+    ("whitepaper", r"\b(white ?paper|industry report|market report|"
+                    r"landscape report|position paper)\b"),
+    ("manual", r"\b(manual|handbook|guide|how[- ]to|instructions|"
+               r"procedures?|playbook)\b"),
+    ("newsletter", r"\b(newsletter|bulletin|digest)\b"),
+    ("technical", r"\b(specification|technical report|engineering report|"
+                  r"architecture document|design document)\b"),
+    ("book", r"\b(book|book[- ]length|treatise|monograph|long[- ]form)\b"),
+)
+
+
+def _document_columns(style: str, forced_columns, parsed_columns) -> int:
+    """A newsletter is two-column even when the model forgot to say so.
+
+    Live: a recovered newsletter rendered single-column because the model (or
+    the recovery author) passed columns=1. The style's own default is the
+    user's request; only an explicit caller choice may override it.
+    """
+    try:
+        forced = int(forced_columns or 0)
+    except (TypeError, ValueError):
+        forced = 0
+    if forced:
+        return forced
+    if str(style or "").strip().lower() == "newsletter":
+        return 2
+    try:
+        return int(parsed_columns or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _auto_document_style(query: str) -> str:
+    """Pick a typographic system when the model did not name one.
+
+    The author prompt lists the styles, but models overwhelmingly leave the
+    default; every document then looked like the same A4 report. The decision
+    is content-driven: a memo is a memo, a newsletter is two-column, an
+    academic paper is serif and justified.
+    """
+    q = str(query or "")
+    for style, pattern in _STYLE_RULES:
+        if re.search(pattern, q, re.I):
+            return style
+    return "report"
+
+
+def _references_from_resolved(resolved: list) -> list[dict]:
+    """Turn researcher source lists into render_document references."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in resolved or []:
+        if not isinstance(entry, dict):
+            continue
+        output = entry.get("output")
+        if not isinstance(output, dict):
+            continue
+        sources = output.get("sources")
+        if not isinstance(sources, list):
+            continue
+        for source in sources[:40]:
+            if isinstance(source, dict):
+                title = str(source.get("title") or source.get("name") or "").strip()
+                url = str(source.get("url") or "").strip()
+                year = str(source.get("year") or source.get("published") or "").strip()
+                if not title and not url:
+                    continue
+                # Researchers label pages "posthog.com: feature flags vs
+                # configuration". Left whole, that became a reference whose
+                # title was the hostname and whose URL was dropped by numeric
+                # citation styles - a bibliography the reader cannot check.
+                site = str(source.get("container") or "").strip()
+                m = re.match(
+                    r"^((?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+)\s*[:\u2013\u2014-]\s*(.+)$",
+                    title, re.I)
+                if m:
+                    site = site or m.group(1).removeprefix("www.")
+                    title = m.group(2).strip()
+                key = (title + "|" + url).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                row = {"title": title or url}
+                if url:
+                    row["url"] = url
+                    row.setdefault("type", "web")
+                if site:
+                    row["container"] = site
+                if year:
+                    row["year"] = year
+                out.append(row)
+            elif isinstance(source, str) and source.strip():
+                key = source.strip().lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"title": source.strip()[:300]})
+            if len(out) >= 60:
+                return out
+    return out
+
+
+def _research_chars(resolved: list) -> int:
+    try:
+        return len(json.dumps(resolved or [], default=str))
+    except Exception:
+        return 0
+
+
+def should_expand_document(query: str, skill_name: str, current_words: int,
+                           outline: list[str], resolved: list) -> tuple[bool, str]:
+    """Decide whether the expensive section-by-section rewrite is warranted.
+
+    The old code expanded unconditionally. That made a "two paragraphs" brief
+    into 1,436 words and a "one-page brief" into a multi-section report, while
+    re-sending the whole author prompt plus 90k chars of research for every
+    section. Deep requests still expand; short or already-complete documents
+    do not.
+    """
+    q = str(query or "")
+    cap = ceiling_for(q, skill_name)
+    floor, _label = length_target(q, skill_name)
+    if cap:
+        return False, f"the request is capped at about {cap:,} words"
+    if len([t for t in outline if str(t).strip()]) < 2:
+        return False, "fewer than two sections are derivable"
+    if _research_chars(resolved) < 6_000:
+        return False, "not enough research to fill extra sections"
+    if floor > 0:
+        if current_words >= int(floor * 0.95):
+            return False, (f"{current_words:,} words already clears the "
+                           f"{floor:,}-word floor")
+        return True, f"{current_words:,} words is below the {floor:,}-word floor"
+    if not re.search(
+            r"\b(comprehensive|exhaustive|thorough(?:ly)?|in[- ]depth|"
+            r"long[- ]form|treatise|whitepaper|white paper|essay|"
+            r"multi[- ]section|detailed (?:analysis|report|study)|"
+            r"book[- ]length|extensive)\b", q, re.I):
+        return False, "no explicit depth request"
+    if current_words >= 1_200:
+        return False, "already substantial for an unspecified-length brief"
+    return True, "explicit depth request below 1,200 words"
+
+
+_SECTION_WORDS_R = re.compile(r"[a-z0-9]{4,}")
+
+
+def _section_relevance(title: str, entry) -> int:
+    """Rough overlap between a section title and one researcher's material.
+
+    Only used to ORDER the fleet, so a misscoring costs nothing but position —
+    every entry is included either way.
+    """
+    out = entry.get("output") if isinstance(entry, dict) else {}
+    if not isinstance(out, dict):
+        return 0
+    hay = " ".join([str(out.get("question") or ""),
+                    str(out.get("findings") or out.get("text") or ""),
+                    " ".join(str(s.get("title") or "")
+                             for s in (out.get("sources") or []))])
+    tw = set(_SECTION_WORDS_R.findall(str(title or "").lower()))
+    hw = set(_SECTION_WORDS_R.findall(hay.lower()))
+    return len(tw & hw)
+
+
+def _fleet_json(entries: list, title: str) -> str:
+    """The researchers' material as JSON, ordered most relevant to `title` first."""
+    ranked = sorted(list(entries), key=lambda e: -_section_relevance(title, e))
+    blocks = []
+    for n, entry in enumerate(ranked, 1):
+        out = entry.get("output") if isinstance(entry, dict) else {}
+        if not isinstance(out, dict):
+            out = {"raw": entry}
+        blocks.append({"order": n,
+                       "question": str(out.get("question") or "").strip(),
+                       "findings": out.get("findings") or out.get("text") or "",
+                       "sources": out.get("sources") or []})
+    return json.dumps({"section": title, "research": blocks}, default=str)
+
+
+def _section_evidence(entries: list, index: int, titles: list[str]) -> str:
+    """Everything the fleet gathered, for every section. Uncut.
+
+    This used to hand section `i` the findings of researcher `i`
+    (`entries[index % len(entries)]`), clipped to 24,000 characters, plus a
+    350-character preview of each of the others. With six researchers a section
+    writer therefore saw one sixth of the research, chosen by position rather
+    than by subject, and the rest was silently gone from the document. The
+    whole fleet travels now, ordered so the most relevant material is first.
+    """
+    if not entries:
+        return ""
+    title = titles[index] if index < len(titles) else ""
+    return ("FULL RESEARCH FLEET (JSON) — every finding gathered for this "
+            "document, ordered by relevance to your section. Write your "
+            "section from all of it; do not summarise the evidence, use it.\n\n"
+            + _fleet_json(entries, title))
+
+
+def _section_evidence_windows(entries: list, index: int,
+                              titles: list[str]) -> list[str]:
+    """The same fleet split at its natural seams: one researcher per pack.
+
+    Used only when a section cannot be written from the complete pack in one
+    call. Splitting by researcher keeps a source's material together, and the
+    window sizes come from the data rather than from a constant — every window
+    gets its own call and the results are merged, so nothing is discarded.
+    """
+    title = titles[index] if index < len(titles) else ""
+    return [_fleet_json([e], title) for e in entries]
+
+
+# One predicate for "this request wants a file back", shared with the
+# orchestrator (flow.py reads this copy). It used to be two, and the
+# worker-side cap below keyed on a literal prefix — `"create a document"` —
+# that the classifier never used, so "produce a pdf about X" or "make a deck
+# of Y" ran the full evidence fleet for what was going to be a three-page
+# brief.
+DOCUMENT_INTENT_RE = re.compile(
+    r"create a document|produce a (pdf|pptx|docx|xlsx|word|excel|deck)"
+    r"|make a (pdf|pptx|docx|xlsx|deck|slide deck|presentation)"
+    r"|render a (pdf|pptx|docx|xlsx)",
+    re.I)
+
+# How much evidence one researcher actually returns, measured rather than
+# assumed: across the 1,112 recorded researcher finals behind the numbers in
+# agent_config.yaml's researcher block, the median findings length was about
+# 1,000 words and only 3.1% passed 2,000. The planner sizes its fleet on THIS
+# figure, so the arithmetic it is given and the yield it gets cannot drift
+# apart the way the old "1,500-4,000-word floor" did — a number no prompt or
+# cap ever set.
+RESEARCHER_EVIDENCE_WORDS = 1_000
+
+# Words of solid prose a page of a document carries, for the pages->words
+# arithmetic the planner is asked to do out loud.
+WORDS_PER_PAGE = 450
+
+
+def _source_hints_note(hints: list[str]) -> str:
+    """Turn the planner's `source_hints` into tool choices the worker knows.
+
+    The hints were only ever stored on the run record for the console to show,
+    so planner.md's promise that they "steer tool choice" reached nobody: a
+    researcher cannot see the plan, and its `QUESTION:` is the whole brief.
+    Hints are named here as capabilities because that is what the planner was
+    told to write — `papers`, not `arxiv_search`.
+    """
+    if not hints:
+        return ""
+    VERB = {
+        "papers": "arxiv_search and openalex_search for preprints and "
+                  "peer-reviewed literature",
+        "preprints": "arxiv_search",
+        "scholar": "openalex_search and arxiv_search",
+        "wikipedia": "wikipedia_search for the overview, then fetch the "
+                     "sources IT cites — a Wikipedia page and the paper it "
+                     "cites are one source, not two",
+        "news": "news_search for dated reporting",
+        "archive": "wayback_fetch for a page that has moved or gone",
+        "web": "web_search",
+    }
+    lines = []
+    for h in hints:
+        key = str(h).strip().lower()
+        if key in VERB:
+            lines.append(f"  - {key} -> {VERB[key]}")
+        elif key:
+            lines.append(f"  - {key} -> choose the search tool that serves it")
+    if not lines:
+        return ""
+    return ("\n\nSOURCE HINTS for this facet — the planner named the kind of "
+            "material the document needs. Use the tool that serves each one, "
+            "alongside the general search:\n" + "\n".join(lines))
+
+
+def _research_effort_note(query: str) -> str:
+    """A worker-side effort cap for a short Authoring brief.
+
+    The researcher prompt is built for evidence-heavy documents: batch 6-20
+    authoritative URLs, then write up every page. On a one-page brief that
+    spends tens of thousands of input tokens on facts the document cannot
+    hold. This note is conditional so a deep report still gets the full fleet.
+    """
+    q = str(query or "")
+    if not DOCUMENT_INTENT_RE.search(q):
+        return ""
+    try:
+        cap = ceiling_for(q, "author")
+        floor, _label = length_target(q, "author")
+    except Exception:
+        return ""
+    if cap:
+        return (
+            "\n\nRESEARCH EFFORT - this document is explicitly short. Use at "
+            "most 3 authoritative sources and one focused search; write findings "
+            "under about 700 words. Do not exhaustively research a brief. Keep "
+            "the facts the document can actually use."
+        )
+    # A normal authoring document still does not need the researcher's
+    # default 6-20 URL fleet per facet: the section writer consumes a bounded
+    # evidence pack, and four good sources are enough for 1,500-6,000 words.
+    if 0 < floor < 6_000:
+        return (
+            "\n\nRESEARCH EFFORT - this is one facet of a longer document. "
+            "Use at most 4 authoritative sources and 3-5 fetched pages for "
+            "your facet; write findings of roughly 700-1,200 words. Prefer "
+            "different sources over many pages of one. Stop when the facet "
+            "is covered; the document needs facts, not a page dump."
+        )
+    if floor <= 0:
+        return (
+            "\n\nRESEARCH EFFORT - this request is a comparison/short "
+            "document with no page floor. Use at most 3 authoritative sources "
+            "for your facet and keep findings under 900 words."
+        )
+    return ""
+
+
+def document_quality_error(words: int, sections: int, query: str,
+                           skill_name: str) -> str:
+    """Reject a file that exists but is not the document that was asked for.
+
+    Live failure: the author returned a 9-word PDF titled "Test" and the run
+    reported success because a file existed. A file is not a document. The
+    guard is deliberately low - it catches degenerate output, not brevity the
+    user requested.
+    """
+    try:
+        floor, _label = length_target(query, skill_name)
+        cap = ceiling_for(query, skill_name)
+    except Exception:
+        floor, cap = 0, 0
+    min_words = 20
+    if floor > 0:
+        min_words = max(min_words, min(250, int(floor * 0.12)))
+    if sections <= 0 and words < 50:
+        return (f"{skill_name} produced {words} words and no sections; "
+                f"that is not a usable document")
+    if words < min_words:
+        return (f"{skill_name} produced only {words} words; the request "
+                f"needs at least about {min_words} before it can be a document")
+    return ""
+
+
 def _format_requested_in(text: str) -> str:
     """The file format the USER explicitly asked for, or "".
 
@@ -2096,41 +3136,117 @@ def _balanced_object(t: str) -> str | None:
     return None
 
 
+# The characters that may legally follow a backslash inside a JSON string.
+_JSON_ESCAPES = set('"\\/bfnrtu')
+
+# Cheap "does this reply contain LaTeX at all" probe: a backslash glued to two
+# or more letters. Used only to decide whether to run the repair pass first.
+_LATEX_IN_JSON_R = re.compile(r"\\[a-zA-Z]{2,}")
+
+# LaTeX commands whose first letter collides with a JSON escape (`\beta`,
+# `\frac`, `\nu`, `\rho`, `\theta`, `\underbrace`...). Read as JSON these
+# silently become a control character, which is how `\theta` turned into a TAB
+# plus "heta" in a live render.
+_LATEX_NEAR_ESCAPES = {
+    "beta", "bar", "binom", "boldsymbol", "bm", "bmod",
+    "frac", "forall", "fbox",
+    "nu", "nabla", "ne", "neq", "notin", "nexists",
+    "rho", "right", "rightarrow", "Rightarrow", "rangle", "rvert", "Vert",
+    "real", "ref", "resizebox",
+    "tau", "theta", "vartheta", "times", "text", "textrm", "textbf", "textit",
+    "to", "top", "triangle", "tilde", "tanh", "tan",
+    "underbrace", "underline", "uparrow", "upsilon", "Upsilon", "union",
+    "sum", "Sigma", "sigma", "sqrt", "sim", "simeq", "subset", "subseteq",
+    "supset", "supseteq", "star", "setminus",
+    "alpha", "gamma", "Gamma", "delta", "Delta", "epsilon", "varepsilon",
+    "eta", "zeta", "iota", "kappa", "lambda", "Lambda", "mu", "pi", "Pi",
+    "phi", "varphi", "Phi", "chi", "psi", "Psi", "omega", "Omega",
+    "le", "leq", "ge", "geq", "cdot", "circ", "cline",
+    "in", "infty", "int", "oint", "prod", "partial", "prime",
+    "left", "langle", "ll", "llangle", "lspace",
+    "mathcal", "mathbb", "mathbf", "mathrm", "mathit", "mathsf", "mathtt",
+    "mathop", "operatorname", "boldsymbol",
+    "odot", "o", "oint",
+    "hbar", "hat", "widehat", "hline",
+    "ell", "exists", "equiv", "emptyset",
+    "qquad", "quad", "dot", "ddot", "dots", "ldots", "cdots",
+    "vec", "varepsilon", "vee", "wedge", "xi", "Xi", "xrightarrow",
+    "approx", "aleph", "arkmathchardef",
+}
+
+
+def _is_latex_escape(t: str, i: int) -> bool:
+    r"""Does the backslash at `i` start a LaTeX command rather than a JSON escape?
+
+    JSON escapes are exactly one character after the backslash (`\t`, `\n`,
+    `\b`, `\f`, `\r`, `\"`, `\\`, `\/`, or `\uXXXX`), so a backslash followed by
+    a recognised command name cannot have been meant as one. The name has to
+    end at a non-letter: `"a\nnext"` keeps its newline, because `ne` is a
+    command but `x` follows it.
+    """
+    if t[i + 1:i + 2].lower() == "u" and re.match(r"[0-9a-fA-F]{4}",
+                                                  t[i + 2:i + 6] or ""):
+        return False
+    j = i + 1
+    while j < len(t) and t[j].isalpha():
+        j += 1
+    run = t[i + 1:j]
+    # The WHOLE letter run has to be the command name. Matching a prefix would
+    # read `"a\nnext"` as `\ne` + "xt" and turn a plain newline into a literal
+    # backslash.
+    return len(run) >= 2 and run in _LATEX_NEAR_ESCAPES
+
+
 def _repair_json(t: str) -> str:
     """Fix the JSON defects models actually emit, without touching valid JSON.
 
     * raw control characters inside string literals (a literal newline in a
-      "findings" string is the single most common one), and
+      "findings" string is the single most common one),
+    * a backslash JSON cannot interpret, and
+    * a LaTeX command that JSON would read as a control character, and
     * trailing commas before `}` / `]`.
     """
-    out = []
+    out: list[str] = []
     in_str = False
-    esc = False
-    for ch in t:
-        if in_str:
-            if esc:
-                esc = False
-                out.append(ch)
-                continue
-            if ch == "\\":
-                esc = True
-                out.append(ch)
-                continue
+    i, n = 0, len(t)
+    while i < n:
+        ch = t[i]
+        if not in_str:
             if ch == '"':
-                in_str = False
-                out.append(ch)
-                continue
-            if ord(ch) < 0x20:
-                # Escape it: \n, \t, \r and the rest.
-                out.append({0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
-                            0x0D: "\\r", 0x0C: "\\f"}.get(ord(ch),
-                                                           f"\\u{ord(ch):04x}"))
-                continue
+                in_str = True
             out.append(ch)
+            i += 1
             continue
         if ch == '"':
-            in_str = True
+            in_str = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            # A single backslash before anything outside JSON's set makes the
+            # ENTIRE document unparseable, and LaTeX inside a string is exactly
+            # that: a section whose prose contained "$\mathcal{O}(N^2)$" failed
+            # all three parse attempts and its raw ```json spec was printed onto
+            # the page as a paragraph. Doubling keeps the author's text and
+            # yields a literal "\mathcal{O}(N^2)", which the renderer turns into
+            # O(N²) - see docgen._rich's math normalisation.
+            nxt = t[i + 1:i + 2]
+            if nxt not in _JSON_ESCAPES or _is_latex_escape(t, i):
+                out.append("\\\\")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ord(ch) < 0x20:
+            # Escape it: \n, \t, \r and the rest.
+            out.append({0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+                        0x0D: "\\r", 0x0C: "\\f"}.get(ord(ch),
+                                                      f"\\u{ord(ch):04x}"))
+            i += 1
+            continue
         out.append(ch)
+        i += 1
     s = "".join(out)
     # Trailing commas: `,}` / `,]` but never inside a string.
     fixed = []
@@ -2176,6 +3292,20 @@ def parse_skill_json(text: str) -> dict:
         if t.endswith("```"):
             t = t[:-3]
         t = t.strip()
+
+    # 0. LaTeX before anything else, because a LaTeX reply is valid JSON that
+    # means the wrong thing: `\theta` parses as a TAB plus "heta" and `\frac`
+    # as a form feed plus "rac", so the section renders and nothing reports a
+    # failure. Repairing first is safe either way — `_is_latex_escape` only
+    # rewrites a backslash whose whole letter run is a real command name, so
+    # `"a\nnext"` still gets its newline.
+    if _LATEX_IN_JSON_R.search(t):
+        try:
+            val = json.loads(_repair_json(t))
+            if isinstance(val, dict):
+                return val
+        except json.JSONDecodeError:
+            pass
 
     # 1. As-is.
     try:
@@ -2231,6 +3361,59 @@ def take_browser_artifacts(session_id: str) -> list[str]:
 # ── MCP tool schemas exposed through the gateway tools= channel ──────────────
 
 _TOOL_CATALOG = {
+    "search_images": {
+        "name": "search_images",
+        "description": (
+            "Find CC-licensed pictures for a document, with the licence and "
+            "creator attached. Returns candidates only — nothing is stored until "
+            "`fetch_image`. Use it when a figure would carry real information a "
+            "paragraph cannot: a place, an artifact, a diagram, a period "
+            "photograph. Openverse specifically rather than a general image "
+            "engine, precisely because every result arrives with a licence to "
+            "credit. `commercial_only=True` narrows to licences allowing "
+            "commercial use. Not for decorative filler."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "What the picture should show."},
+                "max_results": {"type": "integer",
+                                "description": "Candidates to return, 1-20, "
+                                               "default 8."},
+                "commercial_only": {"type": "boolean",
+                                    "description": "Restrict to commercially "
+                                                   "usable licences."},
+            },
+            "required": ["query"],
+        },
+    },
+    "fetch_image": {
+        "name": "fetch_image",
+        "description": (
+            "Download one licensed image and file it into Documents so a document "
+            "can embed it. This is what makes `render_document`'s `image` block "
+            "usable for anything the user did not upload themselves: it returns "
+            "the exact block to paste — {\"type\":\"image\",\"document\":..., "
+            "\"page\":1,\"index\":0} — already resolved. `url` must come from "
+            "`search_images`. Guards: http(s) only, the host and every address it "
+            "resolves to must be publicly routable, redirects are re-checked hop "
+            "by hop, content type AND magic bytes must agree it is PNG or JPEG, "
+            "and a 12MB cap. Pass `credit` (creator + licence) and put the same "
+            "text in the caption."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string",
+                        "description": "The image_url from search_images."},
+                "credit": {"type": "string",
+                           "description": "Attribution for the caption, e.g. "
+                                          "\"Ann Thorpe — CC BY-SA 2.0\"."},
+                "filename": {"type": "string",
+                             "description": "Name to file it under."},
+            },
+            "required": ["url"],
+        },
+    },
     "render_document": {
         "name": "render_document",
         "description": (
@@ -2583,6 +3766,24 @@ _TOOL_CATALOG = {
             "required": ["query"],
         },
     },
+    "read_document": {
+        "name": "read_document",
+        "description": ("Read an indexed document in document order, chunk by "
+                        "chunk, with the full text of each chunk. Use it when "
+                        "the document itself is the subject - summarising it, "
+                        "walking its sections, checking an early claim against "
+                        "the end - instead of search_knowledge, which ranks by "
+                        "similarity and never shows most of the file."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doc_id": {"type": "string"},
+                "start_chunk": {"type": "integer", "default": 0},
+                "count": {"type": "integer", "default": 24},
+            },
+            "required": ["doc_id"],
+        },
+    },
     "send_telegram": {
         "name": "send_telegram",
         "description": "Send a text message to a Telegram chat via the gateway (gateway-owned bot credential).",
@@ -2626,7 +3827,7 @@ _TOOL_CATALOG = {
     },
     "calendar_query": {
         "name": "calendar_query",
-        "description": "List Google Calendar events, read-only (defaults now → +7 days; RFC3339 bounds).",
+        "description": "List Google Calendar events, read-only (defaults now -> +7 days; RFC3339 bounds).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2885,6 +4086,80 @@ _TOOL_CATALOG = {
         "description": "List all scheduled tasks/reminders with their ids, run times, and status.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    "whats_new": {
+        "name": "whats_new",
+        "description": (
+            "What has changed since a given moment: documents, memory, runs, apps "
+            "and produced artifacts, as a bounded index of pointers plus one line "
+            "each — never file contents. Use it for questions about CHANGE ('what "
+            "did the user add since this morning', 'has that document finished "
+            "indexing', 'did anything arrive for the thing I was waiting on') "
+            "rather than about a fact. Reuse the `cursor` from a previous answer "
+            "as `since` to move forward without re-seeing the same changes, or "
+            "pass `conversation_id` to use this conversation's own watermark. "
+            "`counts` and `truncated` say how much was left out, so a big change "
+            "set reads as big instead of quietly short."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string",
+                          "description": "A cursor from an earlier whats_new, or "
+                                         "an epoch/ISO time. Empty with no "
+                                         "conversation_id means 'everything'."},
+                "surfaces": {"type": "string",
+                             "description": "Comma-separated subset of: documents, "
+                                            "memory, runs, apps, artifacts."},
+                "conversation_id": {"type": "string",
+                                    "description": "Use and advance this "
+                                                   "conversation's watermark."},
+                "limit": {"type": "integer",
+                          "description": "Entries per surface, 1-100, default 25."},
+            },
+        },
+    },
+    "schedule_wake": {
+        "name": "schedule_wake",
+        "description": (
+            "Arm your own next wake-up: a cheap repeated look that reports back "
+            "into this conversation only when the thing you named has changed. "
+            "Use it when the work depends on something that has not happened yet "
+            "— a reply that has not arrived, a document still indexing, numbers "
+            "that will land later. This is a POLL, not a one-shot reminder: "
+            "`schedule_task` does a thing at a time, `schedule_wake` watches "
+            "until a thing is true. Each tick asks the change index a model-free "
+            "question; a tick that matches nothing spends nothing and quietly "
+            "re-arms, for up to 24 hours. A tick that matches gets a real turn. "
+            "`reason` is required and must say both what you are waiting for and "
+            "what to do when it arrives — the user reads that line on the "
+            "Scheduler page, and a wake without a stated reason is refused. "
+            "Offer it, do not use it unasked: a watch is standing behaviour the "
+            "user has to live with."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string",
+                           "description": "What you are waiting for AND what to "
+                                          "do when it arrives. User-visible."},
+                "every": {"type": "string",
+                          "description": "How often to look, e.g. '30m', '2h'. "
+                                         "Clamped to a 10-minute floor."},
+                "surface": {"type": "string",
+                            "description": "Narrow the look to one surface: "
+                                           "documents, memory, runs, apps or "
+                                           "artifacts."},
+                "match": {"type": "string",
+                          "description": "Small term filter as JSON, e.g. "
+                                         '{"filename": "solar"}. All terms must '
+                                         "match."},
+                "conversation_id": {"type": "string",
+                                    "description": "Conversation the wake reports "
+                                                   "back into."},
+            },
+            "required": ["reason"],
+        },
+    },
     "cancel_scheduled": {
         "name": "cancel_scheduled",
         "description": "Cancel a previously scheduled task by its id (from list_scheduled).",
@@ -3062,6 +4337,25 @@ _TOOL_CATALOG = {
             "required": [],
         },
     },
+    "git_action": {
+        "name": "git_action",
+        "description": "Run one curated git verb: status/diff/log/branches read; stage/unstage/branch_create write the index or a branch; commit/stash/stash_pop/branch_switch/restore move HEAD or discard work and park for human approval. push/reset/clean/checkout/rebase/merge/init/amend are refused. Prefer this over shelling git so the action is journalled and reviewable.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string",
+                           "enum": ["status", "diff", "log", "branches",
+                                    "stage", "unstage", "commit", "stash",
+                                    "stash_pop", "branch_create",
+                                    "branch_switch", "restore"]},
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "message": {"type": "string"},
+                "name": {"type": "string"},
+                "path": {"type": "string", "default": "."},
+            },
+            "required": ["action"],
+        },
+    },
     "find_symbol": {
         "name": "find_symbol",
         "description": "Find where a function/class is DEFINED and every place it is USED, with line numbers and definitions reported separately from call sites. Better than regex search, which cannot tell a definition from a use.",
@@ -3218,6 +4512,245 @@ _TOOL_CATALOG = {
     },
 }
 
+# Section tools (Parts, Apps) live in the agent process, not the MCP child:
+# they read and write the part/app stores and the job registry, which the
+# child cannot see without becoming a second writer. They are kept in their
+# own catalog: `_TOOL_CATALOG` means "reachable over MCP", and merging local
+# tools into it would break that invariant (tests/test_mcp_tool_reachability).
+# `tool_payload` consults both, so `tools_allowed` remains the one grant
+# mechanism; local calls are answered by `local_tools.dispatch` through the
+# extra_dispatch hook.
+try:
+    import local_tools as _local_tools
+except Exception as _lt_exc:  # pragma: no cover - import-time environment
+    _local_tools = None
+    print(f"[skills] WARNING: local section tools unavailable: {_lt_exc!r}")
+
+# Blender tools live in the MCP child and talk to the live addon. Their schemas
+# are declared here so a skill grant is still the only way the model sees them.
+_TOOL_CATALOG.update({
+    "blender_status": {
+        "name": "blender_status",
+        "description": "Report the Blender executable, live GUI session, headless worker and versions.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "blender_catalog": {
+        "name": "blender_catalog",
+        "description": ("Discover Blender operators and their parameters from Blender's own RNA. "
+                        "Call this before guessing an operator or parameter."),
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search modifier, boolean, remesh, uv, sculpt, render..."},
+            "limit": {"type": "integer", "description": "Max operators (1-100)."},
+        }, "required": []},
+    },
+    "blender_part_op": {
+        "name": "blender_part_op",
+        "description": ("Run one Blender operator on a saved part version and save the result as a new "
+                        "immutable version. Modifiers are applied before measurement."),
+        "input_schema": {"type": "object", "properties": {
+            "part": {"type": "string", "description": "Part id or exact name."},
+            "operator": {"type": "string", "description": "bpy.ops id, e.g. object.modifier_add."},
+            "version": {"type": "string", "description": "Optional source version."},
+            "params": {"type": "object", "description": "Operator parameters discovered from the catalog."},
+        }, "required": ["part", "operator"]},
+    },
+    "blender_part_render": {
+        "name": "blender_part_render",
+        "description": "Render a saved part version with headless Blender/EEVEE; returns the PNG path.",
+        "input_schema": {"type": "object", "properties": {
+            "part": {"type": "string"}, "version": {"type": "string"},
+            "width": {"type": "integer"}, "height": {"type": "integer"},
+            "samples": {"type": "integer"},
+        }, "required": ["part"]},
+    },
+    "blender_rna_get": {
+        "name": "blender_rna_get",
+        "description": "Read a Blender RNA path from the live worker, e.g. bpy.context.scene.render.engine.",
+        "input_schema": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path starting with bpy."},
+        }, "required": ["path"]},
+    },
+    "blender_rna_set": {
+        "name": "blender_rna_set",
+        "description": "Set a Blender RNA path on the live worker. Pair with a versioned operation/export.",
+        "input_schema": {"type": "object", "properties": {
+            "path": {"type": "string"}, "value": {},
+        }, "required": ["path", "value"]},
+    },
+    "blender_python": {
+        "name": "blender_python",
+        "description": ("Execute Python inside Blender for operations not covered by catalog/RNA tools. "
+                        "Disabled unless the host explicitly enables ARIA_BLENDER_ALLOW_PYTHON."),
+        "input_schema": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python using bpy; the user must approve."},
+        }, "required": ["code"]},
+    },
+})
+
+
+# The browser, as MCP tools. Aria has had a browser as a DAG node for a long
+# time and never as something an agent could USE: no `@mcp.tool()` verbs, so no
+# interactive surface could reach one, and the dev loop the studio exists for
+# was impossible on principle. They run in the MCP child over the session-scoped
+# context in `browser_session.py`, and they are granted like every other tool —
+# `_TOOL_CATALOG` means reachable, `tools_allowed` means to whom, and the
+# calling context decides which surface actually hands them to the model.
+_TOOL_CATALOG.update({
+    "browser_open": {
+        "name": "browser_open",
+        "description": ("Open a URL in THIS SESSION's browser and reuse the one already "
+                        "running, so a login or a dev server's state survives to the next "
+                        "call. Reaches anything this machine can, including "
+                        "http://localhost:*. Returns the URL, status and title it got."),
+        "input_schema": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "headed": {"type": "boolean",
+                       "description": "Ask for a visible window. Does not restart a "
+                                      "running headless context — that loses the page."},
+        }, "required": ["url"]},
+    },
+    "browser_status": {
+        "name": "browser_status",
+        "description": ("Whether a browser is running for this session: tabs, url, action "
+                        "count, console errors and idle budget."),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "browser_snapshot": {
+        "name": "browser_snapshot",
+        "description": ("The page's interactive elements as addressable marks — "
+                        "`[3]<button role=\"submit\">Save</button>` — with the epoch they "
+                        "belong to. Call it before acting."),
+        "input_schema": {"type": "object", "properties": {
+            "max_elements": {"type": "integer", "default": 120},
+        }, "required": []},
+    },
+    "browser_read": {
+        "name": "browser_read",
+        "description": ("Read the page: text (what a person sees), html, or links. Reports "
+                        "chars and truncated, so a long page is known to be long."),
+        "input_schema": {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": ["text", "html", "links"], "default": "text"},
+            "limit": {"type": "integer", "default": 6000},
+        }, "required": []},
+    },
+    "browser_screenshot": {
+        "name": "browser_screenshot",
+        "description": "A picture of the page, filed as a session artifact with a served URL.",
+        "input_schema": {"type": "object", "properties": {
+            "full_page": {"type": "boolean", "default": False},
+        }, "required": []},
+    },
+    "browser_click": {
+        "name": "browser_click",
+        "description": ("Click a snapshot mark or a CSS selector and report the URL, title "
+                        "and console errors the click ACTUALLY produced. A stale epoch is "
+                        "refused rather than aimed at whatever moved into those pixels."),
+        "input_schema": {"type": "object", "properties": {
+            "mark": {"type": "integer"}, "selector": {"type": "string"},
+            "epoch": {"type": "integer", "default": -1},
+            "double": {"type": "boolean", "default": False},
+        }, "required": []},
+    },
+    "browser_fill": {
+        "name": "browser_fill",
+        "description": "Type into a field by mark or selector, then report the page after.",
+        "input_schema": {"type": "object", "properties": {
+            "text": {"type": "string"}, "mark": {"type": "integer"},
+            "selector": {"type": "string"},
+            "clear_first": {"type": "boolean", "default": False},
+            "epoch": {"type": "integer", "default": -1},
+        }, "required": ["text"]},
+    },
+    "browser_press": {
+        "name": "browser_press",
+        "description": "One keystroke to the focused element (Enter, Tab, Escape).",
+        "input_schema": {"type": "object", "properties": {
+            "key": {"type": "string", "default": "Enter"},
+        }, "required": []},
+    },
+    "browser_scroll": {
+        "name": "browser_scroll",
+        "description": "Scroll the page by a pixel amount.",
+        "input_schema": {"type": "object", "properties": {
+            "dx": {"type": "integer", "default": 0},
+            "dy": {"type": "integer", "default": 600},
+        }, "required": []},
+    },
+    "browser_history": {
+        "name": "browser_history",
+        "description": "Back or forward in this tab's own history.",
+        "input_schema": {"type": "object", "properties": {
+            "back": {"type": "boolean", "default": True},
+        }, "required": []},
+    },
+    "browser_wait": {
+        "name": "browser_wait",
+        "description": ("Wait for a real condition — a selector visible, or the network "
+                        "idle — instead of sleeping. Names the condition and the budget "
+                        "when it does not happen."),
+        "input_schema": {"type": "object", "properties": {
+            "selector": {"type": "string"},
+            "state": {"type": "string", "enum": ["visible", "hidden", "attached",
+                                                  "detached"], "default": "visible"},
+            "ms": {"type": "integer", "default": 5000},
+        }, "required": []},
+    },
+    "browser_console": {
+        "name": "browser_console",
+        "description": ("What the page's JavaScript said: console output and uncaught "
+                        "errors, with how many the ring dropped. The only way to know a "
+                        "front-end change you made actually runs."),
+        "input_schema": {"type": "object", "properties": {
+            "errors_only": {"type": "boolean", "default": True},
+        }, "required": []},
+    },
+    "browser_network": {
+        "name": "browser_network",
+        "description": "Every request this page made and the status it got back.",
+        "input_schema": {"type": "object", "properties": {
+            "errors_only": {"type": "boolean", "default": False},
+        }, "required": []},
+    },
+    "browser_tab": {
+        "name": "browser_tab",
+        "description": ("Tabs: list, new, select, close. Up to 8; the last tab stays until "
+                        "the browser is closed."),
+        "input_schema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "new", "select", "close"],
+                       "default": "list"},
+            "url": {"type": "string"}, "index": {"type": "integer", "default": 0},
+        }, "required": []},
+    },
+    "browser_evaluate": {
+        "name": "browser_evaluate",
+        "description": ("Run JavaScript in the page and return the value, script capped at "
+                        "4000 characters. For state a snapshot cannot show: computed style, "
+                        "the app's store."),
+        "input_schema": {"type": "object", "properties": {
+            "script": {"type": "string"},
+        }, "required": ["script"]},
+    },
+    "browser_verify": {
+        "name": "browser_verify",
+        "description": ("Did the page actually work? Navigates, waits, asserts the text or "
+                        "element the change was supposed to produce, then returns console "
+                        "errors, failed requests and a screenshot. An assertion-free call "
+                        "reports nothing_checked rather than a pass."),
+        "input_schema": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "expect_text": {"type": "string"},
+            "expect_selector": {"type": "string"},
+            "wait_ms": {"type": "integer", "default": 6000},
+            "screenshot": {"type": "boolean", "default": True},
+        }, "required": []},
+    },
+    "browser_close": {
+        "name": "browser_close",
+        "description": "Close this session's browser and free the Chromium process.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+})
+
 
 def _disabled_tools() -> "set | None":
     """Operator tool guard (Skills page). Live-read, no restart.
@@ -3284,14 +4817,34 @@ def tool_payload(tool_names: list[str]) -> list[dict] | None:
               "— withholding all tools for this run")
         return None
     tool_names = [n for n in tool_names if n not in disabled]
+    # Feature switches withhold their tools from the payload as well as refusing
+    # at the tool, so a switched-off capability is invisible rather than a
+    # promise the model will make and then break. `documents.image_search` off
+    # must mean the author is never shown `search_images` — the refusal text is
+    # a backstop for a stale process, not the mechanism.
+    try:
+        import flags as _f
+        if not _f.is_enabled("documents.image_search", True):
+            tool_names = [n for n in tool_names
+                          if n not in ("search_images", "fetch_image")]
+    except Exception:
+        pass
+
+    def _entry(name: str):
+        if name in _TOOL_CATALOG:
+            return _TOOL_CATALOG[name]
+        if _local_tools is not None:
+            return _local_tools.SCHEMAS.get(name)
+        return None
+
     # Fail LOUD on unknown names (previously silently dropped, leaving the
     # model with fewer tools and no diagnostic anywhere).
-    missing = [n for n in tool_names if n not in _TOOL_CATALOG]
+    missing = [n for n in tool_names if _entry(n) is None]
     if missing:
         print(f"[skills] WARNING: tools_allowed lists unknown tools {missing} "
-              f"(not in _TOOL_CATALOG) — they will be skipped. "
-              f"Add them to _TOOL_CATALOG or fix agent_config.yaml.")
-    return [_TOOL_CATALOG[n] for n in tool_names if n in _TOOL_CATALOG]
+              f"(not in _TOOL_CATALOG or local_tools) — they will be skipped. "
+              f"Fix agent_config.yaml.")
+    return [e for n in tool_names if (e := _entry(n)) is not None]
 
 
 # ── per-node execution ───────────────────────────────────────────────────────
@@ -3345,12 +4898,24 @@ policy_notes: list | None = None,
                              prior_turns=prior_turns,
                              policy_notes=policy_notes,
                              budget_note=budget_note)
+    if skill.name == "researcher":
+        rendered += _research_effort_note(query)
+        _h = node_meta.get("source_hints") if isinstance(node_meta, dict) else None
+        if isinstance(_h, list):
+            rendered += _source_hints_note([str(x) for x in _h][:6])
     # Writing skills get a concrete length target computed from the request.
     # Without it the model resolved "length follows the request" toward the
     # shortest document that technically answers, which is how a request for
     # a 300-page whitepaper shipped 16 words.
+    #
+    # The document writers also get the figure handles their `image` block
+    # needs: the renderer could always lift an embedded raster out of an
+    # uploaded document, but nothing ever told the author which ones exist.
+    figures = ""
     if skill.name in ("author", "deck"):
         rendered = rendered + length_contract(query, skill.name)
+        figures = _figures_context(doc_ids)
+        rendered = rendered + figures
     started = time.time()
 
     if skill.name == "sandbox_executor":
@@ -3386,7 +4951,7 @@ policy_notes: list | None = None,
 
     if skill.name == "browser":
         # Same shape as sandbox_executor: the Browser skill owns its own
-        # cascade (extract → deterministic → a11y → vision) and never
+        # cascade (extract -> deterministic -> a11y -> vision) and never
         # touches the LLM tool/text channel — so we bypass render_prompt
         # and the gateway-chat dispatch entirely and hand off to
         # BrowserSkill.run(NodeSpec).
@@ -3542,7 +5107,7 @@ policy_notes: list | None = None,
                 elapsed_s=time.time() - started,
             ), rendered
         # Same shape as browser: the Computer-Use skill owns its layered
-        # cascade (L1 extract → L2a deterministic → L2b a11y → L3 vision)
+        # cascade (L1 extract -> L2a deterministic -> L2b a11y -> L3 vision)
         # over cua-driver and never touches the LLM tool/text channel — so
         # we bypass render_prompt and the gateway-chat dispatch and hand
         # off to ComputerUseSkill.run(goal). The V9 gateway is used
@@ -3624,6 +5189,62 @@ policy_notes: list | None = None,
             elapsed_s=time.time() - started,
         ), rendered
 
+    if skill.name == "app_builder":
+        # Deterministic section node: the app builder already is the agent
+        # for app design. Wrapping it in a second LLM call would add latency
+        # without adding capability; the DAG still owns the run, the trace,
+        # the skill grant and the persistence step.
+        meta = graph_nodes[node_id].get("metadata") or {}
+        description = str(meta.get("description") or query or "").strip()
+        mode = str(meta.get("mode") or "build").strip().lower()
+        try:
+            import agent_server as _srv
+            import apps as _apps
+            if mode in ("action", "refresh"):
+                existing = meta.get("existing")
+                event = meta.get("event") if mode == "action" else None
+                if not isinstance(existing, dict):
+                    raise ValueError("this mode needs an existing app")
+                if mode == "action" and not isinstance(event, dict):
+                    raise ValueError("an app action needs an event")
+                updated = await _srv._app_builder_generate(
+                    str(existing.get("description") or existing.get("name") or description),
+                    existing=existing, event=event, mode=mode)
+                saved = _apps.save_a2ui_surface(
+                    str(existing.get("id") or ""), updated["surface"],
+                    updated.get("state"), event)
+                if saved is None:
+                    raise ValueError("app disappeared while the action ran")
+                output = {
+                    "app_id": saved.get("id"),
+                    "kind": "a2ui",
+                    "mode": mode,
+                    "action": event.get("action") if event else None,
+                    "surface_components": len(
+                        (saved.get("surface") or {}).get("components") or []),
+                }
+            else:
+                spec = await _srv._app_builder_generate(description, mode="build")
+                if meta.get("name"):
+                    spec["name"] = str(meta["name"])[:80]
+                created = _apps.create_app(spec)
+                output = {
+                    "app_id": created.get("id"),
+                    "name": created.get("name"),
+                    "kind": created.get("kind"),
+                    "schedule": created.get("schedule"),
+                    "surface_components": len(
+                        (created.get("surface") or {}).get("components") or []),
+                }
+            return AgentResult(
+                success=True, agent_name=skill.name, output=output,
+                elapsed_s=time.time() - started), rendered
+        except Exception as exc:
+            return AgentResult(
+                success=False, agent_name=skill.name,
+                error=f"{type(exc).__name__}: {exc}"[:800],
+                elapsed_s=time.time() - started), rendered
+
     tools = tool_payload(skill.tools_allowed)
     # The AUTHORITATIVE record of what the run actually produced.
     #
@@ -3692,10 +5313,17 @@ policy_notes: list | None = None,
             actually received were the model's own and the user's chosen
             format, page and style were quietly discarded.
             """
-            if name != "render_document" or not _forced or not isinstance(args, dict):
+            if name != "render_document" or not isinstance(args, dict):
                 return args
             try:
                 merged = dict(args)
+                _bl = merged.get("blocks")
+                if isinstance(_bl, list) and _bl:
+                    # The model sometimes uses the request itself as the H1.
+                    # That rendered at heading size on every page and made the
+                    # document count as one section.
+                    merged["blocks"] = _strip_request_headings(
+                        _bl, query, _document_title(merged, query))
                 f = _forced.get("format")
                 if f and f != "auto":
                     merged["format"] = f
@@ -3703,6 +5331,27 @@ policy_notes: list | None = None,
                             "style", "citation_style", "slide_size"):
                     if _forced.get(key):
                         merged[key] = _forced[key]
+                # The model usually leaves style at the default. Pick a
+                # content-driven style when neither the user nor the model
+                # named one, so every document is not the same A4 report.
+                if not _forced.get("style") and (
+                        not merged.get("style")
+                        or str(merged.get("style")).lower() == "report"):
+                    auto_style = _auto_document_style(query)
+                    if auto_style != "report":
+                        merged["style"] = auto_style
+                # A newsletter is two-column. The model (or a recovery
+                # author) passing columns=1 silently undid the style.
+                if not _forced.get("columns") and str(
+                        merged.get("style") or "").lower() == "newsletter":
+                    merged["columns"] = 2
+                # Same for references: researcher sources are already in the
+                # inputs, so a researched document should not ship without a
+                # bibliography because the model forgot the field.
+                if not merged.get("references"):
+                    refs = _references_from_resolved(resolved)
+                    if refs:
+                        merged["references"] = refs
                 if _forced.get("running_header"):
                     # The panel asked for a header, not for particular words:
                     # use the document's own title, which is what a reader
@@ -3723,8 +5372,9 @@ policy_notes: list | None = None,
                         }] + list(bl)
                 if _forced.get("columns"):
                     merged["columns"] = _forced["columns"]
-                print(f"[skills] {skill.name}: applied the user's setup "
-                      f"{sorted(_forced)} to the render")
+                if _forced:
+                    print(f"[skills] {skill.name}: applied the user's setup "
+                          f"{sorted(_forced)} to the render")
                 return merged
             except Exception as e:
                 print(f"[skills] could not apply the setup: {e!r}")
@@ -3778,26 +5428,61 @@ policy_notes: list | None = None,
                 "stats": got.get("stats") or {},
             })
 
-        reply = await run_with_tools(
-            prompt=rendered,
-            tools_payload=tools,
-            agent=skill.name,
-            session_id=session_id,
-            provider_pin=skill.provider_pin,
-            max_tokens=skill.max_tokens,
-            temperature=skill.temperature,
-            # Deterministic tool-outcome memory: previously the only way an
-            # outcome was recorded was the model choosing to call
-            # remember(kind=tool_outcome) itself, so a tool that quietly
-            # returned nothing taught the agent nothing. Queued off the
-            # critical path in outcomes.py.
-            on_outcome=_capture,
-            prepare_fn=_prepare,
-            extra_dispatch=_computer_tool_dispatch,
-            max_tool_result_chars=skill.max_tool_result_chars,
-            capture_transcript=skill.sectioned_findings,
-            doc_ids=doc_ids,
-        )
+        # Section tools are fenced by THIS skill's grant, not by whatever
+        # names the model happens to emit. The schema list is the UI; this
+        # closure is the boundary.
+        _allowed_local = (set(skill.tools_allowed or [])
+                          & (_local_tools.LOCAL_TOOL_NAMES
+                             if _local_tools is not None else set()))
+
+        async def _dispatch_extra(name: str, args: dict):
+            if name in _allowed_local:
+                disabled_now = _disabled_tools()
+                if disabled_now is None or name in disabled_now:
+                    return json.dumps({
+                        "ok": False,
+                        "error": f"tool '{name}' is disabled by the operator"})
+                return await _local_tools.dispatch(name, args)
+            return await _computer_tool_dispatch(name, args)
+
+        async def _run_loop(prompt_text: str):
+            return await run_with_tools(
+                prompt=prompt_text,
+                tools_payload=tools,
+                agent=skill.name,
+                session_id=session_id,
+                provider_pin=skill.provider_pin,
+                max_tokens=skill.max_tokens,
+                temperature=skill.temperature,
+                max_hops=6,
+                # Deterministic tool-outcome memory: previously the only way an
+                # outcome was recorded was the model choosing to call
+                # remember(kind=tool_outcome) itself, so a tool that quietly
+                # returned nothing taught the agent nothing. Queued off the
+                # critical path in outcomes.py.
+                on_outcome=_capture,
+                prepare_fn=_prepare,
+                extra_dispatch=_dispatch_extra,
+                # 0 = no harness clip: a fetched page reaches the model in full.
+                # The per-skill char bound used to shorten every page a
+                # researcher read, which is a cap on the evidence itself.
+                max_tool_result_chars=0,
+                capture_transcript=skill.sectioned_findings,
+                doc_ids=doc_ids,
+            )
+
+        reply = await _run_loop(rendered)
+        if (skill.name in ("author", "deck") and not produced
+                and "empty reply" in str((reply or {}).get("error") or "")):
+            # Gemini sometimes completes a large author call with zero tokens.
+            # The rescue used to be a trimmed prompt, which bought a reply by
+            # throwing most of the research away. The retry now repeats the
+            # FULL evidence: a document too big for one call is handled by the
+            # sectioned expansion below, which spends calls on size rather than
+            # dropping content.
+            print(f"[skills] {skill.name}: empty reply; retrying once with "
+                  f"the complete prompt", flush=True)
+            reply = await _run_loop(rendered)
         # Whatever the model said about the artifact, the receipt uses this.
         _authoritative = produced
     elif skill.tools_allowed:
@@ -3893,6 +5578,33 @@ policy_notes: list | None = None,
     # {"text": "", "error": ...} when the model never produced final text.
     # parse_skill_json("") is {}, which used to return success=True with an
     # empty output — a silent false-success.
+    async def _sections_from_latest_render(files: list) -> list:
+        """Keep ONE rendered draft and still expand it to the length floor.
+
+        A live author made three render_document calls, then ended with an
+        empty summary. The node returned all three files (three near-identical
+        PDFs in the console) and skipped the sectioned rewrite entirely, so a
+        3,000-word request shipped an 1,725-word document. Having a file is not
+        a reason to stop working: the planner outline and the research are
+        still here, so the same writer runs on the latest render.
+        """
+        if not files:
+            return files
+        latest = files[-1]
+        try:
+            def _f(k, d=""):
+                return str(_forced.get(k) or d)
+            got = await _expand_document_sections(
+                skill, rendered, [], resolved, graph_nodes, query,
+                session_id, {}, str(latest.get("format") or "pdf"),
+                _forced, _f, latest, pre_rendered=True, figures=figures)
+            if isinstance(got, list) and got:
+                return got
+        except Exception as e:
+            print(f"[skills] {skill.name}: post-render expansion failed "
+                  f"{type(e).__name__}: {e}"[:200])
+        return [latest]
+
     if reply.get("error") and not (reply.get("text") or "").strip() \
             and not reply.get("tool_calls") and not _find["text"]:
         # The document EXISTS if the renderer ran, even when the model never
@@ -3903,12 +5615,13 @@ policy_notes: list | None = None,
         if _authoritative:
             print(f"[skills] {skill.name}: model never summarised the "
                   f"document, but {len(_authoritative)} file(s) were rendered")
+            _authoritative = await _sections_from_latest_render(_authoritative)
             return AgentResult(
                 success=True, agent_name=skill.name,
                 output={"produced": _authoritative,
-                        "filename": _authoritative[0].get("filename"),
-                        "format": _authoritative[0].get("format"),
-                        "artifact": _authoritative[0]["artifact"],
+                        "filename": _authoritative[-1].get("filename"),
+                        "format": _authoritative[-1].get("format"),
+                        "artifact": _authoritative[-1]["artifact"],
                         "summary": ("The document was rendered, but the "
                                     "assistant did not summarise it.")},
                 elapsed_s=time.time() - started,
@@ -3941,6 +5654,19 @@ policy_notes: list | None = None,
     # near-identically-named PDFs and the user had to guess which was which.
     # The latest render is the finished one, so it is the one that is kept -
     # see the collapse of `produced` below.
+
+    # A researcher that returned no findings is not a researcher that found
+    # nothing. See `empty_facet_error` for the ledger measurement behind it.
+    if _ef := empty_facet_error(skill.name, parsed, reply):
+        return AgentResult(
+            success=False, agent_name=skill.name, output=parsed,
+            elapsed_s=time.time() - started,
+            provider=reply.get("provider", ""),
+            error=_ef,
+        ), rendered
+    if _tn := thin_facet_notice(skill.name, parsed,
+                                node_meta.get("question") or query):
+        print(f"[skills] researcher: {_tn}")
 
     # The tool loop came back with nothing at all - no text, no tool call.
     # Observed live, repeatedly, on the author node: the prompt asks it to
@@ -4056,12 +5782,13 @@ policy_notes: list | None = None,
         if _authoritative:
             print(f"[skills] {skill.name}: {_why}, but "
                   f"{len(_authoritative)} file(s) were rendered")
+            _authoritative = await _sections_from_latest_render(_authoritative)
             return AgentResult(
                 success=True, agent_name=skill.name,
                 output={"produced": _authoritative,
-                        "filename": _authoritative[0].get("filename"),
-                        "format": _authoritative[0].get("format"),
-                        "artifact": _authoritative[0]["artifact"],
+                        "filename": _authoritative[-1].get("filename"),
+                        "format": _authoritative[-1].get("format"),
+                        "artifact": _authoritative[-1]["artifact"],
                         "summary": ("The document was rendered, but the "
                                     "assistant did not summarise it.")},
                 elapsed_s=time.time() - started,
@@ -4154,12 +5881,19 @@ policy_notes: list | None = None,
             _want_cover = bool(_forced.get("cover"))
             _blocks = [b for b in parsed["blocks"][:400]
                        if isinstance(b, dict)]
+            _blocks = _strip_request_headings(
+                _blocks, query, _document_title(parsed, query))
             if _want_cover and not any(b.get("type") == "cover"
                                        for b in _blocks):
                 _blocks = [{"type": "cover",
                             "title": str(parsed.get("title") or "")[:200],
                             "subtitle": str(parsed.get("subtitle") or "")[:300],
                             }] + _blocks
+            _style_name = (_f("style")
+                           or (str(parsed.get("style") or "")
+                               if str(parsed.get("style") or "").lower()
+                               not in ("", "report") else "")
+                           or _auto_document_style(query))
             got = _mcp.render_document(
                 format=fmt,
                 title=_document_title(parsed, query),
@@ -4171,11 +5905,14 @@ policy_notes: list | None = None,
                 page_size=_f("page_size"),
                 orientation=_f("orientation"),
                 margins=_f("margins"),
-                columns=int(_forced.get("columns") or parsed.get("columns") or 0),
-                style=_f("style"),
+                columns=_document_columns(_style_name, _forced.get("columns"),
+                                          parsed.get("columns")),
+                style=_style_name,
                 citation_style=_f("citation_style"),
-                references=parsed.get("references") if isinstance(
-                    parsed.get("references"), list) else None,
+                references=(parsed.get("references")
+                            if isinstance(parsed.get("references"), list)
+                            and parsed.get("references")
+                            else _references_from_resolved(resolved)),
                 slide_size=_f("slide_size"),
                 blocks=_blocks,
                 sheets=parsed.get("sheets") if isinstance(
@@ -4203,7 +5940,7 @@ policy_notes: list | None = None,
                 _authoritative = await _expand_document_sections(
                     skill, rendered, _blocks, resolved, graph_nodes, query,
                     session_id, parsed, fmt, _forced, _f, got,
-                    pre_rendered=False)
+                    pre_rendered=False, figures=figures)
             else:
                 _why = (f"spec fallback render failed: "
                         f"{str((got or {}).get('error') or got)[:250]}")
@@ -4254,21 +5991,21 @@ policy_notes: list | None = None,
                 skill, rendered, parsed.get("blocks") or [], resolved,
                 graph_nodes, query, session_id, parsed,
                 str(_authoritative.get("format") or "pdf"), _forced, _f,
-                _authoritative, pre_rendered=True)
+                _authoritative, pre_rendered=True, figures=figures)
         elif isinstance(_authoritative, list) and _authoritative:
             _cur = _authoritative[-1]
             _authoritative = await _expand_document_sections(
                 skill, rendered, parsed.get("blocks") or [], resolved,
                 graph_nodes, query, session_id, parsed,
                 str(_cur.get("format") or "pdf"), _forced, _f, _cur,
-                pre_rendered=True)
+                pre_rendered=True, figures=figures)
         elif produced:
             _cur = produced[-1]
             produced[:] = [await _expand_document_sections(
                 skill, rendered, parsed.get("blocks") or [], resolved,
                 graph_nodes, query, session_id, parsed,
                 str(_cur.get("format") or "pdf"), _forced, _f, _cur,
-                pre_rendered=True)[0]]
+                pre_rendered=True, figures=figures)[0]]
 
     # Collapse duplicate renders to the LAST one. The author often renders,
     # reads `stats.words`, and re-renders fuller; both files then reached
@@ -4339,6 +6076,22 @@ policy_notes: list | None = None,
         for k in ("artifact", "filename"):
             if parsed.get(k):
                 out.pop(k, None)
+
+    if skill.name in ("author", "deck") and _authoritative:
+        try:
+            _last = _authoritative[-1]
+            _stats = _last.get("stats") or {}
+            _qerr = document_quality_error(
+                int(_stats.get("words") or 0),
+                int(_stats.get("sections") or 0), query, skill.name)
+        except Exception:
+            _qerr = ""
+        if _qerr:
+            print(f"[skills] {skill.name}: {_qerr}")
+            return AgentResult(
+                success=False, agent_name=skill.name, output=parsed,
+                elapsed_s=time.time() - started,
+                provider=reply.get("provider", ""), error=_qerr), rendered
 
     return AgentResult(
         success=True,

@@ -5,6 +5,7 @@ import {
 import { Rail, TopBar, Empty, Stat, Pill, SkipLink } from '../components/ui';
 import { useMainId, useSectionActive } from '../components/KeepAlive';
 import { api, type ComputerApproval } from '../api';
+import { Pane } from '../lib/panes';
 
 /* The Computer view: the human half of the computer-use gate.
  *
@@ -156,9 +157,11 @@ export default function Computer() {
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Control
+          <Pane id="computer.badge">
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">
             {pending.length} pending
           </span>
+          </Pane>
         </div>
         <div className="space-y-1.5 px-2.5">
           {([['approvals', 'Approvals'], ['audit', 'Audit trail'], ['runs', 'Recordings']] as const).map(
@@ -177,13 +180,15 @@ export default function Computer() {
               </button>
             ))}
         </div>
+        <Pane id="computer.footer">
         <div className="mt-auto hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">
           {apps.length} apps · {running} running
         </div>
+        </Pane>
       </div>
 
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Computer">
+        <TopBar crumb="Computer" panes="computer">
           <Pill tone={!enabled ? 'muted' : mode === 'live' ? 'err' : 'muted'}>
             {!enabled ? '○ disabled' : mode === 'live' ? '● live mode' : '○ dry-run mode'}
           </Pill>
@@ -229,6 +234,10 @@ export default function Computer() {
               {flash}
             </p>
           )}
+          {/* One pane, two banners: they are mutually exclusive states of the
+              same read-only notice, and their className strings are identical,
+              so a boundary keyed on markup instead of text would grab both. */}
+          <Pane id="computer.banners">
           {!enabled && (
             <p className="mx-3.5 mb-3.5 mt-3 rounded-[10px] border border-amber-400/40 bg-amber-400/10 px-3.5 py-2.5 text-[12.5px] text-amber-100">
               <ShieldCheck size={13} className="mr-1.5 inline" />
@@ -249,6 +258,7 @@ export default function Computer() {
               machine into a target.
             </p>
           )}
+          </Pane>
 
           {tab === 'approvals' && (
             <section className="mx-3.5 mb-3.5 mt-3 overflow-hidden rounded-[10px] border border-white/10 bg-[#0e0e12]">

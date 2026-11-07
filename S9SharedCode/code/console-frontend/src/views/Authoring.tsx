@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
   FileDown, Loader2, AlertTriangle, Sparkles, LayoutGrid, ScrollText,
   Terminal, Download, History, FileText, Table2, Presentation,
+  Maximize2, MessageSquareText, Send, ArrowLeft,
 } from 'lucide-react';
 import { SkipLink, Rail, TopBar, Pill } from '../components/ui';
 import { useMainId, useSectionActive } from '../components/KeepAlive';
@@ -9,15 +11,29 @@ import { toast } from 'sonner';
 import { renderMarkdown } from '../components/markdown';
 import { api, headers, ago, displayTopic, type DocPreview, type SessionSummary } from '../api';
 import { DocumentViewer } from './DocSetup';
+import { DocumentModal, type DocumentTarget } from '../components/DocumentModal';
+import { ModelPicker } from '../components/ModelPicker';
+import { FilePreview } from '../components/FilePreview';
+import { type PdfQuote, type QuoteHit } from '../components/PdfViewer';
+import { answerCitations } from '../lib/citations';
+import { Pane } from '../lib/panes';
 
 type Kind = 'auto' | 'pdf' | 'pptx' | 'docx' | 'xlsx';
-type View = 'preview' | 'receipt' | 'log';
+type View = 'preview' | 'receipt' | 'log' | 'discuss';
 
-/* The output tabs, in the order the arrows walk them. */
+/* The output tabs, in the order the arrows walk them.
+
+   Focus is NOT in this list. It used to be a tab that re-skinned the Discuss
+   workspace, which left the tab strip, the top bar, the pills and the run's
+   chrome on screen — the opposite of what a reading mode is for. It is now its
+   own page at `/authoring/focus`, resolved to this same section by
+   `SUB_SECTIONS` in App.tsx so entering it never starts a new conversation,
+   and rendering nothing but the document and Aria. */
 const TABS: [View, string, typeof FileText][] = [
   ['preview', 'Preview', LayoutGrid],
   ['receipt', 'Result', ScrollText],
   ['log', 'Run log', Terminal],
+  ['discuss', 'Discuss', MessageSquareText],
 ];
 const TAB_ORDER = TABS.map(([id]) => id);
 
@@ -33,6 +49,10 @@ interface MadeFile {
   format: string;
   artifact: string;
   bytes?: number;
+  /** The Documents-library entry these bytes were indexed into, with their
+   *  chunk embeddings. It is what makes the file searchable and what a
+   *  discussion about it binds to; "" or absent means it never got filed. */
+  document_id?: string;
   /** What render_document reported about the delivered document. */
   blocks?: number;
   stats?: { words?: number; sections?: number; format?: string };
@@ -136,6 +156,7 @@ const withProduced = (r: Run, snap: Produced): Run => {
     blocks: f.blocks,
     stats: f.stats,
     cost: f.cost,
+    document_id: f.document_id,
   }));
   return {
     ...r,
@@ -193,10 +214,44 @@ const KIND_ICON: Record<string, typeof FileText> = {
   pdf: FileText, pptx: Presentation, docx: FileText, xlsx: Table2,
 };
 
+/** A delivered file, drawn in place.
+ *
+ *  This used to be the server-rasterised page strip, which asked the gateway
+ *  for a fixed sample of pages — twelve of a forty-page document, with the
+ *  rest unreachable — and offered one zoom step and no text to select. pdf.js
+ *  draws every page instead, lazily, and puts the words in the DOM. The local
+ *  wrapper is gone too: `FilePreview` is the one that decides pdf.js / the
+ *  browser's own text view / the raster pager, so Authoring, Research and the
+ *  document window cannot disagree about what a format needs.
+ */
+const PDF_BOX = 'flex h-[70vh] min-h-[420px] flex-col overflow-hidden ' +
+                'rounded-lg border border-white/10 bg-[#0b0b0f]';
+
 export default function Authoring() {
   const mainId = useMainId();
   const active = useSectionActive();
+  const navigate = useNavigate();
+  const { pathname } = useLocation();
+  /* Focus is a page, not a view state, so a cold link, browser-back and the
+     address bar all reach it. `ui.authoring_focus` is its switch: off means the
+     route renders the ordinary Authoring screen and no Focus control appears —
+     the same thread, the same data, nothing left half-built.
+     Fail open on a flag read that throws: a feature silently disappearing
+     because the console could not reach /api/flags is worse than the feature
+     staying on one turn too long. */
+  const [focusAllowed, setFocusAllowed] = useState(true);
+  useEffect(() => {
+    let live = true;
+    api.flags().then((r: any) => {
+      if (!live) return;
+      const row = (r?.flags || []).find((f: any) => f.name === 'ui.authoring_focus');
+      if (row) setFocusAllowed(row.value !== false);
+    }).catch(() => { /* keep it on */ });
+    return () => { live = false; };
+  }, []);
+  const focus = pathname === '/authoring/focus' && focusAllowed;
   const [brief, setBrief] = useState('');
+  const [docStyle, setDocStyle] = useState('auto');
   const [running, setRunning] = useState(false);
   const [note, setNote] = useState('');
   const [err, setErr] = useState('');
@@ -226,6 +281,116 @@ export default function Authoring() {
   const logBox = useRef<HTMLDivElement>(null);
   const resultRef = useRef<HTMLDivElement>(null);
   const [busyFile, setBusyFile] = useState('');
+  /* The document on screen, opened as a window over the page. */
+  const [viewer, setViewer] = useState<DocumentTarget | null>(null);
+  /* The discussion thread about one produced file. */
+  const [discDoc, setDiscDoc] = useState<MadeFile | null>(null);
+  const [discMsgs, setDiscMsgs] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
+  const [discCid, setDiscCid] = useState('');
+  /* The thread's identity is derived from the document, not minted by the
+     server on the first turn. A random id meant a Discuss conversation lived
+     only as long as the component: reload the page, reopen the same run, and
+     the questions and answers were gone even though the server had stored
+     every one of them. One thread per document is also what a reader expects
+     when they come back to a paper they were discussing. */
+  const discCidFor = (fileId?: string) => (fileId ? `disc-${fileId}` : '');
+  /* Which gateway model answers here. Empty means "the gateway decides", which
+     is the existing behaviour; a pick is remembered per document so a long
+     discussion does not change model between visits. */
+  const [discModel, setDiscModel] = useState('');
+  const [discInput, setDiscInput] = useState('');
+  const [discBusy, setDiscBusy] = useState(false);
+  const [discNote, setDiscNote] = useState('');
+  const [discErr, setDiscErr] = useState('');
+  const discCtl = useRef<AbortController | null>(null);
+  const discBox = useRef<HTMLDivElement>(null);
+  /* ── what the open page is lighting up ────────────────────────────────
+   * A discussion answers about a document the reader can see, so the words it
+   * quotes are worth pointing at. `discFocus` is the answer whose citations are
+   * lit — the newest by default, and whichever chip row was clicked otherwise.
+   * Lit-then-quiet beats every turn of a long thread highlighted at once. */
+  const [discFocus, setDiscFocus] = useState<number | null>(null);
+  const [discActive, setDiscActive] = useState<{ id: string; nonce: number } | null>(null);
+  const [discHits, setDiscHits] = useState<QuoteHit[]>([]);
+  /* The Focus split: how much of the row the document keeps, as a percentage.
+   * Dragged because reading a page and asking a one-line question want
+   * different room, and a fixed 32% is a guess about which is happening now.
+   * Persisted, so a layout once chosen survives the next run and a reload.
+   * Only meaningful at xl and above, where the two panes sit side by side; the
+   * stacked layout is the divider's own hiding place. */
+  const FOCUS_SPLIT_KEY = 'aria.focus.split';
+  const SPLIT_MIN = 25;
+  const SPLIT_MAX = 85;
+  const [focusSplit, setFocusSplit] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem(FOCUS_SPLIT_KEY));
+      return v >= SPLIT_MIN && v <= SPLIT_MAX ? v : 68;
+    } catch {
+      return 68;
+    }
+  });
+  const focusRow = useRef<HTMLDivElement | null>(null);
+  /* Tailwind's `xl`, where the two panes sit side by side. Below it the row
+   * stacks, and a percentage width would squeeze the conversation into a strip
+   * across a tall page — so the split is applied only while it means something.
+   * Read from a matchMedia listener rather than the container width, because
+   * the container is already at 100% either way and cannot tell them apart. */
+  const [splitLive, setSplitLive] = useState(
+    () => typeof window !== 'undefined'
+      && window.matchMedia('(min-width: 1280px)').matches);
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1280px)');
+    const on = (e: MediaQueryListEvent) => setSplitLive(e.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(FOCUS_SPLIT_KEY, String(focusSplit));
+    } catch { /* a blocked storage must not block the layout */ }
+  }, [focusSplit]);
+
+  const startSplitDrag = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startPct = focusSplit;
+    const move = (ev: PointerEvent) => {
+      const rect = focusRow.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      const pct = startPct + ((ev.clientX - startX) / rect.width) * 100;
+      setFocusSplit(Math.round(Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, pct))));
+    };
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+  }, [focusSplit]);
+
+  const discQuotes = useMemo<PdfQuote[]>(() => {
+    if (discFocus == null) return [];
+    const m = discMsgs[discFocus];
+    if (!m || m.role !== 'assistant') return [];
+    return answerCitations(m.text)
+      .map((c, i) => ({ id: `q${discFocus}-${i}`, page: c.page, quote: c.quote }));
+  }, [discFocus, discMsgs]);
+
+  /** Where each lit quote was actually found, for the chip labels. */
+  const hitByQuote = useMemo(() => {
+    const m = new Map<string, QuoteHit>();
+    for (const h of discHits) if (!m.has(h.id)) m.set(h.id, h);
+    return m;
+  }, [discHits]);
+
+  const focusQuote = useCallback((id: string) => {
+    setDiscActive({ id, nonce: Date.now() });
+  }, []);
+
+  const onQuoteHits = useCallback((hits: QuoteHit[]) => {
+    setDiscHits((prev) => (prev.length === hits.length ? hits : hits.slice()));
+  }, []);
 
   /* session ids whose /produced has been queued, and the reads in flight. Both
    * exist so the mount prefetch, the scroll prefetch and a click cannot fire
@@ -585,6 +750,7 @@ export default function Authoring() {
            listed on the Authoring page from its first second and never in the
            Research sidebar. */
         runKind: 'authoring',
+        docSetup: docStyle === 'auto' ? undefined : { style: docStyle },
       })) {
         if (reqRef.current !== req) return;
         if (ev.type === 'started') {
@@ -682,7 +848,7 @@ export default function Authoring() {
   // Columns updated the panel and the live preview, and then sent the
   // defaults to the renderer. Three of the four always-visible controls were
   // inert.
-  }, [brief, running, saveRun]);
+  }, [brief, docStyle, running, saveRun]);
 
   /* Aborting the SSE stream only stops the CLIENT: the worker keeps running
    * and its spend keeps mounting (agent_server documents this). Cancel on
@@ -757,6 +923,243 @@ export default function Authoring() {
       setBusyFile('');
     }
   };
+
+  /* ── discussing a document Aria produced ──────────────────────────────
+   * A rendered file is not the end of the conversation. Every produced
+   * artifact is indexed in the Documents library with its own chunks, so a
+   * question about it can be answered from what is actually on disk — and the
+   * thread is bound to exactly that document, so nothing else answers for it.
+   *
+   * `ensureDocument` is the self-healing half: a run that finished before the
+   * filing existed, or one whose upload failed while the gateway was away,
+   * still has its bytes. Indexing them now is the difference between "ask about
+   * this" and a file the agent cannot read. */
+  const ensureDocument = useCallback(async (f: MadeFile): Promise<string> => {
+    if (f.document_id) return f.document_id;
+    const r = await api.indexArtifact(f.artifact);
+    const id = String(r?.document_id || '');
+    if (!id) {
+      throw new Error(r?.error
+        || 'this file is not in Documents yet and could not be added');
+    }
+    setFiles((prev) => prev.map((p) => (
+      p.artifact === f.artifact ? { ...p, document_id: id } : p)));
+    setDiscDoc((d) => (d && d.artifact === f.artifact ? { ...d, document_id: id } : d));
+    return id;
+  }, []);
+
+  const bindDiscussion = useCallback(async (f: MadeFile) => {
+    setDiscErr('');
+    setDiscNote(`reading ${f.filename}…`);
+    try {
+      const id = await ensureDocument(f);
+      const d = await api.documentDetail(id);
+      const doc = d?.document;
+      if (!doc) {
+        setDiscNote(`${f.filename} is bound to this thread. Ask about it.`);
+        return;
+      }
+      if (doc.status !== 'ready') {
+        setDiscNote(`${doc.filename} is still ${doc.status}. Ask now and Aria `
+          + 'answers from the parts already read.');
+      } else if (!doc.enabled) {
+        await api.setDocumentEnabled(id, true);
+        setDiscNote(`${doc.filename} was switched off for agent search. It is `
+          + 'on now and bound to this thread.');
+      } else {
+        setDiscNote(`${doc.filename} is bound to this thread. Ask about it.`);
+      }
+    } catch (e) {
+      setDiscErr(`could not read ${f.filename}: ${String((e as Error)?.message || e)}`);
+      setDiscNote('');
+    }
+  }, [ensureDocument]);
+
+  /** Read a stored discussion thread back into the panel. */
+  const hydrateDiscussion = useCallback(async (cid: string) => {
+    if (!cid) return;
+    try {
+      const d: any = await api.chatThread(cid);
+      const msgs = Array.isArray(d?.messages) ? d.messages : [];
+      const mapped = msgs
+        .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant'))
+        .map((m: any) => ({
+          role: m.role as 'user' | 'assistant',
+          // A stored report/answer rides on `content`; a citation marker the
+          // model emitted is part of the text and the highlighter reads it
+          // from there, so it is kept rather than stripped.
+          text: String(m.content ?? m.text ?? ''),
+        }))
+        .filter((m: any) => m.text.trim());
+      // Only fill an empty panel: this runs on open, and a turn already in
+      // flight must not be overwritten by the snapshot taken before it.
+      if (mapped.length) {
+        setDiscMsgs((cur) => (cur.length ? cur : mapped));
+      }
+    } catch {
+      /* A thread that does not exist yet is the normal first case, and the
+         panel is already empty. Nothing to say about it. */
+    }
+  }, []);
+
+  const openDiscussion = useCallback((f: MadeFile) => {
+    setView('discuss');
+    setDiscFocus(null);
+    setDiscActive(null);
+    setDiscHits([]);
+    if (discDoc?.artifact === f.artifact) return;
+    discCtl.current?.abort();
+    setDiscBusy(false);
+    setDiscDoc(f);
+    setDiscMsgs([]);
+    // The thread's id is the document's, so the questions asked about a paper
+    // are the same thread tomorrow. `''` here used to mean "let the server
+    // mint one", which is why the panel opened empty every time.
+    const cid = discCidFor(f.document_id || f.artifact || f.filename);
+    setDiscCid(cid);
+    setDiscModel(localStorage.getItem(`aria.disc.model.${cid}`) || '');
+    void hydrateDiscussion(cid);
+    void bindDiscussion(f);
+  }, [bindDiscussion, discDoc]);
+
+  const sendDiscussion = useCallback(async () => {
+    const text = discInput.trim();
+    if (!text || discBusy || !discDoc) return;
+    setDiscInput('');
+    setDiscErr('');
+    let docId = discDoc.document_id || '';
+    if (!docId) {
+      try {
+        docId = await ensureDocument(discDoc);
+      } catch (e) {
+        setDiscInput(text);
+        setDiscErr(String((e as Error)?.message || e));
+        return;
+      }
+    }
+    setDiscMsgs((m) => [...m, { role: 'user', text }, { role: 'assistant', text: '' }]);
+    /* The index this turn's answer will land at, so its citations can be lit
+       the moment it finishes. */
+    const assistantAt = discMsgs.length + 1;
+    setDiscBusy(true);
+    setDiscFocus(assistantAt);
+    setDiscActive(null);
+    setDiscHits([]);
+    const ac = new AbortController();
+    discCtl.current = ac;
+    const setLast = (value: string) => setDiscMsgs((m) => {
+      const out = [...m];
+      const last = out[out.length - 1];
+      if (last && last.role === 'assistant') {
+        out[out.length - 1] = { ...last, text: value };
+      }
+      return out;
+    });
+    let answer = '';
+    let cid = discCid;
+    try {
+      for await (const ev of api.chatSimpleStream(
+        text, cid || undefined, ac.signal, discModel || undefined,
+        { docIds: [docId], cite: true },
+      )) {
+        if (ev.type === 'started' && ev.conversation_id) {
+          cid = String(ev.conversation_id);
+          setDiscCid(cid);
+          // Persist the binding on the thread, not just this turn. A body value
+          // is authoritative for the turn it belongs to, so without this the
+          // conversation forgets what it is about the moment it is opened in
+          // Chat tomorrow. Best-effort: the turn is already streaming.
+          void api.setChatThreadPrefs(cid, true, undefined, [docId]);
+        } else if (ev.type === 'delta' && ev.text) {
+          answer += String(ev.text);
+          setLast(answer);
+        } else if (ev.type === 'status' && ev.text) {
+          setDiscNote(String(ev.text));
+        } else if (ev.type === 'done') {
+          if (ev.conversation_id) {
+            cid = String(ev.conversation_id);
+            setDiscCid(cid);
+          }
+          // The streamed deltas and the final answer are the same text; trust
+          // `answer` when it is there, because a delta can be dropped by a
+          // back-pressured queue while the persisted answer cannot.
+          const final = String(ev.answer || '');
+          if (final) setLast(final);
+          setDiscNote('');
+          // Walk the reader to the first thing this answer actually quoted.
+          // Waiting for the whole text matters: a marker is only a citation
+          // once its closing bracket has arrived.
+          const cited = answerCitations(final || answer);
+          if (cited.length) {
+            setDiscActive({ id: `q${assistantAt}-0`, nonce: Date.now() });
+          }
+        } else if (ev.type === 'error') {
+          setDiscErr(String(ev.text || 'Aria could not answer this turn'));
+        }
+      }
+    } catch (e) {
+      if (!ac.signal.aborted) {
+        setDiscErr(String((e as Error)?.message || e));
+      }
+    } finally {
+      setDiscBusy(false);
+      discCtl.current = null;
+    }
+  }, [discBusy, discCid, discDoc, discInput, discMsgs.length, ensureDocument]);
+
+  const stopDiscussion = useCallback(() => {
+    discCtl.current?.abort();
+    discCtl.current = null;
+    setDiscBusy(false);
+  }, []);
+
+  /** Open a produced file in the document window. */
+  const openDocument = useCallback((f: MadeFile) => {
+    setViewer({
+      kind: 'artifact', artifact: f.artifact,
+      format: f.format || 'pdf', label: f.filename,
+    });
+  }, []);
+  /* Which of this run's files the window is showing, when it came from the
+     list. That is what lets Download and Discuss work inside the window. */
+  const viewerFile = viewer && viewer.kind === 'artifact'
+    ? files.find((f) => f.artifact === viewer.artifact)
+    : undefined;
+
+  /* A different run is a different set of documents; do not leave the previous
+     one's thread bound to a file that is no longer on screen. */
+  useEffect(() => {
+    discCtl.current?.abort();
+    setDiscDoc(null);
+    setDiscMsgs([]);
+    setDiscCid('');
+    setDiscNote('');
+    setDiscErr('');
+    setDiscBusy(false);
+    setDiscFocus(null);
+    setDiscActive(null);
+    setDiscHits([]);
+    setDiscModel('');
+  }, [activeId]);
+
+  /* The Discuss workspace is only useful with a document on the page. Opening
+     it from the tab bar, or arriving at /authoring/focus directly, picks the
+     run's first file, so it never arrives as an empty chat next to an empty
+     pane. */
+  useEffect(() => {
+    /* A cold /authoring/focus deep link has never seen the tab strip, so
+       `view` is still 'preview'. Set it to 'discuss' on the way in and leaving
+       Focus lands back on the workspace rather than on a tab the user was never
+       on. Setting the value it already holds is a no-op in React. */
+    if (focus) setView('discuss');
+    if ((view === 'discuss' || focus) && !discDoc && files.length) openDiscussion(files[0]);
+  }, [view, focus, discDoc, files, openDiscussion]);
+
+  useEffect(() => {
+    if ((view === 'discuss' || focus) && discBox.current) {
+      discBox.current.scrollTop = discBox.current.scrollHeight;
+    }
+  }, [discMsgs, view, focus]);
   const totalWarnings = useMemo(
     () => files.reduce((n, f) => n + (preview[f.artifact]?.warnings?.length || 0), 0),
     [files, preview],
@@ -770,7 +1173,8 @@ export default function Authoring() {
   /* ── the output tablist ──────────────────────────────
    * A disabled tab cannot take focus, so the arrows skip it: landing on one
    * would swallow the key press and read as broken. */
-  const tabEnabled = (t: View) => t !== 'preview' || files.length > 0;
+  const tabEnabled = (t: View) => (t === 'preview' || t === 'discuss')
+    ? files.length > 0 : true;
   const stepTab = (from: View, dir: 1 | -1) => {
     const n = TAB_ORDER.length;
     const i = Math.max(0, TAB_ORDER.indexOf(from));
@@ -792,7 +1196,11 @@ export default function Authoring() {
 
   /* ── preview bodies ─────────────────────────────────────────────────── */
 
-  const PreviewPane = ({ f }: { f: MadeFile }) => {
+  /* Rendered as a plain call, not a component: this body closes over the run's
+   * state, so defining it as a component would give it a new identity on every
+   * Authoring render. React then unmounts the whole preview, and the viewer
+   * re-downloads the document and snaps back to fit-width mid-zoom. */
+  const renderPreview = (f: MadeFile) => {
     /* A PDF does not need `artifactPreview` to be drawable: DocumentViewer
      * rasterises the artifact itself and reports its own page count. Waiting
      * for pypdf first put an avoidable round-trip in front of the first page,
@@ -803,7 +1211,7 @@ export default function Authoring() {
       ?? (f.format === 'pdf' ? { kind: 'pdf' } as DocPreview : null);
     if (!p) {
       return (
-        <div className="flex h-full items-center justify-center p-6 text-[12.5px] text-zinc-muted">
+        <div key={f.artifact} className="flex h-full items-center justify-center p-6 text-[12.5px] text-zinc-muted">
           <Loader2 size={14} className="mr-2 animate-spin" /> reading {f.filename}…
         </div>
       );
@@ -811,7 +1219,7 @@ export default function Authoring() {
     const warns = p.warnings || [];
 
     return (
-      <div className="space-y-3 p-3.5">
+      <div key={f.artifact} className="space-y-3 p-3.5">
         {warns.length > 0 && (
           <div role="status" className="flex items-start gap-2 rounded-lg border border-amber-400/30 bg-amber-400/10 p-2.5 text-[12px] text-amber-100">
             <AlertTriangle size={14} className="mt-px flex-none" />
@@ -934,28 +1342,10 @@ export default function Authoring() {
         )}
 
         {p.kind === 'pdf' && (
-          <div className="space-y-2.5">
-            {/* The DOCUMENT, not an outline of it. This used to be extracted
-                text, with a comment explaining that an inline PDF viewer is
-                impossible in headless Chromium so it rendered as a white
-                panel. The fix was to rasterise the delivered pages server-side
-                and show those images - which needs no browser PDF plugin at
-                all, and is the only way to actually SEE whether the margins,
-                the measure and the chart are right. */}
-            <div className="docview-frame">
-              <DocumentViewer source={{
-                kind: 'artifact', artifact: f.artifact,
-                format: f.format || 'pdf', label: f.filename,
-              }} />
-            </div>
-            {/* The extracted text of every page used to be dumped here, one
-                block per page. It was noise, not information: the rasterised
-                page above IS the document, the words are already on screen,
-                and each block repeated the running header and the title. A
-                reader scrolling past three full pages of duplicated prose to
-                reach nothing was the opposite of a preview. The page images
-                and the thumbnail strip are the whole story. */}
-          </div>
+          <FilePreview target={{
+            kind: 'artifact', artifact: f.artifact,
+            format: f.format || 'pdf', label: f.filename,
+          }} className={PDF_BOX} />
         )}
 
         {p.kind === 'docx' && (
@@ -1004,16 +1394,132 @@ export default function Authoring() {
 
   /* ── render ─────────────────────────────────────────────────────────── */
 
+  /* One tab strip, drawn by the normal page and by the Discuss workspace alike:
+   * a discussion is a view of the same run, not a different place, and leaving
+   * it must be the same single click as leaving any other tab.
+   *
+   * A function returning JSX, not a component: a nested component type is
+   * re-created on every parent render, which would remount the PDF and redraw
+   * every page each time a message arrived. */
+  const tabStrip = () => (!hasOutput && !running ? null : (
+    <div className="flex flex-none flex-wrap items-center gap-2 border-b border-white/10 p-2">
+      <div role="tablist" aria-label="Output view" className="flex gap-1">
+        {TABS.map(([id, label, Icon]) => (
+          <button
+            key={id}
+            ref={(el) => { tabRefs.current[id] = el; }}
+            type="button"
+            role="tab"
+            id={`tab-${id}`}
+            aria-selected={view === id}
+            aria-controls={`panel-${id}`}
+            tabIndex={view === id ? 0 : -1}
+            disabled={!tabEnabled(id)}
+            onClick={() => setView(id)}
+            onKeyDown={(e) => {
+            /* The arrows move the selection AND the focus. Selecting alone left focus
+            on a tab that was no longer the selected one, and Tab jumped out of the
+            tablist instead of moving to the next control - the roving tabindex had
+            already moved the only tab stop elsewhere. */
+            const to = e.key === 'ArrowRight' ? stepTab(view, 1)
+            : e.key === 'ArrowLeft' ? stepTab(view, -1)
+            : e.key === 'Home' ? edgeTab(1)
+            : e.key === 'End' ? edgeTab(-1)
+            : null;
+            if (!to) return;
+            e.preventDefault();
+            setView(to);
+            tabRefs.current[to]?.focus();
+            }}
+            className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[11.5px] disabled:opacity-40 ${
+            view === id
+            ? 'bg-violet-400/20 font-bold text-zinc-100'
+            : 'text-zinc-400 hover:text-zinc-200'}`}
+            >
+            <Icon size={12} />
+            {label}
+            {id === 'log' && logs.length ? ` (${logs.length})` : ''}
+          </button>
+        ))}
+      </div>
+      <span className="flex-1" />
+      <Pane id="authoring.pills">
+        {totalWarnings > 0 && <Pill tone="warn">{totalWarnings} warning</Pill>}
+        {files.length > 0 && (
+          <Pill tone="ok">{files.length} file{files.length === 1 ? '' : 's'}</Pill>
+        )}
+      </Pane>
+      {/* The way out of Discuss lives here, not in the Documents rail. That
+          rail is a pane the user may fold away, and an exit that disappears
+          along with the thing it exits from is how a view becomes a cage.
+          Focus has its own exit in the document header, because on that page
+          there is no strip to put one in. */}
+      {view === 'discuss' && (
+        <button type="button" onClick={() => setView('receipt')}
+                className="flex flex-none items-center gap-1.5 rounded border border-white/10
+                           px-2 py-1 text-[11px] text-zinc-400 hover:border-violet-400
+                           hover:text-zinc-100">
+          <ArrowLeft size={12} /> Back to the run
+        </button>
+      )}
+    </div>
+  ));
+
+  const discTarget: DocumentTarget | null = discDoc ? {
+    kind: 'artifact', artifact: discDoc.artifact,
+    format: discDoc.format || 'pdf', label: discDoc.filename,
+  } : null;
+  const discussing = (view === 'discuss' || focus) && !!discDoc && !!discTarget;
+
+  /** The words Aria pointed at, as chips under her answer.
+   *
+   *  A chip says where the quote was *found*, which is not always where she
+   *  said it was: the page a chunk carried can disagree with the page the model
+   *  remembered. Saying "on p.5" instead of quietly highlighting page 5 under a
+   *  "p.3" label is the difference between a citation you can check and one you
+   *  have to take on trust. */
+  const chipsFor = (idx: number, text: string) => {
+    const cs = answerCitations(text);
+    if (!cs.length) return null;
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-1">
+        {cs.map((c, i) => {
+          const id = `q${idx}-${i}`;
+          const hit = hitByQuote.get(id);
+          const label = c.page ? `p.${c.page}` : 'in this document';
+          const where = !hit ? ''
+            : hit.page !== c.page ? ` · found on p.${hit.page}` : '';
+          return (
+            <button key={id} type="button"
+                    title={c.quote}
+                    onClick={() => { setDiscFocus(idx); focusQuote(id); }}
+                    className="flex max-w-[240px] items-center gap-1 rounded-full border border-white/10 px-2 py-0.5 text-[10.5px] text-zinc-400 hover:border-violet-400 hover:text-zinc-100">
+              <span className="flex-none font-semibold text-amber-200/90">{label}{where}</span>
+              <span className="min-w-0 truncate">“{c.quote}”</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
-      <Rail />
+      {/* Focus strips the page down to the document and Aria: no section rail,
+          no top bar, no tab strip, no pills, no run list. The way out is one
+          button in the document header, and it goes back to /authoring with
+          everything else as it was — the same thread, the same scroll, the same
+          document. */}
+      {!focus && <Rail />}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Authoring">
+        {!focus && (
+        <TopBar crumb="Authoring" panes="authoring">
           <span className="text-[11.5px] text-zinc-muted">
             {running ? 'building…' : note || 'Ctrl+Enter to build'}
           </span>
         </TopBar>
+        )}
 
         {/* The Setup card is gone. It asked for format, paper, typeface,
             length, orientation, columns, margins, citations and three
@@ -1024,6 +1530,276 @@ export default function Authoring() {
             when they said the document should be right without them having to
             specify it. The `doc_setup` plumbing is untouched on the server, so
             a forced setup still works for callers that send one. */}
+        {focus && !discussing ? (
+          /* `/authoring/focus` reached with nothing to read — the run has not
+             produced a document yet, or the URL was opened before the session
+             came back. The alternative is the ordinary chrome-less page, which
+             looks like a broken layout rather than an empty one. */
+          <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+            <div className="max-w-[440px] text-center">
+              <Maximize2 size={18} className="mx-auto mb-2 text-zinc-600" />
+              <p className="text-[12.5px] text-zinc-400">
+                {activeId
+                  ? 'This run has not produced a document to read yet.'
+                  : 'Focus reads one document beside the conversation about it — open a finished run first.'}
+              </p>
+              <button type="button" onClick={() => navigate('/authoring')}
+                      className="mt-3 inline-flex items-center gap-1.5 rounded border border-white/15
+                                 px-2.5 py-1 text-[11.5px] text-zinc-300 hover:border-violet-400">
+                <ArrowLeft size={12} /> Back to Authoring
+              </button>
+            </div>
+          </div>
+        ) : discussing && discDoc && discTarget ? (
+          /* ── the Discuss workspace, and the Focus page ───────────────
+           * The document, the words about it, and nothing else. A discussion
+           * is read with the page open beside it, so the brief, the run list
+           * and the file rows' buttons all step out of the way.
+           *
+           * Discuss keeps the run's document rail (a multi-file run needs a way
+           * to switch) and the tab strip. Focus is the same thread on its own
+           * page with both gone, because one document on screen does not need a
+           * list of one document and a reader working through a forty-page
+           * report wants the width. Same messages, same binding, so moving
+           * between the two never starts a new conversation. */
+          <div className="flex min-h-0 flex-1 flex-col gap-2 p-2.5">
+            {!focus && tabStrip()}
+            <div ref={focusRow}
+                 className="flex min-h-0 flex-1 flex-col gap-2.5 xl:flex-row">
+              {view === 'discuss' && !focus && (
+              <Pane id="authoring.discussRail">
+                <nav aria-label="Documents from this run"
+                     className="flex w-full min-h-0 shrink-0 flex-col gap-1.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-2 max-md:max-h-[30vh] xl:w-[218px]">
+                  <h2 className="flex items-center gap-1.5 px-1 text-[11px] font-bold uppercase tracking-[0.12em] text-zinc-muted">
+                    <FileText size={12} /> Documents
+                  </h2>
+                  <ul className="min-h-0 flex-1 space-y-1 overflow-y-auto">
+                    {files.map((f) => {
+                      const Icon = KIND_ICON[f.format] || FileDown;
+                      const on = f.artifact === discDoc.artifact;
+                      return (
+                        <li key={f.artifact}>
+                          <button type="button"
+                                  onClick={() => openDiscussion(f)}
+                                  aria-current={on ? 'true' : undefined}
+                                  title={f.filename}
+                                  className={`w-full rounded-lg px-2 py-1.5 text-left hover:bg-white/5 ${
+                                    on ? 'bg-violet-400/10 ring-1 ring-violet-400/40' : ''}`}>
+                            <span className="flex items-center gap-1.5">
+                              <Icon size={12} className="flex-none text-violet-300" />
+                              <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">
+                                {f.filename}
+                              </span>
+                            </span>
+                            <span className="mt-0.5 block truncate text-[10.5px] text-zinc-500">
+                              {fileMeta(f).join(' · ') || f.format}
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </nav>
+              </Pane>
+              )}
+
+              <section aria-label="The document"
+                       className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-white/10 bg-[#08080a]">
+                <header className="flex flex-none items-center gap-2 border-b border-white/10 px-2.5 py-1.5">
+                  <FileText size={13} className="flex-none text-zinc-muted" />
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold"
+                        title={discDoc.filename}>
+                    {discDoc.filename}
+                  </span>
+                  {discDoc.format && <Pill tone="info">{discDoc.format}</Pill>}
+                  {discDoc.document_id && <Pill tone="ok">in Documents</Pill>}
+                  {/* Which gateway model answers this document. The roster comes
+                      from the gateway itself, so a model added there is pickable
+                      here without a console change. The pick is remembered per
+                      document, because a discussion that changes model halfway
+                      through reads like two different people answering.
+                      Shown in Focus too: the mode hides the rail, the run list
+                      and the tab strip — furniture around the reading — but the
+                      model answering the question is not furniture, and a reader
+                      who cannot see or set it has no idea which model a passage
+                      was reasoned with. */}
+                  <ModelPicker model={discModel} busy={discBusy} applyDefault={false}
+                               label="Model for this discussion"
+                               onChange={(id) => {
+                                 setDiscModel(id);
+                                 try {
+                                   if (id) localStorage.setItem(`aria.disc.model.${discCid}`, id);
+                                   else localStorage.removeItem(`aria.disc.model.${discCid}`);
+                                 } catch { /* a blocked storage never blocks a reply */ }
+                               }} />
+                  {/* Focus's entry and exit live on the document itself, not in
+                      the strip it hides: on the Focus page there is no tab strip
+                      to put a button in, and an exit that only exists in the
+                      thing being exited is how a mode becomes a cage. */}
+                  {focusAllowed && (
+                    <button type="button"
+                            onClick={() => navigate(focus ? '/authoring' : '/authoring/focus')}
+                            title={focus ? 'Leave Focus and go back to the run'
+                                         : 'Focus — only this document and Aria'}
+                            className="flex flex-none items-center gap-1 rounded border border-white/10
+                                       px-1.5 py-0.5 text-[11px] text-zinc-400
+                                       hover:border-violet-400 hover:text-zinc-100">
+                      {focus ? <ArrowLeft size={11} /> : <Maximize2 size={11} />}
+                      {focus ? 'Exit focus' : 'Focus'}
+                    </button>
+                  )}
+                </header>
+                <FilePreview target={discTarget}
+                             quotes={discQuotes} active={discActive}
+                             onHits={onQuoteHits}
+                             className="flex min-h-0 flex-1 flex-col"
+                             rasterClassName="min-h-0 flex-1 overflow-y-auto" />
+              </section>
+
+              {/* The split between the page and the conversation, Focus only.
+                  A separator role with arrow keys, because a drag a keyboard
+                  user cannot reach is a control that does not exist for them. */}
+              {focus && (
+                <div role="separator" aria-orientation="vertical"
+                     aria-label="Resize the document and the conversation"
+                     aria-valuenow={focusSplit} aria-valuemin={SPLIT_MIN}
+                     aria-valuemax={SPLIT_MAX}
+                     tabIndex={0}
+                     onPointerDown={startSplitDrag}
+                     onKeyDown={(e) => {
+                       const step = e.shiftKey ? 10 : 2;
+                       if (e.key === 'ArrowLeft') {
+                         e.preventDefault();
+                         setFocusSplit((v) => Math.max(SPLIT_MIN, v - step));
+                       } else if (e.key === 'ArrowRight') {
+                         e.preventDefault();
+                         setFocusSplit((v) => Math.min(SPLIT_MAX, v + step));
+                       }
+                     }}
+                     className="hidden h-1.5 flex-none cursor-col-resize self-stretch
+                                rounded-full border border-white/10 bg-white/5
+                                transition-colors hover:border-violet-400/70 hover:bg-violet-400/20
+                                focus-visible:border-violet-400 focus-visible:outline-none
+                                xl:block xl:h-auto xl:w-1.5 xl:self-stretch"
+                     title={`${focusSplit}% document · ${100 - focusSplit}% conversation`}
+                />
+              )}
+
+              {/* On the Focus page there is no tablist, so this must not claim
+                  to be a tabpanel — an orphan `aria-labelledby` points at a tab
+                  that is not on the page. */}
+              <section aria-label="Discussion with Aria"
+                       {...(focus ? {} : { role: 'tabpanel', id: `panel-${view}`,
+                                           'aria-labelledby': `tab-${view}` })}
+                       tabIndex={-1}
+                       className={`flex w-full min-h-0 shrink-0 flex-col rounded-[10px] border border-white/10 bg-[#0e0e12] max-md:max-h-[60vh] ${
+                         /* Focus gives the extra width to the page, which is
+                            the whole point of the mode — and the reader decides
+                            how much, so this is a percentage off the slider
+                            rather than a fixed 32%. `shrink-0` above already
+                            keeps it from collapsing; the inline width is the
+                            only place the split is expressed, so the class list
+                            and the style can never disagree. */
+                         focus ? '' : 'xl:w-[430px] xl:max-w-[46%]'}`}
+                       style={focus && splitLive
+                         ? { width: `${100 - focusSplit}%`, maxWidth: 'none' }
+                         : undefined}>
+                <div className="flex flex-none items-center gap-2 border-b border-white/10 px-3 py-2">
+                  <MessageSquareText size={13} className="flex-none text-violet-300" />
+                  <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">
+                    About {discDoc.filename}
+                  </span>
+                  {discBusy && (
+                    <Loader2 size={12} className="flex-none animate-spin text-zinc-muted" />
+                  )}
+                </div>
+                {discNote && (
+                  <p role="status"
+                     className="flex-none border-b border-white/10 bg-white/5 px-3 py-1.5 text-[10.5px] text-zinc-400">
+                    {discNote}
+                  </p>
+                )}
+                <div ref={discBox} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+                  {!discMsgs.length && !discBusy && (
+                    <div className="space-y-2">
+                      <p className="text-[12.5px] text-zinc-400">
+                        Ask about anything in this document. Aria reads the copy
+                        the run filed in your Documents library — its own chunks,
+                        not a re-search of the web — and when she quotes it, the
+                        words light up on the page beside her.
+                      </p>
+                      <div className="flex flex-wrap gap-1.5 pt-1">
+                        {[
+                          'Summarise what this document concludes',
+                          'Which claims here are weakest?',
+                          'Explain the numbers in the comparison',
+                          'What is missing that belongs in it?',
+                        ].map((s) => (
+                          <button key={s} type="button"
+                                  disabled={discBusy}
+                                  onClick={() => setDiscInput(s)}
+                                  className="rounded-full border border-white/10 px-2.5 py-1 text-[11px] text-zinc-400 hover:border-violet-400 hover:text-zinc-200 disabled:opacity-40">
+                            {s}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {discMsgs.map((m, i) => (
+                    <div key={i} className={m.role === 'user'
+                      ? 'ml-auto max-w-[85%] rounded-lg bg-violet-400/15 px-2.5 py-1.5 text-[12px] text-zinc-100'
+                      : 'mr-auto max-w-[96%] text-[12.5px] text-zinc-200'}>
+                      {m.role === 'assistant' ? (
+                        m.text ? (
+                          <>
+                            <div className="prose-chat"
+                              dangerouslySetInnerHTML={{ __html: renderMarkdown(m.text, 1, true) }} />
+                            {chipsFor(i, m.text)}
+                          </>
+                        ) : (
+                          <p className="flex items-center gap-2 text-[12px] text-zinc-muted">
+                            <Loader2 size={12} className="animate-spin" /> reading the document…
+                          </p>
+                        )
+                      ) : m.text}
+                    </div>
+                  ))}
+                  {discErr && (
+                    <p role="alert" className="text-[11.5px] text-red-200">{discErr}</p>
+                  )}
+                </div>
+                <div className="flex flex-none items-end gap-2 border-t border-white/10 p-2.5">
+                  <textarea
+                    value={discInput}
+                    onChange={(e) => setDiscInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        void sendDiscussion();
+                      }
+                    }}
+                    rows={2}
+                    aria-label="Ask about this document"
+                    placeholder="Ask about this document… (Enter sends, Shift+Enter adds a line)"
+                    className="min-h-[42px] flex-1 resize-none rounded-md border border-white/10 bg-[#08080a] px-2.5 py-2 text-[12.5px] outline-none focus:border-violet-400"
+                  />
+                  {discBusy ? (
+                    <button type="button" onClick={stopDiscussion}
+                            className="flex flex-none items-center gap-1 rounded-md border border-red-400/40 px-2.5 py-2 text-[11.5px] font-semibold text-red-200">
+                      Stop
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => void sendDiscussion()}
+                            disabled={!discInput.trim()}
+                            className="flex flex-none items-center gap-1 rounded-md bg-violet-400/20 px-2.5 py-2 text-[11.5px] font-bold text-zinc-100 disabled:opacity-40">
+                      <Send size={12} /> Send
+                    </button>
+                  )}
+                </div>
+              </section>
+            </div>
+          </div>
+        ) : (
         <div className="flex min-h-0 flex-1 flex-col gap-3 p-3.5 xl:flex-row">
           {/* ── left column: composer + history ─────────────────────── */}
           <div className="flex min-h-0 w-full shrink-0 flex-col gap-3 max-md:max-h-[52vh] max-md:overflow-y-auto xl:w-[400px] xl:max-w-[44%]">
@@ -1056,6 +1832,29 @@ export default function Authoring() {
                * at 390px the bases summed to 353px in 332px of space and the
                 * Submit button wrapped to a second line, so the card jumped
                 * 42px between states. */}
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-[10.5px] text-zinc-500">
+                <label htmlFor="doc-style" className="font-semibold uppercase tracking-wide">
+                  Style
+                </label>
+                <select id="doc-style" value={docStyle}
+                  onChange={(e) => setDocStyle(e.target.value)}
+                  className="rounded-md border border-white/10 bg-black/40 px-2 py-1 text-[11px] text-zinc-200 outline-none focus:border-violet-400">
+                  <option value="auto">Auto — Aria picks from the brief</option>
+                  <option value="report">Report</option>
+                  <option value="brief">Brief</option>
+                  <option value="memo">Memo</option>
+                  <option value="academic">Academic</option>
+                  <option value="whitepaper">Whitepaper</option>
+                  <option value="manual">Manual</option>
+                  <option value="newsletter">Newsletter (2-col)</option>
+                  <option value="technical">Technical</option>
+                  <option value="book">Book</option>
+                  <option value="plain">Plain</option>
+                </select>
+                <span className="text-zinc-600">
+                  Typography and structure; Auto reads the brief.
+                </span>
+              </div>
               <div className="mt-2.5 flex items-center justify-between gap-2">
                 <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-muted" role="status">
                   {running
@@ -1104,6 +1903,7 @@ export default function Authoring() {
                   back for. Folded under the brief they cost one closed row
                   and stay a keystroke away. */}
               {!hasOutput && !running && (
+                <Pane id="authoring.suggestions">
                 <details className="mt-2.5">
                   <summary className="cursor-pointer text-[11px] font-semibold text-zinc-muted">
                     Try one of these
@@ -1122,6 +1922,7 @@ export default function Authoring() {
                     ))}
                   </ul>
                 </details>
+                </Pane>
               )}
             </section>
 
@@ -1229,57 +2030,7 @@ export default function Authoring() {
             className="flex min-h-0 min-w-0 flex-1 flex-col rounded-[10px] border border-white/10 bg-[#08080a] shadow-[0_8px_24px_rgba(0,0,0,0.45)]"
           >
             <h2 id="out-h" className="sr-only">Output</h2>
-            {/* Hidden until there is something to switch between: with no
-                files the tabs are all disabled, and a dead tab bar sitting
-                under a full-bleed preview just reads as broken. */}
-            {(hasOutput || running) && (
-            <div className="flex flex-none flex-wrap items-center gap-2 border-b border-white/10 p-2">
-              <div role="tablist" aria-label="Output view" className="flex gap-1">
-                {TABS.map(([id, label, Icon]) => (
-                  <button
-                    key={id}
-                    ref={(el) => { tabRefs.current[id] = el; }}
-                    type="button"
-                    role="tab"
-                    id={`tab-${id}`}
-                    aria-selected={view === id}
-                    aria-controls={`panel-${id}`}
-                    tabIndex={view === id ? 0 : -1}
-                    disabled={id === 'preview' && !files.length}
-                    onClick={() => setView(id)}
-                    onKeyDown={(e) => {
-                    /* The arrows move the selection AND the focus. Selecting alone left focus
-                    on a tab that was no longer the selected one, and Tab jumped out of the
-                    tablist instead of moving to the next control - the roving tabindex had
-                    already moved the only tab stop elsewhere. */
-                    const to = e.key === 'ArrowRight' ? stepTab(view, 1)
-                    : e.key === 'ArrowLeft' ? stepTab(view, -1)
-                    : e.key === 'Home' ? edgeTab(1)
-                    : e.key === 'End' ? edgeTab(-1)
-                    : null;
-                    if (!to) return;
-                    e.preventDefault();
-                    setView(to);
-                    tabRefs.current[to]?.focus();
-                    }}
-                    className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-[11.5px] disabled:opacity-40 ${
-                    view === id
-                    ? 'bg-violet-400/20 font-bold text-zinc-100'
-                    : 'text-zinc-400 hover:text-zinc-200'}`}
-                    >
-                    <Icon size={12} />
-                    {label}
-                    {id === 'log' && logs.length ? ` (${logs.length})` : ''}
-                  </button>
-                ))}
-                    </div>
-              <span className="flex-1" />
-              {totalWarnings > 0 && <Pill tone="warn">{totalWarnings} warning</Pill>}
-              {files.length > 0 && (
-                <Pill tone="ok">{files.length} file{files.length === 1 ? '' : 's'}</Pill>
-              )}
-            </div>
-            )}
+            {tabStrip()}
 
             {/* The pre-run layout preview is gone with the Setup card. It
                 * rendered a SAMPLE_SPEC through whatever the controls were
@@ -1335,6 +2086,26 @@ export default function Authoring() {
                         </span>
                       </span>
                       {f.format && <Pill tone="info">{f.format}</Pill>}
+                      {/* Open is the deliverable: the browser's own document
+                          viewer, in a window over the page. */}
+                      <button
+                        type="button"
+                        onClick={() => openDocument(f)}
+                        aria-label={`Open ${f.filename}`}
+                        title="Open the document"
+                        className="flex flex-none items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400"
+                      >
+                        <Maximize2 size={12} /> Open
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openDiscussion(f)}
+                        aria-label={`Discuss ${f.filename} with Aria`}
+                        title="Talk to Aria about this document"
+                        className="flex flex-none items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400"
+                      >
+                        <MessageSquareText size={12} /> Discuss
+                      </button>
                       <button
                         type="button"
                         onClick={() => downloadFile(f)}
@@ -1382,9 +2153,14 @@ export default function Authoring() {
                     <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> follow
                   </label>
                 </div>
+              ) : view === 'discuss' ? (
+                <div role="tabpanel" id={`panel-${view}`} aria-labelledby={`tab-${view}`}
+                     tabIndex={-1} className="p-4 text-[12.5px] text-zinc-muted">
+                  This run has no document to discuss yet.
+                </div>
               ) : view === 'preview' ? (
                 <div role="tabpanel" id="panel-preview" aria-labelledby="tab-preview" tabIndex={-1}>
-                  {files.map((f) => <PreviewPane key={f.artifact} f={f} />)}
+                  {files.map((f) => renderPreview(f))}
                 </div>
               ) : (
                 <div role="tabpanel" id="panel-receipt" aria-labelledby="tab-receipt" tabIndex={-1}>
@@ -1422,7 +2198,24 @@ export default function Authoring() {
             </div>
           </section>
         </div>
+        )}
       </main>
+
+      {/* The document window: centred, with the console blurred behind it —
+          the same shape Chat's "read full report" uses, because a document
+          deserves to arrive that way. A PDF opens in the browser's own viewer,
+          so page scroll, selection, search and zoom are the real ones. */}
+      <DocumentModal
+        open={!!viewer}
+        target={viewer}
+        onClose={() => setViewer(null)}
+        onDownload={viewerFile ? () => void downloadFile(viewerFile) : undefined}
+        onDiscuss={viewerFile ? () => {
+          const f = viewerFile;
+          setViewer(null);
+          openDiscussion(f);
+        } : undefined}
+      />
     </div>
   );
 }

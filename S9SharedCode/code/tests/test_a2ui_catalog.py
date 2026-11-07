@@ -76,9 +76,10 @@ def test_prompt_mentions_every_component_and_the_key_rules():
         assert name in p, f"{name} missing from the prompt"
     assert "root" in p
     assert "rejected" in p
-    # The read-only guarantee must be stated, or a model will happily emit a
-    # text field and a submit button.
-    assert "no text input" in p
+    # Inputs are allowed, but only through the declared component and a
+    # submit Action; the prompt must say how values travel.
+    assert "Collect user input" in p
+    assert "Action's `input` key" in p
     assert "rejected" in p
 
 
@@ -97,13 +98,19 @@ def test_prompt_shows_enum_values_so_the_model_cannot_guess_them():
                 assert value in p, f"{name}.{prop} value {value!r} not in prompt"
 
 
-def test_catalog_has_no_interactive_text_input():
-    """Deliberate. A generated form whose submit performs an action is an
-    approval flow wearing a disguise."""
+def test_inputs_are_declared_not_arbitrary_form_markup():
+    """Apps collect values through one bounded Input component and hand them
+    to an Action. There is still no Form/TextField free-for-all, no HTML and
+    no handler property."""
+    assert "Input" in C.CATALOG
+    input_props = C.CATALOG["Input"]["props"]
+    assert "name" in input_props
+    assert "multiline" in input_props
     for name, spec in C.CATALOG.items():
         props = " ".join(spec["props"]).lower()
-        assert "submit" not in props, name
         assert "onclick" not in props, name
+        assert "html" not in props, name
+        assert "url" not in props, name
     assert "TextField" not in C.CATALOG
     assert "Form" not in C.CATALOG
 
@@ -163,6 +170,10 @@ def test_all_catalog_components_are_accepted_at_the_shape_level():
                 props[pname] = []
             elif ptype == "bool":
                 props[pname] = True
+            elif ptype == "event":
+                props[pname] = "go"
+            elif ptype == "object":
+                props[pname] = {}
             elif ptype.startswith("enum:"):
                 props[pname] = ptype.split(":", 1)[1].split("|")[0]
         root = {"id": "root", "component": name, **props}

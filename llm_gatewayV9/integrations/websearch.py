@@ -287,6 +287,119 @@ def _call_with_deadline(fn, query: str, max_results: int,
     return box.get("results") or []
 
 
+_OPENVERSE_URL = "https://api.openverse.org/v1/images/"
+# Its own timeout, not the shared SOURCE_TIMEOUT_S (6s). Measured: an anonymous
+# unauthenticated Openverse query answered in 12.8s and the call returned
+# nothing but a ReadTimeout, which the author then read as "no images exist".
+# The text chain needs to be quick because a researcher calls it forty times a
+# run; picking a picture is one call at the end of a document.
+IMAGE_TIMEOUT_S = float(os.getenv("IMAGE_SEARCH_TIMEOUT_S", "25") or 25)
+# 20, not 10. Image search is a PICK, not a read: the text chain returns pages
+# an agent will mostly fetch, while here the model looks at a handful of
+# candidates and keeps one or two. A thin page forces a second call, which is
+# the same round trip paid twice for a worse picture.
+_IMAGE_MAX = 20
+
+
+def search_images(*, query: str, max_results: int = 8,
+                  commercial_only: bool = False) -> dict:
+    """CC-licensed images, with the licence and author carried through.
+
+    This is the missing SUPPLY half of pictures in documents. Placement already
+    works — `docgen` lifts an embedded raster out of any stored document and the
+    author is shown its `(page, index)` handle — but there was no way to obtain
+    an image, so a report built from web research could only ever be text and
+    charts.
+
+    Openverse rather than a general image engine, deliberately: every result
+    arrives with `license`, `license_version`, `license_url`, `creator` and a
+    `foreign_landing_url`, so a figure can be placed WITH attribution instead of
+    with a prayer. It needs no API key for modest volume (anonymous is
+    rate-limited, which is why this returns a clean error rather than retrying
+    hard). `websearch.search`'s paid/free chain is not reused: those engines
+    return a picture URL with no licence attached, and an unlicensed image in a
+    document the user might publish is a worse default than no image.
+
+    Returns `{"ok": True, "results": [...]}` — a dict, unlike `search`, because
+    a licensing failure and an empty result set must not look the same to the
+    caller.
+    """
+    import httpx as _hx
+    q = str(query or "").strip()
+    if not q:
+        return {"ok": False, "error": "query is required"}
+    n = max(1, min(int(max_results or 8), _IMAGE_MAX))
+    params = {"q": q, "page_size": n,
+              # Mature content is not a document illustration; there is no
+              # argument for it here and a big argument against.
+              "mature": "false"}
+    if commercial_only:
+        params["license_type"] = "commercial,modification"
+    try:
+        with _hx.Client(timeout=IMAGE_TIMEOUT_S) as c:
+            r = c.get(_OPENVERSE_URL, params=params,
+                      headers={"Accept": "application/json"})
+            if r.status_code == 429:
+                return {"ok": False,
+                        "error": "openverse rate limit reached; try again in a "
+                                 "moment or narrow the query"}
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"image search failed: {type(e).__name__}"}
+    out: list[dict] = []
+    for it in (payload.get("results") or [])[:n]:
+        url = str(it.get("url") or "")
+        if not url.lower().endswith((".jpg", ".jpeg", ".png")):
+            # docgen embeds PNG/JPEG only. A GIF/WebP/SVG result would search
+            # successfully and then be dropped at render time with no explanation.
+            continue
+        lic = str(it.get("license") or "").upper()
+        ver = str(it.get("license_version") or "")
+        out.append({
+            "title": str(it.get("title") or "")[:200],
+            "image_url": url,
+            "thumbnail_url": str(it.get("thumbnail") or ""),
+            "page_url": str(it.get("foreign_landing_url") or ""),
+            "width": int(it.get("width") or 0),
+            "height": int(it.get("height") or 0),
+            "source": str(it.get("source") or ""),
+            "creator": str(it.get("creator") or ""),
+            "license": f"{lic} {ver}".strip(),
+            "license_url": str(it.get("license_url") or ""),
+            "attribution": str(it.get("attribution") or ""),
+        })
+    return {"ok": True, "results": out,
+            "count": len(out),
+            "total_available": payload.get("result_count", len(out))}
+
+
+def image_usage(*, url: str) -> dict:
+    """Provenance for one Openverse image id/URL, when a caption needs checking.
+
+    A caption that misattributes a picture is worse than no caption, and the
+    author only ever sees the short list `search_images` returned.
+    """
+    import httpx as _hx
+    u = str(url or "").strip()
+    if not u:
+        return {"ok": False, "error": "url is required"}
+    try:
+        with _hx.Client(timeout=IMAGE_TIMEOUT_S) as c:
+            r = c.get(u, headers={"Accept": "application/json"})
+            r.raise_for_status()
+            it = r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"lookup failed: {type(e).__name__}"}
+    lic = str(it.get("license") or "").upper()
+    return {"ok": True,
+            "title": str(it.get("title") or ""),
+            "creator": str(it.get("creator") or ""),
+            "license": f"{lic} {str(it.get('license_version') or '')}".strip(),
+            "license_url": str(it.get("license_url") or ""),
+            "page_url": str(it.get("foreign_landing_url") or "")}
+
+
 def search(*, query: str, max_results: int = MAX_RESULTS) -> list[dict]:
     """Search the chain under a total deadline.
 

@@ -65,14 +65,6 @@ def test_override_type_validation(flags):
         flags.set_override("unknown.flag", True)
 
 
-def test_view_flags_default_on(flags):
-    assert flags.is_enabled("apps.views.table") is True
-    assert flags.is_enabled("apps.views.cards") is True
-    assert flags.is_enabled("apps.views.prefab") is True
-    rows = {r["name"]: r for r in flags.all_flags()}
-    assert rows["apps.views.cards"]["source"] == "default"
-
-
 def test_evaluation_never_raises_without_key(flags, monkeypatch):
     # Even a broken store falls back to the definition default.
     _sd = Path(os.environ["S9_STATE_DIR"])
@@ -80,3 +72,63 @@ def test_evaluation_never_raises_without_key(flags, monkeypatch):
     (_sd / "flags.json").write_text("{not json", encoding="utf-8")
     assert flags.is_enabled("chat.tools") is True
     assert flags.get_value("chat.tools") is True
+
+
+def test_pane_hiding_flag_is_defined_and_default_on(flags):
+    """The console's pane-hiding kill switch.
+
+    Default-on matters: an operator who never hears of this feature must get
+    today's console, and the frontend treats an absent row as enabled so an
+    older backend cannot blank out panes it has no opinion about.
+    """
+    assert flags.is_enabled("ui.pane_hiding") is True
+    rows = {r["name"]: r for r in flags.all_flags()}
+    assert rows["ui.pane_hiding"]["source"] == "default"
+    assert rows["ui.pane_hiding"]["type"] == "bool"
+
+
+def test_pane_hiding_flag_can_be_switched_off_and_reverted(flags):
+    off = flags.set_override("ui.pane_hiding", False)
+    assert off["value"] is False
+    assert flags.is_enabled("ui.pane_hiding") is False
+    # Reverting removes the override rather than storing False, so the flag
+    # follows the definition default again and state/flags.json stays sparse.
+    assert flags.clear_override("ui.pane_hiding") is True
+    assert flags.is_enabled("ui.pane_hiding") is True
+
+
+def test_authoring_focus_flag_is_defined_and_default_on(flags):
+    """Focus is its own page (`/authoring/focus`), and this is its switch.
+
+    Default-on for the same reason as pane hiding: nobody who has never heard
+    of the flag may get a different console. The frontend also fails OPEN on a
+    flag read that throws, so an unreachable /api/flags cannot make a page the
+    user navigated to silently fall back.
+    """
+    rows = {r["name"]: r for r in flags.all_flags()}
+    assert "ui.authoring_focus" in rows, \
+        "the console renders a Focus entry point with no switch behind it"
+    assert rows["ui.authoring_focus"]["type"] == "bool"
+    assert flags.is_enabled("ui.authoring_focus") is True
+
+
+def test_authoring_focus_can_be_switched_off_and_reverted(flags):
+    assert flags.set_override("ui.authoring_focus", False)["value"] is False
+    assert flags.is_enabled("ui.authoring_focus") is False
+    assert flags.clear_override("ui.authoring_focus") is True
+    assert flags.is_enabled("ui.authoring_focus") is True
+
+
+def test_chat_recall_gate_flag_is_defined_and_default_on(flags):
+    """`chat.recall_gate` skips the memory-corpus search for a greeting.
+
+    It is a behaviour change on the request path — a "hi" used to spend a
+    35-second search — so it needs a switch that restores the old call exactly.
+    Off must mean "recall on every turn", not "recall off".
+    """
+    rows = {r["name"]: r for r in flags.all_flags()}
+    assert "chat.recall_gate" in rows
+    assert flags.is_enabled("chat.recall_gate") is True
+    assert flags.set_override("chat.recall_gate", False)["value"] is False
+    assert flags.is_enabled("chat.recall_gate") is False
+    assert flags.clear_override("chat.recall_gate") is True

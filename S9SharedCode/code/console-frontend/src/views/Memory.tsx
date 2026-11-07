@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Database, SearchX, Trash2 } from 'lucide-react';
+import { ChevronRight, Database, Plus, SearchX, Trash2 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, SkipLink } from '../components/ui';
 import { useMainId } from '../components/KeepAlive';
-import { api, type MemItem, type MemStats } from '../api';
+import { api, type FeedbackLearningStatus, type MemItem, type MemStats, type PersonaMeta } from '../api';
 import { mergeMemoryPage } from '../lib/memoryPage';
+import { renderMarkdown } from '../components/markdown';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
 /* The four memory types the agent actually works with. This list used to be
    the seven gateway DRAWERS (working / episode / fact / playbook / policy /
@@ -109,6 +111,14 @@ export default function Memory() {
      the list was left 119px tall on a 390x844 phone — about one card — while
      10,210px of cards scrolled behind it. */
   const [formOpen, setFormOpen] = useState(false);
+  /* 'browse' is the memory list; 'persona' shows Aria's AI-written portrait. */
+  const [view, setView] = useState<'browse' | 'persona'>('browse');
+  const [personaMd, setPersonaMd] = useState('');
+  const [personaMeta, setPersonaMeta] = useState<PersonaMeta | null>(null);
+  const [personaLoading, setPersonaLoading] = useState(false);
+  const [personaErr, setPersonaErr] = useState('');
+  const [syncOut, setSyncOut] = useState('');
+  const [learning, setLearning] = useState<FeedbackLearningStatus | null>(null);
   const reqRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   /** Current rows, for the append offset. A ref (not state) because `load`
@@ -166,6 +176,73 @@ export default function Memory() {
   }, [load]);
 
   useEffect(() => { itemsRef.current = items; }, [items]);
+
+  const loadLearning = useCallback(async () => {
+    try {
+      setLearning(await api.feedbackLearning());
+    } catch {
+      setLearning(null);
+    }
+  }, []);
+
+  const loadPersona = useCallback(async () => {
+    setPersonaLoading(true); setPersonaErr('');
+    try {
+      const d = await api.profilePersona();
+      setPersonaMd(d.markdown || '');
+      setPersonaMeta(d.meta || null);
+    } catch (e) {
+      setPersonaErr(e instanceof Error ? e.message : String(e));
+    } finally { setPersonaLoading(false); }
+    void loadLearning();
+  }, [loadLearning]);
+
+  const regeneratePersona = useCallback(async () => {
+    setSyncOut('writing a new portrait from your interactions…');
+    try {
+      const d = await api.profilePersonaRegenerate();
+      if (!d.ok) {
+        setSyncOut(`persona not written: ${d.error || 'unknown error'}`);
+        return;
+      }
+      setSyncOut(`persona v${d.version ?? '?'} written`
+        + (d.documents?.ok ? ' and saved to Documents.' : '.'));
+      await loadPersona();
+      void loadLearning();
+    } catch (e) {
+      setSyncOut(`persona not written: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [loadPersona, loadLearning]);
+
+  const syncPersona = useCallback(async (dryRun: boolean) => {
+    setSyncOut(dryRun ? 'previewing feedback…' : 'applying feedback to memory…');
+    try {
+      const d = await api.profilePersonaSync(dryRun);
+      const proposed = d.proposed || [];
+      const applied = d.applied || [];
+      const skipped = d.skipped || [];
+      if (dryRun) {
+        setSyncOut(`preview: ${proposed.length} would update memory, ${skipped.length} skipped. Nothing written.`);
+        return;
+      }
+      setSyncOut(`applied ${applied.length} to memory (${skipped.length} skipped). Refreshing persona…`);
+      await Promise.all([loadPersona(), load('replace')]);
+    } catch (e) {
+      setSyncOut(`sync failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [loadPersona, load]);
+
+  const savePersonaDocs = useCallback(async () => {
+    setSyncOut('saving persona documents…');
+    try {
+      const d = await api.profilePersonaDocument();
+      setSyncOut(d.ok
+        ? `saved: current=${d.current?.slice(0, 8)} evolution=${d.evolution?.slice(0, 8)}`
+        : `save failed: ${d.error || JSON.stringify(d)}`);
+    } catch (e) {
+      setSyncOut(`save failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, []);
 
   /* Counts are a separate read from the list: a stats outage must not blank
      the rows, and a list failure must not hide the counts. */
@@ -366,8 +443,11 @@ export default function Memory() {
   const statusText = !loaded
     ? 'loading memory'
     : submitted
-      ? `${items.length} nearest items for ${submitted}`
+      ? `${items.length} matches for ${submitted}`
       : `${items.length} memory items shown`;
+
+  const kindsMode = usePaneMode('memory.kinds');
+  const noticedMode = usePaneMode('memory.noticed');
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
@@ -392,6 +472,9 @@ export default function Memory() {
       </div>
       {/* Kind panel: a wrapping chip row on phones (2 short rows instead of a
           34vh block), the 248px column from lg up. */}
+      {kindsMode === 'collapsed'
+        ? <PaneStrip id="memory.kinds" label="Memory types" />
+        : (
       <div className="flex w-full flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:h-full lg:w-[248px] lg:flex-none lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3 text-xs font-bold tracking-wide">
           <h2 className="text-xs font-bold tracking-wide">Memory types</h2>
@@ -405,15 +488,10 @@ export default function Memory() {
             {stats ? `${stats.total} live` : '—'}
           </span>
         </div>
-        <p className="hidden px-3.5 pb-2 text-[10.5px] leading-snug text-zinc-muted lg:block">
-          Live records the Memory page browses. Uploaded document chunks and the
-          audit log have their own views and are not counted here.
-        </p>
-        {/* ONE scroll container for the whole list. The kind list used to sit
-            in a fixed block above a separately-scrolling drawer list, which
-            squeezed the scroll area to a few pixels on a phone — the list
-            appeared not to scroll at all. */}
-        <div className="flex flex-wrap gap-2 px-2.5 pb-3 lg:block lg:min-h-0 lg:flex-1 lg:space-y-2 lg:overflow-y-auto">
+        {/* One compact list. The long explanatory paragraph and the second
+            line of copy under every type made the rail taller than the content
+            it filters; the type's meaning is available on hover. */}
+        <div className="flex flex-wrap gap-1.5 px-2.5 pb-3 lg:block lg:min-h-0 lg:flex-1 lg:space-y-1 lg:overflow-y-auto">
           {[{ id: '', label: 'all memory', sub: 'search everything' },
             ...KINDS].map((k) => {
             const on = kindFilter === k.id;
@@ -423,9 +501,10 @@ export default function Memory() {
               key={k.id || 'all'}
               onClick={() => pickKind(k.id)}
               aria-pressed={on}
-              className={`block w-full rounded-[10px] border p-2.5 text-left max-lg:w-auto max-lg:flex-none max-lg:whitespace-nowrap max-lg:py-1.5 ${on ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
+              title={k.sub}
+              className={`block w-full rounded-md border px-2.5 py-2 text-left max-lg:w-auto max-lg:flex-none max-lg:whitespace-nowrap max-lg:py-1.5 ${on ? 'border-violet-400/60 bg-violet-400/5' : 'border-white/10 bg-[#0e0e12] hover:border-white/25'}`}
             >
-              <div className="flex items-center text-[12.5px] font-semibold">
+              <div className="flex items-center text-[12px] font-semibold">
                 {/* selection is not colour-only: aria-pressed covers screen
                     readers, this dot covers everyone else. */}
                 <span aria-hidden className={`mr-1.5 h-1.5 w-1.5 flex-none rounded-full ${on ? 'bg-violet-400' : 'bg-transparent'}`} />
@@ -436,42 +515,70 @@ export default function Memory() {
                   </span>
                 )}
               </div>
-              <div className="mt-1 hidden text-[11px] text-zinc-muted lg:block">{k.sub}</div>
             </button>
             );
           })}
         </div>
       </div>
+        )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <h1 className="sr-only">Memory</h1>
-        <TopBar crumb="Memory">
+        <TopBar crumb="Memory" panes="memory">
           <input
             value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
             placeholder="Search memory…" aria-label="Search memory"
             className="w-44 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400"
           />
+          <Pane id="memory.superseded">
           <label className="flex items-center gap-1.5 text-[11px] text-zinc-400">
             <input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} className="accent-violet-400" />
             hide superseded
           </label>
-          <button onClick={submit} aria-label="Run memory search" className="rounded-md border border-white/15 bg-white/5 px-3.5 py-1.5 text-xs hover:border-violet-400">Search</button>
+          </Pane>
+          <button onClick={submit} aria-label="Run memory search" className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs hover:border-violet-400">Search</button>
+          {view === 'browse' && (
+            <button
+              type="button"
+              onClick={() => setFormOpen((open) => !open)}
+              aria-expanded={formOpen}
+              aria-controls="remember-form"
+              className={`flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                formOpen
+                  ? 'border-violet-400/60 bg-violet-400/10 text-violet-200'
+                  : 'border-white/15 bg-white/5 text-zinc-300 hover:border-violet-400'
+              }`}>
+              <Plus size={12} /> Add memory
+            </button>
+          )}
+          <div role="tablist" aria-label="Memory view" className="ml-1.5 flex items-center gap-1 rounded-md border border-white/10 bg-[#0e0e12] p-1 text-[11px]">
+            <button
+              onClick={() => { setView('browse'); }}
+              aria-selected={view === 'browse'}
+              role="tab"
+              className={`rounded px-2 py-0.5 font-semibold ${view === 'browse' ? 'bg-violet-400/15 text-violet-200' : 'text-zinc-400 hover:text-zinc-200'}`}
+            >browse</button>
+            <button
+              onClick={() => { setView('persona'); if (personaMd === '') void loadPersona(); }}
+              aria-selected={view === 'persona'}
+              role="tab"
+              className={`rounded px-2 py-0.5 font-semibold ${view === 'persona' ? 'bg-violet-400/15 text-violet-200' : 'text-zinc-400 hover:text-zinc-200'}`}
+            >persona</button>
+          </div>
         </TopBar>
-        {/* Result provenance. `api.memory` returns the 60 nearest items and no
-            distance or score field (checked against the live endpoint), so
-            there is no relevance floor to apply and no per-item ranking to
-            show. State what the list is and name the query that produced it,
-            otherwise "60 cards came back" reads as "60 things matched". */}
+        {/* Result provenance. The gateway recalls nearest neighbours, but the
+            dashboard search filters those candidates against the query's own
+            words so a nonsense query returns no rows instead of the whole
+            store. State the rule and the query that produced the list. */}
+        <Pane id="memory.provenance">
         <div className="mx-3.5 mt-2.5 flex flex-wrap items-baseline gap-x-2 gap-y-1 rounded-[10px] border border-white/10 bg-[#0e0e12] px-3 py-2">
           {submitted ? (<>
             <span className="text-[11px] font-bold tracking-[0.12em] text-zinc-muted">SEARCH</span>
             <span className="min-w-0 max-w-full truncate font-mono text-[11.5px] text-zinc-200" title={submitted}>{submitted}</span>
             <span className="text-[11.5px] text-zinc-300">
-              <span className="font-bold">{items.length}</span> nearest stored {items.length === 1 ? 'item' : 'items'}
+              <span className="font-bold">{items.length}</span> stored {items.length === 1 ? 'match' : 'matches'}
             </span>
             <span className="text-[11px] leading-snug text-zinc-muted">
-              semantic recall, not a text match: no score is returned, so these
-              are simply the {items.length} closest records — a query with no
-              real meaning still returns {items.length} of them
+              word match in descriptor and keywords
             </span>
             <button
               onClick={clearSearch}
@@ -488,10 +595,59 @@ export default function Memory() {
                 : stats
                   ? <> of <span className="font-bold">{stats.total}</span> across all types</>
                   : ' across all types'}
-              {' · '}newest first, 60 at a time
+              {' · '}newest first
             </span>
           </>)}
         </div>
+        </Pane>
+        {/* Persona view: Aria's evolving, AI-written portrait. Memory is the
+            factual/episodic drawer below; this is the impression that develops
+            from it and from your conversations. */}
+        {view === 'persona' && (
+          <div className="mx-3.5 mt-2.5 min-h-[60vh] overflow-y-auto">
+            <p className="mb-2 text-[11.5px] text-zinc-muted">
+              Aria's evolving, AI-written impression of you — not a list of stored memories.
+            </p>
+            {personaLoading && <Skel />}
+            {personaErr && (
+              <div role="alert" className="rounded-[10px] border border-red-400/30 bg-red-400/5 px-3 py-2 text-[11.5px] text-red-200">couldn't load persona — {personaErr}</div>
+            )}
+            {!personaLoading && !personaErr && personaMd && (
+              <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200"
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(personaMd) }} />
+            )}
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+              <button onClick={() => void regeneratePersona()} className="rounded border border-violet-400/40 bg-violet-400/10 px-3 py-1.5 text-xs font-bold text-violet-200 hover:border-violet-400">regenerate persona</button>
+              <button onClick={() => void loadPersona()} className="rounded border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-bold hover:border-violet-400">refresh</button>
+              <button onClick={() => void syncPersona(true)} className="rounded border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-bold hover:border-violet-400">preview feedback learning</button>
+              <button onClick={() => void syncPersona(false)} className="rounded border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-bold hover:border-violet-400">apply feedback learning</button>
+              <button onClick={() => void savePersonaDocs()} className="rounded border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-bold hover:border-violet-400">save persona docs</button>
+              {personaMeta && personaMeta.version ? (
+                <span className="text-zinc-400">
+                  v{personaMeta.version}
+                  {' · '}updated {personaMeta.updated_iso || '—'}
+                  {' · '}{personaMeta.total_turns ?? 0} chat turns
+                  {personaMeta.based_on?.interactions
+                    ? ` · ${personaMeta.based_on.interactions} recent interactions`
+                    : ''}
+                </span>
+              ) : (
+                <span className="text-amber-300/80">not generated yet</span>
+              )}
+              {learning && (
+                <span className="text-zinc-400">
+                  {learning.enabled ? 'auto-learning on' : 'auto-learning off'}
+                  {' · '}{learning.pending} pending
+                  {' · '}{learning.counts.applied ?? 0} applied
+                  {learning.persona_autosave ? ' · persona autosave on' : ''}
+                </span>
+              )}
+              {syncOut && <span className="text-zinc-300">{syncOut}</span>}
+            </div>
+          </div>
+        )}
+        {view === 'browse' && (
+        <>
         <p className="sr-only" role="status" aria-live="polite">{statusText}</p>
         {/* The behavioural profile, above the generic memory list.
             It earns its own panel because its rows are not facts: each is a
@@ -503,89 +659,80 @@ export default function Memory() {
             from ~1 row to N moved the results list and the whole sidebar
             beneath it - 0.25 CLS on tablet, the worst left on the site. It is
             a bounded panel, so a floor is honest. */}
-        <div className="mx-3.5 mt-2.5 min-h-[180px] rounded-[10px] border border-white/10 bg-[#0e0e12]">
-          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 border-b border-white/10 px-3 py-2">
-            <span className="text-[11px] font-bold tracking-[0.12em] text-zinc-muted">WHAT WE'VE NOTICED</span>
-            {profileEnabled ? (
-              <>
-                <span className="text-[11.5px] text-zinc-300">
-                  <span className="font-bold">{observations.length}</span>{' '}
-                  {observations.length === 1 ? 'observation' : 'observations'}
-                  <span className="text-zinc-muted"> · each with your words as evidence</span>
-                </span>
+        {profileEnabled && observations.length > 0 && (noticedMode === 'collapsed'
+          ? <PaneStrip id="memory.noticed" label="What we've noticed" />
+          : (
+          <details className="group mx-3.5 mt-2.5 rounded-[10px] border border-white/10 bg-[#0e0e12]">
+            <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-[11.5px] text-zinc-300">
+              <ChevronRight size={12} className="flex-none text-zinc-muted transition-transform group-open:rotate-90" />
+              <span className="text-[10.5px] font-bold tracking-[0.12em] text-zinc-muted">WHAT WE'VE NOTICED</span>
+              <span className="text-zinc-400">
+                <span className="font-bold text-zinc-300">{observations.length}</span>{' '}
+                observation{observations.length === 1 ? '' : 's'}
+              </span>
+              <span className="ml-auto hidden text-[10.5px] text-zinc-muted sm:inline">
+                evidence included
+              </span>
+            </summary>
+            <div className="border-t border-white/10">
+              <ul className="max-h-[30vh] overflow-y-auto divide-y divide-white/5">
+                {observations.map((o) => {
+                  const seen = o.seen_count ?? 1;
+                  return (
+                    <li key={o.id} className="px-3 py-2">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <p className="break-words text-[12px] leading-snug text-zinc-100">{o.observation}</p>
+                          {o.evidence && (
+                            <p className="mt-0.5 break-words border-l-2 border-violet-400/40 pl-2 text-[11px] italic text-zinc-muted">
+                              “{o.evidence}”
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex flex-none items-center gap-1.5">
+                          <Pill tone={seen > 1 ? 'ok' : 'warn'}>
+                            {seen > 1 ? `seen ${seen}×` : 'seen once'}
+                          </Pill>
+                          {seen > 1 && typeof o.confidence === 'number' && (
+                            <span className="font-mono text-[10.5px] text-zinc-muted">
+                              {o.confidence.toFixed(2)}
+                            </span>
+                          )}
+                          <button
+                            onClick={() => forgetObservation(o)}
+                            title="Delete this observation"
+                            aria-label={`Delete observation: ${o.observation}`}
+                            className="flex min-h-6 min-w-6 items-center justify-center rounded-md border border-white/15 px-2 py-1 text-zinc-muted hover:border-red-400 hover:text-red-300"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="flex items-center justify-end border-t border-white/10 px-3 py-1.5">
                 <button
                   onClick={exportProfile}
                   disabled={busy}
                   title="Save this profile and your standing preferences as a document"
-                  className="ml-auto rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 hover:border-violet-400 disabled:opacity-40"
+                  className="rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-300 hover:border-violet-400 disabled:opacity-40"
                 >
                   {busy ? 'Saving…' : 'Save as document'}
                 </button>
-              </>
-            ) : (
-              <span className="text-[11.5px] text-zinc-muted">
-                {profileNote}
-                {profileErr && (
-                  <> <button onClick={() => void loadProfile()} className="underline">retry</button></>
-                )}
-              </span>
+              </div>
+            </div>
+          </details>
+          ))}
+        {!profileEnabled && (
+          <p className="mx-3.5 mt-2 text-[11px] text-zinc-muted">
+            {profileNote}
+            {profileErr && (
+              <> <button onClick={() => void loadProfile()} className="underline">retry</button></>
             )}
-          </div>
-          {profileEnabled && observations.length > 0 && (
-            /* Bounded and independently scrollable. This panel sits ABOVE the
-               memory list in a non-scrolling flex column, so without a height
-               cap a long profile pushes everything below it off-screen with
-               no way to reach it - the page looked stuck. The header stays
-               put; only the rows scroll. */
-            <ul className="max-h-[34vh] overflow-x-hidden overflow-y-auto divide-y divide-white/5">
-              {observations.map((o) => {
-                const seen = o.seen_count ?? 1;
-                return (
-                <li key={o.id} className="px-3 py-2.5">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <p className="break-words text-[12.5px] leading-snug text-zinc-100">{o.observation}</p>
-                      {o.evidence && (
-                        <p className="mt-1 break-words border-l-2 border-violet-400/40 pl-2 text-[11.5px] italic text-zinc-muted">
-                          “{o.evidence}”
-                        </p>
-                      )}
-                    </div>
-                    <div className="flex flex-none items-center gap-1.5">
-                      {/* How many times this has actually been seen, stated
-                          plainly. A single incident is an anecdote, and
-                          presenting it beside a confidence score made one
-                          message read as an established preference. */}
-                      <Pill tone={seen > 1 ? 'ok' : 'warn'}>
-                        {seen > 1 ? `seen ${seen}×` : 'seen once'}
-                      </Pill>
-                      {seen > 1 && typeof o.confidence === 'number' && (
-                        <span className="font-mono text-[10.5px] text-zinc-muted">
-                          {o.confidence.toFixed(2)}
-                        </span>
-                      )}
-                      <button
-                        onClick={() => forgetObservation(o)}
-                        title="Delete this observation"
-                        aria-label={`Delete observation: ${o.observation}`}
-                        className="flex min-h-6 min-w-6 items-center justify-center rounded-md border border-white/15 px-2 py-1 text-zinc-muted hover:border-red-400 hover:text-red-300"
-                      >
-                        <Trash2 size={13} />
-                      </button>
-                    </div>
-                  </div>
-                </li>
-                );
-              })}
-            </ul>
-          )}
-          {profileEnabled && observations.length === 0 && (
-            <p className="px-3 py-2.5 text-[11.5px] text-zinc-muted">
-              Nothing recorded yet. This grows only when you correct the agent or
-              say how you want something done.
-            </p>
-          )}
-        </div>
+          </p>
+        )}
         {/* Load failures get their own region, above the list, so they are
             never mistaken for the result of a Remember/Forget/Wipe and are
             cleared by the next successful load. */}
@@ -595,52 +742,32 @@ export default function Memory() {
             <button onClick={() => void load('replace')} className="rounded border border-red-400/40 px-2 py-0.5 text-[10.5px] font-bold underline">retry</button>
           </div>
         )}
-        {/* write form: a disclosure below lg so the list gets the viewport */}
-        <h2 className="mx-3.5 mt-2.5 lg:hidden">
-          <button
-            onClick={() => setFormOpen((o) => !o)}
-            aria-expanded={formOpen}
-            aria-controls="remember-form"
-            className="flex w-full items-center justify-between rounded-[10px] border border-white/10 bg-[#0e0e12] px-3.5 py-2.5 text-[10px] font-bold tracking-[0.12em] text-zinc-300"
-          >
-            REMEMBER
-            <span className="text-[10.5px] font-medium normal-case tracking-normal text-zinc-muted">
-              {formOpen ? 'hide' : 'write a memory'}
-            </span>
-          </button>
-        </h2>
-        <div id="remember-form" className={`${formOpen ? 'block' : 'hidden'} lg:block`}>
-          {/* Measured: this card rendered 36px tall and settled at 360px, and
-              the sidebar growing past the viewport is what pushed the page
-              around (0.13 CLS on desktop). Reserving its real height stops the
-              shift whatever inside it is late. */}
-          <div className="mx-3.5 mt-2.5 min-h-[356px] rounded-[10px] border border-white/10 bg-[#0e0e12] p-3.5">
-            <div className="mb-1 hidden text-[10px] font-bold tracking-[0.12em] text-zinc-muted lg:block">REMEMBER</div>
-            <div className="flex flex-wrap items-end gap-2.5">
-              <label className="text-[11px] text-zinc-muted">kind<br />
-                <select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Memory kind" className="mt-1 rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-xs outline-none">
-                  {/* `observation` was missing here while the sidebar filter,
-                      the "what we've noticed" section and 20 stored records
-                      all used it: the console showed a whole type of memory
-                      the user could filter for but not add to. Same five kinds
-                      as KINDS, kept in step deliberately. */}
-                  <option>fact</option><option>preference</option><option>observation</option><option>tool_outcome</option><option>scratchpad</option>
-                </select>
-              </label>
-              <label className="min-w-[220px] flex-1 text-[11px] text-zinc-muted">descriptor<br />
-                <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="one short human-readable line" aria-label="Memory descriptor" className="mt-1 w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
-              </label>
-              <label className="text-[11px] text-zinc-muted">keywords<br />
-                <input value={kw} onChange={(e) => setKw(e.target.value)} placeholder="a, b" aria-label="Memory keywords" className="mt-1 w-36 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
-              </label>
-              <button onClick={remember} disabled={busy} aria-label="Remember this fact" className="rounded-md bg-violet-400 px-4 py-2 text-xs font-bold text-[#0b0b0e] disabled:opacity-50 hover:brightness-110">{busy ? 'Saving…' : 'Remember'}</button>
-              <label className="text-[11px] text-zinc-muted">wipe session<br />
-                <span className="mt-1 flex gap-1.5">
-                  <input value={sess} onChange={(e) => setSess(e.target.value)} placeholder="session id" aria-label="Session id to wipe" className="w-32 rounded-md border border-white/10 bg-black/40 px-2 py-1.5 text-xs outline-none focus:border-violet-400" />
-                  <button onClick={wipe} disabled={busy} aria-label="Wipe session memory" className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs hover:border-red-400 hover:text-red-300 disabled:opacity-50">Wipe</button>
-                </span>
-              </label>
+        {/* Write memory. Hidden until the Add memory button asks for it: the
+            always-open form was a 356px empty card sitting above every list. */}
+        <div id="remember-form" className={formOpen ? 'block' : 'hidden'}>
+          <div className="mx-3.5 mt-2.5 rounded-[10px] border border-white/10 bg-[#0e0e12] p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[10px] font-bold tracking-[0.12em] text-zinc-muted">ADD MEMORY</span>
+              <button onClick={() => setFormOpen(false)}
+                className="rounded px-1 text-[11px] text-zinc-500 hover:text-zinc-200">
+                close
+              </button>
             </div>
+            <div className="grid items-end gap-2 sm:grid-cols-[110px_minmax(0,1fr)_150px_auto]">
+              <select value={kind} onChange={(e) => setKind(e.target.value)} aria-label="Memory kind" className="h-8 rounded-md border border-white/10 bg-black/40 px-2 text-xs outline-none">
+                <option>fact</option><option>preference</option><option>observation</option><option>tool_outcome</option><option>scratchpad</option>
+              </select>
+              <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="What should Aria remember?" aria-label="Memory descriptor" className="h-8 w-full rounded-md border border-white/10 bg-black/40 px-2.5 text-xs outline-none focus:border-violet-400" />
+              <input value={kw} onChange={(e) => setKw(e.target.value)} placeholder="keywords, comma-separated" aria-label="Memory keywords" className="h-8 w-full rounded-md border border-white/10 bg-black/40 px-2.5 text-xs outline-none focus:border-violet-400" />
+              <button onClick={remember} disabled={busy} aria-label="Remember this fact" className="h-8 rounded-md bg-violet-400 px-3 text-xs font-bold text-[#0b0b0e] disabled:opacity-50 hover:brightness-110">{busy ? 'Saving…' : 'Remember'}</button>
+            </div>
+            <details className="mt-2 border-t border-white/10 pt-2">
+              <summary className="cursor-pointer text-[10.5px] text-zinc-500">Session tools</summary>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                <input value={sess} onChange={(e) => setSess(e.target.value)} placeholder="session id" aria-label="Session id to wipe" className="h-8 w-44 rounded-md border border-white/10 bg-black/40 px-2 text-xs outline-none focus:border-violet-400" />
+                <button onClick={wipe} disabled={busy} aria-label="Wipe session memory" className="h-8 rounded-md border border-white/15 bg-white/5 px-2.5 text-xs hover:border-red-400 hover:text-red-300 disabled:opacity-50">Wipe session</button>
+              </div>
+            </details>
             {out && <div className="mt-2 text-[11px] text-zinc-muted" role="status">{out}</div>}
           </div>
         </div>
@@ -650,7 +777,7 @@ export default function Memory() {
             CLS 0.25 on tablet, 0.22 on mobile. Reserving one viewport's worth
             means the scrollbar and the content below hold still while data
             arrives. */}
-        <div className="min-h-[60vh] space-y-2.5 overflow-y-auto p-3.5">
+        <div className="min-h-[50vh] space-y-2 overflow-y-auto p-3">
           {!loaded && <Skel />}
           {loaded && !loadError && !items.length && submitted && (
             /* An empty list behind a query is a search result, not a lack of
@@ -661,7 +788,7 @@ export default function Memory() {
               <Empty
                 icon={<SearchX size={30} />}
                 title="No memories for that search"
-                sub={`Nothing came back for "${submitted.slice(0, 120)}". Semantic recall usually returns the 60 nearest records whatever the query, so an empty list here means the store has nothing for this type filter — not that your query failed.`}
+                sub={`No stored memory matches "${submitted.slice(0, 120)}" under the current type filter.`}
               />
               <div className="-mt-6 flex justify-center">
                 <button
@@ -673,14 +800,14 @@ export default function Memory() {
               </div>
             </>
           )}
-          {loaded && !loadError && !items.length && !submitted && <Empty icon={<Database size={30} />} title="Nothing stored here" sub="Write a memory with the Remember form, pick another type, or search." />}
+          {loaded && !loadError && !items.length && !submitted && <Empty icon={<Database size={30} />} title="Nothing stored here" sub="Use Add memory, pick another type, or search." />}
           {items.map((it) => {
             const cut = cutOff(it.descriptor);
             const body = readable(it.descriptor);
             const kws = it.keywords || [];
             return (
             <section key={it.id || `${it.kind}-${it.descriptor}`} className="rounded-[10px] border border-white/10 bg-[#0e0e12]">
-              <div className="flex items-center gap-2 border-b border-white/10 px-3.5 py-2.5">
+              <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2">
                 {it.superseded_by ? <Pill tone="err">superseded</Pill> : <Pill tone="ok">{it.kind || '?'}</Pill>}
                 {/* Only for kinds that write a real score. Everything else
                     defaults to 1.0, so showing it everywhere would put a
@@ -697,19 +824,19 @@ export default function Memory() {
                     disabled={busy}
                     aria-label={`Forget memory ${it.id}`}
                     title="Forget this memory"
-                    className="rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[10.5px] font-bold text-zinc-400 hover:border-red-400/50 hover:text-red-300 disabled:opacity-40"
+                    className="flex h-6 w-6 items-center justify-center rounded border border-white/15 bg-white/5 text-zinc-400 hover:border-red-400/50 hover:text-red-300 disabled:opacity-40"
                   >
-                    forget
+                    <Trash2 size={12} />
                   </button>
                 )}
-                <span className="font-mono text-[11px] text-zinc-400">{shortId(it.id)}</span>
+                <span className="font-mono text-[10.5px] text-zinc-500">{shortId(it.id)}</span>
               </div>
               {/* A tool_outcome descriptor is a raw JSON log line. Rendered
                   verbatim it exposed internal artifact handles on 51 of 500
                   cards (`"artifact": "art:5a193fb23cbf6079"`) and was cut
                   mid-JSON by the 200-char server cap, so it looked broken as
                   well as leaking internals. Show the readable head instead. */}
-              <div className="px-3.5 py-2.5 text-[12.5px] break-words text-zinc-200">
+              <div className="px-3 py-2 text-[12.5px] break-words text-zinc-200">
                 {body}
                 {/* the cap is silent: without this a 660-char fact read as a
                     complete sentence that happened to stop. */}
@@ -720,7 +847,7 @@ export default function Memory() {
                   </span>
                 )}
               </div>
-              <div className="flex flex-wrap items-center gap-1.5 px-3.5 pb-2.5">
+              <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
                 {kws.map((k) => (
                   <span key={k} className="max-w-[240px] truncate rounded border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-[10.5px] text-zinc-400">{k}</span>
                 ))}
@@ -749,6 +876,8 @@ export default function Memory() {
             </div>
           )}
         </div>
+      </>
+        )}
       </main>
     </div>
   );

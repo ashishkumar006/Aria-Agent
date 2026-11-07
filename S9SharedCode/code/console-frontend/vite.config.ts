@@ -2,10 +2,16 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
-// Built assets are served by the agent (FastAPI) under /app-assets/,
-// index.html is served at /research. Relative base keeps it robust.
+// The agent serves the built shell at every route and its chunks under
+// /assets/ (agent_server.py's `@app.get("/assets/{path}")`). The base has to be
+// absolute for that to work: with './', `index.html` emits `./assets/app.js`,
+// which the browser resolves against the CURRENT directory — so a nested route
+// like /authoring/focus asks for /authoring/assets/app.js, the fallback answers
+// 404 by design, and the console loads as a blank page with no error anywhere
+// in it. Root-absolute URLs resolve the same from any depth, which is also what
+// makes the trailing-slash rebase the fallback documents there harmless.
 export default defineConfig({
-  base: './',
+  base: '/',
   plugins: [react(), tailwindcss()],
   build: {
     outDir: 'dist',

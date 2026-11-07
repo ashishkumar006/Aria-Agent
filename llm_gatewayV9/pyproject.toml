@@ -12,6 +12,9 @@ dependencies = [
     "jsonschema>=4.21",
     "pyyaml>=6.0",
     "python-multipart>=0.0.9",
+    # Per-user provider keys are encrypted at rest (user_store.py). Not
+    # optional: without it the gateway cannot start a multi-user pool.
+    "cryptography>=42.0",
     # Document parsing for the /documents feature. Each parser degrades
     # gracefully if one is missing, but indexing is much better with them.
     "pypdf>=4.0",

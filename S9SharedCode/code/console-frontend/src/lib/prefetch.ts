@@ -22,6 +22,7 @@ const LOADERS: Record<string, () => Promise<unknown>> = {
   '/mission': () => import('../views/Mission'),
   '/settings': () => import('../views/Settings'),
   '/code': () => import('../views/Code'),
+  '/studio': () => import('../views/studio/Studio'),
   '/authoring': () => import('../views/Authoring'),
   '/parts': () => import('../views/Parts'),
   '/computer': () => import('../views/Computer'),
@@ -47,7 +48,9 @@ export function prefetchSection(id: string): void {
  * usually there before the navigation does. The prefetcher's job is to make a
  * hop free, not to make a page load expensive.
  */
-const NEVER_PRELOADED = new Set<string>(['/code']);
+/* Studio pulls the same editor chunk, so it inherits the same rule: warming it
+   on idle would cost 4 MB to a page that may never be opened. */
+const NEVER_PRELOADED = new Set<string>(['/code', '/studio']);
 
 /** Warm every section's chunk EXCEPT the ones that cost more than they save. */
 export function prefetchAll(): void {

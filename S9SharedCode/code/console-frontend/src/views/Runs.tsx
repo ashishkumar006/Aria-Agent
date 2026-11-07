@@ -7,6 +7,7 @@ import { classifyStatus, isRunLive, pillForStatus, type RunStatus } from '../com
 import DagCanvas from '../components/DagCanvas';
 import Inspector from '../components/Inspector';
 import { api, ago, displayTopic, CONF, type RunRow, type GraphPayload } from '../api';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
 function statusOf(r: RunRow): RunStatus {
   return classifyStatus(Object.keys(r.status_counts || {}).join(' '));
@@ -37,11 +38,19 @@ function pillFor(r: RunRow): { label: string; tone: RunStatus } {
 
 export default function Runs() {
   const mainId = useMainId();
+  const listMode = usePaneMode('runs.list');
+  const inspectorMode = usePaneMode('runs.inspector');
   const loc = useLocation();
 const nav = useNavigate();
   const active = useSectionActive();
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [totals, setTotals] = useState<{ runs?: number; nodes?: number; dollars?: number }>({});
+  /* The summary endpoint is paged. Keep the count of session rows actually
+     read so "load older" can request the next page, and keep pages already
+     loaded when the 15s refresh brings page 0 back. */
+  const [hasMore, setHasMore] = useState(false);
+  const [moreLoading, setMoreLoading] = useState(false);
+  const runsFetchedRef = useRef(0);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [q, setQ] = useState('');
@@ -61,10 +70,18 @@ const nav = useNavigate();
 
   const refresh = useCallback(async () => {
     try {
-      const d = await api.runsSummary(200);
+      const d = await api.runsSummary(200, 0);
       if (!aliveRef.current) return;
-      setRuns(d.runs || []);
+      const first = d.runs || [];
+      setRuns((prev) => {
+        /* Keep older pages; only replace the rows page 0 still owns. */
+        const seen = new Set(first.map((r) => r.session_id));
+        return [...first, ...prev.filter((r) => !seen.has(r.session_id))];
+      });
       setTotals(d.totals || {});
+      runsFetchedRef.current = Math.max(runsFetchedRef.current, first.length);
+      const total = Number(d.totals?.runs || first.length);
+      setHasMore(Boolean(d.has_more) && runsFetchedRef.current < total);
       setLoaded(true);
       setLoadError('');
     } catch (e) {
@@ -73,6 +90,32 @@ const nav = useNavigate();
       setLoadError(e instanceof Error ? e.message : String(e));
     }
   }, []);
+
+  const loadMoreRuns = useCallback(async () => {
+    if (moreLoading || !hasMore) return;
+    setMoreLoading(true);
+    const from = runsFetchedRef.current;
+    try {
+      const d = await api.runsSummary(200, from);
+      if (!aliveRef.current) return;
+      const extra = d.runs || [];
+      setRuns((prev) => {
+        const seen = new Set(prev.map((r) => r.session_id));
+        return [...prev, ...extra.filter((r) => !seen.has(r.session_id))];
+      });
+      /* Header nodes/spend stay the page-0 figures: a later page's rollup
+         covers only that page, and swapping it in would make the header
+         change just because the user scrolled back in time. */
+      runsFetchedRef.current = from + extra.length;
+      const total = Number(d.totals?.runs || runsFetchedRef.current);
+      setHasMore(runsFetchedRef.current < total || Boolean(d.has_more));
+      setLoadError('');
+    } catch (e) {
+      if (aliveRef.current) setLoadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (aliveRef.current) setMoreLoading(false);
+    }
+  }, [hasMore, moreLoading]);
 
   useActivePoll(refresh, CONF.pollSlowMs);
 
@@ -148,7 +191,21 @@ const nav = useNavigate();
     return () => { dead = true; clearInterval(t); };
   }, [active, liveSid]);
 
+  // A 0 here is the gateway's "no price", not a free run. Do not print a
+  // dollar amount unless at least one run carries a real one.
+  const hasSpend = runs.some((s) => Number(s.usd || 0) !== 0)
+    || Number(totals.dollars || 0) !== 0;
+
+  /* Graph-less, untitled session records are empty shells (fixtures or runs
+     that died before setup). They have nothing to inspect and used to fill
+     the top of the list with "(untitled) · no graph". A real failed run with
+     a query stays visible; only the no-content shells are hidden. */
+  const emptyShells = runs.filter(
+    (s) => s.has_graph === false && !(s.topic || s.query || '').trim(),
+  ).length;
+
   const vis = runs.filter((s) => {
+    if (s.has_graph === false && !(s.topic || s.query || '').trim()) return false;
     /* Search the topic first, then fall back to the raw prompt so a run is
        still findable by text that only exists in the skill instruction. */
     if (q && !(`${s.topic || ''} ${s.query || ''}`.toLowerCase().includes(q.toLowerCase()))) return false;
@@ -166,17 +223,24 @@ const nav = useNavigate();
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {listMode === 'collapsed'
+        ? <PaneStrip id="runs.list" label="Runs list" />
+        : (
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[264px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Runs
+          <Pane id="runs.badge">
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[10.5px] font-bold text-zinc-400">{loaded ? (totals.runs ?? 0) : '—'}</span>
+          </Pane>
         </div>
+        <Pane id="runs.filters">
         <div className="flex gap-1.5 px-2.5 pb-2">
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter runs" className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
           <select value={flt} onChange={(e) => setFlt(e.target.value as '' | 'ok' | 'err')} aria-label="Status filter" className="rounded-md border border-white/10 bg-black/40 px-1.5 py-1.5 text-xs outline-none">
             <option value="">all</option><option value="ok">ok</option><option value="err">errors</option>
           </select>
         </div>
+        </Pane>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-2.5 pb-3">
           {!loaded && <Skel />}
           {loaded && loadError && !!runs.length && (
@@ -211,7 +275,7 @@ const nav = useNavigate();
                 </div>
                 <div className="mt-1 flex flex-wrap gap-x-2 text-[11px] tabular-nums text-zinc-muted">
                   <span>{s.has_graph === false ? 'no graph' : `${s.nodes || 0} nodes`}</span>
-                  <span>${Number(s.usd || 0).toFixed(4)}</span>
+                  {hasSpend && <span>${Number(s.usd || 0).toFixed(4)}</span>}
                   {/* The `s.updated ? ... : 0` here rendered "0s ago" for any
                       run whose timestamp was 0, which read as "just now" for
                       runs up to 119 hours old. Fall back to the server's own
@@ -228,10 +292,31 @@ const nav = useNavigate();
               </button>
             );
           })}
+          {hasMore && (
+            <button
+              onClick={() => void loadMoreRuns()}
+              disabled={moreLoading}
+              title="Read the next page of runs from the session store."
+              className="w-full rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] text-zinc-300 hover:border-violet-400 disabled:opacity-50"
+            >
+              {moreLoading
+                ? 'loading…'
+                : `load older runs (${Math.max(0, (totals.runs || 0) - runs.length)} hidden)`}
+            </button>
+          )}
+          {emptyShells > 0 && (
+            <Pane id="runs.shells">
+            <p className="px-1 pt-1 text-[10.5px] leading-snug text-zinc-600">
+              {emptyShells} empty session{emptyShells === 1 ? '' : 's'} without a
+              graph hidden.
+            </p>
+            </Pane>
+          )}
         </div>
       </div>
+        )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Runs">
+        <TopBar crumb="Runs" panes="runs">
           {/* Kept mounted and hidden rather than conditionally rendered:
               swapping the button out on run start/end destroyed keyboard
               focus mid-interaction and threw focus back to <body>. */}
@@ -251,11 +336,14 @@ const nav = useNavigate();
           >
             <Square size={11} /> Stop run
           </button>
+          <Pane id="runs.totals">
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10.5px] font-bold text-zinc-400">
             {loaded
-              ? `${totals.runs || 0} runs · ${totals.nodes || 0} nodes · $${Number(totals.dollars || 0).toFixed(4)}`
+              ? `${totals.runs || 0} runs · ${totals.nodes || 0} nodes · `
+                + (hasSpend ? `$${Number(totals.dollars || 0).toFixed(4)}` : 'spend n/a')
               : 'reading runs…'}
           </span>
+          </Pane>
         </TopBar>
         {note && (
           <div className="px-4 pt-2 text-[11px] text-zinc-400">{note}</div>
@@ -281,7 +369,9 @@ const nav = useNavigate();
               <DagCanvas key={sid} graph={graph} running={!!liveSid} selectedId={selected} onSelect={setSelected} />
             )}
           </div>
-          {selected && sid && (
+          {selected && sid && (inspectorMode === 'collapsed'
+            ? <PaneStrip id="runs.inspector" label="Node inspector" />
+            : (
             <div className="w-[400px] max-w-[45vw] flex-none overflow-y-auto rounded-[10px] border border-white/10 bg-[#0b0b0e]">
               {/* "Run again" used to be an empty arrow function, so the
                   button did nothing at all. It now hands the original query
@@ -293,9 +383,13 @@ const nav = useNavigate();
                 onRerun={() => nav('/research', { state: { brief: query } })}
               />
             </div>
-          )}
+            ))}
         </div>
-        {!!nErr && <div className="px-4 pb-2 text-[11px] text-red-300">{nErr} run{nErr === 1 ? '' : 's'} with failures</div>}
+        {!!nErr && (
+          <Pane id="runs.failures">
+          <div className="px-4 pb-2 text-[11px] text-red-300">{nErr} run{nErr === 1 ? '' : 's'} with failures</div>
+          </Pane>
+        )}
       </main>
     </div>
   );

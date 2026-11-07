@@ -39,8 +39,9 @@ const THEME = {
 
 const FONT = '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace';
 
-function TerminalSession({ visible, nonce, onStatus }: {
+function TerminalSession({ visible, nonce, onStatus, cwd, sid }: {
   visible: boolean; nonce: number; onStatus: (s: Status) => void;
+  cwd?: string; sid?: string;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Xterm | null>(null);
@@ -78,6 +79,12 @@ function TerminalSession({ visible, nonce, onStatus }: {
     const qs = new URLSearchParams({
       token: launchToken(), cols: String(term.cols), rows: String(term.rows),
     });
+    /* A studio shell starts inside one of the session's folders. The server
+       re-checks this rather than trusting it — a query parameter is the least
+       trustworthy place to put a path — but asking for the right one is what
+       makes "a shell in this project" mean anything. */
+    if (cwd) qs.set('cwd', cwd);
+    if (sid) qs.set('sid', sid);
     onStatus('connecting');
     const ws = new WebSocket(`${proto}://${location.host}/api/terminal?${qs}`);
     ws.binaryType = 'arraybuffer';
@@ -119,8 +126,10 @@ function TerminalSession({ visible, nonce, onStatus }: {
       termRef.current = null;
       fitRef.current = null;
     };
-    // nonce re-creates the session (restart); the rest is one-time setup.
-  }, [nonce, onStatus]);
+    // nonce re-creates the session (restart); a new cwd or session is a
+    // different shell, so it re-creates it too rather than lying about where
+    // the prompt is.
+  }, [nonce, onStatus, cwd, sid]);
 
   useEffect(() => {
     if (!visible) return;
@@ -139,12 +148,14 @@ function TerminalSession({ visible, nonce, onStatus }: {
    session stays mounted (hidden) when another tab is selected. Collapsing the
    panel must not lose the scrollback. */
 export default function TerminalDock({ open: openProp, onToggle, bare,
-  nonce: nonceProp, onStatus }: {
+  nonce: nonceProp, onStatus, cwd, sid }: {
   open?: boolean;
   onToggle?: () => void;
   bare?: boolean;
   nonce?: number;
   onStatus?: (s: TerminalStatus) => void;
+  cwd?: string;
+  sid?: string;
 } = {}) {
   const [ownOpen, setOwnOpen] = useState(false);
   const [everOpened, setEverOpened] = useState(false);
@@ -173,7 +184,8 @@ export default function TerminalDock({ open: openProp, onToggle, bare,
     return (
       <div className={open ? 'relative block h-full' : 'relative hidden h-full'}>
         {everOpened && (
-          <TerminalSession visible={open} nonce={nonce} onStatus={report} />
+          <TerminalSession visible={open} nonce={nonce} onStatus={report}
+                           cwd={cwd} sid={sid} />
         )}
         {/* The docked panel has a Restart button in its header; bare mode
             (Code's shared bottom panel) had no control at all, so an exited
@@ -225,7 +237,8 @@ export default function TerminalDock({ open: openProp, onToggle, bare,
       </div>
       <div className={open ? 'block' : 'hidden'} style={{ height: 240 }}>
         {everOpened && (
-          <TerminalSession visible={open} nonce={nonce} onStatus={setStatus} />
+          <TerminalSession visible={open} nonce={nonce} onStatus={setStatus}
+                           cwd={cwd} sid={sid} />
         )}
       </div>
     </div>

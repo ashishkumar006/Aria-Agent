@@ -1,13 +1,16 @@
 import {
-  Suspense, lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
+  memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { useNavigate } from 'react-router-dom';
 import {
   Plus, RefreshCw, Send, Download, Eye, X, Loader2, FileText, Table2, Presentation,
-  Paperclip, Clock,
+  Paperclip, Clock, Mic, MicOff, Volume2, VolumeX, Square,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, useHealth, SkipLink } from '../components/ui';
 import { useMainId, useSectionActive } from '../components/KeepAlive';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
 /* The same list the Documents drop-zone accepts, because this calls the same
    api.uploadDocument. The server rejects anything else with a 400 naming the
@@ -17,16 +20,22 @@ import { useMainId, useSectionActive } from '../components/KeepAlive';
 const UPLOAD_ACCEPT =
   '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm';
 import { renderMarkdown } from '../components/markdown';
-import { api, ago, CONF, headers, type ChatThread, type DocPreview, type StreamFile, type A2uiSurface } from '../api';
+import {
+  api, ago, CONF, headers, type ChatThread, type DocFolder, type DocPreview,
+  type StreamFile, type A2uiSurface, type VoiceOption, type VoiceStatus,
+} from '../api';
+import { flattenFolders } from '../lib/folders';
 import { ModelPicker } from '../components/ModelPicker';
 import { useFocusTrap } from '../lib/a11y';
 import { A2ui } from '../components/A2ui';
-
-/* The document viewer drags the whole setup panel in behind it and chat has no
-   setup panel, so it is route-split the same way App.tsx splits the views: the
-   transcript does not pay for it until a produced file is actually opened. */
-const DocumentViewer = lazy(() =>
-  import('./DocSetup').then((m) => ({ default: m.DocumentViewer })));
+import { Feedback } from '../components/Feedback';
+import { SpeakButton } from '../components/SpeakButton';
+import {
+  DEFAULT_VOICES, VoiceRecorder, filenameFor, loadVoicePrefs,
+  mediaRecordingSupported, saveVoicePrefs, speakText, stopSpeaking,
+  subscribeSpeech,
+} from '../lib/voice';
+import { DocumentModal } from '../components/DocumentModal';
 
 /** Mirrors agent_server._CHAT_MAX_QUERY. The server rejects a longer query
  *  with a 400, so the composer has to refuse one - visibly, with the text
@@ -69,6 +78,10 @@ interface Msg {
   pending?: boolean;
   /** A2UI surface for structured responses. */
   surface?: A2uiSurface;
+  /** Provenance of a self-scheduled turn: why Aria armed a watch, the job that
+   *  fired, and what had changed when it did. Set only when kind === 'wake'. */
+  wake?: { reason?: string; schedule_id?: string; counts?: Record<string, number>;
+           wakes_left?: number; at?: number };
   /** Identity of the stored turn this row came from. Local-only turns have
    *  none. Used by the poll merge, never by the renderer. */
   sig?: string;
@@ -82,12 +95,21 @@ interface StoredMsg {
   title?: string;
   pending?: boolean;
   surface?: A2uiSurface;
+  wake?: { reason?: string; schedule_id?: string; counts?: Record<string, number>;
+           wakes_left?: number; at?: number };
 }
 
 /** What makes two stored turns the same row. The server list is append-only
  *  within a thread, so this is enough to know a poll changed nothing. */
 function storedSig(m: StoredMsg): string {
-  return JSON.stringify([m.role, m.content, m.kind, m.title, !!m.pending, m.surface ?? null]);
+  /* Empty kind/title and absent kind/title are the same stored turn. Live
+     frames arrive with "" while reloaded rows have undefined (null in JSON);
+     without normalising, the feedback note's msg_id stopped matching after a
+     refresh. */
+  return JSON.stringify([
+    m.role, m.content, m.kind || null, m.title || null,
+    !!m.pending, m.surface ?? null,
+  ]);
 }
 
 /** One stored turn → one bubble. The id is derived from the row's position,
@@ -113,10 +135,18 @@ function toMsg(m: StoredMsg, id: number, sig: string): Msg {
   }
   if (m.kind === 'stopped') {
     return { id, who: 'aria', html: renderMarkdown(m.content),
-      meta: 'stopped', arts: artRefs(m.content), sig };
+      text: m.content, meta: 'stopped', arts: artRefs(m.content), sig };
+  }
+  if (m.kind === 'wake') {
+    /* A turn the agent took because it scheduled itself. It renders as an
+       ordinary answer so it can be replied to, but it is labelled: a message
+       that appeared with nobody typing has to say where it came from, and the
+       reason it was armed is the sentence that makes it make sense. */
+    return { id, who: 'aria', html: renderMarkdown(m.content), text: m.content,
+      kind: 'wake', wake: m.wake, arts: artRefs(m.content), sig };
   }
   return { id, who: 'aria', html: renderMarkdown(m.content),
-    arts: artRefs(m.content), sig };
+    text: m.content, arts: artRefs(m.content), sig };
 }
 
 /** Stored thread messages → transcript bubbles. One mapper for both load
@@ -221,7 +251,21 @@ function serverFileName(cd: string | null): string {
 
 const KIND_ICON: Record<string, typeof FileText> = {
   pdf: FileText, pptx: Presentation, docx: FileText, xlsx: Table2,
+  png: ImageIcon, jpg: ImageIcon, jpeg: ImageIcon, gif: ImageIcon,
+  webp: ImageIcon, bmp: ImageIcon, svg: ImageIcon, image: ImageIcon,
 };
+
+/* The server names the kind from the artifact descriptor, and an image stored by
+   `fetch_image` arrives with the format it was uploaded as. Falling back to the
+   label's own extension means a photograph does not present as `document.bin`
+   in the transcript — which is what made a produced image look like it had
+   failed to appear at all. */
+function artKind(kind: string, label: string): string {
+  if (kind) return kind;
+  const m = /\.([A-Za-z0-9]{1,5})$/.exec((label || '').trim());
+  return m ? m[1].toLowerCase() : '';
+}
+
 /** One produced document, inside the answer that named it: the file row, the
  *  download and the preview.
  *
@@ -234,7 +278,7 @@ function ArtRow({ art, label, state }: { art: string; label?: string; state: Art
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ text: string; bad: boolean } | null>(null);
   const p = state.status === 'ok' ? state.preview : null;
-  const kind = p && p.kind !== 'unknown' ? p.kind : '';
+  const kind = artKind(p && p.kind !== 'unknown' ? p.kind : '', label || '');
   const Icon = KIND_ICON[kind] || FileText;
   // Prefer the model's own link text when it looks like a filename. The server
   // re-derives a name from the artifact descriptor and that is the name the
@@ -294,10 +338,9 @@ function ArtRow({ art, label, state }: { art: string; label?: string; state: Art
             {p.kind !== 'unknown' && (
               <button
                 type="button"
-                onClick={() => setOpen(!open)}
-                aria-expanded={open}
-                aria-controls={`artpv-${art}`}
-                aria-label={`${open ? 'Hide' : 'Show'} preview of ${name}`}
+                onClick={() => setOpen(true)}
+                aria-haspopup="dialog"
+                aria-label={`Open ${name} in the document window`}
                 className="flex flex-none items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] font-semibold hover:border-violet-400"
               >
                 {open ? <X size={12} /> : <Eye size={12} />} preview
@@ -333,11 +376,19 @@ function ArtRow({ art, label, state }: { art: string; label?: string; state: Art
         </p>
       )}
       {open && p && p.kind !== 'unknown' && (
-        <div id={`artpv-${art}`} className="docview-frame mt-2.5">
-          <Suspense fallback={<div className="p-3 text-[11.5px] text-zinc-muted">loading the preview…</div>}>
-            <DocumentViewer source={{ kind: 'artifact', artifact: art, format: p.kind, label: name }} />
-          </Suspense>
-        </div>
+        /* The shared document window, not an inline pane. A produced PDF is
+           the same object whether it was opened from Documents, from a run's
+           files or from the sentence in chat that named it, and it should look
+           the same: the page behind it dims, focus is trapped, Escape closes.
+           Inline here meant a 46vh strip inside the transcript that scrolled
+           with the conversation, had no zoom parity with the window, and left
+           the reader staring at a document while the answer that produced it
+           moved out of view. */
+        <DocumentModal
+          open
+          target={{ kind: 'artifact', artifact: art, format: p.kind, label: name }}
+          onClose={() => setOpen(false)}
+        />
       )}
     </div>
   );
@@ -442,12 +493,15 @@ function ReportCard({ title, body }: { title: string; body: string }) {
  *  so the comparator can be identity-based; it only ignores the shared artifact
  *  map for rows that name no artifact. */
 const MessageRow = memo(function MessageRow({
-  m, streaming, artStates, onAction,
+  m, streaming, artStates, onAction, sessionId, msgId, voiceId,
 }: {
   m: Msg;
   streaming: boolean;
   artStates: Record<string, ArtState>;
   onAction: (action: string, args: Record<string, unknown>) => void;
+  sessionId: string;
+  msgId: string;
+  voiceId: string;
 }) {
   return (
     <div
@@ -481,6 +535,24 @@ const MessageRow = memo(function MessageRow({
         <A2ui surface={m.surface} onAction={onAction} />
       ) : m.kind === 'report' ? (
         <ReportCard title={m.title || ''} body={m.text || ''} />
+      ) : m.kind === 'wake' ? (
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-1.5 text-[10.5px] text-zinc-muted">
+            <span className="inline-flex items-center gap-1 rounded border border-violet-400/30
+                             bg-violet-400/10 px-1.5 py-0.5 font-semibold text-violet-200">
+              <Clock size={10} /> Aria woke up
+            </span>
+            {m.wake?.reason && <span className="min-w-0 break-words">“{m.wake.reason}”</span>}
+            {m.wake?.counts && Object.keys(m.wake.counts).length > 0 && (
+              <span title="what had changed since Aria last looked" className="font-mono text-[10px]">
+                {Object.entries(m.wake.counts).filter(([, n]) => n > 0)
+                  .map(([k, n]) => `${k} +${n}`).join(' · ')}
+              </span>
+            )}
+          </div>
+          <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200"
+            dangerouslySetInnerHTML={{ __html: m.html || '' }} />
+        </div>
       ) : m.html ? (
         <div className="prose-chat space-y-2 text-[13px] leading-relaxed text-zinc-200"
           dangerouslySetInnerHTML={{ __html: m.html }} />
@@ -505,13 +577,54 @@ const MessageRow = memo(function MessageRow({
         </div>
       )}
       {m.meta && <div className="mt-1.5 text-[11px] text-zinc-muted">{m.meta}</div>}
+      {m.who === 'aria' && !m.pending && (m.text || msgId) && (
+        <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+          {m.text && <SpeakButton text={m.text} voice={voiceId} />}
+          {msgId && <Feedback msgId={msgId} sessionId={sessionId} />}
+        </div>
+      )}
     </div>
   );
 }, (a, b) =>
   a.m === b.m
   && a.streaming === b.streaming
   && a.onAction === b.onAction
+  && a.sessionId === b.sessionId
+  && a.msgId === b.msgId
+  && a.voiceId === b.voiceId
   && (!a.m.arts?.length || a.artStates === b.artStates));
+
+/* What to show in the activity line while a DAG run is going.
+
+   The executor's stdout arrives as `log` frames, and every line used to become
+   the status verbatim — so the progress bar cycled through a wall of `====`,
+   "[memory.read] 8 hit(s) visible to every skill this run" and the raw node
+   table, and the reader could not tell which of those meant work was happening.
+   Between real lines the only thing left was "working… 40s elapsed", which looks
+   identical whether one planner is thinking or six researchers are fetching.
+
+   Node lines carry the answer already: `[n:2] researcher running · Construction
+   materials: mortar and pozzolana…`. Take the skill and its brief, drop the
+   padding, and hold the last one while an elapsed-time tick arrives — so the
+   ticker refreshes the number without erasing what is actually running.
+
+   Returns null for anything that is not activity, which is then ignored rather
+   than displayed. */
+const ACTIVITY_RE = /^\[([^\]]+)\]\s+([a-z_]+)\s+(running|complete|failed|skipped)\b\s*(.*)$/;
+
+export function activityLabel(raw: string): string | null {
+  const m = ACTIVITY_RE.exec(raw.trim());
+  if (!m) return null;
+  const [, , skill, state, tail] = m;
+  const human = state === 'running' ? 'reading' : state;
+  // `complete (51.9s)` keeps the timing; `running · <brief>` keeps the brief.
+  const timing = /\((\d+(?:\.\d+)?s)\)/.exec(tail);
+  const brief = tail.replace(/\([^)]*\)/, '').replace(/^[·\-–—]\s*/, '').trim();
+  if (state === 'running' && brief) {
+    return `${skill} ${human}: ${brief}`;
+  }
+  return timing ? `${skill} ${human} in ${timing[1]}` : `${skill} ${human}`;
+}
 
 /* Lightweight chat: one direct LLM call per turn via /api/chat/simple.
    No DAG, no sessions, no cost ledger — threads live in their own store
@@ -519,6 +632,7 @@ const MessageRow = memo(function MessageRow({
 export default function Chat() {
   const mainId = useMainId();
   const active = useSectionActive();
+  const navigate = useNavigate();
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -593,6 +707,10 @@ export default function Chat() {
   /* Per-conversation document access. On by default; turning it off means no
      uploaded document may contribute to this conversation's answers. */
   const [useDocs, setUseDocs] = useState(true);
+  /* Folder scope for this conversation. '' means all enabled documents; a
+     folder id limits retrieval to that subtree. Stored with the thread prefs. */
+  const [docFolder, setDocFolder] = useState('');
+  const [docFolders, setDocFolders] = useState<DocFolder[]>([]);
   /* Execution engine for the NEXT message. The choice is pinned onto a thread
      when its first message is sent, so an existing conversation never
      silently changes engines under the user. */
@@ -624,7 +742,71 @@ export default function Chat() {
       else localStorage.removeItem('aria.chat.model');
     } catch { /* private mode */ }
   }, [aiModel]);
+  /* ── voice channel ───────────────────────────────────────────────────
+     Capture happens here (getUserMedia); the gateway owns STT/TTS. Voice
+     mode means: transcribed speech auto-sends, and replies are spoken
+     automatically. The per-message speaker works even with voice mode off. */
+  const [voiceMode, setVoiceMode] = useState(() => loadVoicePrefs().mode);
+  const [voiceId, setVoiceId] = useState(() => loadVoicePrefs().voice);
+  const voiceModeRef = useRef(voiceMode);
+  const voiceIdRef = useRef(voiceId);
+  const ttsReadyRef = useRef(true);
+  const [voices, setVoices] = useState<VoiceOption[]>(DEFAULT_VOICES);
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  const recorderRef = useRef<VoiceRecorder | null>(null);
+  const recordTimerRef = useRef<number | undefined>(undefined);
+  const recordingRef = useRef(false);
+  const voiceBaseRef = useRef('');
+  const liveSeqRef = useRef(0);
+  const liveBusyRef = useRef(false);
+  const liveTimerRef = useRef<number | undefined>(undefined);
+  const lastLiveRef = useRef('');
+  const sttChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  const canRecord = mediaRecordingSupported();
+  const sttReady = voiceStatus?.stt?.available !== false;
+  const ttsReady = voiceStatus?.tts?.available !== false;
+
+  useEffect(() => {
+    voiceModeRef.current = voiceMode;
+    saveVoicePrefs({ mode: voiceMode });
+  }, [voiceMode]);
+  useEffect(() => {
+    voiceIdRef.current = voiceId;
+    saveVoicePrefs({ voice: voiceId });
+  }, [voiceId]);
+  useEffect(() => {
+    ttsReadyRef.current = ttsReady;
+  }, [ttsReady]);
+  useEffect(() => {
+    let live = true;
+    api.ttsVoices().then((d) => {
+      if (live && d.voices?.length) setVoices(d.voices);
+    }).catch(() => { /* curated fallback already shown */ });
+    api.voiceStatus().then((d) => {
+      if (!live) return;
+      setVoiceStatus(d);
+      if (d.voices?.length) setVoices(d.voices);
+    }).catch(() => { /* status is advisory; the calls report real errors */ });
+    return () => { live = false; };
+  }, []);
+  useEffect(() => subscribeSpeech((_owner, state) => {
+    setSpeaking(state === 'speaking' || state === 'loading');
+  }), []);
+  useEffect(() => () => {
+    recordingRef.current = false;
+    liveSeqRef.current++;
+    recorderRef.current?.cancel();
+    if (recordTimerRef.current) window.clearTimeout(recordTimerRef.current);
+    if (liveTimerRef.current) window.clearInterval(liveTimerRef.current);
+    stopSpeaking();
+  }, []);
   const [status, setStatus] = useState('');
+  /* The last node line seen this run, so an elapsed-time tick can repeat it
+   * instead of wiping it. Cleared when a turn starts. */
+  const lastActRef = useRef('');
 
   const handleA2uiAction = useCallback((action: string, args: Record<string, unknown>) => {
     // Dispatch the action to the appropriate handler. Stable identity: every
@@ -649,10 +831,17 @@ export default function Chat() {
         // Dispatch computer action
         void api.computerAction(args.action as string, args.params as Record<string, unknown>);
         break;
+      case 'open_part': {
+        // A DAG part card is useful even in Chat; opening the section is a
+        // navigation, not an agentic operation, so it stays lightweight.
+        const part = String(args.part || args.part_id || '');
+        if (part) navigate(`/parts?id=${encodeURIComponent(part)}`);
+        break;
+      }
       default:
         console.warn('Unknown A2UI action:', action, args);
     }
-  }, []);
+  }, [navigate]);
   /* The gateway pill reads the shared health hook like every other page.
      A hand-rolled one-shot fetch here stayed stale after a gateway flap
      while the rail dot next to it updated — two indicators disagreeing. */
@@ -672,10 +861,17 @@ export default function Chat() {
   const progRef = useRef(false);
   const jumpRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  // Mirror of `threads` so loadMore can read the current length without
-  // re-creating its callback on every poll.
+  // Mirror of `threads` for callbacks that must not be re-created on every
+  // list update (engine switch cache, selected-thread lookup).
   const threadsRef = useRef<ChatThread[]>([]);
   useEffect(() => { threadsRef.current = threads; }, [threads]);
+  /* Per-engine list cache. Switching to DAG and back used to reset the list
+     to page 0, so the 50 older threads the user had just paged in vanished.
+     Keep each engine's loaded pages and restore them on the way back; the
+     first-page refresh then merges over the cache instead of clearing it. */
+  const threadCacheRef = useRef<Partial<Record<ChatMode, {
+    threads: ChatThread[]; total: number;
+  }>>>({});
   // Mirror of `mode` for the fetch callbacks, whose identity must stay stable
   // across a toggle. The sidebar lists only the current engine's threads.
   const modeRef = useRef<ChatMode>(mode);
@@ -709,25 +905,50 @@ export default function Chat() {
 
   const nextId = () => idRef.current++;
 
-  const PAGE = 50;
+  /* The server pages at 100 rows max. The rail loads EVERY page on its first
+     read instead of offering a "load 50 older" button: the user asked for all
+     threads, and the summary rows are small. Subsequent 15s polls read page 0
+     only and merge, so a growing store costs one cheap request per poll. */
+  const PAGE = 100;
   const [total, setTotal] = useState(0);
-  const [moreLoading, setMoreLoading] = useState(false);
-  const loadedOnceRef = useRef(false);
+  const loadedModesRef = useRef<Set<ChatMode>>(new Set());
+  useEffect(() => {
+    if (!loaded) return;
+    threadCacheRef.current[mode] = { threads, total };
+  }, [threads, total, mode, loaded]);
 
   const refresh = useCallback(async () => {
+    const which = modeRef.current;
     try {
-      const d = await api.chatThreads(PAGE, 0, modeRef.current);
+      const d = await api.chatThreads(PAGE, 0, which);
       if (!mountedRef.current) return;
-      loadedOnceRef.current = true;
-      const first = d.threads || [];
-      /* Keep whatever loadMore paged in. This used to `setThreads(page0)`
-         outright, so fifteen seconds after "load 50 older threads" the poll
-         quietly threw them away and offered to load them all over again. */
-      setThreads((prev) => {
-        const seen = new Set(first.map((t) => t.conversation_id));
-        return [...first, ...prev.filter((t) => !seen.has(t.conversation_id))];
-      });
-      setTotal(typeof d.total === 'number' ? d.total : first.length);
+      let all = d.threads || [];
+      let serverTotal = typeof d.total === 'number' ? d.total : all.length;
+      let hasMore = Boolean(d.has_more);
+      /* First read for this engine: walk the pages until every thread is in
+         the rail. The guard prevents an insane/corrupt total from looping
+         forever; 30 pages is 3,000 threads. */
+      if (!loadedModesRef.current.has(which)) {
+        let offset = all.length;
+        for (let i = 0; i < 30 && hasMore; i++) {
+          const next = await api.chatThreads(PAGE, offset, which);
+          if (!mountedRef.current || modeRef.current !== which) return;
+          const rows = next.threads || [];
+          all = [...all, ...rows];
+          offset += rows.length;
+          hasMore = Boolean(next.has_more) && rows.length > 0;
+          if (typeof next.total === 'number') serverTotal = next.total;
+        }
+        loadedModesRef.current.add(which);
+        setThreads(all);
+      } else {
+        /* Keep the full list while the poll refreshes page 0. */
+        setThreads((prev) => {
+          const seen = new Set(all.map((t) => t.conversation_id));
+          return [...all, ...prev.filter((t) => !seen.has(t.conversation_id))];
+        });
+      }
+      setTotal(serverTotal);
       setLoaded(true);
       setLoadError('');
     } catch (e) {
@@ -736,30 +957,6 @@ export default function Chat() {
       setLoadError(e instanceof Error ? e.message : String(e));
     }
   }, []);
-
-  /* Older threads were unreachable: the rail requested limit=50 and had no
-     way to ask for more, while the badge showed "50" as if it were the
-     total. Fetch the next page on demand (the server's `offset` +
-     `has_more`). */
-  const loadMore = useCallback(async () => {
-    if (moreLoading) return;
-    setMoreLoading(true);
-    try {
-      const from = threadsRef.current.length;
-      const d = await api.chatThreads(PAGE, from, modeRef.current);
-      if (!mountedRef.current) return;
-      const extra = d.threads || [];
-      setThreads((prev) => {
-        const seen = new Set(prev.map((t) => t.conversation_id));
-        return [...prev, ...extra.filter((t) => !seen.has(t.conversation_id))];
-      });
-      setTotal(typeof d.total === 'number' ? d.total : from + extra.length);
-    } catch (e) {
-      if (mountedRef.current) setLoadError(e instanceof Error ? e.message : String(e));
-    } finally {
-      if (mountedRef.current) setMoreLoading(false);
-    }
-  }, [moreLoading]);
   /* Load one thread into the transcript. The request counter is the same one
      `select` and `send` use, so a stale fetch cannot paint over a newer one. */
   const loadThread = async (id: string, req: number, fallback = 'Chat',
@@ -818,8 +1015,11 @@ export default function Chat() {
       try { nextCid = localStorage.getItem(LAST_CID_KEY) || ''; } catch { /* ignore */ }
     }
     rememberCid(nextCid, next);
-    setThreads([]);
-    setTotal(0);
+    threadCacheRef.current[mode] = { threads: threadsRef.current, total };
+    const cached = threadCacheRef.current[next];
+    setThreads(cached?.threads ?? []);
+    setTotal(cached?.total ?? 0);
+    setLoaded(!!cached);
     setRemoteActive(false);
     setMsgs([]);
     stickRef.current = true;
@@ -906,6 +1106,17 @@ export default function Chat() {
       try {
         const d = await api.chatThread(cid);
         if (cancelled || !mountedRef.current) return;
+        /* The list is usually still empty at this point on a reload, so this
+           fallback is the normal restore path. Read the same prefs `select()`
+           reads, or a folder scope look like it reset to all on every reload
+           even though the server still had it. */
+        try {
+          const pr = await api.chatThreadPrefs(cid);
+          if (!cancelled && mountedRef.current) {
+            setUseDocs(pr.prefs?.use_documents !== false);
+            setDocFolder(pr.prefs?.folder_ids?.[0] || '');
+          }
+        } catch { /* keep the all-documents default */ }
         setCrumb((d.title || 'Chat').slice(0, 40));
         stickRef.current = true;
         setStuck(true);
@@ -1137,6 +1348,7 @@ export default function Chat() {
       const pr = await api.chatThreadPrefs(t.conversation_id);
       if (!mountedRef.current || reqRef.current !== req) return;
       setUseDocs(pr.prefs?.use_documents !== false);
+      setDocFolder(pr.prefs?.folder_ids?.[0] || '');
     } catch { /* leave the default */ }
     // Hands are scanned on reload too, so a document produced in an earlier
     // conversation comes back reachable rather than as prose. A report comes
@@ -1151,6 +1363,14 @@ export default function Chat() {
 
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const folderOptions = useMemo(() => flattenFolders(docFolders), [docFolders]);
+  useEffect(() => {
+    let live = true;
+    api.documentFolders()
+      .then((d) => { if (live) setDocFolders(d.folders || []); })
+      .catch(() => { /* folders unavailable: the picker falls back to all/off */ });
+    return () => { live = false; };
+  }, []);
 
   /* A fresh upload lands DISABLED: the Documents view deliberately asks the
      user to review a file before it informs answers. Chat is different - the
@@ -1203,7 +1423,7 @@ export default function Chat() {
     const bad: string[] = [];
     for (const f of files) {
       try {
-        const r = await api.uploadDocument(f);
+        const r = await api.uploadDocument(f, docFolder);
         ok.push(f.name);
         if (r.document?.id) void enableDocWhenReady(r.document.id, f.name);
       } catch (err) {
@@ -1287,6 +1507,7 @@ export default function Chat() {
     // composer then would wipe whatever the user is typing for the next turn.
     if (override === undefined) setInput('');
     setStatus('thinking…');
+    lastActRef.current = '';
     /* The assistant slot is reserved in the same commit as the question. It
        used to appear only when the first delta arrived, then change height
        again at settle: three layout steps for one turn. */
@@ -1342,7 +1563,7 @@ export default function Chat() {
     // the research agent's own text as the answer, and inlining several
     // thousand words would bury the conversation it belongs to.
 const settle = (meta: string, files?: StreamFile[], kind?: string,
-    title?: string, surface?: A2uiSurface) => {
+    title?: string, surface?: A2uiSurface, sig?: string) => {
       if (queued) { cancelAnimationFrame(queued); queued = 0; }
       const next: Msg = kind === 'report'
         ? { id: bubbleId, who: 'aria', meta, text: acc,
@@ -1350,11 +1571,15 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
         : surface
         ? { id: bubbleId, who: 'aria', meta, surface, arts: [] }
         : {
-          id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), meta,
-          arts: files?.length
+          id: bubbleId, who: 'aria', html: renderMarkdown(acc || '…'), text: acc,
+          meta, arts: files?.length
             ? files.map((f) => ({ id: f.artifact, label: f.filename }))
             : artRefs(acc),
         };
+      /* A live turn never went through `toMsg`, which is where stored rows get
+         their signature. Without one here, Feedback refuses to render and a
+         fresh answer has no thumbs until the thread is reloaded. */
+      if (sig) next.sig = sig;
       /* Replace the reserved slot, never filter-and-append: the bubble keeps
          its position and its identity, so the transcript does not collapse
          and regrow when the answer arrives. */
@@ -1390,7 +1615,22 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
           rememberCid(nid, useMode);
           pinThis(nid);
       } else if (ev.type === 'status' || ev.type === 'log') {
-            setStatus((ev as { text?: string }).text || 'working…');
+            const raw = (ev as { text?: string }).text || '';
+            const act = activityLabel(raw);
+            if (act) {
+              lastActRef.current = act;
+              setStatus(act);
+            } else if (ev.type === 'status') {
+              // An elapsed-time tick. Shown beside what is running rather than
+              // instead of it — "reading: gradients and hydraulics… · 40s"
+              // answers the question a bare "working…" cannot.
+              setStatus(lastActRef.current
+                ? `${lastActRef.current} · ${raw}`
+                : (raw || 'working…'));
+            }
+            // Any other log line (the session banner, the memory count, a JSON
+            // repair notice) stays in the transcript and never hijacks the
+            // status, which is how a wall of ==== became the progress bar.
           } else if (ev.type === 'delta') {
             acc += (ev as { text?: string }).text ?? '';
             paint();
@@ -1414,6 +1654,16 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
           const secs = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
            const stopped = !!(ev as { stopped?: boolean }).stopped;
            const surfaceVal = (ev as { surface?: A2uiSurface }).surface;
+           const kindVal = (ev as { kind?: string }).kind;
+           const titleVal = (ev as { title?: string }).title;
+           /* The signature is computed from the stored shape, before a
+              surface replaces the visible text. It must match the server's
+              `storedSig` so the feedback row survives a reload. */
+           const sigText = acc;
+           const localSig = storedSig({
+             role: 'assistant', content: sigText, kind: kindVal,
+             title: titleVal, pending: false, surface: surfaceVal,
+           });
            if (surfaceVal) {
              acc = '';  // surface replaces text
            }
@@ -1421,9 +1671,13 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
              ? `stopped after ${secs}`
              : `done in ${secs} · ${useMode === 'dag' ? 'DAG' : 'lightweight'}`,
              (ev as { files?: StreamFile[] }).files,
-             (ev as { kind?: string }).kind,
-             (ev as { title?: string }).title,
-             surfaceVal);
+             kindVal,
+             titleVal,
+             surfaceVal,
+             localSig);
+          // Voice replies are for completed answers only; a stopped or
+          // surface-only turn has nothing natural to read aloud.
+          if (!stopped && !surfaceVal) playVoiceReply(acc);
           /* Both engines persist their own turn server-side now. Writing the
              DAG turn a second time here duplicated it, and was the reason a
              refresh could show the answer twice. */
@@ -1543,7 +1797,159 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
     void sendRef.current(next);
   }, [sending, remoteActive, queued]);
 
+  /* Voice replies. Only live completions call this; a restored transcript
+     must not start talking on its own. */
+  function playVoiceReply(text: string) {
+    if (!voiceModeRef.current || !ttsReadyRef.current) return;
+    if (!String(text || '').trim()) return;
+    void speakText(text, voiceIdRef.current).catch((e) => {
+      setHint({
+        text: `Voice reply failed: ${e instanceof Error ? e.message : String(e)}`,
+        tone: 'err',
+      });
+    });
+  }
+
+  /* All STT calls run one at a time: live snapshots and the final full clip
+     must not transcribe concurrently on the same Whisper model. */
+  const transcribe = (blob: Blob): Promise<{ text: string }> => {
+    const run = sttChainRef.current.then(
+      () => api.stt(blob, filenameFor(blob)));
+    sttChainRef.current = run.then(() => undefined, () => undefined);
+    return run;
+  };
+
+  const transcribeLive = async (session: number) => {
+    if (!recordingRef.current || session !== liveSeqRef.current
+        || liveBusyRef.current) return;
+    const snap = recorderRef.current?.snapshot();
+    if (!snap || snap.size < 1500) return;
+    liveBusyRef.current = true;
+    try {
+      const { text } = await transcribe(snap);
+      if (!recordingRef.current || session !== liveSeqRef.current) return;
+      const trimmed = String(text || '').trim();
+      if (!trimmed) return;
+      lastLiveRef.current = trimmed;
+      setInput([voiceBaseRef.current, trimmed].filter(Boolean).join(' '));
+    } catch {
+      // The final pass reports failures; a slow partial is not fatal.
+    } finally {
+      liveBusyRef.current = false;
+    }
+  };
+
+  const finishRecording = async () => {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    recorderRef.current = null;
+    recordingRef.current = false;
+    liveSeqRef.current += 1; // invalidate any in-flight partial result
+    if (recordTimerRef.current) {
+      window.clearTimeout(recordTimerRef.current);
+      recordTimerRef.current = undefined;
+    }
+    if (liveTimerRef.current) {
+      window.clearInterval(liveTimerRef.current);
+      liveTimerRef.current = undefined;
+    }
+    setRecording(false);
+    setTranscribing(true);
+    setHint({ text: 'Finishing transcript…', tone: 'warn' });
+    let finalText = '';
+    try {
+      const blob = await rec.stop();
+      const { text } = await transcribe(blob);
+      finalText = String(text || '').trim();
+    } catch (e) {
+      if (lastLiveRef.current) {
+        finalText = lastLiveRef.current;
+        setHint({
+          text: `Final transcript failed; keeping the live text. ${e instanceof Error ? e.message : String(e)}`,
+          tone: 'warn',
+        });
+      } else {
+        setHint({
+          text: `Voice input failed: ${e instanceof Error ? e.message : String(e)}`,
+          tone: 'err',
+        });
+        setTranscribing(false);
+        return;
+      }
+    }
+    if (!finalText && lastLiveRef.current) finalText = lastLiveRef.current;
+    if (!finalText) {
+      setHint({ text: 'No speech detected. Try again closer to the mic.', tone: 'err' });
+      setTranscribing(false);
+      return;
+    }
+    const merged = [voiceBaseRef.current, finalText].filter(Boolean).join(' ');
+    setInput(merged);
+    if (voiceModeRef.current) {
+      setInput('');
+      sendRef.current(merged);
+    } else {
+      setHint({ text: 'Transcript ready — edit it or press Send.', tone: 'warn' });
+    }
+    setTranscribing(false);
+  };
+
+  const toggleRecording = async () => {
+    if (transcribing) return;
+    if (recording) {
+      await finishRecording();
+      return;
+    }
+    if (!canRecord) {
+      setHint({ text: 'This browser cannot record audio. Voice input is unavailable.', tone: 'err' });
+      return;
+    }
+    if (!sttReady) {
+      setHint({
+        text: voiceStatus?.stt?.error || 'Speech-to-text is not available on the gateway.',
+        tone: 'err',
+      });
+      return;
+    }
+    try {
+      stopSpeaking();
+      const rec = new VoiceRecorder();
+      await rec.start();
+      recorderRef.current = rec;
+      recordingRef.current = true;
+      voiceBaseRef.current = input.trim();
+      lastLiveRef.current = '';
+      const session = ++liveSeqRef.current;
+      setRecording(true);
+      setHint({
+        text: 'Listening — your words appear here as you speak. Click the mic to stop.',
+        tone: 'warn',
+      });
+      liveTimerRef.current = window.setInterval(() => {
+        void transcribeLive(session);
+      }, 2500);
+      recordTimerRef.current = window.setTimeout(() => {
+        if (recorderRef.current === rec) void finishRecording();
+      }, 120_000);
+    } catch (e) {
+      setHint({
+        text: e instanceof Error ? e.message : String(e),
+        tone: 'err',
+      });
+    }
+  };
+
   const fresh = () => {
+    if (recordingRef.current) {
+      recordingRef.current = false;
+      liveSeqRef.current += 1;
+      recorderRef.current?.cancel();
+      recorderRef.current = null;
+      if (liveTimerRef.current) window.clearInterval(liveTimerRef.current);
+      if (recordTimerRef.current) window.clearTimeout(recordTimerRef.current);
+      setRecording(false);
+      setTranscribing(false);
+    }
     reqRef.current++; // invalidate any in-flight select/send
     abortRef.current?.abort(); // detach this viewer; the server run continues
     abortRef.current = null;
@@ -1636,10 +2042,15 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
   const toolLabel = toolsOn === false
     ? 'no tools'
     : toolCount === null ? 'tools unknown' : `${toolCount} tool${toolCount === 1 ? '' : 's'}`;
+
+  const threadsMode = usePaneMode('chat.threads');
   return (
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {threadsMode === 'collapsed'
+        ? <PaneStrip id="chat.threads" label="Threads list" />
+        : (
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
           <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
             Threads
@@ -1648,9 +2059,11 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
             {!loaded ? '—' : total > threads.length ? `${threads.length} of ${total}` : threads.length}
           </span>
         </div>
+        <Pane id="chat.filter">
         <div className="px-2.5 pb-2">
           <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter…" aria-label="Filter threads" className="w-full rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
         </div>
+        </Pane>
         {/* Engine + model for the next chat. In the rail because these are
             properties of a conversation, not of a single message. */}
         <div className="space-y-1.5 px-2.5 pb-2">
@@ -1688,15 +2101,6 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
             </div>
           )}
           {loaded && !loadError && !vis.length && <Empty title="No threads" sub="Say hello below to start the first one." />}
-          {threads.length < total && (
-            <button
-              onClick={loadMore}
-              disabled={moreLoading}
-              className="w-full rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] text-zinc-300 hover:border-violet-400 disabled:opacity-50"
-            >
-              {moreLoading ? 'loading…' : `load ${Math.min(PAGE, total - threads.length)} older threads (${total - threads.length} hidden)`}
-            </button>
-          )}
           {vis.map((t) => (
             <div
               key={t.conversation_id}
@@ -1725,8 +2129,9 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
           ))}
         </div>
       </div>
+        )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb={crumb}>
+        <TopBar crumb={crumb} panes="chat">
           {/* What chat can reach, counted from the server's own chat toolset
               rather than asserted here. It used to read a hardcoded
               "21 tools · no pipeline", which would keep claiming 21 after
@@ -1740,23 +2145,36 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
               {toolLabel} · no pipeline
             </Pill>
           </span>
-          <button
-            onClick={async () => {
+          <select
+            value={useDocs ? docFolder : 'off'}
+            onChange={async (e) => {
+              const value = e.target.value;
+              const nextUse = value !== 'off';
+              const nextFolder = value === 'off' ? '' : value;
+              const prevUse = useDocs;
+              const prevFolder = docFolder;
+              setUseDocs(nextUse);
+              setDocFolder(nextFolder);
               if (!cid) return;
-              const next = !useDocs;
-              setUseDocs(next);
-              try { await api.setChatThreadPrefs(cid, next); }
-              catch { setUseDocs(!next); }
+              try {
+                await api.setChatThreadPrefs(cid, nextUse,
+                  nextFolder ? [nextFolder] : []);
+              } catch {
+                setUseDocs(prevUse);
+                setDocFolder(prevFolder);
+              }
             }}
             disabled={!cid}
-            aria-pressed={useDocs}
-            title={useDocs
-              ? 'Uploaded documents can inform this chat'
-              : 'This chat will not use uploaded documents'}
-            className="rounded-full border border-white/15 bg-white/5 px-2.5 py-1 text-[10.5px] font-bold text-zinc-400 hover:border-violet-400 disabled:opacity-40"
+            aria-label="Document scope for this chat"
+            title="Choose which uploaded documents may inform this chat"
+            className="max-w-[160px] rounded-full border border-white/15 bg-white/5 px-2 py-1 text-[10.5px] font-bold text-zinc-400 outline-none hover:border-violet-400 disabled:opacity-40"
           >
-            {useDocs ? 'docs on' : 'docs off'}
-          </button>
+            <option value="off">docs off</option>
+            <option value="">all documents</option>
+            {folderOptions.map((f) => (
+              <option key={f.id} value={f.id}>{f.path}</option>
+            ))}
+          </select>
           <Pill tone={gwUp ? 'ok' : 'muted'}>{gwUp ? 'gateway' : 'gateway…'}</Pill>
           <button onClick={() => { refresh(); loadCaps(); }} title="Refresh" aria-label="Refresh threads" className="rounded-md border border-white/15 bg-white/5 px-2.5 py-1.5 hover:border-violet-400"><RefreshCw size={14} /></button>
           <button onClick={fresh} title="New chat" aria-label="Start new chat" className="rounded-md border border-white/15 bg-white/5 px-2.5 py-1.5 hover:border-violet-400"><Plus size={14} /></button>
@@ -1786,6 +2204,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
                 <p className="text-[13px] leading-relaxed text-zinc-300">
                   Quick answers, no pipeline, nothing recorded in Runs. For deep research with a visible pipeline, use <a href="/research" className="text-violet-300 hover:underline">Research</a>.
                 </p>
+                <Pane id="chat.starters">
                 <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Starter prompts">
                   {STARTERS.map((s) => (
                     <button
@@ -1798,6 +2217,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
                     </button>
                   ))}
                 </div>
+                </Pane>
               </div>
             )}
             {msgs.map((m) => (
@@ -1807,10 +2227,14 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
                 streaming={m.who === 'aria' && streamingId === m.id}
                 artStates={arts}
                 onAction={handleA2uiAction}
+                sessionId={cid}
+                msgId={m.sig || ''}
+                voiceId={voiceId}
               />
             ))}
           </div>
           <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex flex-col items-center gap-2 px-3">
+            <Pane id="chat.jump">
             <div className={`transition-all duration-200 ${
               stuck || !msgs.length
                 ? 'pointer-events-none translate-y-1 opacity-0'
@@ -1823,6 +2247,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
                 jump to latest
               </button>
             </div>
+            </Pane>
             <div
               role="status"
               aria-live="polite"
@@ -1852,8 +2277,8 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
             </div>
           </div>
         </div>
-        <div className="border-t border-white/10 p-3">
-          <div className="flex items-end gap-2">
+        <div className="border-t border-white/10 p-2.5">
+          <div className="flex items-end gap-1.5">
             {/* Attach. Chat had no upload affordance at all, so the only way
                 to get a file into a conversation was to leave for Documents
                 and come back - while the CONSUMPTION half already existed
@@ -1874,10 +2299,33 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
               disabled={busy || uploading}
               title="Attach a document: PDF, DOCX, MD, TXT, HTML, CSV or XLSX (images cannot be read yet)"
               aria-label="Attach files"
-              className="flex min-w-[112px] flex-none items-center justify-center gap-1.5 self-end rounded-md border border-white/15 bg-white/5 px-3 py-2.5 text-xs font-bold text-zinc-300 transition-colors hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
+              className="flex h-10 w-10 flex-none items-center justify-center self-end rounded-md border border-white/15 bg-white/5 text-zinc-300 transition-colors hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
             >
-              <Paperclip size={13} />
-              {uploading ? 'Uploading…' : 'Attach'}
+              {uploading
+                ? <Loader2 size={14} className="animate-spin" />
+                : <Paperclip size={15} />}
+            </button>
+            <button
+              type="button"
+              onClick={() => void toggleRecording()}
+              disabled={transcribing || !canRecord || !sttReady}
+              title={!canRecord
+                ? 'This browser cannot record audio'
+                : !sttReady
+                  ? (voiceStatus?.stt?.error || 'Speech-to-text is unavailable')
+                  : recording ? 'Stop recording' : 'Record a voice message'}
+              aria-label={recording ? 'Stop voice recording'
+                : transcribing ? 'Transcribing voice message' : 'Record a voice message'}
+              aria-pressed={recording}
+              className={`flex h-10 w-10 flex-none items-center justify-center self-end rounded-md border transition-colors disabled:opacity-50 ${
+                recording
+                  ? 'border-red-400/60 bg-red-400/10 text-red-200'
+                  : 'border-white/15 bg-white/5 text-zinc-300 hover:border-violet-400 hover:text-zinc-100'
+              }`}
+            >
+              {transcribing
+                ? <Loader2 size={14} className="animate-spin" />
+                : recording ? <MicOff size={15} /> : <Mic size={15} />}
             </button>
             <textarea
               ref={taRef}
@@ -1918,7 +2366,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
               {busy ? <Clock size={13} /> : <Send size={13} />} {busy ? 'Queue' : 'Send'}
             </button>
           </div>
-          <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
             {/* The limit, stated once, read out when the composer takes focus.
                 The live counter below is deliberately NOT a live region: it
                 changes on every keystroke, and a polite announcement per
@@ -1930,9 +2378,89 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
             {/* The keys used to live in the placeholder, which at a 1000px
                 window wrapped to two lines and made the empty composer 17px
                 taller than a typed one. Stated here it also survives typing. */}
-            <span aria-hidden className="text-[11px] text-zinc-muted">
-              Enter to send · Shift+Enter for a new line
+            <span aria-hidden title="Enter sends; Shift+Enter adds a new line"
+                  className="text-[10.5px] text-zinc-muted">
+              Enter sends
             </span>
+            {/* Which engine answers — the same control that lives in the rail,
+                repeated here on purpose. The rail is hideable (`ui.pane_hiding`)
+                and narrow, and the mode decides whether a turn costs 2s or 60s
+                and whether it appears in Runs at all; a choice that important
+                was invisible enough that the user asked for it to be added.
+                Kept to two 6px-tall buttons so the composer does not grow. */}
+            <div role="group" aria-label="Engine for this conversation"
+                 className="flex overflow-hidden rounded border border-white/15 bg-white/5 text-[10px] font-semibold">
+              <button type="button" onClick={() => switchMode('light')}
+                      aria-pressed={mode === 'light'}
+                      title="Lightweight — one direct model call. Fast, not recorded in Runs."
+                      className={`px-1.5 py-0.5 ${mode === 'light'
+                        ? 'bg-violet-400/25 text-violet-100'
+                        : 'text-zinc-400 hover:text-zinc-200'}`}>
+                Light
+              </button>
+              <button type="button" onClick={() => switchMode('dag')}
+                      aria-pressed={mode === 'dag'}
+                      title="DAG — planner and executor. Multi-step, visible pipeline, recorded in Runs."
+                      className={`px-1.5 py-0.5 ${mode === 'dag'
+                        ? 'bg-violet-400/25 text-violet-100'
+                        : 'text-zinc-400 hover:text-zinc-200'}`}>
+                DAG
+              </button>
+            </div>
+            <Pane id="chat.voice">
+            <button
+              type="button"
+              onClick={() => setVoiceMode((v) => !v)}
+              disabled={!ttsReady}
+              aria-pressed={voiceMode}
+              aria-label={voiceMode ? 'Turn automatic voice replies off' : 'Turn automatic voice replies on'}
+              title={!ttsReady
+                ? `Voice replies unavailable: ${voiceStatus?.tts?.error || 'gateway TTS is down'}`
+                : voiceMode
+                  ? 'Replies are spoken automatically'
+                  : 'Speak replies automatically'}
+              className={`flex h-6 w-6 items-center justify-center rounded border transition-colors disabled:opacity-50 ${
+                voiceMode
+                  ? 'border-violet-400/50 bg-violet-400/10 text-violet-200'
+                  : 'border-white/15 bg-white/5 text-zinc-400 hover:border-violet-400'
+              }`}
+            >
+              {voiceMode ? <Volume2 size={11} /> : <VolumeX size={11} />}
+            </button>
+            {voices.length > 0 && (
+              <select
+                value={voiceId}
+                onChange={(e) => setVoiceId(e.target.value)}
+                aria-label="Voice for spoken replies"
+                disabled={!ttsReady}
+                className="w-[148px] truncate rounded border border-white/15 bg-[#0e0e12] px-1 py-0.5 text-[10.5px] text-zinc-300 outline-none focus:border-violet-400 disabled:opacity-50"
+              >
+                {(voices.some((v) => v.id === voiceId)
+                  ? voices
+                  : [{ id: voiceId, label: voiceId }, ...voices]).map((v) => (
+                  <option key={v.id} value={v.id}>{v.label}</option>
+                ))}
+              </select>
+            )}
+            </Pane>
+            {speaking && (
+              <button
+                type="button"
+                onClick={stopSpeaking}
+                className="flex items-center gap-1 rounded border border-violet-400/40 bg-violet-400/10 px-2 py-0.5 text-[11px] font-bold text-violet-200"
+              >
+                <Square size={10} /> stop voice
+              </button>
+            )}
+            {voiceStatus && (!ttsReady || !sttReady) && (
+              <span
+                className="text-[11px] text-amber-300/80"
+                title={[voiceStatus.tts?.error, voiceStatus.stt?.error]
+                  .filter(Boolean).join(' · ')}
+              >
+                {!ttsReady ? 'voice replies unavailable' : 'voice input unavailable'}
+              </span>
+            )}
             {hint && (
               <span
                 role="status"
@@ -1949,6 +2477,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
                   className="ml-0.5 text-violet-200/70 hover:text-violet-100"><X size={10} /></button>
               </span>
             )}
+            <Pane id="chat.counter">
             <span
               id="chat-len"
               className={`ml-auto tabular-nums text-[11px] ${overLimit ? 'text-red-300' : nearLimit ? 'text-amber-300' : 'text-zinc-muted'}`}
@@ -1960,6 +2489,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
                   ? `${input.length.toLocaleString()} / ${CHAT_MAX_QUERY.toLocaleString()}`
                   : ''}
             </span>
+            </Pane>
           </div>
         </div>
       </main>

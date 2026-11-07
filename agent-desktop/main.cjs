@@ -312,6 +312,13 @@ async function createWindow() {
       // stating it means a future default change cannot quietly widen this.
       nodeIntegration: false,
       sandbox: true,
+      // Chromium's built-in PDF viewer is an internal plugin, and `plugins`
+      // defaults to false, so without this a blob-url <iframe> of a PDF paints
+      // a blank panel in the desktop shell while the same file opens fine in
+      // Chrome. The console's document modal hands PDFs to that viewer, so the
+      // shell has to opt in. Internal plugins only — this does not enable
+      // external ones, and the sandbox above still holds.
+      plugins: true,
     },
   });
 

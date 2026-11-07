@@ -24,7 +24,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent_server  # noqa: E402
-import memory as memory_mod  # noqa: E402
 
 
 CONV = "conv-docs-toggle-probe"
@@ -39,14 +38,22 @@ DOCS = {"documents": [
 def _stub_registry(monkeypatch, payload=None, boom=False):
     """Stub at the gateway HTTP seam so the real `_gw_enabled_doc_ids` filter
     runs. Patching `_gw_enabled_doc_ids` itself would bypass the filter and
-    make these tests pass for the wrong reason."""
+    make these tests pass for the wrong reason.
+
+    The seam is `gateway.get_json`, not `memory._get`. The registry read moved
+    because it sits on a run's critical path and `memory._get` carries a 30s
+    timeout with an `ensure_gateway()` probe in front of it — a loaded gateway
+    could hold a turn's start, and every later turn in that conversation behind
+    its session lock, for half a minute. `get_json` is fail-soft, so an
+    unreachable registry answers None rather than raising; the scope function
+    fails closed either way, which is what `boom=True` pins here.
+    """
+    import gateway as gw
     if boom:
-        def _raise(*_a, **_k):
-            raise RuntimeError("gateway unreachable")
-        monkeypatch.setattr(memory_mod, "_get", _raise)
+        monkeypatch.setattr(gw, "get_json", lambda *a, **k: None)
         return
     body = payload if payload is not None else DOCS
-    monkeypatch.setattr(memory_mod, "_get", lambda *_a, **_k: body)
+    monkeypatch.setattr(gw, "get_json", lambda *a, **k: body)
 
 
 def _reset_prefs(conversation_id: str) -> None:
@@ -236,3 +243,231 @@ def test_per_turn_use_documents_false_reaches_the_orchestrator(monkeypatch):
     assert seen.get("doc_ids") == set(), seen.get("doc_ids")
     assert not any('"error"' in str(f) for f in frames), frames
 
+
+# ── single-document binding ("discuss this document") ───────────────────────
+#
+# A thread bound to one document must retrieve from THAT document only. Without
+# a binding the only scope the console could express was a folder, so discussing
+# a generated report dragged in every other enabled document.
+
+def _clear_binding(conversation_id: str) -> None:
+    agent_server._chat_prefs(conversation_id, doc_ids=[])
+
+
+def test_bound_document_narrows_retrieval_to_itself(monkeypatch):
+    _stub_registry(monkeypatch)
+    agent_server._chat_prefs("conv-bound", use_documents=True, doc_ids=["doc-a"])
+    try:
+        assert agent_server._conversation_doc_ids("conv-bound") == {"doc-a"}
+    finally:
+        _clear_binding("conv-bound")
+
+
+def test_per_turn_doc_ids_override_the_stored_binding(monkeypatch):
+    """Same rule as `use_documents`: a body value is authoritative for this
+    turn, so a client can bind a thread before it has an id to write prefs to."""
+    _stub_registry(monkeypatch)
+    agent_server._chat_prefs("conv-bound-turn", use_documents=True,
+                             doc_ids=["doc-a"])
+    try:
+        got = agent_server._conversation_doc_ids(
+            "conv-bound-turn", {"doc_ids": ["doc-b"]})
+        assert got == {"doc-b"}, got
+    finally:
+        _clear_binding("conv-bound-turn")
+
+
+def test_binding_an_off_or_indexing_document_yields_nothing(monkeypatch):
+    """Binding is a scope narrowing, not an authorization: a document that is
+    switched off or still indexing has no complete vectors and must not answer
+    just because a client named it."""
+    _stub_registry(monkeypatch)
+    assert agent_server._gw_bound_doc_ids(["doc-off", "doc-busy"]) == set()
+    assert agent_server._gw_bound_doc_ids(["doc-a", "doc-off"]) == {"doc-a"}
+
+
+def test_docs_off_still_wins_over_a_binding(monkeypatch):
+    """The conversation toggle is the outer switch. Turning documents off for a
+    thread must silence it even when the thread carries a document binding."""
+    _stub_registry(monkeypatch)
+    agent_server._chat_prefs("conv-off-bound", use_documents=False,
+                             doc_ids=["doc-a"])
+    try:
+        assert agent_server._conversation_doc_ids("conv-off-bound") == set()
+    finally:
+        agent_server._chat_prefs("conv-off-bound", use_documents=True)
+        _clear_binding("conv-off-bound")
+
+
+def test_binding_and_folder_scope_union(monkeypatch):
+    """Both are explicit user choices about what may answer; naming a document
+    must not silently delete the folder scope the thread already carries."""
+    _stub_registry(monkeypatch, {"documents": [
+        {"id": "doc-a", "enabled": True, "status": "ready", "folder_id": "f1"},
+        {"id": "doc-b", "enabled": True, "status": "ready", "folder_id": "f2"},
+    ], "folders": [{"id": "f1", "parent_id": ""}, {"id": "f2", "parent_id": ""}]})
+    agent_server._chat_prefs("conv-both", use_documents=True,
+                             doc_ids=["doc-b"], folder_ids=["f1"])
+    try:
+        assert agent_server._conversation_doc_ids("conv-both") == {"doc-a", "doc-b"}
+    finally:
+        agent_server._chat_prefs("conv-both", doc_ids=[], folder_ids=[])
+
+
+def test_binding_round_trips_through_the_prefs_endpoint(monkeypatch):
+    """The thread has to exist before preferences can be written to it."""
+    from fastapi.testclient import TestClient
+
+    cid = "conv-prefs-doc-binding"
+    with agent_server._CHAT_THREADS_LOCK:
+        data = agent_server._chat_threads_load()
+        data.setdefault(cid, {"id": cid, "messages": []})
+        agent_server._chat_threads_save(data)
+    _clear_binding(cid)
+    try:
+        with TestClient(agent_server.app) as client:
+            r = client.post(f"/api/chat/threads/{cid}/prefs",
+                            json={"doc_ids": ["doc-a"]})
+            assert r.status_code == 200, r.text
+            assert r.json()["prefs"]["doc_ids"] == ["doc-a"]
+            r = client.get(f"/api/chat/threads/{cid}/prefs")
+            assert r.json()["prefs"]["doc_ids"] == ["doc-a"]
+            bad = client.post(f"/api/chat/threads/{cid}/prefs",
+                              json={"doc_ids": "doc-a"})
+            assert bad.status_code == 400, bad.text
+    finally:
+        _clear_binding(cid)
+        with agent_server._CHAT_THREADS_LOCK:
+            data = agent_server._chat_threads_load()
+            data.pop(cid, None)
+            agent_server._chat_threads_save(data)
+
+
+# ── the prompt note that names the bound document ───────────────────────────
+#
+# Light chat stopped retrieving up front and leaves `search_knowledge` to the
+# model. For "discuss this document" that is wrong twice over: the model does
+# not know WHICH document is on the user's screen, and it may answer from its
+# own weights about a file it could read.
+
+NAMED = {"documents": [
+    {"id": "doc-a", "filename": "Q3 review.pdf", "enabled": True,
+     "status": "ready"},
+    {"id": "doc-b", "filename": "Bluebook.md", "enabled": True,
+     "status": "ready"},
+]}
+
+
+def test_binding_note_names_the_document_and_orders_a_search(monkeypatch):
+    _stub_registry(monkeypatch, NAMED)
+    note = agent_server._doc_binding_note(["doc-a"])
+    assert "Q3 review.pdf" in note, note
+    assert "doc-a" in note, "the id is what lets the model cite the right file"
+    assert "search_knowledge" in note
+    assert "Do not substitute" in note
+
+
+def test_no_binding_means_no_note():
+    """An ordinary conversation must not gain a document instruction it never
+    asked for — the note also narrows what the model believes it may answer."""
+    assert agent_server._doc_binding_note([]) == ""
+    assert agent_server._doc_binding_note(None) == ""
+
+
+def test_the_scope_reports_which_documents_are_bound(monkeypatch):
+    """One read answers both questions the light chat needs: what may be
+    searched, and what to name in the prompt."""
+    _stub_registry(monkeypatch, NAMED)
+    agent_server._chat_prefs("conv-scope", use_documents=True,
+                             doc_ids=["doc-a"])
+    try:
+        ids, bound = agent_server._conversation_doc_scope("conv-scope", {})
+        assert ids == {"doc-a"}
+        assert bound == ["doc-a"]
+        assert "Q3 review.pdf" in agent_server._doc_binding_note(bound)
+        # an unbound conversation gets no note
+        ids2, bound2 = agent_server._conversation_doc_scope(
+            "conv-scope", {"doc_ids": []})
+        assert bound2 == [], bound2
+    finally:
+        _clear_binding("conv-scope")
+
+
+def test_a_bound_document_that_cannot_answer_is_not_named(monkeypatch):
+    """Naming a document the tool cannot read would tell the model "this is the
+    subject" and leave it guessing at the contents."""
+    _stub_registry(monkeypatch, {"documents": [
+        {"id": "doc-off", "filename": "Private.pdf", "enabled": False,
+         "status": "ready"},
+        {"id": "doc-a", "filename": "Q3 review.pdf", "enabled": True,
+         "status": "ready"},
+    ]})
+    ids, bound = agent_server._conversation_doc_scope(
+        "conv-unreadable", {"doc_ids": ["doc-off", "doc-a"]})
+    assert ids == {"doc-a"}
+    assert bound == ["doc-a"], "a switched-off document must not be named as the subject"
+
+
+def test_binding_note_still_says_so_when_titles_cannot_be_read(monkeypatch):
+    """The registry being away must not turn a bound turn into an unbound one:
+    the tool allowlist is already narrow, and the model has to be told to search
+    rather than left to infer nothing is bound."""
+    _stub_registry(monkeypatch, boom=True)
+    note = agent_server._doc_binding_note(["doc-a"])
+    assert note and "could not be read" in note, note
+
+
+
+
+def test_the_citation_contract_is_opt_in_per_turn(monkeypatch):
+    """`[[p:3|words]]` is only worth asking for when a viewer can light it up.
+
+    Plain Chat has no page on screen, so a marker there is punctuation the user
+    would have to read around. The document pane sends `cite_markers`; nothing
+    else does, and the note has to keep the two apart.
+    """
+    _stub_registry(monkeypatch, NAMED)
+    plain = agent_server._doc_binding_note(["doc-a"])
+    assert "[[p:" not in plain, plain
+    cited = agent_server._doc_binding_note(["doc-a"], cite=True)
+    assert "[[p:PAGE|WORDS]]" in cited, cited
+    assert "CHARACTER FOR CHARACTER" in cited, cited
+    # The page number has to come from the excerpt header, not from the model's
+    # memory of pagination: a wrong page highlights the wrong page.
+    assert "page number that" in cited, cited
+
+
+def test_citation_markers_do_not_replay_into_the_next_turn():
+    """A marker is a display contract with one surface, not part of the prose.
+
+    Left in the history, the model learns the format and starts using it in a
+    later ordinary chat turn that has no viewer at all — the reader then sees
+    bracketed fragments in an answer about something else."""
+    history = [
+        {"role": "assistant",
+         "content": "Line 7 retired in August [[p:2|Line 7 retired in August]], "
+                    "and the deck stayed open [[p:3|the deck stayed open]]."},
+        {"role": "user", "content": "and the forecast?"},
+    ]
+    out = agent_server._chat_history_for_model(history)
+    joined = "\n".join(m["content"] for m in out)
+    assert "[[p:" not in joined, joined
+    assert "Line 7 retired in August" in joined, "the prose survives; only the marker goes"
+
+
+def test_a_plain_double_bracket_survives_the_strip():
+    """Only the `p:` form is a citation. Wiki-style links in a document quote
+    are the user's text and must not be eaten by the marker regex."""
+    assert agent_server._strip_citation_markers(
+        "see [[Chapter 2]] and [[p:1|see this]]") == "see [[Chapter 2]] and "
+
+
+def test_a_dropped_closing_bracket_still_does_not_reach_the_model():
+    """Live shape: `[[p:7|Supervised Fine-Tuning (SFT)]` — one bracket, not two.
+
+    The strict reader missed it, so the marker stayed in the stored answer and
+    went back into the next turn's history, where the model learns to write
+    citations at a surface that cannot draw them."""
+    assert agent_server._strip_citation_markers(
+        "phases [[p:7|Supervised Fine-Tuning (SFT)]" + "\n\n" + "more"
+    ) == "phases " + "\n\n" + "more"

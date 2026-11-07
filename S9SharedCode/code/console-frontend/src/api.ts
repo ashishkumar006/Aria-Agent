@@ -97,7 +97,7 @@ export interface SessionSummary {
          tell its own history from the other's.
          Named `run_kind`, not `kind`: in the Authoring sidebar `kind` already
          means the FILE FORMAT (pdf/pptx/docx/xlsx). */
-     run_kind?: 'authoring' | 'research' | 'chat';
+     run_kind?: 'authoring' | 'research' | 'chat' | 'parts' | 'app';
      /* Did this run actually write a file? Named `has_files` because the
         authoring sidebar already uses `files` for the file LIST. */
      has_files?: boolean;
@@ -185,6 +185,89 @@ export interface FeedbackRollup {
   note?: string;
 }
 
+export interface FeedbackLearningEvent {
+  feedback_id: string;
+  status: 'applied' | 'skipped' | 'duplicate' | 'error' | 'failed';
+  at: number;
+  kind?: string;
+  statement?: string;
+  note_excerpt?: string;
+  confidence?: number;
+  reason?: string;
+  memory_id?: string;
+  attempts?: number;
+  vote?: number;
+  session_id?: string;
+  node_id?: string;
+  msg_id?: string;
+  skill?: string;
+}
+
+export interface FeedbackLearningStatus {
+  enabled: boolean;
+  persona_autosave: boolean;
+  pending: number;
+  last_run: number | null;
+  counts: Record<string, number>;
+  processed: FeedbackLearningEvent[];
+}
+
+export interface FeedbackSyncResult {
+  dry_run: boolean;
+  pending_before: number;
+  pending: number;
+  selected: number;
+  proposed: {
+    action?: string;
+    text?: string;
+    kind?: string;
+    confidence?: number;
+    reason?: string;
+    feedback_id?: string;
+    context_source?: string;
+    context_matched?: boolean;
+  }[];
+  applied: { feedback_id?: string; kind?: string; text?: string; memory_id?: string }[];
+  skipped: { action?: string; text?: string; reason?: string; feedback_id?: string }[];
+  errors: { feedback_id?: string; error?: string }[];
+  last_run?: number | null;
+  persona?: {
+    ok?: boolean; error?: string; version?: number; markdown?: string;
+    documents?: { ok?: boolean; error?: string; current?: string; evolution?: string };
+  };
+}
+
+export interface VoiceOption {
+  id: string;
+  label: string;
+}
+
+export interface VoiceStatus {
+  tts: {
+    available: boolean;
+    loaded?: boolean;
+    dependencies?: boolean;
+    model?: string;
+    error?: string;
+  };
+  stt: {
+    available: boolean;
+    loaded?: boolean;
+    model?: string;
+    error?: string;
+  };
+  voices: VoiceOption[];
+}
+
+export interface PersonaMeta {
+  version?: number;
+  updated_iso?: string;
+  reason?: string;
+  turns_since_update?: number;
+  total_turns?: number;
+  based_on?: Record<string, number>;
+}
+
 export interface ScheduleJob {
   id: string;
   query?: string;
@@ -195,6 +278,20 @@ export interface ScheduleJob {
   last_fire?: number;
   last_error?: string;
   created?: number;
+  /* Self-wake. A wake row carries a reason and no query, so every field here
+   * exists to keep the two readable apart in the list — without `kind`, a watch
+   * the agent armed for itself is indistinguishable from a reminder you asked
+   * for, in the one place you come to see what is going to happen. */
+  kind?: string;
+  reason?: string;
+  every?: string;
+  step_s?: number;
+  wakes_left?: number;
+  wakes_fired?: number;
+  armed_by?: string;
+  parent?: string;
+  watch_until?: number;
+  watch?: { surface?: string; match?: Record<string, string> };
 }
 
 export interface ToolSpec {
@@ -227,11 +324,21 @@ export interface MemStats {
   excluded_drawers?: string[];
 }
 
+/** A logical document folder. parent_id="" is a top-level folder. */
+export interface DocFolder {
+  id: string;
+  name: string;
+  parent_id: string;
+  created_at: string;
+}
+
 export interface DocItem {
   id: string;
   filename: string;
   doc_type: string;
   size_bytes: number;
+  /** Folder id, or "" for unfiled documents in the root bucket. */
+  folder_id?: string;
   /** pending | parsing | chunking | embedding | ready | blocked | failed */
   status: string;
   enabled: boolean;
@@ -243,6 +350,18 @@ export interface DocItem {
   error?: string;
   embed_model?: string;
   embed_dim?: number;
+  /** Where the file came from: `upload`, `authoring`, `deck`, `research`,
+      `web`, `chat`… Set at registration with the bytes, so a document in the
+      library says which section of Aria made it. */
+  origin?: string;
+  /** Its source pointer — the URL for a fetched page, the artifact handle for
+      a generated file. */
+  origin_ref?: string;
+  /** The run that produced it, when there was one. */
+  session_id?: string;
+  /** False only when the user switched it off deliberately; a document that
+      has never been touched is enabled as soon as it finishes indexing. */
+  auto_enable?: boolean;
   /** Present on the detail response. */
   chunks?: DocChunk[];
   chunk_error?: string;
@@ -282,6 +401,342 @@ export interface CodeWorkspace {
   name: string;
   roots?: string[];
   is_default?: boolean;
+}
+
+/** One folder a studio session holds. `scoped` on the payload below is whether
+ *  the request belongs to a session at all — NOT whether it holds folders, so a
+ *  reset session reads as yours-and-empty rather than as the shared default. */
+export interface StudioRoot { path: string; name: string }
+
+/** One studio run as the registry lists it. `status` is the field that makes
+ *  a list of agents readable: `running` and `waiting` look identical in a
+ *  transcript and mean opposite things to someone deciding whether to stop. */
+export interface StudioRun {
+  id: string;
+  sid: string;
+  question: string;
+  model?: string;
+  provider?: string;
+  mode?: string;
+  status: 'running' | 'waiting' | 'stopping' | 'finished' | 'stopped' | 'error';
+  started: number;
+  ended?: number;
+  frames?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  tool_calls?: number;
+  answer?: string;
+  stopped?: string;
+  error?: string;
+  files?: string[];
+  live?: boolean;
+}
+
+export interface StudioRunsResult {
+  runs?: StudioRun[];
+  live?: number;
+  waiting?: string[];
+  error?: string;
+}
+
+/** A replayed frame. `t` is the SSE kind the panel already knows how to
+ *  render, so replay and live stream share one code path — which is the only
+ *  reason they cannot disagree about what a run looked like. */
+export interface StudioRunFrame {
+  t: string;
+  at?: number;
+  [key: string]: unknown;
+}
+
+export interface StudioRunFrames {
+  frames?: StudioRunFrame[];
+  run?: string;
+  live?: boolean;
+  status?: string;
+  unreadable?: number;
+  error?: string;
+}
+
+/** Slice 6 — what `@<fragment>` can complete to. Paths come back in the
+ *  explorer's vocabulary (`<root>/dir/file`), which is the form the server
+ *  maps onto a tool path, so a completion and a hand-typed mention mean the
+ *  same file. */
+export interface StudioMention {
+  path: string;
+  name: string;
+  dir: boolean;
+}
+
+export interface StudioMentionsResult {
+  matches?: StudioMention[];
+  count?: number;
+  truncated?: boolean;
+  /** True when the walk ran out of budget: the list is early results, not
+   *  every match, and the popup has to say so. */
+  stopped?: boolean;
+  note?: string;
+  error?: string;
+}
+
+export interface StudioCommand {
+  name: string;
+  args: string;
+  kind: string;
+  desc: string;
+}
+
+/** One run's money, read from the gateway ledger. `unknown` is the honest
+ *  third state — the ledger was unreachable — and is never rendered as $0. */
+export interface StudioRunCost {
+  run?: string;
+  unknown?: boolean;
+  usd?: number | null;
+  in_tok?: number;
+  out_tok?: number;
+  calls?: number;
+  note?: string;
+  error?: string;
+}
+
+export interface StudioCommitMsgResult {  ok?: boolean;
+  subject?: string;
+  body?: string;
+  text?: string;
+  /** Which diff the message was written from — the UI has to label it. */
+  staged?: boolean;
+  repo?: string;
+  files?: string[];
+  files_with_diffs?: string[];
+  omitted?: string[];
+  truncated?: boolean;
+  chars_sent?: number;
+  note?: string;
+  error?: string;
+}
+
+/** Slice 8 — one file operation the server planned or performed. */
+export interface StudioFileOp {
+  op: 'rename' | 'move' | 'delete' | 'mkdir';
+  from?: string;
+  to?: string;
+}
+
+export interface StudioFileOpResult {
+  op: string;
+  ok?: boolean;
+  from?: string;
+  to?: string;
+  path?: string;
+  reason?: string;
+}
+
+export interface StudioFilesResult {
+  ok?: boolean;
+  applied?: number;
+  refused_count?: number;
+  results?: StudioFileOpResult[];
+  /** The checkpoint the batch was captured into — the undo for a delete. */
+  checkpoint?: string;
+  note?: string;
+  error?: string;
+}
+
+export interface StudioSearchMatch {
+  path: string;
+  line: number;
+  col: number;
+  text: string;
+}
+
+export interface StudioSearchResult {
+  matches?: StudioSearchMatch[];
+  count?: number;
+  truncated?: boolean;
+  scanned?: number;
+  binary_skipped?: number;
+  note?: string;
+  error?: string;
+}
+
+export interface StudioReplacePreview {
+  ok?: boolean;
+  dry_run?: boolean;
+  token?: string;
+  files?: { path: string; count: number; bytes_before: number; bytes_after: number }[];
+  count?: number;
+  refused?: string[];
+  note?: string;
+  error?: string;
+  expires_in?: number;
+}
+
+export interface StudioReplaceResult {
+  ok?: boolean;
+  applied?: number;
+  written?: { path: string; count: number }[];
+  stale?: string[];
+  checkpoint?: string;
+  note?: string;
+  error?: string;
+}
+
+export interface StudioGitPath {
+  path: string;
+  index: string;
+  worktree: string;
+  staged: boolean;
+  untracked: boolean;
+  unmerged: boolean;
+  deleted: boolean;
+}
+
+export interface StudioGitResult {
+  ok?: boolean;
+  action?: string;
+  repo?: string;
+  summary?: string;
+  moves_head?: boolean;
+  exit_code?: number | null;
+  output?: string;
+  stderr?: string;
+  truncated?: boolean;
+  paths?: StudioGitPath[];
+  branches?: string[];
+  log?: string[];
+  error?: string;
+  /** Present on the 428 answer: the diff to read before confirming. */
+  confirm_required?: boolean;
+  preview?: {
+    diff?: { ok?: boolean; output?: string; error?: string };
+    status?: { ok?: boolean; output?: string };
+  };
+}
+
+export interface StudioJournalEntry {
+  at: number;
+  kind: string;
+  sid?: string;
+  [key: string]: unknown;
+}
+
+/** Slice 10 — the browser pane. `casting` distinguishes a live view from a
+ *  filmstrip of screenshots, and the pane says which it is showing rather
+ *  than letting an empty box be read as a blank page. */
+export interface StudioBrowserStatus {
+  running?: boolean;
+  disabled?: boolean;
+  sid?: string;
+  headed?: boolean | null;
+  tabs?: number;
+  active?: number;
+  url?: string;
+  actions?: number;
+  epoch?: number;
+  console_errors?: number;
+  requests?: number;
+  casting?: boolean;
+  cast_fps?: number;
+  cast_frames?: number;
+  cast_error?: string;
+  idle_in_s?: number;
+  alive_s?: number;
+  need_restart?: boolean;
+  fallback_note?: string;
+  note?: string;
+  error?: string;
+}
+
+export interface StudioBrowserEvent {
+  at: number;
+  type?: string;
+  level?: string;
+  text?: string;
+  method?: string;
+  url?: string;
+  status?: number | null;
+  resource?: string;
+}
+
+export interface StudioBrowserEvents {
+  events?: StudioBrowserEvent[];
+  count?: number;
+  dropped?: number;
+  showing?: number;
+  kind?: string;
+  url?: string;
+  disabled?: boolean;
+  error?: string;
+}
+
+export interface StudioBrowserShot {
+  name: string;
+  url: string;
+  at: number;
+  bytes: number;
+}
+
+export interface StudioBrowserShots {
+  shots?: StudioBrowserShot[];
+  count?: number;
+  more?: number;
+  dir?: string;
+  disabled?: boolean;
+  error?: string;
+}
+
+export interface StudioBrowserNav {
+  ok?: boolean;
+  url?: string;
+  status?: number | null;
+  title?: string;
+  tabs?: number;
+  error?: string;
+}
+
+export interface StudioBrowserFrame {
+  type: string;
+  image?: string;
+  url?: string;
+  at?: number;
+  fps?: number;
+  frames?: number;
+  error?: string;
+  note?: string;
+  reason?: string;
+}
+
+/** One studio session as the left column lists it. `label` is the first task
+ *  typed into it, which is what makes a list of sessions readable; `roots` and
+ *  `paths` say where it works without opening it. */
+export interface StudioSession {  sid: string;
+  label: string;
+  roots: number;
+  paths: string[];
+  archived: boolean;
+  created: number;
+  updated: number;
+  current: boolean;
+}
+
+export interface StudioSessionsResult {
+  sessions?: StudioSession[];
+  current?: string;
+  error?: string;
+}
+
+export interface StudioWorkspace {
+  sid: string;
+  scoped: boolean;
+  base: string;
+  roots: StudioRoot[];
+  declared: StudioRoot[];
+  count: number;
+  max: number;
+  is_default?: boolean;
+  workspace?: string;
+  warning?: string;
+  created?: string;
+  error?: string;
 }
 
 /** One file from `/api/code/file`. Served read-only by the agent. */
@@ -409,6 +864,33 @@ export interface CodeAskFrame {
   context_files?: string[];
 }
 
+export type CodePlanStatus = 'pending' | 'doing' | 'done' | 'blocked';
+
+export interface CodePlanStep {
+  id?: string;
+  title: string;
+  status: CodePlanStatus;
+}
+
+export interface CodeVerificationCheck {
+  path?: string;
+  kind?: string;
+  ok?: boolean;
+  skipped?: boolean;
+  error?: string;
+  note?: string;
+}
+
+export interface CodeVerification {
+  ok: boolean;
+  checked: number;
+  changed?: string[];
+  checks?: CodeVerificationCheck[];
+  error?: string;
+  duration_ms?: number;
+  round?: number;
+}
+
 /** A frame from `/api/code/agent` — the tool-using agentic loop.
  *
  *  Superset of CodeAskFrame: it adds the live tool trace (`tool_call` /
@@ -432,6 +914,22 @@ export interface CodeAgentFrame extends CodeAskFrame {
    *  repeat). Empty on a normal completion. */
   stopped?: string;
   tool_calls?: number;
+  /** plan: the current task checklist. */
+  steps?: CodePlanStep[];
+  /** error / verify: the human-readable failure reason. */
+  error?: string;
+  /** verify only: the harness's post-edit syntax/type check. `retry` means
+   *  the server is starting a fix round (the panel must clear the live answer). */
+  checked?: number;
+  changed?: string[];
+  checks?: CodeVerificationCheck[];
+  duration_ms?: number;
+  round?: number;
+  retry?: boolean;
+  /** done only: final verification snapshot, if any. */
+  verification?: CodeVerification | null;
+  plan?: CodePlanStep[] | null;
+  mode?: 'ask' | 'auto-edit' | 'auto-all' | 'read-only';
   /** permission only: the agent wants to write and is parked until this id is
    *  decided through `codePermission`. `diff` is the exact patch.
    *  write (auto) only: the same payload, but the write is already dispatched
@@ -441,6 +939,12 @@ export interface CodeAgentFrame extends CodeAskFrame {
   summary?: string;
   diff?: string;
   args?: Record<string, unknown>;
+  /** permission (command) only: the run carried a session id, so "always
+   *  allow this command for this session" is offered alongside Accept. */
+  rememberable?: boolean;
+  /** exec only: this command ran under a standing approval the operator gave
+   *  earlier in the session — reported, never silent. */
+  standing?: boolean;
   /** permission / write: the CLIENT-visible path of the file the write touches
    *  ("<root>/dir/file"), safe to hand straight to `codeFile`/`open`. */
   path?: string;
@@ -457,6 +961,78 @@ export interface CodeAgentChange {
   when?: number;
   /** true when the agent created the file (before-content: nothing). */
   created?: boolean;
+  /** Present from slice 4 on both surfaces: the same hunks the studio renders,
+   *  each with a content fingerprint. The legacy rail ignores them. */
+  hunks?: StudioHunk[];
+  added?: number;
+  removed?: number;
+}
+
+/** One addressable region of an unreviewed change.
+ *
+ *  `id` is a fingerprint of the hunk's own lines plus its context — NOT of its
+ *  line numbers, which move the moment another hunk is decided. Clicking a
+ *  hunk whose text has since been edited away is therefore refused
+ *  (`hunk-moved`) instead of applied to the wrong region. */
+export interface StudioHunk {
+  id: string;
+  index: number;
+  header: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  added: number;
+  removed: number;
+  /** context + removed / context + added, as the server sees them. */
+  old: string[];
+  new: string[];
+}
+
+export interface StudioChange extends CodeAgentChange {
+  hunks: StudioHunk[];
+  /** Only with `path=`: the state pending hunks are measured against. After a
+   *  keep this is NOT the file as the agent found it — it is that plus what
+   *  the user accepted, which is why the diff view needs it from the server. */
+  baseline?: string;
+  baseline_missing?: boolean;
+}
+
+export interface StudioChangesResult {
+  changes?: StudioChange[];
+  sid?: string;
+  error?: string;
+}
+
+export interface StudioApplyResult {
+  ok?: boolean;
+  action?: string;
+  path?: string;
+  hunk?: string;
+  index?: number;
+  hunks_remaining?: number;
+  deleted?: boolean;
+  error?: string;
+}
+
+export interface StudioCheckpoint {
+  id: string;
+  name: string;
+  turn: string;
+  when: number;
+  files: number;
+  bytes: number;
+}
+
+export interface StudioCheckpointRestoreResult {
+  ok?: boolean;
+  checkpoint?: string;
+  name?: string;
+  restored?: string[];
+  failed?: { path: string; reason: string }[];
+  skipped?: { path: string; reason: string }[];
+  undo?: { id: string; turn: string; name: string };
+  error?: string;
 }
 
 /** One entry of the gateway's Kilo catalogue, normalized upstream. */
@@ -734,10 +1310,11 @@ async function j<T>(url: string, init?: JInit): Promise<T> {
     contract bug. */
 function pj<T>(url: string, body: unknown, init?: RequestInit): Promise<T> {
   /* `j` invalidates the read-through cache for every non-GET verb, so a POST
-     through here needs no invalidation of its own. */
+     through here needs no invalidation of its own. PATCH/DELETE methods are
+     honored when the caller supplies one. */
   return j<T>(url, {
     ...init,
-    method: 'POST',
+    method: init?.method || 'POST',
     headers: headers({ 'Content-Type': 'application/json', ...((init?.headers || {}) as Record<string, string>) }),
     body: JSON.stringify(body),
   });
@@ -751,6 +1328,25 @@ async function safe<T>(p: Promise<T>): Promise<T | null> {
   }
 }
 
+/** POST whose 4xx answer is CONTENT, not a transport failure.
+ *
+ *  `/api/studio/git` answers a HEAD-moving verb with 428 + the diff to read,
+ *  and the replace route answers a spent preview token with 409 + the reason.
+ *  Those are the next step of the flow, so a caller that only ever sees a
+ *  thrown `428 …` string cannot render the confirmation — the panel would
+ *  show an error where a decision belongs. Genuine failures still throw. */
+async function pjBody<T>(url: string, body: unknown,
+                         accept: number[] = [403, 409, 428]): Promise<T> {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: headers({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+  });
+  invalidate();
+  if (!r.ok && !accept.includes(r.status)) throw new Error(await reason(r));
+  return (await r.json()) as T;
+}
+
 export interface ChatThread {
   conversation_id: string;
   title?: string;
@@ -761,6 +1357,28 @@ export interface ChatThread {
   /** True while the server still owns a run for this thread, even when no
       browser is watching its stream. */
   active?: boolean;
+}
+
+export interface TtsStreamEvent {
+  type: 'chunk' | 'done' | 'error';
+  index?: number;
+  total?: number;
+  text?: string;
+  sample_rate?: number;
+  duration_s?: number;
+  audio?: string;
+  chunks?: number;
+  seconds?: number;
+  error?: string;
+}
+
+export interface GatewayUserStatus {
+  configured: boolean;
+  token_hint?: string;
+  valid?: boolean;
+  kind?: 'user' | 'operator';
+  user?: { id?: string; name?: string; keys?: number };
+  error?: string;
 }
 
 export interface FlagRow {
@@ -785,10 +1403,170 @@ export interface A2uiSurface {
   components: A2uiComponent[];
 }
 
+export interface PartMetrics {
+  faces?: number;
+  vertices?: number;
+  volume_mm3?: number;
+  surface_area_mm2?: number;
+  dimensions_mm?: number[];
+  bbox_min?: number[];
+  bbox_max?: number[];
+  min_edge_mm?: number;
+  median_edge_mm?: number;
+  overhang_faces?: number;
+  overhang_area_mm2?: number;
+  thin_regions?: number;
+  thinnest_wall_mm?: number;
+}
+
+export interface PartIssue {
+  code: string;
+  severity: 'error' | 'warn' | 'info' | string;
+  message: string;
+}
+
+export interface PartVerdict {
+  status?: 'ok' | 'warn' | 'unusable' | string;
+  errors?: number;
+  warnings?: number;
+  printable?: boolean;
+}
+
+export interface PartView {
+  preset?: string;
+  mode?: 'shaded' | 'wireframe' | string;
+  overlay?: 'none' | 'overhang' | 'thin_walls' | 'issues' | string;
+  compare?: { from?: string; to?: string; mode?: string } | null;
+}
+
+export interface PartVersion {
+  id: string;
+  parent?: string | null;
+  op: string;
+  params?: Record<string, unknown>;
+  created: number;
+  filename?: string;
+  format?: string;
+  bytes?: number;
+  metrics?: PartMetrics;
+  objective?: number | null;
+  verdict?: PartVerdict;
+  issues?: PartIssue[];
+  kept?: boolean;
+  note?: string;
+  origin?: string;
+}
+
+export interface PartSummary {
+  id: string;
+  name: string;
+  description?: string;
+  tags?: string[];
+  created?: number;
+  updated?: number;
+  source?: { filename?: string; format?: string; bytes?: number; sha256?: string };
+  current_version?: string;
+  versions?: number;
+  faces?: number;
+  vertices?: number;
+  objective?: number | null;
+  verdict?: PartVerdict;
+  op?: string;
+  kept?: boolean;
+  bytes?: number;
+  format?: string;
+  view?: PartView;
+}
+
+export interface PartDetail extends Omit<PartSummary, 'versions'> {
+  versions: PartVersion[];
+  current?: PartVersion | null;
+  report?: Record<string, unknown>;
+  issues?: PartIssue[];
+  view?: PartView;
+}
+
+export interface PartGeometry {
+  positions: number[];
+  indices: number[];
+  position_count: number;
+  face_count: number;
+}
+
+export interface PartJob {
+  id: string;
+  part_id: string;
+  version: string;
+  base_version?: string;
+  current_version?: string;
+  pass: string;
+  params?: Record<string, unknown>;
+  max_steps: number;
+  step: number;
+  status: 'queued' | 'running' | 'cancelling' | 'done' | 'cancelled' | 'error' | string;
+  log?: string[];
+  versions?: string[];
+  error?: string | null;
+  note?: string;
+  origin?: string;
+  created?: number;
+  updated?: number;
+  finished?: number;
+}
+
+export interface BlenderBounds {
+  x: number; y: number; width: number; height: number;
+}
+
+export interface BlenderStatus {
+  available?: boolean;
+  executable?: string | null;
+  live?: { live?: boolean; part_id?: string; version?: string;
+           pid?: number; port?: number; info?: Record<string, unknown> };
+  worker?: { alive?: boolean; info?: Record<string, unknown> };
+  root?: string;
+}
+
+export interface BlenderOperator {
+  name: string;
+  group?: string;
+  op?: string;
+  label?: string;
+  description?: string;
+  params?: { name: string; type?: string; label?: string;
+             description?: string; default?: unknown; enum?: string[] }[];
+}
+
+export interface BlenderCatalog {
+  ok?: boolean; total?: number; operators?: BlenderOperator[];
+  groups?: Record<string, number>; truncated?: boolean; note?: string;
+  error?: string;
+}
+
+export interface BlenderRender {
+  ok?: boolean; error?: string; path?: string; filename?: string;
+  bytes?: number; image_base64?: string; engine?: string;
+}
+
+export interface PartPassInfo {
+  name: string;
+  description: string;
+  params?: Record<string, unknown>;
+  modifies?: boolean;
+}
+
+export interface PartCapabilities {
+  backends?: Record<string, { available?: boolean; version?: string | null; error?: string | null }>;
+  natively_readable?: string[];
+  limits?: { max_bytes?: number; max_faces?: number; max_vertices?: number };
+  notes?: string[];
+}
+
 export interface TrackerApp {
   id: string;
   name: string;
   kind: string;
+  description?: string;
   schedule: string;
   next_refresh: number | null;
   refreshed_at: number | null;
@@ -799,7 +1577,16 @@ export interface TrackerApp {
 }
 
 export interface TrackerAppDetail extends TrackerApp {
-  spec: Record<string, unknown>;
+  spec: Record<string, unknown> & {
+    kind?: string;
+    description?: string;
+    refresh_prompt?: string;
+    surface?: A2uiSurface;
+    state?: Record<string, unknown>;
+  };
+  surface?: A2uiSurface | null;
+  state?: Record<string, unknown> | null;
+  last_event?: { action?: string; input?: Record<string, string> } | null;
   items: Record<string, unknown>[];
   added_items: Record<string, unknown>[];
   removed_ids: string[];
@@ -851,6 +1638,17 @@ async function* sseFrames(r: Response, signal?: AbortSignal): AsyncGenerator<Rec
     try { reader.releaseLock(); } catch { /* already released */ }
   }
 }
+
+/** `?sid=` / `&sid=` for the code routes a studio session owns.
+ *
+ *  Absent sid means "the shared workspace" — which is every caller that exists
+ *  today, so the URL the Code page sends is byte-identical to before. It is
+ *  passed explicitly rather than read from a module-level "current session",
+ *  because the console keeps every section mounted: a global here would make a
+ *  hidden Code page's fetches carry the studio's session, and the symptom of
+ *  that bug is a file written into the wrong project, not an error. */
+const sidQs = (sid?: string, hasQuery = false): string =>
+  (sid ? `${hasQuery ? '&' : '?'}sid=${encodeURIComponent(sid)}` : '');
 
 export const api = {
   health: (fresh = false) => j<{ agent: string; gateway_up: boolean }>(
@@ -945,12 +1743,13 @@ export const api = {
       query, conversation_id: conversationId || undefined,
       ...(model ? { model } : {}),
     }),
-  sessions: (limit = 50) =>
-    j<{ sessions: SessionSummary[] }>(
-      `/api/sessions?limit=${limit}`, { ttlMs: LIST_TTL_MS }),
-  runsSummary: (limit = 200) =>
-    j<{ runs: RunRow[]; totals?: { runs?: number; nodes?: number; dollars?: number } }>(
-      `/api/runs/summary?limit=${limit}`, { ttlMs: LIST_TTL_MS },
+  sessions: (limit = 50, offset = 0) =>
+    j<{ sessions: SessionSummary[]; total?: number; offset?: number; has_more?: boolean }>(
+      `/api/sessions?limit=${limit}&offset=${offset}`, { ttlMs: LIST_TTL_MS }),
+  runsSummary: (limit = 200, offset = 0) =>
+    j<{ runs: RunRow[]; totals?: { runs?: number; nodes?: number; dollars?: number };
+        offset?: number; has_more?: boolean }>(
+      `/api/runs/summary?limit=${limit}&offset=${offset}`, { ttlMs: LIST_TTL_MS },
     ),
   /** The graph is always requested `light`: `light=false` makes the server
       serialise every NodeState (untrimmed, "some nodes are megabytes") into
@@ -999,8 +1798,12 @@ export const api = {
     j<{ disabled: string[] | null; error?: string }>('/api/config/tools'),
   setTool: (tool: string, enabled: boolean) =>
     pj<{ disabled?: string[]; error?: string }>('/api/config/tools', { tool, enabled }),
-  flags: () =>
-    j<{ flags: FlagRow[]; prefab: { configured: boolean; live: boolean } }>('/api/apps/flags'),
+  /** `live` opts out of the 30s read-through cache. The pane-hiding gate needs
+   *  it: a flag you just switched off must not keep hiding panes for half a
+   *  minute, which is the same liveness problem the gateway-down banner had. */
+  flags: (live?: boolean) =>
+    j<{ flags: FlagRow[]; prefab: { configured: boolean; live: boolean } }>(
+      '/api/apps/flags', live ? { cache: 'no-store' } : undefined),
   setFlag: (name: string, value: unknown) =>
     pj<{ name?: string; value?: unknown; cleared?: boolean; flags?: FlagRow[]; error?: string }>(
       '/api/apps/flags', { name, value },
@@ -1011,6 +1814,12 @@ export const api = {
       `/api/apps/${encodeURIComponent(id)}`, { cache: 'no-store' }),
   trackerCreate: (spec: Record<string, unknown>) =>
     pj<{ spec?: Record<string, unknown>; apps?: TrackerApp[]; error?: string }>('/api/apps', spec),
+  appBuild: (description: string, name?: string) =>
+    pj<{ ok?: boolean; app?: TrackerAppDetail; apps?: TrackerApp[]; error?: string }>(
+      '/api/apps/build', { description, ...(name ? { name } : {}) }),
+  appAction: (id: string, action: string, input: Record<string, string>) =>
+    pj<{ ok?: boolean; app?: TrackerAppDetail; surface?: A2uiSurface; error?: string }>(
+      `/api/apps/${encodeURIComponent(id)}/actions`, { action, input }),
   trackerRefresh: (id: string) =>
     j<{ count?: number; added?: number; removed?: number; error?: string | null; refreshed_at?: number }>(
       `/api/apps/${encodeURIComponent(id)}/refresh`,
@@ -1083,6 +1892,108 @@ export const api = {
     j<{ token: string; exp: number }>(
       `/api/apps/${encodeURIComponent(id)}/prefab-token`,
     ),
+  /* Parts library. The three legacy scratch proxies still exist for
+     compatibility, but the view uses the versioned library routes. */
+  partsList: () =>
+    j<{ parts: PartSummary[]; stats?: Record<string, number> }>('/api/parts'),
+  partDetail: (id: string) =>
+    j<{ part: PartDetail }>(`/api/parts/${encodeURIComponent(id)}`, { cache: 'no-store' }),
+  partImport: (file: File, opts: { name?: string; description?: string;
+    tags?: string[]; scale?: number; autoRepair?: boolean }) => {
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    if (opts.name) fd.append('name', opts.name);
+    if (opts.description) fd.append('description', opts.description);
+    if (opts.tags?.length) fd.append('tags', JSON.stringify(opts.tags));
+    if (opts.scale) fd.append('scale', String(opts.scale));
+    fd.append('auto_repair', opts.autoRepair === false ? 'false' : 'true');
+    return j<{ part?: PartDetail; error?: string; existing?: PartSummary }>(
+      '/api/parts', { method: 'POST', body: fd });
+  },
+  partUpdate: (id: string, patch: { name?: string; description?: string; tags?: string[] }) =>
+    pj<{ part?: PartDetail; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}`, patch, { method: 'PATCH' }),
+  partSetView: (id: string, view: PartView) =>
+    pj<{ part?: PartDetail; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/view`, view, { method: 'PATCH' }),
+  partDelete: (id: string) =>
+    j<{ ok?: boolean; error?: string }>(`/api/parts/${encodeURIComponent(id)}`,
+      { method: 'DELETE' }),
+  partDuplicate: (id: string, name?: string) =>
+    pj<{ part?: PartDetail; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/duplicate`, { name }),
+  partAnalyse: (id: string, body: { version?: string; repair?: boolean; slicer?: boolean }) =>
+    pj<{ part?: PartDetail; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/analyse`, body),
+  partRepair: (id: string, body: { version?: string; watertight?: boolean;
+    fix_normals?: boolean; weld?: boolean }) =>
+    pj<{ part?: PartDetail; version?: PartVersion; changed?: boolean;
+         result?: Record<string, unknown>; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/repair`, body),
+  partOptimise: (id: string, body: { version?: string; pass: string;
+    params?: Record<string, unknown> }) =>
+    pj<{ part?: PartDetail; version?: PartVersion; changed?: boolean;
+         improved?: boolean; result?: Record<string, unknown>; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/optimise`, body),
+  partOptimiseLoop: (id: string, body: { version?: string; pass: string;
+    params?: Record<string, unknown>; max_steps?: number }) =>
+    pj<{ job?: PartJob; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/optimise-loop`, body),
+  partJobs: (partId?: string) =>
+    j<{ jobs: PartJob[] }>(`/api/parts/jobs${partId ? `?part_id=${encodeURIComponent(partId)}` : ''}`),
+  partJob: (jobId: string) =>
+    j<{ job?: PartJob; error?: string }>(`/api/parts/jobs/${encodeURIComponent(jobId)}`,
+      { cache: 'no-store' }),
+  partCancelJob: (jobId: string) =>
+    j<{ job?: PartJob; error?: string }>(
+      `/api/parts/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' }),
+  partRestore: (id: string, version: string) =>
+    j<{ part?: PartDetail; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/restore`,
+      { method: 'POST' }),
+  partGeometry: (id: string, version: string, maxFaces = 140_000) =>
+    j<{ geometry: PartGeometry; metrics?: PartMetrics; objective?: number;
+         note?: string; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/geometry?max_faces=${maxFaces}`),
+  /** Authenticated blob download. An <a href> cannot carry X-Aria-Token. */
+  partDownload: async (id: string, version?: string): Promise<Blob> => {
+    const path = version
+      ? `/api/parts/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/stl`
+      : `/api/parts/${encodeURIComponent(id)}/stl`;
+    const r = await fetch(path, { headers: headers() });
+    if (!r.ok) throw new Error(await reason(r));
+    return await r.blob();
+  },
+  blenderStatus: () => j<BlenderStatus>('/api/blender/status', { cache: 'no-store' }),
+  blenderCatalog: (query = '', limit = 30) =>
+    j<BlenderCatalog>(`/api/blender/catalog?query=${encodeURIComponent(query)}&limit=${limit}`),
+  blenderOpen: (id: string, version: string, bounds: BlenderBounds) =>
+    pj<Record<string, unknown> & { error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/blender/open`,
+      { version, bounds }),
+  blenderBounds: (id: string, bounds: BlenderBounds) =>
+    pj<Record<string, unknown> & { error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/blender/bounds`, { bounds }),
+  blenderShow: (id: string, visible: boolean) =>
+    pj<Record<string, unknown> & { error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/blender/show`, { visible }),
+  blenderSync: (id: string) =>
+    pj<{ part?: PartDetail; version?: string; bytes?: number; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/blender/sync`, {}),
+  blenderOp: (id: string, body: { version?: string; op: string;
+    params?: Record<string, unknown>; active?: string; mode?: string }) =>
+    pj<{ part?: PartDetail; result?: Record<string, unknown>;
+         job?: string; error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/blender/op`, body),
+  blenderRender: (id: string, body: { version?: string; engine?: string;
+    width?: number; height?: number; samples?: number; transparent?: boolean }) =>
+    pj<BlenderRender>(`/api/parts/${encodeURIComponent(id)}/blender/render`, body),
+  blenderClose: (id: string) =>
+    pj<Record<string, unknown> & { error?: string }>(
+      `/api/parts/${encodeURIComponent(id)}/blender/close`, {}),
+  partCapabilities: () => j<PartCapabilities>('/api/parts/capabilities', { ttlMs: LIST_TTL_MS }),
+  partPasses: () => j<{ passes: PartPassInfo[]; error?: string }>(
+    '/api/parts/passes', { ttlMs: LIST_TTL_MS }),
   memory: (params: URLSearchParams, signal?: AbortSignal) =>
     j<{ items?: MemItem[]; has_more?: boolean; error?: string }>(
       `/api/memory?${params}`, { signal }),
@@ -1123,14 +2034,20 @@ export const api = {
      drawer for a session — that is far too destructive for fixing one
      mis-captured preference. */
   /* Per-conversation document access. Defaults to on; a conversation that
-     turns it off gets no document chunks in its prompt. */
+     turns it off gets no document chunks in its prompt.
+     `doc_ids` binds the thread to specific documents — "discuss this
+     document" — and is stored with the thread, so the binding survives a
+     reload instead of being re-sent by whichever page happens to be open. */
   chatThreadPrefs: (id: string) =>
-    j<{ prefs?: { use_documents: boolean } }>(
+    j<{ prefs?: { use_documents: boolean; folder_ids?: string[]; doc_ids?: string[] } }>(
       `/api/chat/threads/${encodeURIComponent(id)}/prefs`),
-  setChatThreadPrefs: (id: string, useDocuments: boolean) =>
-    pj<{ prefs?: { use_documents: boolean } }>(
+  setChatThreadPrefs: (id: string, useDocuments: boolean,
+                       folderIds?: string[], docIds?: string[]) =>
+    pj<{ prefs?: { use_documents: boolean; folder_ids?: string[]; doc_ids?: string[] } }>(
       `/api/chat/threads/${encodeURIComponent(id)}/prefs`,
-      { use_documents: useDocuments }),
+      { use_documents: useDocuments,
+        ...(folderIds ? { folder_ids: folderIds } : {}),
+        ...(docIds ? { doc_ids: docIds } : {}) }),
   deleteMemory: (id: string) =>
     j<Record<string, unknown>>(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   events: (limit = 200) => j<{ events?: FeedEvent[]; count?: number }>(
@@ -1161,15 +2078,32 @@ export const api = {
     if (!r.ok) throw new Error(await reason(r));
     return r.blob();
   },
-  uploadDocument: (file: File) => {
+  uploadDocument: (file: File, folderId = '') => {
     const fd = new FormData();
     fd.append('file', file, file.name);
+    if (folderId) fd.append('folder_id', folderId);
     // NOT pj: it forces Content-Type: application/json, which would override
     // the multipart boundary the browser generates and the server could not
     // parse the file at all.
     return j<{ document: DocItem; warnings?: string[]; error?: string }>(
       '/api/documents', { method: 'POST', body: fd });
   },
+  documentFolders: () => j<{ folders: DocFolder[] }>('/api/documents/folders'),
+  createDocumentFolder: (name: string, parentId = '') =>
+    pj<{ folder?: DocFolder; error?: string }>('/api/documents/folders',
+      { name, parent_id: parentId }),
+  renameDocumentFolder: (id: string, name: string) =>
+    pj<{ folder?: DocFolder; error?: string }>(
+      `/api/documents/folders/${encodeURIComponent(id)}`, { name },
+      { method: 'PATCH' }),
+  deleteDocumentFolder: (id: string) =>
+    pj<{ status?: string; error?: string }>(
+      `/api/documents/folders/${encodeURIComponent(id)}`, {},
+      { method: 'DELETE' }),
+  moveDocument: (id: string, folderId: string) =>
+    pj<{ document?: DocItem; error?: string }>(
+      `/api/documents/${encodeURIComponent(id)}/folder`,
+      { folder_id: folderId }),
   setDocumentEnabled: (id: string, enabled: boolean) =>
     pj<{ document?: DocItem; error?: string }>(
       `/api/documents/${encodeURIComponent(id)}/enabled`, { enabled }),
@@ -1188,44 +2122,50 @@ export const api = {
      or New Playground re-roots it, path-confined, at a local directory. The
      console pays a human confirm for the one write path (save), and the
      coding agent's writes pause for approval in the panel (see views/Code.tsx). */
-  codeRoots: () =>
+  codeRoots: (sid?: string) =>
     j<{ root?: string; roots?: { name: string; exists: boolean }[]; max_bytes?: number }>(
-      '/api/code/roots'),
+      `/api/code/roots${sidQs(sid)}`),
   /** The workspace the explorer is browsing right now. */
-  codeWorkspace: () => j<CodeWorkspace>('/api/code/workspace'),
+  codeWorkspace: (sid?: string) =>
+    j<CodeWorkspace>(`/api/code/workspace${sidQs(sid)}`),
   /** Open a folder on this machine as the Code workspace. Single-operator,
    *  loopback, token-gated: the same trust level as the user's own shell.
-   *  Re-roots only `/api/code/*`; the agent's tool sandbox is separate. */
-  openCodeWorkspace: (path: string) =>
-    pj<CodeWorkspace>('/api/code/workspace', { path }),
+   *  Re-roots only `/api/code/*`; the agent's tool sandbox is separate.
+   *
+   *  With a `sid` the server adds the folder to THAT session instead of
+   *  rewriting the process globals — which is the difference between opening a
+   *  project here and silently re-pointing another tab's editor, or re-rooting
+   *  an agent that is mid-run. */
+  openCodeWorkspace: (path: string, sid?: string) =>
+    pj<CodeWorkspace>(`/api/code/workspace${sidQs(sid)}`, { path }),
   /** Create an empty scratch workspace and switch to it. */
-  newCodePlayground: () =>
-    pj<CodeWorkspace>('/api/code/workspace', { playground: true }),
+  newCodePlayground: (sid?: string) =>
+    pj<CodeWorkspace>(`/api/code/workspace${sidQs(sid)}`, { playground: true }),
   /** Return to the shipped default: the empty scratch workspace. */
-  resetCodeWorkspace: () =>
-    pj<CodeWorkspace>('/api/code/workspace/reset', {}),
-  codeTree: (path: string, signal?: AbortSignal) =>
+  resetCodeWorkspace: (sid?: string) =>
+    pj<CodeWorkspace>(`/api/code/workspace/reset${sidQs(sid)}`, {}),
+  codeTree: (path: string, signal?: AbortSignal, sid?: string) =>
     j<{ path?: string; parent?: string; entries?: CodeEntry[]; error?: string }>(
-      `/api/code/tree?path=${encodeURIComponent(path)}`,
+      `/api/code/tree?path=${encodeURIComponent(path)}${sidQs(sid, true)}`,
       signal ? { signal } : undefined),
-  codeFiles: (signal?: AbortSignal) =>
+  codeFiles: (signal?: AbortSignal, sid?: string) =>
     j<{ files?: string[]; count?: number; truncated?: boolean }>(
-      '/api/code/files', signal ? { signal } : undefined),
+      `/api/code/files${sidQs(sid)}`, signal ? { signal } : undefined),
   /** Syntax-check a DRAFT buffer. Takes text, never a path — the server judges
       what is on screen and cannot be turned into a second file reader. */
   codeCheck: (text: string, language: string, signal?: AbortSignal) =>
     pj<CodeCheck>('/api/code/check', { text, language },
       signal ? { signal } : undefined),
-  codeSearch: (q: string, limit = 200, signal?: AbortSignal) =>
+  codeSearch: (q: string, limit = 200, signal?: AbortSignal, sid?: string) =>
     j<{ matches?: CodeMatch[]; count?: number; truncated?: boolean }>(
-      `/api/code/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+      `/api/code/search?q=${encodeURIComponent(q)}&limit=${limit}${sidQs(sid, true)}`,
       signal ? { signal } : undefined),
   /* NOT wrapped in safe(). Every failure came back as null, so a 413 "file too
      large", a 415 "not UTF-8 text", a 403 "outside the allowed roots" and a
      dead gateway were all the same dead end to the user: "cannot open
      <path>". The server already sends a readable reason; let it through. */
-  codeFile: (path: string, signal?: AbortSignal) =>
-    j<CodeFile>(`/api/code/file?path=${encodeURIComponent(path)}`,
+  codeFile: (path: string, signal?: AbortSignal, sid?: string) =>
+    j<CodeFile>(`/api/code/file?path=${encodeURIComponent(path)}${sidQs(sid, true)}`,
       signal ? { signal } : undefined),
   /** Run the project's own lint / typecheck / tests.
    *
@@ -1233,10 +2173,208 @@ export const api = {
    *  runs pytest / tsc / npm test / ruff / cargo / go vet for whichever the
    *  project actually has. Slow by nature - that is the point. It is what makes
    *  the panel a feedback loop rather than a spell-checker. */
-  codeChecks: (path?: string, signal?: AbortSignal) =>
-    pj<CodeChecks>(`/api/code/checks`, { path: path || '' },
+  codeChecks: (path?: string, signal?: AbortSignal, sid?: string) =>
+    pj<CodeChecks>(`/api/code/checks${sidQs(sid)}`, { path: path || '' },
       signal ? { signal } : undefined),
 
+  /* ── Studio workspaces (slice 1 surface) ───────────────────────────────
+     A session holds folders; the process holds one. These are the only
+     routes that read or write that list, and `validate_root` on the server is
+     the rule — which refuses the state directory and anything holding it, so
+     a mis-clicked "Open Folder" cannot publish sessions/ or agent.token. */
+  studioWorkspace: (sid: string, signal?: AbortSignal) =>
+    j<StudioWorkspace>(`/api/studio/roots?sid=${encodeURIComponent(sid)}`,
+      signal ? { signal } : undefined),
+  studioRootAdd: (sid: string, path: string) =>
+    pj<StudioWorkspace>(`/api/studio/roots${sidQs(sid)}`, { path }),
+  studioRootRemove: (sid: string, path: string) =>
+    pj<StudioWorkspace>(`/api/studio/roots/remove${sidQs(sid)}`, { path }),
+  studioPlayground: (sid: string) =>
+    pj<StudioWorkspace>(`/api/studio/playground${sidQs(sid)}`, {}),
+  studioReset: (sid: string) =>
+    pj<StudioWorkspace>(`/api/studio/workspace/reset${sidQs(sid)}`, {}),
+  /** The sessions the left column lists. This is a list of AGENTS rather than
+   *  a list of files, which is the framing the whole surface is built on. */
+  studioSessions: (sid: string, signal?: AbortSignal) =>
+    j<StudioSessionsResult>(`/api/studio/sessions?sid=${encodeURIComponent(sid)}`,
+      signal ? { signal } : undefined),
+  /** Name a session. The first task typed becomes its title. */
+  studioSessionRename: (sid: string, label: string) =>
+    pj<{ ok?: boolean; sid?: string; label?: string; error?: string }>(
+      `/api/studio/session/rename${sidQs(sid)}`, { sid, label }),
+  studioSessionArchive: (sid: string, archived: boolean) =>
+    pj<{ ok?: boolean; sid?: string; archived?: boolean; error?: string }>(
+      `/api/studio/session/archive${sidQs(sid)}`, { sid, archived }),
+  /** Slice 4 — the review model, per session.
+   *
+   *  `path` additionally returns that file's baseline text. Without it the
+   *  list is deliberately metadata-only: shipping every snapshot in the
+   *  session to paint a sidebar would be the same write-amplification mistake
+   *  the memory store already made, in the read direction. */
+  studioChanges: (sid: string, path?: string, signal?: AbortSignal) =>
+    j<StudioChangesResult>(
+      `/api/studio/changes?sid=${encodeURIComponent(sid)}`
+      + (path ? `&path=${encodeURIComponent(path)}` : ''),
+      signal ? { signal } : undefined),
+  /** Slice 5 — the runs this session has. A run is an object now: an id you
+   *  can stop from another tab, a transcript a reload can replay, a cost. */
+  studioRuns: (sid: string, signal?: AbortSignal) =>
+    j<StudioRunsResult>(`/api/studio/runs?sid=${encodeURIComponent(sid)}`,
+      signal ? { signal } : undefined),
+  /** The watcher stream: this session's run statuses, pushed as they change.
+   *
+   *  The server closes it when nothing is live, so a tab with no agents
+   *  running costs one short request. The caller reopens it when it starts a
+   *  run — which is also why this is a generator rather than a hook: the
+   *  re-open has to happen next to the code that starts the run. */
+  async *studioLive(sid: string,
+                    signal?: AbortSignal): AsyncGenerator<StudioRunsResult> {
+    const r = await fetch(`/api/studio/live${sidQs(sid)}`,
+      { headers: headers(), signal });
+    if (!r.ok) throw new Error(await reason(r));
+    if (!r.body) throw new Error('empty response body');
+    for await (const f of sseFrames(r, signal)) {
+      if (f.type === 'status') yield f as unknown as StudioRunsResult;
+    }
+  },
+  /** Replay one run: the frames, in the order they were sent. `after` is a
+   *  line offset, so a long transcript can be followed rather than refetched. */
+  studioRunFrames: (sid: string, runId: string, after = 0,
+                    signal?: AbortSignal) =>
+    j<StudioRunFrames>(
+      `/api/studio/runs/${encodeURIComponent(runId)}`
+      + `?sid=${encodeURIComponent(sid)}&after=${after}`,
+      signal ? { signal } : undefined),
+  /** Stop a run AT ITS NEXT HOP. A different verb from aborting the fetch,
+   *  which only closes this view and leaves the loop buying model calls. */
+  studioRunStop: (sid: string, id: string) =>
+    pj<{ ok?: boolean; id?: string; error?: string; note?: string }>(
+      '/api/studio/run/stop', { sid, id }),
+  /** What `@<fragment>` completes to, across every folder the session holds.
+   *  Server-side on purpose: the alternative is shipping a whole repository
+   *  tree to the browser to filter it on every keystroke. */
+  studioMentions: (sid: string, q: string, signal?: AbortSignal) =>
+    j<StudioMentionsResult>(
+      `/api/studio/mentions?sid=${encodeURIComponent(sid)}`
+      + `&q=${encodeURIComponent(q)}`, signal ? { signal } : undefined),
+  /** The slash commands, served rather than hardcoded: a popup that invents a
+   *  verb is a button that does nothing. */
+  studioCommands: (signal?: AbortSignal) =>
+    j<{ commands?: StudioCommand[] }>(
+      '/api/studio/commands', signal ? { signal } : undefined),
+  /** A run's real spend, from the gateway ledger. `unknown: true` means the
+   *  ledger was not reachable — the panel must show a gap, not $0.00. */
+  studioRunCost: (sid: string, runId: string, signal?: AbortSignal) =>
+    j<StudioRunCost>(
+      `/api/studio/runs/${encodeURIComponent(runId)}/cost`
+      + `?sid=${encodeURIComponent(sid)}`, signal ? { signal } : undefined),
+  /** Draft a commit message from the staged (or working) diff. One bounded
+   *  call, not an agent run — and it reports which hunks it did not see. */
+  studioCommitMsg: (sid: string, staged = true, model?: string) =>
+    pj<StudioCommitMsgResult>('/api/studio/commit-msg', {
+      sid, staged, ...(model ? { model } : {}),
+    }),
+  /** Slice 8 — file operations, batched so one user intent is one undo. */
+  studioFiles: (sid: string, ops: StudioFileOp[]) =>
+    pj<StudioFilesResult>(`/api/studio/files${sidQs(sid)}`, { sid, ops }),
+  /** Find in files, with the expression switch the IDE needs. */
+  studioSearch: (sid: string, q: string, opts?: {
+    regex?: boolean; case?: boolean; glob?: string; limit?: number;
+  }, signal?: AbortSignal) => {
+    const p = new URLSearchParams({ sid, q });
+    p.set('regex', String(opts?.regex !== false));
+    p.set('case', String(opts?.case !== false));
+    if (opts?.glob) p.set('glob', opts.glob);
+    if (opts?.limit) p.set('limit', String(opts.limit));
+    return j<StudioSearchResult>(`/api/studio/search?${p}`,
+      signal ? { signal } : undefined);
+  },
+  /** The dry run: returns the token the apply step must carry. */
+  studioReplacePreview: (sid: string, body: {
+    hits: StudioSearchMatch[]; pattern: string; replacement: string;
+    regex?: boolean; case?: boolean;
+  }) => pj<StudioReplacePreview>(`/api/studio/replace${sidQs(sid)}`,
+    { sid, ...body }),
+  /** The apply. Without the preview token it is refused — that is the point. */
+  studioReplaceApply: (sid: string, body: {
+    hits: StudioSearchMatch[]; pattern: string; replacement: string; token: string;
+    regex?: boolean; case?: boolean;
+  }) => pjBody<StudioReplaceResult>(`/api/studio/replace${sidQs(sid)}`,
+    { sid, apply: true, ...body }, [400, 409]),
+  /** One git verb. `confirm` is what turns a 428 into an action. */
+  studioGit: (sid: string, action: string, args?: Record<string, unknown>,
+              confirm = false) =>
+    pjBody<StudioGitResult>(`/api/studio/git${sidQs(sid)}`,
+      { sid, action, args: args || {}, confirm }),
+  studioJournal: (sid: string, limit = 200, signal?: AbortSignal) =>
+    j<{ entries?: StudioJournalEntry[]; count?: number }>(
+      `/api/studio/journal?sid=${encodeURIComponent(sid)}&limit=${limit}`,
+      signal ? { signal } : undefined),
+  /* ── Studio browser pane (slice 10) ─────────────────────────────── */
+  studioBrowserStatus: (sid: string, signal?: AbortSignal) =>
+    j<StudioBrowserStatus>(`/api/studio/browser/status?sid=${encodeURIComponent(sid)}`,
+      signal ? { signal } : undefined),
+  studioBrowserEvents: (sid: string, kind: 'console' | 'network' = 'console',
+                        all = false, signal?: AbortSignal) =>
+    j<StudioBrowserEvents>(
+      `/api/studio/browser/events?sid=${encodeURIComponent(sid)}`
+      + `&kind=${kind}&all=${all}`, signal ? { signal } : undefined),
+  studioBrowserShots: (sid: string, limit = 24, signal?: AbortSignal) =>
+    j<StudioBrowserShots>(
+      `/api/studio/browser/shots?sid=${encodeURIComponent(sid)}&limit=${limit}`,
+      signal ? { signal } : undefined),
+  studioBrowserPage: (sid: string, kind: 'snapshot' | 'read' = 'snapshot',
+                      signal?: AbortSignal) =>
+    j<Record<string, unknown>>(
+      `/api/studio/browser/page?sid=${encodeURIComponent(sid)}&kind=${kind}`,
+      signal ? { signal } : undefined),
+  studioBrowserNavigate: (sid: string, url: string) =>
+    pjBody<StudioBrowserNav>(`/api/studio/browser/navigate${sidQs(sid)}`,
+      { sid, url }, [400, 403, 500]),
+  studioBrowserTab: (sid: string, action: string, index?: number, url?: string) =>
+    pjBody<Record<string, unknown>>(`/api/studio/browser/tab${sidQs(sid)}`,
+      { sid, action, index, url }, [400, 403, 500]),
+  studioBrowserClose: (sid: string) =>
+    pj<{ ok?: boolean; closed?: boolean; disabled?: boolean }>(
+      `/api/studio/browser/close${sidQs(sid)}`, { sid }),
+  /** The live view. Yields each frame as it arrives and returns when the
+   *  server ends the window, so the caller reopens it — the same shape as
+   *  `studioLive`, and for the same reason: no long-lived idle socket. */
+  async *studioBrowserView(sid: string, everyMs = 250,
+                           signal?: AbortSignal): AsyncGenerator<StudioBrowserFrame> {
+    const r = await fetch(
+      `/api/studio/browser/view?sid=${encodeURIComponent(sid)}&every_ms=${everyMs}`,
+      { headers: headers(), signal });
+    if (!r.ok) throw new Error(await reason(r));
+    if (!r.body) throw new Error('empty response body');
+    for await (const f of sseFrames(r, signal)) {
+      yield f as unknown as StudioBrowserFrame;
+    }
+  },
+  /** Forget a session's runs and checkpoints. Never touches a workspace file:
+   *  deleting an agent's memory is not the same act as deleting a project. */
+  studioSessionForget: (sid: string) =>
+    pj<{ ok?: boolean; sid?: string; error?: string }>(
+      '/api/studio/session/forget', { sid }),
+  /** Decide ONE hunk. `keep` folds it into the baseline and never touches the
+   *  file; `revert` reverses it in the file. A hunk whose content has moved is
+   *  a 409 that says so — the panel must show that rather than retry blindly. */
+  studioHunkApply: (sid: string, path: string, hunkId: string,
+                    action: 'keep' | 'revert') =>
+    pj<StudioApplyResult>(`/api/studio/changes/apply${sidQs(sid)}`,
+      { path, hunk_id: hunkId, action }),
+  /** Named "before task N" states, newest first. Persisted, so these survive
+   *  both a reload and an agent restart. */
+  studioCheckpoints: (sid: string, signal?: AbortSignal) =>
+    j<{ checkpoints?: StudioCheckpoint[]; error?: string }>(
+      `/api/studio/checkpoints?sid=${encodeURIComponent(sid)}`,
+      signal ? { signal } : undefined),
+  /** Put one turn's files back. The server captures what it replaces as a
+   *  checkpoint of its own first, so this is always reversible from the same
+   *  panel — `undo.id` is that checkpoint. */
+  studioCheckpointRestore: (sid: string, id: string) =>
+    pj<StudioCheckpointRestoreResult>(`/api/studio/checkpoint/restore${sidQs(sid)}`,
+      { id }),
   /** Code intelligence for the agent panel.
    *
    *  One endpoint over the gateway's `code_intel`: symbols, references, blast
@@ -1316,16 +2454,57 @@ export const api = {
                          model?: string,
                          maxHops?: number,
                          paths?: string[],
-                         autoApprove = false): AsyncGenerator<CodeAgentFrame> {
-    const r = await fetch('/api/code/agent', {
+                         autoApprove = false,
+                         readOnly = false,
+                         context?: {
+                           tabs?: string[];
+                           diagnostics?: Array<{
+                             path?: string; line?: number; col?: number;
+                             message?: string;
+                           }>;
+                           /** `@browser` — the page this session's browser is
+                            *  on. Sent as an object rather than as pasted text
+                            *  so the server can bound and label the excerpt the
+                            *  same way it bounds a file. */
+                           browser_page?: {
+                             url: string; title?: string; text?: string;
+                             errors?: string[];
+                           };
+                         },
+                         /* Commands and checks are a separate opt-in from file
+                            writes: running the project's checks executes
+                            repository code, so "Auto" on writes has never
+                            implied it. Trailing so no positional caller shifts. */
+                         autoApproveExec = false,
+                         /* Scopes "always allow this command for this session".
+                            Without an owner a standing approval in one session
+                            could authorise another session's command. */
+                         session?: string,
+                         /* The studio session this run belongs to — which
+                            FOLDERS it may touch. Sent in the query as well as
+                            the body because the middleware that binds a
+                            session reads the query, and a run that binds
+                            nothing does not fail: it silently works in the
+                            process-wide default workspace instead of the
+                            project the user opened. That is the one failure
+                            this parameter exists to prevent. */
+                         sid?: string): AsyncGenerator<CodeAgentFrame> {
+    const r = await fetch(`/api/code/agent${sidQs(sid)}`, {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         question, path, text, history: history ?? [],
+        ...(sid ? { sid } : {}),
         ...(model ? { model } : {}),
         ...(maxHops ? { max_hops: maxHops } : {}),
         ...(paths && paths.length ? { paths } : {}),
         ...(autoApprove ? { auto_approve: true } : {}),
+        ...(readOnly ? { read_only: true } : {}),
+        ...(autoApproveExec ? { auto_approve_exec: true } : {}),
+        ...(session ? { session } : {}),
+        ...(context?.tabs?.length ? { tabs: context.tabs } : {}),
+        ...(context?.diagnostics?.length
+          ? { diagnostics: context.diagnostics } : {}),
       }),
       signal,
     });
@@ -1342,52 +2521,62 @@ export const api = {
    *  releases it. A refusal is a real outcome - the model is told the change was
    *  declined and continues - so the panel can always say "Decline" and let the
    *  agent adapt rather than hang. */
-  codePermission: (id: string, approve: boolean) =>
+  codePermission: (id: string, approve: boolean, remember = false) =>
     pj<{ status?: string; id?: string; approve?: boolean; error?: string }>(
-      `/api/code/permission/${encodeURIComponent(id)}`, { approve }),
+      `/api/code/permission/${encodeURIComponent(id)}`,
+      { approve, ...(remember ? { remember: true } : {}) }),
   /** Files the agent changed whose change is still unreviewed.
    *
    *  With auto-approve the writes land immediately and the user keeps or
    *  reverts each file afterwards; this lists what is still pending so a page
    *  reload does not lose the review. `created` marks a file the agent brought
    *  into existence (Revert deletes it). */
-  codeChanges: (signal?: AbortSignal) =>
-    j<{ changes?: CodeAgentChange[] }>('/api/code/agent/changes',
+  codeChanges: (signal?: AbortSignal, sid?: string) =>
+    j<{ changes?: CodeAgentChange[] }>(`/api/code/agent/changes${sidQs(sid)}`,
       signal ? { signal } : undefined),
   /** Accept the agent's change to a path: it stays on disk, marks come off. */
-  codeKeep: (path: string) =>
+  codeKeep: (path: string, sid?: string) =>
     pj<{ ok?: boolean; path?: string; error?: string }>(
-      '/api/code/agent/keep', { path }),
+      `/api/code/agent/keep${sidQs(sid)}`, { path }),
+  /** Undo ONE hunk of an unreviewed change, leaving the rest of the file's
+   *  edits in place. 409 when that hunk is no longer in the file — the server
+   *  refuses rather than guessing at a merge. */
+  codeRevertHunk: (path: string, hunk: number, sid?: string) =>
+    pj<{ ok?: boolean; path?: string; hunks_remaining?: number;
+         error?: string }>(
+      `/api/code/agent/revert-hunk${sidQs(sid)}`, { path, hunk }),
   /** Put a path back the way it was before the agent touched it. A file the
    *  agent created is removed. */
-  codeRevert: (path: string) =>
+  codeRevert: (path: string, sid?: string) =>
     pj<{ ok?: boolean; path?: string; restored?: boolean; deleted?: boolean;
-         error?: string }>('/api/code/agent/revert', { path }),
+         error?: string }>(`/api/code/agent/revert${sidQs(sid)}`, { path }),
   /** Save a buffer to disk. The only human write route, and gated: the payload
    *  must carry confirm:true (the user pressed save) plus the mtime the caller
    *  read, so a stale tab cannot silently clobber newer work. */
-  codeWrite: (path: string, text: string, opts: { confirm: boolean; mtime?: number }) =>
-    pj<{ ok?: boolean; path?: string; written?: boolean; unchanged?: boolean;
+  codeWrite: (path: string, text: string, opts: { confirm: boolean; mtime?: number; sid?: string }) => {
+    const { sid, ...rest } = opts;
+    return pj<{ ok?: boolean; path?: string; written?: boolean; unchanged?: boolean;
          backup?: string; bytes?: number; error?: string }>(
-      '/api/code/write', { path, text, ...opts }),
+      `/api/code/write${sidQs(sid)}`, { path, text, ...rest });
+  },
   /** Create one empty file in the workspace, for the explorer's "New file".
    *
    *  `/api/code/write` only saves a buffer that was already open, so nothing in
    *  the console could bring a file into existence. This can only add an empty
    *  file (never truncates), and needs confirm:true like every write here. */
-  codeNewFile: (name: string, dir?: string) =>
+  codeNewFile: (name: string, dir?: string, sid?: string) =>
     pj<{ ok?: boolean; path?: string; created?: boolean; bytes?: number; error?: string }>(
-      '/api/code/newfile', { name, dir: dir || '', confirm: true }),
+      `/api/code/newfile${sidQs(sid)}`, { name, dir: dir || '', confirm: true }),
   /** Review what is on disk: status, diff, or recent log.
    *
    *  Read-only by construction — the server offers no write verb, so this
    *  cannot stage, commit or revert. It is the review step for anything that
    *  edited a file: browser drafts are invisible here, disk changes are not. */
   codeGit: (target: 'status' | 'diff' | 'log' = 'status',
-            signal?: AbortSignal) =>
+            signal?: AbortSignal, sid?: string) =>
     j<{ ok?: boolean; target?: string; exit_code?: number | null;
          output?: string; truncated?: boolean; error?: string }>(
-      `/api/code/git?target=${target}`,
+      `/api/code/git?target=${target}${sidQs(sid, true)}`,
       signal ? { signal } : undefined),
   adopt: (sessionId: string) =>
     pj<{ conversation_id?: string; error?: string }>('/api/conversations/adopt', {
@@ -1397,24 +2586,123 @@ export const api = {
       lookup returns the latest vote cast on that index in ANY run —
       a thumbs-down on yesterday's n:3 would color today's n:3.
       Always pass the session id to scope the read. */
-  feedbackGet: (nodeId: string, sessionId?: string) =>
-    j<{ vote: number }>(
+  feedbackGet: (nodeId: string, sessionId?: string, msgId?: string) =>
+    j<{ vote: number; note?: string; feedback_id?: string; t?: number }>(
       `/api/feedback?node_id=${encodeURIComponent(nodeId)}` +
+      (msgId ? `&msg_id=${encodeURIComponent(msgId)}` : '') +
       `${sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ''}`,
     ),
   /** `skill` is sent so votes can be rolled up per skill. Without it the
       server can only group by node id, and a rollup over pruned runs loses
-      the attribution entirely. */
-  feedbackPost: (sessionId: string, nodeId: string, vote: 1 | -1, skill?: string) =>
-    pj<{ status: string }>('/api/feedback', { session_id: sessionId, node_id: nodeId, vote, skill }),
+      the attribution entirely. `msgId` scopes chat-turn votes (assistant chat
+      messages have no DAG node id). `note` is free-text explanation, capped
+      server-side to 280 chars. */
+  feedbackPost: (sessionId: string, nodeId: string, vote: 1 | -1 | 0, skill?: string, msgId?: string, note?: string) =>
+    pj<{ status: string; feedback_id?: string; learning?: 'queued' | 'no_note' | 'disabled' | 'error' }>(
+      '/api/feedback', { session_id: sessionId, node_id: nodeId, vote, skill, msg_id: msgId, note }),
+  /** Progress of the feedback → memory learner: what is waiting, what was
+      applied, and whether automatic learning/autosave is switched on. */
+  feedbackLearning: () => j<FeedbackLearningStatus>('/api/feedback/learning'),
+  /** Gateway voice channel readiness (Kokoro TTS + Whisper STT). */
+  voiceStatus: () => j<VoiceStatus>('/api/voice/status'),
+  ttsVoices: () => j<{ voices: VoiceOption[] }>('/api/tts/voices'),
+  /** Synthesize text to a playable WAV Blob through the gateway. */
+  tts: async (text: string, voice = 'af_heart', speed = 1.0): Promise<Blob> => {
+    const r = await fetch('/api/tts', {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ text, voice, speed }),
+    });
+    if (!r.ok) throw new Error(await reason(r));
+    return await r.blob();
+  },
+  /** Transcribe a recorded clip through the gateway's Whisper service. */
+  /** Sentence-chunked TTS. Events arrive as the gateway synthesizes them;
+      the caller plays chunk N while N+1 is still being made. */
+  ttsStream: async function* (
+    text: string, voice = 'af_heart', speed = 1.0, signal?: AbortSignal,
+  ): AsyncGenerator<TtsStreamEvent> {
+    const r = await fetch('/api/tts/stream', {
+      method: 'POST',
+      headers: headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ text, voice, speed }),
+      signal,
+    });
+    if (!r.ok) throw new Error(await reason(r));
+    if (!r.body) throw new Error('empty voice stream');
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl = buf.indexOf('\n');
+        while (nl >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line) {
+            let ev: TtsStreamEvent;
+            try { ev = JSON.parse(line) as TtsStreamEvent; }
+            catch { ev = { type: 'error', error: 'malformed voice chunk' }; }
+            yield ev;
+            if (ev.type === 'error' || ev.type === 'done') return;
+          }
+          nl = buf.indexOf('\n');
+        }
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* already closed */ }
+    }
+  },
+  stt: async (audio: Blob, filename = 'clip.webm'): Promise<{ text: string }> => {
+    const form = new FormData();
+    form.append('file', audio, filename);
+    const r = await fetch('/api/stt', {
+      method: 'POST',
+      headers: headers(),
+      body: form,
+    });
+    let data: { text?: string; error?: string } | null = null;
+    try { data = await r.json(); } catch { /* non-JSON error body */ }
+    if (!r.ok || data?.error) {
+      throw new Error(data?.error || await reason(r));
+    }
+    return { text: String(data?.text || '') };
+  },
   /** Aggregated votes: the only honest way to tell whether a prompt edit
       helped. `min_votes` marks low-sample rows rather than presenting them
       as a rate. */
   feedbackRollup: (days = 30, minVotes = 1) =>
     j<FeedbackRollup>(`/api/feedback/rollup?days=${days}&min_votes=${minVotes}`),
+  /** Persona is Aria's AI-written, evolving portrait of the user — not a
+      render of the memory drawers. `dry_run` defaults to true on the server
+      for the separate feedback→memory cross-check. */
+  profilePersona: () => j<{
+    markdown: string; generated?: boolean; meta?: PersonaMeta;
+  }>('/api/profile/persona'),
+  profilePersonaEvolution: () => j<{ markdown: string }>(
+    '/api/profile/persona/evolution'),
+  profilePersonaRegenerate: () => pj<{
+    ok: boolean; version?: number; markdown?: string; error?: string;
+    meta?: PersonaMeta;
+    documents?: { ok?: boolean; error?: string };
+  }>('/api/profile/persona/regenerate', {}),
+  profilePersonaSync: (dryRun = true) =>
+    pj<FeedbackSyncResult>(
+      `/api/profile/persona/sync?dry_run=${dryRun}`, { dry_run: dryRun }),
+  profilePersonaDocument: () =>
+    pj<{ ok: boolean; current?: string; evolution?: string; error?: string }>(
+      '/api/profile/persona/document', {}),
   /** Runtime counters the UI cannot otherwise see: fetch-cache hit rate (the
       thing behind research latency), how many tool outcomes reached memory,
       and whether the MCP tool subprocess breaker is open. */
+  gatewayUser: () => j<GatewayUserStatus>('/api/gateway/user'),
+  gatewayUserSet: (token: string) =>
+    pj<GatewayUserStatus>('/api/gateway/user', { token }),
+  gatewayUserClear: () =>
+    j<GatewayUserStatus>('/api/gateway/user', { method: 'DELETE' }),
   mcpStats: () => j<McpStats>('/api/mcp/stats'),
   /** Ask the agent to actually STOP a live run (server-side; the run ends
       at its next node boundary and remaining nodes are saved as `skipped`).
@@ -1430,6 +2718,24 @@ export const api = {
    *  whose slides did not exist in the file. */
   artifactPreview: (artifactId: string) =>
     j<DocPreview>(`/api/artifact/${encodeURIComponent(artifactId)}/preview`),
+  /** The artifact's own bytes, for a viewer that renders them itself.
+   *  `download=0` makes the server answer inline with the real content type,
+   *  which is what lets the browser's built-in PDF viewer open it — an
+   *  `<a href>` cannot carry the launch token, so the bytes come through here
+   *  and the iframe gets a blob URL. */
+  artifactBlob: async (artifactId: string): Promise<Blob> => {
+    const r = await fetch(`/api/artifact/${encodeURIComponent(artifactId)}?download=0`,
+      { headers: headers() });
+    if (!r.ok) throw new Error(await reason(r));
+    return await r.blob();
+  },
+  /** Index a stored artifact into the Documents library if it is not there
+      yet, and report the document id it lives under. `pj` swallows a non-2xx
+      into `{error}`, which is what the caller wants to show. */
+  indexArtifact: (artifactId: string) =>
+    pj<{ document_id?: string; folder?: string; origin?: string;
+         already?: boolean; error?: string }>(
+      `/api/artifact/${encodeURIComponent(artifactId)}/documents`, {}),
   /** What a run has produced so far. This is how the Authoring view
    *  reattaches to a run the user walked away from: the run keeps executing
    *  server-side after the stream closes, so on return we poll this instead
@@ -1437,7 +2743,8 @@ export const api = {
   runProduced: (sid: string) =>
     j<{
       session_id: string;
-      files: { artifact: string; filename: string; format: string; skill: string }[];
+      files: { artifact: string; filename: string; format: string; skill: string;
+               bytes?: number; document_id?: string }[];
       answer: string;
       live: boolean;
       /** The run lost a branch: the answer is not complete. Persisted, so it
@@ -1458,7 +2765,11 @@ async *chat(query: string, conversationId?: string, signal?: AbortSignal,
                opts?: { research?: boolean; idempotencyKey?: string;
                         docSetup?: Record<string, unknown>;
                         depth?: 'quick' | 'standard' | 'deep';
-                        runKind?: 'research' | 'authoring' | 'chat' }): AsyncGenerator<ChatEvent> {
+                        folderIds?: string[];
+                        docIds?: string[];
+                        partId?: string;
+                        versionId?: string;
+                        runKind?: 'research' | 'authoring' | 'chat' | 'parts' | 'app' }): AsyncGenerator<ChatEvent> {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
@@ -1474,9 +2785,20 @@ async *chat(query: string, conversationId?: string, signal?: AbortSignal,
            the skills it emits. Persisted at run start, so a new research
            topic is listed in the sidebar immediately. */
         run_kind: opts?.runKind,
+        /* Section runs are scoped to one library object. The server loads the
+           brief from its own store, so the client cannot forge part metrics. */
+        part_id: opts?.partId,
+        version_id: opts?.versionId,
         /* Planner-only. `query` is the TOPIC itself; depth never rides inside
            it, or every worker reads it as its own instruction. */
         depth: opts?.depth,
+        /* Folder subtree scope for this run's document retrieval. The body
+           value wins over the chat-thread preference on the server. */
+        folder_ids: opts?.folderIds?.length ? opts.folderIds : undefined,
+        /* Bind this turn to specific documents. Same override rule as
+           folder_ids, and what lets a document be discussed without the
+           rest of the enabled corpus answering for it. */
+        doc_ids: opts?.docIds?.length ? opts.docIds : undefined,
         /* The setup panel is applied to the render server-side, not merely
            described in the prompt - see _clean_doc_setup. */
         doc_setup: opts?.docSetup,
@@ -1497,14 +2819,25 @@ async *chat(query: string, conversationId?: string, signal?: AbortSignal,
   /** POST /api/chat/simple/stream as an async generator of SSE events
       (started/status/delta/done/error). Same abort contract as chat(). */
   async *chatSimpleStream(query: string, conversationId?: string, signal?: AbortSignal,
-                          model?: string): AsyncGenerator<SimpleStreamEvent> {
+                          model?: string,
+                          opts?: { docIds?: string[]; cite?: boolean }): AsyncGenerator<SimpleStreamEvent> {
     const r = await fetch('/api/chat/simple/stream', {
       method: 'POST',
       headers: headers({ 'Content-Type': 'application/json' }),
       // Conditional spread: an empty pick must leave the request identical
       // to the pre-picker shape so the gateway default still applies.
       body: JSON.stringify({ query, conversation_id: conversationId || undefined,
-                              ...(model ? { model } : {}) }),
+                              ...(model ? { model } : {}),
+                             /* Bind this turn to the document on screen. A body
+                                value is authoritative for its turn server-side,
+                                so the panel that owns the thread sends it every
+                                turn instead of writing preferences once. */
+                             ...(opts?.docIds?.length ? { doc_ids: opts.docIds } : {}),
+                             /* Ask for page-and-words citations. Only the
+                                document pane sends it: a marker is a feature
+                                when a viewer can light it up and noise
+                                everywhere else. */
+                             ...(opts?.cite ? { cite_markers: true } : {}) }),
       signal,
     });
     if (!r.ok) throw new Error(await reason(r));

@@ -80,15 +80,20 @@ def test_tool_payload_returns_schemas_for_a_whole_skill(catalog):
     import yaml
     cfg_path = pathlib.Path(skills.__file__).parent / "agent_config.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    # Section tools are dispatched in-process (see local_tools), not over
+    # MCP, so they are valid grants without being mcp_server tools. The union
+    # is the real surface a skill may be granted.
+    import local_tools
+    local = set(local_tools.LOCAL_TOOL_NAMES)
     problems = []
     for skill, entry in (cfg or {}).items():
         if not isinstance(entry, dict):
             continue
         allowed = entry.get("tools_allowed") or []
         for t in allowed:
-            if t not in catalog:
+            if t not in catalog and t not in local:
                 problems.append(f"{skill}: {t}")
-    assert not problems, f"skills list tools absent from the catalog: {problems}"
+    assert not problems, f"skills list tools absent from both catalogs: {problems}"
 
 
 def test_the_stale_tool_cache_is_not_the_source_of_truth(registered):

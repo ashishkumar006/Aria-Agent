@@ -95,7 +95,7 @@
     </div>
     <div class="card-body scrollable">
       <table id="led-calls-table">
-        <thead><tr><th>Time</th><th>Role</th><th>Provider</th><th>Model</th><th>Status</th><th>In</th><th>Out</th><th>Latency</th><th>Error / Attempts</th></tr></thead>
+        <thead><tr><th>Time</th><th>Role</th><th>Provider</th><th>Model</th><th>Status</th><th>In</th><th>Out</th><th>Tk/s</th><th>Latency</th><th>Error / Attempts</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -259,9 +259,9 @@ function renderLedgerCalls() {
     const dt = new Date(c.ts * 1000).toLocaleTimeString();
     return `<tr><td>${dt}</td><td>${escH(c.call_role || 'worker')}</td><td class="prov">${escH(c.provider)}</td>` +
       `<td>${escH(c.model)}</td><td class="${c.status === 'ok' ? 'ok' : 'err'}">${escH(c.status)}</td>` +
-      `<td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td><td>${c.latency_ms}ms</td>` +
+      `<td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td><td>${window.tpsCell(c)}</td><td>${c.latency_ms}ms</td>` +
       `<td class="err-msg">${escH(c.error || (c.attempted || '—'))}</td></tr>`;
-  }).join('') || '<tr><td colspan="9">no rows match the filters</td></tr>';
+  }).join('') || '<tr><td colspan="10">no rows match the filters</td></tr>';
 }
 function exportLedgerCSV() {
   const rows = ledFiltered();
@@ -273,9 +273,11 @@ function exportLedgerCSV() {
     const safe = /^[=+\-@]/.test(s) ? "'" + s : s;
     return '"' + safe.replace(/"/g, '""') + '"';
   };
-  const csv = ['ts,time,role,provider,model,status,in,out,latency_ms,error,attempted']
+  const csv = ['ts,time,role,provider,model,status,in,out,tk_s,thinking_tokens,latency_ms,error,attempted']
     .concat(rows.map((c) => [c.ts, new Date(c.ts * 1000).toISOString(), c.call_role || 'worker',
       c.provider, c.model, c.status, c.input_tokens || 0, c.output_tokens || 0,
+      Number(c.output_tps) > 0 ? Number(c.output_tps).toFixed(2) : '',
+      Number(c.thinking_tokens) || 0,
       c.latency_ms, c.error || '', c.attempted || ''].map(q).join(','))).join('\n');
   const url = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
   const a = document.createElement('a');

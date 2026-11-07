@@ -38,12 +38,20 @@ def clean_registry():
 
 @pytest.fixture(autouse=True)
 def gateway_down(monkeypatch):
-    """Fail fast instead of spending real money on every test here."""
+    """Fail fast instead of spending real money on every test here.
+
+    The document scope goes with it: it is one live read of the registry on the
+    run's critical path, and this file is about claims and registrations. Left
+    unpatched, these tests pass or hang depending on whether a gateway happens
+    to be listening on :8109.
+    """
     monkeypatch.setattr(
         gateway, "ensure_gateway",
         lambda: (_ for _ in ()).throw(RuntimeError("gateway unreachable")))
     monkeypatch.setattr(agent_server, "_shell_intent_offline",
                         lambda q: None, raising=False)
+    monkeypatch.setattr(agent_server, "_conversation_doc_ids",
+                        lambda *a, **k: set())
 
 
 def _drain(resp):
@@ -97,12 +105,29 @@ def test_key_released_when_the_body_raises_mid_stream(monkeypatch):
     assert agent_server._inflight_run_lookup("k-midbody") == ""
 
 
-def test_no_run_stays_registered_after_an_abort():
+def test_no_run_stays_registered_after_an_abort(monkeypatch):
     """The phantom-run half of the same bug: Stop listing runs that never
-    existed, one per aborted stream, until a restart."""
-    before = agent_server._active_run_count()
+    existed, one per aborted stream, until a restart.
 
-    resp = agent_server._stream_run("something ordinary", None,
+    The wait is the point, not the convenience. An abandoned STREAM is not a
+    stopped RUN: `test_the_worker_starts_before_the_first_frame_and_survives_abort`
+    pins that navigating away must not destroy the work, so the worker outlives
+    the client and its cancel event stays registered until the worker settles.
+    What must never happen is the leak — one event per closed tab, counting as
+    a live run forever.
+
+    Asserted on this run's own key rather than a snapshot of the global count,
+    because the abandoned workers of the tests above this one are still
+    settling in their own threads; a total taken at the start of the run is not
+    a stable baseline in a single-process suite.
+    """
+    import time
+
+    monkeypatch.setattr(agent_server, "_GATEWAY_WARMUP_THREAD", None)
+    monkeypatch.setattr(agent_server, "_EMBEDDER_WARMUP_THREAD", None)
+    conv = "ct-abort-registry"
+
+    resp = agent_server._stream_run("something ordinary", conv,
                                     idem_key="k-abort-at-started")
 
     async def _abort_at_first():
@@ -112,7 +137,17 @@ def test_no_run_stays_registered_after_an_abort():
 
     asyncio.run(_abort_at_first())
 
-    assert agent_server._active_run_count() == before
+    def _registered() -> bool:
+        with agent_server._ACTIVE_RUNS_LOCK:
+            return bool(agent_server._ACTIVE_RUNS.get(conv))
+
+    deadline = time.time() + 20
+    while _registered() and time.time() < deadline:
+        time.sleep(0.05)
+    assert not _registered(), (
+        "the abandoned run never left the cancel registry — every closed tab "
+        "would leave a phantom live run behind")
+
 
 
 def test_a_completed_stream_also_releases_the_key():

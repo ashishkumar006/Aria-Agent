@@ -29,6 +29,14 @@ import agent_server
 from agent_server import _research_depth_note, app
 from persistence import SESSIONS_ROOT, SessionStore
 
+import re  # noqa: E402
+
+# "at most 3 researchers", "up to 6 researcher nodes", "exactly one researcher"
+_COUNT_CEILING = re.compile(
+    r"(at most|no more than|up to|maximum of|exactly)\s+"
+    r"(one|two|three|four|five|six|seven|eight|\d+)\s+"
+    r"(researcher|research nodes|facet)", re.I)
+
 
 def test_depth_note_is_planner_only_and_never_impersonates_a_researcher():
     note = _research_depth_note("deep")
@@ -37,14 +45,19 @@ def test_depth_note_is_planner_only_and_never_impersonates_a_researcher():
     assert "you are a research agent" not in note.lower()
     assert "deliver a final report as markdown" not in note.lower()
     assert "RUN PARAMETERS" in note
-    # Quick/standard are budgets, not adjectives.
-    assert "EXACTLY ONE researcher" in _research_depth_note("quick")
-    assert "AT MOST 3" in _research_depth_note("standard")
+    # Depth is effort, not a head-count. These used to assert "EXACTLY ONE
+    # researcher" / "AT MOST 3" — the prose ceiling that trimmed a 12-facet
+    # topic to three researchers while planner.md promised there was no ceiling.
+    for depth in ("quick", "standard", "deep"):
+        assert not _COUNT_CEILING.search(_research_depth_note(depth)), depth
+        assert "NOT a node count" in _research_depth_note(depth)
 
 
 def test_unknown_depth_falls_back_to_standard():
-    assert "AT MOST 3" in _research_depth_note("banana")
-    assert "AT MOST 3" in _research_depth_note("")
+    for depth in ("banana", ""):
+        note = _research_depth_note(depth)
+        assert "STANDARD" in note, depth
+        assert not _COUNT_CEILING.search(note), depth
 
 
 def _post_chat(client: TestClient, body: dict) -> None:
@@ -115,7 +128,9 @@ def test_research_true_without_run_kind_still_declares_research(monkeypatch):
     with TestClient(app) as client:
         _post_chat(client, {"query": "a topic", "research": True})
     assert seen["run_kind"] == "research"
-    assert "AT MOST 3" in seen["run_note"]  # standard is the default
+    assert "STANDARD" in seen["run_note"]          # standard is the default
+    assert not _COUNT_CEILING.search(seen["run_note"]), (
+        "the run note still caps the fleet by name")
 
 
 def test_chat_dag_run_declares_chat_not_research(monkeypatch):

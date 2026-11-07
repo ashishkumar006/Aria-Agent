@@ -46,10 +46,16 @@ async def docgen_schema():
     normaliser is checked against - so it cannot fall behind the code again.
     """
     out = docgen.spec_schema()
+    # Only the resource bound is still advertised. The content limits that used
+    # to live here (blocks, table rows and columns, text length) were removed
+    # because they silently dropped reader-visible content from the finished
+    # file — publishing them told a caller how much of its document would go
+    # missing rather than warning it away from a real ceiling.
     out["limits"] = {
-        "max_blocks": docgen.MAX_BLOCKS,
-        "max_table_rows": docgen.MAX_TABLE_ROWS,
-        "max_table_cols": docgen.MAX_TABLE_COLS,
+        "max_blocks": None,
+        "max_table_rows": None,
+        "max_table_cols": None,
+        "max_text_chars": None,
         "max_output_bytes": docgen.MAX_BYTES,
     }
     return out

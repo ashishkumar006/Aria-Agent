@@ -216,6 +216,15 @@ DEFAULT_STYLE = "report"
 def resolve_style(name: str | None) -> dict:
     if not name:
         return dict(DOC_STYLES[DEFAULT_STYLE])
+    # A caller may hand a whole style through as an object rather than a name
+    # (the console and the API both can). Layer it over the default instead of
+    # stringifying it into a key that matches nothing and silently losing the
+    # accent the caller asked for.
+    if isinstance(name, dict):
+        base = dict(DOC_STYLES.get(str(name.get("name") or ""),
+                                   DOC_STYLES[DEFAULT_STYLE]))
+        base.update({k: v for k, v in name.items() if v is not None})
+        return base
     key = re.sub(r"[^a-z]", "", str(name).lower())
     if key in DOC_STYLES:
         return dict(DOC_STYLES[key])
@@ -414,20 +423,30 @@ def format_reference(ref: dict, style: dict, number: int | None = None) -> str:
     pages = str(ref.get("pages") or "").strip()
     url = str(ref.get("url") or ref.get("doi") or "").strip()
     if kind in ("web", "website", "online") or (url and not container):
-        container = container or "Web"
+        # "Web" alone was printed as the container and the URL then dropped by
+        # every numbered style: "[1] feature flags vs configuration. Web." A
+        # source the reader cannot open is not a citation. Keep a real
+        # container (the site name); otherwise the URL itself is the locator.
+        container = "" if url else "Web"
     prefix = f"[{number}] " if (style["numbered"] and number) else ""
+    if url and label in ("IEEE", "Vancouver", "AMA"):
+        online = {"IEEE": f"[Online]. Available: {url}",
+                  "Vancouver": f"Available from: {url}",
+                  "AMA": f"Available at: {url}"}[label]
+    else:
+        online = ""
     # Numeric styles put the year last; author-date puts it right after the
     # author. That is the visible shape of the two families.
     if label in ("IEEE", "Vancouver", "AMA"):
         core = _join([a for a in (authors, title) if a], ". ")
         tail = _join([f"vol. {volume}" if volume else "",
                       f"no. {issue}" if issue else "",
-                      pages, year, container])
+                      pages, year, container, online])
         return _sentence([prefix + core, tail])
     if label == "MLA":
         core = _join([authors, title], ". ")
         tail = _join([container, f"vol. {volume}" if volume else "",
-                      f"no. {issue}" if issue else "", year, pages], ", ")
+                      f"no. {issue}" if issue else "", year, pages, url], ", ")
         return _sentence([prefix + core, tail])
     if label in ("Bluebook", "OSCOLA"):
         return _sentence([prefix + authors, title, container, year, url])

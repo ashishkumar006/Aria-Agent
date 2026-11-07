@@ -37,3 +37,29 @@
   temp dir instead, delete when done.
 - Scratch E2E/visual scripts (`*.cjs`, temp `.py`) live outside the repo and
   are deleted after the run they verify.
+
+## Studio (`/studio`) — what is where
+- The coding workspace: `views/studio/{Studio,AgentPanel,Composer,Explorer,
+  ReviewEditor,Sessions,Dock,GitPanel,SearchReplace,BrowserPane}.tsx`,
+  session state in `lib/studioSession.ts`.
+- Backend modules, one concern each: `studio_workspace.py` (sessions/roots),
+  `studio_review.py` (baselines, content-fingerprinted hunks, checkpoints),
+  `studio_runs.py` (run registry + JSONL transcripts + replay),
+  `studio_composer.py` (`@` mentions, `/` commands, commit messages),
+  `studio_files.py` (file ops, search/replace plans, git argv — planners only,
+  it never writes), `browser_session.py` (the session's persistent Chromium).
+  `agent_server.py` owns the routes and the path vocabulary.
+- **The code agent's system prompt is inline in `agent_server.py`**, not in
+  `prompts/`. Editing `prompts/coder.md` changes nothing for the IDE agent.
+  The prompt directory is `prompts/`; the tool payload is built by
+  `skills.tool_payload`, and `tests/test_studio_prompt_truth.py` fails if the
+  prompt names a tool the payload does not carry.
+- Default code workspace is `state/code_workspace` (an empty scratch folder),
+  and with a studio session bound it is that session's own roots — never the
+  process default.
+- Switches live in `flags.py`, not `agent_config.yaml`: `ui.code_ide`
+  (off = the old `/code` page, untouched), `browser.tools` (off = no browser
+  verb in the agent's payload and the pane routes answer `disabled`),
+  `browser.headed` (visible Chromium on the next browser a session starts).
+- `TEST.md` in `S9SharedCode/code` is the studio's verification checklist —
+  read it before changing a studio surface, and add to it when you add one.

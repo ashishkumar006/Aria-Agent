@@ -537,3 +537,33 @@ class TestTextReplayedToolCalls:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
+
+
+def test_the_run_token_ceiling_stops_an_unbounded_chat():
+    """Chat has no hop cap, so invariant 8 needs a different hard bound."""
+    async def chat(_messages):
+        return {"text": "", "tool_calls": [_tc("list_dir", {"path": "."})],
+                "input_tokens": 100, "output_tokens": 100, "provider": "x"}
+
+    async def dispatch(_name, _args):
+        return "ok"
+
+    out = asyncio.run(mr.run_tool_loop(
+        messages=[{"role": "user", "content": "go"}], chat_fn=chat,
+        dispatch_fn=dispatch, max_hops=0, max_total_tokens=50))
+    assert "token ceiling" in (out.get("error") or ""), out
+
+
+def test_the_run_time_ceiling_stops_an_unbounded_chat():
+    async def chat(_messages):
+        await asyncio.sleep(0.05)
+        return {"text": "", "tool_calls": [_tc("list_dir", {"path": "."})],
+                "input_tokens": 1, "output_tokens": 1, "provider": "x"}
+
+    async def dispatch(_name, _args):
+        return "ok"
+
+    out = asyncio.run(mr.run_tool_loop(
+        messages=[{"role": "user", "content": "go"}], chat_fn=chat,
+        dispatch_fn=dispatch, max_hops=0, max_seconds=0.01))
+    assert "time ceiling" in (out.get("error") or ""), out

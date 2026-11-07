@@ -28,6 +28,7 @@ const Code = lazy(() => import('./views/Code'));
 const Authoring = lazy(() => import('./views/Authoring'));
 const Parts = lazy(() => import('./views/Parts'));
 const Computer = lazy(() => import('./views/Computer'));
+const Studio = lazy(() => import('./views/studio/Studio'));
 
 /* Warm the split chunks shortly after first paint so that only the very
    first section can suspend; afterwards every hop is served from the module
@@ -146,10 +147,24 @@ export const SECTIONS = [
   { id: '/mission', render: () => <Mission /> },
   { id: '/settings', render: () => <Settings /> },
   { id: '/code', render: () => <Code /> },
+  { id: '/studio', render: () => <Studio /> },
   { id: '/authoring', render: () => <Authoring /> },
   { id: '/parts', render: () => <Parts /> },
   { id: '/computer', render: () => <Computer /> },
 ] as const;
+
+/* Pages that are a different VIEW OF a section rather than a new section.
+   `/authoring/focus` is Authoring stripped to the document and the agent, so
+   it has to resolve to the same keep-alive entry: giving it its own id would
+   mount a second Authoring and the discussion would silently start a fresh
+   conversation the moment you entered focus.
+
+   An explicit table, not a prefix test — `/authoring` + anything must not be
+   absorbed by Authoring. `/chat` already taught that lesson by falling through
+   to Research and looking like a working page. */
+export const SUB_SECTIONS: Record<string, string> = {
+  '/authoring/focus': '/authoring',
+};
 
 /** Map a raw pathname onto a registered section id. */
 function sectionFor(pathname: string): string {
@@ -159,6 +174,7 @@ function sectionFor(pathname: string): string {
   // them distinct would mount the view twice.
   const trimmed = pathname.replace(/\/+$/, '') || '/';
   if (SECTIONS.some((s) => s.id === trimmed)) return trimmed;
+  if (SUB_SECTIONS[trimmed]) return SUB_SECTIONS[trimmed];
   return '/research';
 }
 

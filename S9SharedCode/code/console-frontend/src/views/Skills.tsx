@@ -3,6 +3,7 @@ import { Boxes } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Pill, Stat, SkipLink } from '../components/ui';
 import { useMainId, useActivePoll } from '../components/KeepAlive';
 import { api, CONF, type ToolSpec } from '../api';
+import { Pane, usePaneMode } from '../lib/panes';
 
 const PACKS = [
   { id: 'research', name: 'Web Research', ico: '◉',
@@ -174,10 +175,16 @@ export default function Skills() {
     (t.description || '').toLowerCase().includes(ql) ||
     packsOf(t.name).some((p) => p.toLowerCase().includes(ql)));
 
+  /* The Capabilities column is a sidebar, so its mode is read here — this is a
+     hook — and applied at the block's two boundaries instead of re-indenting
+     forty lines of unchanged JSX. */
+  const railMode = usePaneMode('skills.rail');
+
   return (
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {railMode === 'hidden' ? null : (
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Capabilities
@@ -222,11 +229,15 @@ export default function Skills() {
           </div>
         </div>
       </div>
+      )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Skills">
+        <TopBar crumb="Skills" panes="skills">
+          <Pane id="skills.filter">
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter tools" className="w-44 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
+          </Pane>
         </TopBar>
         <div className="min-h-0 flex-1 overflow-y-auto">
+          <Pane id="skills.stats">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
             <Stat k="PACKS" v={String(PACKS.length)} s="capability bundles" />
             {guardError ? (
@@ -250,6 +261,7 @@ export default function Skills() {
               </>
             )}
           </div>
+          </Pane>
           {toggleError && (
             <p role="alert" className="mx-3.5 mb-3 mt-3 rounded-[10px] border border-amber-400/40 bg-amber-400/5 px-3.5 py-2.5 text-[12.5px] text-amber-200">
               toggle did not apply: {toggleError.slice(0, 200)}

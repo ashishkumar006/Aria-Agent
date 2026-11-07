@@ -84,6 +84,61 @@ def test_a_title_is_always_one_line():
     assert "\n" not in t and "\r" not in t, repr(t)
 
 
+def test_a_model_title_that_is_the_request_is_rejected():
+    """A model that cannot think of a title echoes the brief; that echo was
+    printed at 19pt on the cover and in every page header."""
+    brief = ("Write a comprehensive, highly detailed report on the state of "
+             "vector databases in 2026. Cover the major players.")
+    t = skills._document_title({"title": brief}, brief)
+    assert not t.lower().startswith("write a"), t
+    assert "Cover the major players" not in t, t
+
+
+def test_the_title_is_the_first_sentence_of_the_brief():
+    brief = ("Create a document.\n\nWrite a comprehensive, highly detailed "
+             "report on the state of vector databases in 2026. Cover the "
+             "major players (Pinecone, Weaviate, Qdrant), benchmarks, cost "
+             "models, and a decision guide.")
+    t = skills._document_title({}, brief)
+    assert t == "The state of vector databases in 2026", t
+
+
+LLM_PROMPT = ("Create me an detailed pdf about working of llm's, make it big "
+              "and nearky 25 pages long")
+
+
+def test_a_request_verb_with_a_different_object_is_still_a_request():
+    """The detector used to match only "create a document", so a model that
+    echoed "Create me an detailed pdf about working of llm's, make it big and
+    nearky 25 pages long" as its title was believed - and that sentence was
+    then printed in the header and footer of all 23 pages."""
+    assert skills._title_is_request(LLM_PROMPT), LLM_PROMPT
+    t = skills._document_title({"title": LLM_PROMPT}, LLM_PROMPT)
+    assert not t.lower().startswith("create"), t
+    assert "25 pages" not in t, t
+
+
+def test_an_instruction_clause_does_not_survive_into_the_title():
+    """Even after the verb and the noun are stripped, the request keeps
+    talking: "..., make it big and nearky 25 pages long"."""
+    t = skills._document_title({}, LLM_PROMPT)
+    for junk in ("make it", "nearky", "25 pages", "pdf"):
+        assert junk not in t.lower(), (junk, t)
+
+
+def test_a_title_that_names_a_length_is_the_request():
+    assert skills._title_is_request("Everything about attention, 40 pages long")
+    assert not skills._title_is_request("Notes from a 1953 seminar")
+
+
+def test_pdf_and_deck_count_as_document_nouns():
+    """The strip list knew "report" and "treatise" but not the formats people
+    actually ask for, so the noun survived into the title."""
+    t = skills._document_title({}, "Create me a detailed pdf about attention heads")
+    assert "pdf" not in t.lower(), t
+    assert "attention heads" in t.lower(), t
+
+
 def test_section_headings_are_not_stripped_from_the_merge():
     """Merging used to drop heading blocks by type to dodge double-numbering.
 

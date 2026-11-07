@@ -1,18 +1,17 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { FileText, Upload, RefreshCw, Trash2, Search, Eye, Download } from 'lucide-react';
+import {
+  useCallback, useEffect, useMemo, useRef, useState, type FormEvent,
+} from 'react';
+import {
+  Download, Eye, FileText, Folder, FolderPlus, Pencil, Plus,
+  RefreshCw, Search, Trash2, Upload,
+} from 'lucide-react';
 import { Rail, TopBar, Empty, Stat, Pill, Skel, SkipLink } from '../components/ui';
 import { useFocusTrap } from '../lib/a11y';
 import { useMainId, useRefreshOnActive, useSectionActive } from '../components/KeepAlive';
-import { api, type DocItem } from '../api';
-
-/* The viewer imports the setup panel's machinery, so it is loaded only when a
-   preview opens rather than on the Documents route. */
-const DocumentViewer = lazy(() =>
-  import('./DocSetup').then((m) => ({ default: m.DocumentViewer })));
-
-/* Formats the gateway can render from the stored bytes. Text-like uploads keep
-   the iframe path because there is no meaningful page image to rasterise. */
-const SERVER_PREVIEW_TYPES = new Set(['pdf', 'docx', 'xlsx']);
+import { api, type DocFolder, type DocItem } from '../api';
+import { flattenFolders, folderSubtree } from '../lib/folders';
+import { DocumentModal } from '../components/DocumentModal';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
 /* Statuses the gateway reports. A document may only be ENABLED when it is
    `ready`; anything else means its vectors are incomplete, and enabling it
@@ -23,7 +22,7 @@ const STATUS_TONE: Record<string, 'ok' | 'err' | 'warn' | 'info' | 'muted'> = {
   embedding: 'info', chunking: 'info', parsing: 'info', pending: 'muted',
 };
 
-const ACCEPT = '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm';
+const ACCEPT = '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm,.png,.jpg,.jpeg';
 const MB = (n: number) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB`
   : n > 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
@@ -41,11 +40,75 @@ export default function Documents() {
   const [q, setQ] = useState('');
   const [hits, setHits] = useState<any[] | null>(null);
   const [searching, setSearching] = useState(false);
-  const [preview, setPreview] = useState<{ doc: DocItem; url?: string } | null>(null);
+  const [preview, setPreview] = useState<{ doc: DocItem } | null>(null);
   const [previewing, setPreviewing] = useState('');
+  /* Folder tree. The selection is persisted so returning to Documents lands
+     where the user was, not back at the root. */
+  const [folders, setFolders] = useState<DocFolder[]>([]);
+  const [foldersLoaded, setFoldersLoaded] = useState(false);
+  const [folderSel, setFolderSel] = useState<string>(() => {
+    try { return localStorage.getItem('aria.docs.folder') || '__all__'; }
+    catch { return '__all__'; }
+  });
+  const [newFolderParent, setNewFolderParent] = useState<string | null>(null);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [editingFolder, setEditingFolder] = useState('');
+  const [editingName, setEditingName] = useState('');
+  const [folderErr, setFolderErr] = useState('');
+  const [folderBusy, setFolderBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const reqRef = useRef(0);
-  const previewReq = useRef(0);
+
+  const loadFolders = useCallback(async () => {
+    try {
+      const d = await api.documentFolders();
+      setFolders(d.folders || []);
+    } catch (e) {
+      setFolderErr(String((e as Error)?.message || e));
+    } finally {
+      setFoldersLoaded(true);
+    }
+  }, []);
+  useEffect(() => { void loadFolders(); }, [loadFolders]);
+  useEffect(() => {
+    try { localStorage.setItem('aria.docs.folder', folderSel); } catch { /* ignore */ }
+  }, [folderSel]);
+
+  const folderNodes = useMemo(() => flattenFolders(folders), [folders]);
+  const selectedFolder = folderNodes.find((f) => f.id === folderSel);
+  const selectedLabel = folderSel === '__all__' ? 'All documents'
+    : folderSel === '__unfiled__' ? 'Unfiled'
+      : selectedFolder?.path || 'All documents';
+  const uploadTargetLabel = folderSel.startsWith('__') ? 'Unfiled' : selectedLabel;
+  const scopeIds = useMemo(
+    () => (folderSel === '__all__' || folderSel === '__unfiled__'
+      ? new Set<string>()
+      : folderSubtree(folderSel, folders)),
+    [folderSel, folders]);
+  const scopedDocs = useMemo(() => docs.filter((d) => {
+    if (folderSel === '__all__') return true;
+    if (folderSel === '__unfiled__') return !d.folder_id;
+    return !!d.folder_id && scopeIds.has(d.folder_id);
+  }), [docs, folderSel, scopeIds]);
+  const folderCounts = useMemo(() => {
+    const byId = new Map(folders.map((f) => [f.id, f]));
+    const counts = new Map<string, number>();
+    for (const d of docs) {
+      let fid = d.folder_id || '';
+      const seen = new Set<string>();
+      while (fid && !seen.has(fid)) {
+        seen.add(fid);
+        counts.set(fid, (counts.get(fid) || 0) + 1);
+        fid = byId.get(fid)?.parent_id || '';
+      }
+    }
+    return counts;
+  }, [docs, folders]);
+  const unfiledCount = docs.filter((d) => !d.folder_id).length;
+  useEffect(() => {
+    if (!foldersLoaded || folderSel.startsWith('__')) return;
+    if (!folderNodes.some((f) => f.id === folderSel)) setFolderSel('__all__');
+  }, [folderNodes, folderSel, foldersLoaded]);
 
   const load = useCallback(async (fresh = false) => {
     try {
@@ -121,9 +184,10 @@ export default function Documents() {
        POST response is authoritative, so put its row on screen now and let the
        normal poll reconcile it. */
     const added: DocItem[] = [];
+    const targetFolder = folderSel.startsWith('__') ? '' : folderSel;
     for (const f of list) {
       try {
-        const r = await api.uploadDocument(f);
+        const r = await api.uploadDocument(f, targetFolder);
         if (r.document) added.push(r.document);
         const nw = (r.warnings || []).length;
         const w = nw ? ` (${nw} warning(s))` : '';
@@ -139,7 +203,8 @@ export default function Documents() {
     const parts: string[] = [];
     if (ok.length) {
       parts.push(`uploaded ${ok.length === 1 ? '' : `${ok.length} files: `}`
-        + ok.join(', ').slice(0, 200) + ' — indexing has started');
+        + ok.join(', ').slice(0, 200)
+        + ' — indexing has started; enable it when ready');
     }
     if (bad.length) parts.push(`upload failed: ${bad.join('; ').slice(0, 240)}`);
     setNote(parts.join(' | ') || 'nothing uploaded');
@@ -183,41 +248,93 @@ export default function Documents() {
     finally { setBusy(''); }
   };
 
-  /* Open the modal immediately, then let the server render PDF/DOCX/XLSX.
-     The old path downloaded the whole upload before showing anything and
-     handed it to the browser's PDF plugin - a blank frame wherever Electron
-     did not provide that plugin, and a full second copy of every file even
-     when it did. Text-like formats still use a blob because their bytes are
-     what the iframe is meant to display. */
-  const previewDoc = async (d: DocItem) => {
-    const req = ++previewReq.current;
-    setNote('');
-    setPreviewing(d.id);
-    setPreview((p) => {
-      if (p?.url) URL.revokeObjectURL(p.url);
-      return { doc: d };
-    });
-    if (SERVER_PREVIEW_TYPES.has((d.doc_type || '').toLowerCase())) {
-      setPreviewing('');
-      return;
-    }
+  const openCreateFolder = (parentId: string) => {
+    setNewFolderParent(parentId);
+    setNewFolderName('');
+    setFolderErr('');
+  };
+
+  const createFolder = async (e?: FormEvent) => {
+    e?.preventDefault();
+    const name = newFolderName.trim();
+    if (!name || folderBusy) return;
+    setFolderBusy(true);
+    setFolderErr('');
     try {
-      const blob = await api.documentContent(d.id);
-      if (req !== previewReq.current) return;
-      const url = URL.createObjectURL(blob);
-      setPreview((p) => {
-        if (req !== previewReq.current) { URL.revokeObjectURL(url); return p; }
-        if (p?.url) URL.revokeObjectURL(p.url);
-        return { doc: d, url };
-      });
-    } catch (e) {
-      if (req === previewReq.current) {
-        setPreview(null);
-        setNote(String((e as Error)?.message || e));
-      }
-    } finally {
-      if (req === previewReq.current) setPreviewing('');
+      const r = await api.createDocumentFolder(name, newFolderParent || '');
+      if (r.error) throw new Error(r.error);
+      await loadFolders();
+      setNewFolderParent(null);
+      setNewFolderName('');
+      if (r.folder?.id) setFolderSel(r.folder.id);
+    } catch (err) {
+      setFolderErr(String((err as Error)?.message || err));
+    } finally { setFolderBusy(false); }
+  };
+
+  const renameFolder = async (folderId: string) => {
+    const name = editingName.trim();
+    if (!name || folderBusy) return;
+    setFolderBusy(true);
+    setFolderErr('');
+    try {
+      const r = await api.renameDocumentFolder(folderId, name);
+      if (r.error) throw new Error(r.error);
+      setEditingFolder('');
+      setEditingName('');
+      await loadFolders();
+    } catch (err) {
+      setFolderErr(String((err as Error)?.message || err));
+    } finally { setFolderBusy(false); }
+  };
+
+  const deleteFolder = async (folderId: string, path: string) => {
+    if (folderBusy) return;
+    if (!confirm(`Delete the empty folder "${path}"?\n\nFolders with documents or subfolders must be emptied first.`)) return;
+    setFolderBusy(true);
+    setFolderErr('');
+    try {
+      const r = await api.deleteDocumentFolder(folderId);
+      if (r.error) throw new Error(r.error);
+      if (folderSel === folderId) setFolderSel('__all__');
+      await loadFolders();
+    } catch (err) {
+      setFolderErr(String((err as Error)?.message || err));
+    } finally { setFolderBusy(false); }
+  };
+
+  const moveDoc = async (d: DocItem, folderId: string) => {
+    if (busy) return;
+    setBusy(d.id);
+    setFolderErr('');
+    try {
+      const r = await api.moveDocument(d.id, folderId);
+      if (r.error) throw new Error(r.error);
+      if (detail?.id === d.id) setDetail({ ...detail, folder_id: folderId });
+      await load(true);
+    } catch (err) {
+      setFolderErr(String((err as Error)?.message || err));
+    } finally { setBusy(''); }
+  };
+
+  const fileTone = (d: DocItem) => {
+    if (d.status === 'failed') return 'text-rose-300';
+    if (d.status === 'blocked') return 'text-amber-300';
+    if (['pending', 'parsing', 'chunking', 'embedding'].includes(d.status)) {
+      return 'text-sky-300';
     }
+    if (d.status === 'ready') return d.enabled ? 'text-emerald-300' : 'text-zinc-300';
+    return 'text-zinc-200';
+  };
+
+  /* Open the window at once. The viewer inside it fetches what it needs:
+     a PDF goes to the browser's own viewer as a blob URL (real page scroll,
+     selection, search, zoom), and anything the browser cannot show is rendered
+     from server-made pages. Neither path downloads a second copy up front the
+     way this used to. */
+  const previewDoc = (d: DocItem) => {
+    setNote('');
+    setPreview({ doc: d });
   };
 
   const downloadDoc = async (d: DocItem) => {
@@ -235,12 +352,8 @@ export default function Documents() {
   };
 
   const closePreview = () => {
-    previewReq.current += 1;
     setPreviewing('');
-    setPreview((p) => {
-      if (p?.url) URL.revokeObjectURL(p.url);
-      return null;
-    });
+    setPreview(null);
   };
 
   const search = async () => {
@@ -258,26 +371,156 @@ export default function Documents() {
     } finally { if (id === reqRef.current) setSearching(false); }
   };
 
-  const ready = docs.filter((d) => d.status === 'ready');
-  const enabled = docs.filter((d) => d.enabled);
+  const ready = scopedDocs.filter((d) => d.status === 'ready');
+  const enabled = scopedDocs.filter((d) => d.enabled);
+  const indexing = scopedDocs.filter((d) =>
+    ['pending', 'parsing', 'chunking', 'embedding'].includes(d.status));
+  const blocked = scopedDocs.filter((d) => d.status === 'blocked');
 
-  /* Both overlays are modal: a backdrop covers the page behind
-     them, so the keyboard must not be able to tab out onto the
-     covered content, and Escape closes them like the × button
-     does. Focus returns to the row that opened each one when it
-     unmounts. */
+  /* The detail drawer is an overlay: a backdrop covers the page behind it,
+     so the keyboard must not be able to tab out onto the covered content, and
+     Escape closes it like the × button does. Focus returns to the row that
+     opened it when it unmounts. The document window traps its own focus. */
   const closeDetail = () => { setSel(null); setDetail(null); };
   const drawerRef = useRef<HTMLDivElement | null>(null);
-  const previewRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(drawerRef, { active: !!sel, onEscape: closeDetail });
-  useFocusTrap(previewRef, { active: !!preview, onEscape: closePreview });
+
+  const foldersMode = usePaneMode('documents.folders');
 
   return (
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {foldersMode === 'collapsed'
+        ? <PaneStrip id="documents.folders" label="Document folders" />
+        : (
+      <aside className="flex w-full max-h-[32vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:h-full lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r"
+             aria-label="Document folders">
+        <div className="flex items-center justify-between px-3 pb-2 pt-3">
+          <h2 className="text-xs font-bold tracking-wide">Folders</h2>
+          <button
+            onClick={() => openCreateFolder('')}
+            title="Create a main folder"
+            aria-label="New main folder"
+            className="flex items-center gap-1 rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10.5px] text-zinc-300 hover:border-violet-400 hover:text-zinc-100">
+            <FolderPlus size={11} /> New
+          </button>
+        </div>
+        {newFolderParent !== null && (
+          <form onSubmit={(e) => { void createFolder(e); }}
+                className="mx-2 mb-2 rounded-md border border-violet-400/40 bg-[#0e0e12] p-1.5">
+            <div className="mb-1 truncate text-[10px] text-zinc-500">
+              {newFolderParent
+                ? `Inside ${folderNodes.find((f) => f.id === newFolderParent)?.path || 'folder'}`
+                : 'New main folder'}
+            </div>
+            <input
+              autoFocus
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') setNewFolderParent(null); }}
+              placeholder="Folder name"
+              aria-label="New folder name"
+              className="h-7 w-full rounded border border-white/10 bg-black/40 px-2 text-xs outline-none focus:border-violet-400"
+            />
+            <div className="mt-1 flex justify-end gap-1">
+              <button type="button" onClick={() => setNewFolderParent(null)}
+                className="rounded px-1.5 py-0.5 text-[10px] text-zinc-500 hover:text-zinc-200">
+                cancel
+              </button>
+              <button type="submit" disabled={!newFolderName.trim() || folderBusy}
+                className="rounded bg-violet-400 px-2 py-0.5 text-[10px] font-bold text-[#0b0b0e] disabled:opacity-40">
+                {folderBusy ? '…' : 'Add'}
+              </button>
+            </div>
+          </form>
+        )}
+        {folderErr && (
+          <Pane id="documents.foldererr">
+          <p role="status" className="mx-2 mb-2 rounded border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-[10.5px] leading-snug text-amber-200">
+            {folderErr}
+          </p>
+          </Pane>
+        )}
+        <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
+          <button
+            onClick={() => setFolderSel('__all__')}
+            aria-pressed={folderSel === '__all__'}
+            className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[12px] ${folderSel === '__all__' ? 'bg-violet-400/10 text-violet-100' : 'text-zinc-300 hover:bg-white/5'}`}>
+            <FileText size={12} className="text-zinc-500" />
+            <span className="min-w-0 flex-1 truncate">All documents</span>
+            <span className="font-mono text-[10px] text-zinc-500">{docs.length}</span>
+          </button>
+          {unfiledCount > 0 && (
+            <button
+              onClick={() => setFolderSel('__unfiled__')}
+              aria-pressed={folderSel === '__unfiled__'}
+              className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[12px] ${folderSel === '__unfiled__' ? 'bg-violet-400/10 text-violet-100' : 'text-zinc-400 hover:bg-white/5'}`}>
+              <Folder size={12} className="text-zinc-600" />
+              <span className="min-w-0 flex-1 truncate">Unfiled</span>
+              <span className="font-mono text-[10px] text-zinc-500">{unfiledCount}</span>
+            </button>
+          )}
+          <div className="px-2 pb-1 pt-2 text-[9.5px] font-bold tracking-[0.14em] text-zinc-600">FOLDERS</div>
+          {folderNodes.map((f) => {
+            const count = folderCounts.get(f.id) || 0;
+            const selected = folderSel === f.id;
+            return (
+              <div key={f.id} style={{ paddingLeft: 6 + f.depth * 12 }}
+                   className={`group flex items-center rounded-md ${selected ? 'bg-violet-400/10 text-violet-100' : 'text-zinc-300 hover:bg-white/5'}`}>
+                {editingFolder === f.id ? (
+                  <form onSubmit={(e) => { e.preventDefault(); void renameFolder(f.id); }}
+                        className="flex min-w-0 flex-1 items-center gap-1 py-0.5">
+                    <input autoFocus value={editingName}
+                           onChange={(e) => setEditingName(e.target.value)}
+                           onKeyDown={(e) => { if (e.key === 'Escape') setEditingFolder(''); }}
+                           aria-label="Folder name"
+                           className="h-6 min-w-0 flex-1 rounded border border-white/15 bg-black/40 px-1.5 text-[11px] outline-none focus:border-violet-400" />
+                    <button type="submit" className="px-1 text-[10px] text-emerald-300" title="Save name">✓</button>
+                    <button type="button" onClick={() => setEditingFolder('')} className="px-1 text-[10px] text-zinc-500" title="Cancel">×</button>
+                  </form>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => setFolderSel(f.id)}
+                      aria-pressed={selected}
+                      title={f.path}
+                      className="flex min-w-0 flex-1 items-center gap-1.5 py-1.5 text-left text-[11.5px]">
+                      <Folder size={11} className={selected ? 'text-violet-300' : 'text-zinc-600'} />
+                      <span className="min-w-0 flex-1 truncate">{f.name}</span>
+                      <span className="font-mono text-[9.5px] text-zinc-500">{count}</span>
+                    </button>
+                    <span className="flex flex-none items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                      <button onClick={() => openCreateFolder(f.id)} title="New subfolder" aria-label={`New subfolder in ${f.path}`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-zinc-500 hover:text-violet-200">
+                        <Plus size={10} />
+                      </button>
+                      <button onClick={() => { setEditingFolder(f.id); setEditingName(f.name); }} title="Rename folder" aria-label={`Rename folder ${f.path}`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-zinc-500 hover:text-zinc-200">
+                        <Pencil size={9} />
+                      </button>
+                      <button onClick={() => void deleteFolder(f.id, f.path)} title="Delete empty folder" aria-label={`Delete folder ${f.path}`}
+                        className="flex h-5 w-5 items-center justify-center rounded text-zinc-500 hover:text-rose-300">
+                        <Trash2 size={9} />
+                      </button>
+                    </span>
+                  </>
+                )}
+              </div>
+            );
+          })}
+          {!folderNodes.length && (
+            <Pane id="documents.nofolders">
+            <p className="px-2 py-2 text-[10.5px] leading-snug text-zinc-600">
+              No folders yet. Create one or use All documents.
+            </p>
+            </Pane>
+          )}
+        </div>
+      </aside>
+        )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Documents">
+        <TopBar crumb="Documents" panes="documents">
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -297,15 +540,22 @@ export default function Documents() {
         </TopBar>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
-            <Stat k="DOCUMENTS" v={String(docs.length)} s="uploaded" loading={!loaded} />
-            <Stat k="READY" v={String(ready.length)} s="fully embedded" loading={!loaded}
-              tone={ready.length ? 'ok' : undefined} />
-            <Stat k="IN USE" v={String(enabled.length)} s="enabled for chat" loading={!loaded} />
-            <Stat k="BLOCKED" v={String(docs.filter((d) => d.status === 'blocked').length)}
-              s="waiting for the embedder" loading={!loaded}
-              tone={docs.some((d) => d.status === 'blocked') ? 'warn' : undefined} />
+          {/* A single status line replaces four large tiles. The numbers are
+              scoped to the selected folder; the file rows carry the colors. */}
+          <Pane id="documents.scope">
+          <div className="mx-3.5 mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-white/8 pb-2 text-[11px] text-zinc-400">
+            <span className="font-semibold text-zinc-200">{selectedLabel}</span>
+            <span><b className="text-zinc-300">{scopedDocs.length}</b> docs</span>
+            <span><b className="text-emerald-300">{ready.length}</b> ready</span>
+            <span><b className="text-zinc-300">{enabled.length}</b> enabled</span>
+            {indexing.length > 0 && (
+              <span className="text-sky-300">{indexing.length} indexing</span>
+            )}
+            {blocked.length > 0 && (
+              <span className="text-amber-300">{blocked.length} blocked</span>
+            )}
           </div>
+          </Pane>
 
           {/* Drop zone: there is no size cap, so a large file is fine; the
               indexing worker paces itself to leave the model free. */}
@@ -317,19 +567,25 @@ export default function Documents() {
               setDropping(false);
               if (e.dataTransfer.files?.length) upload(e.dataTransfer.files);
             }}
-            className={`mx-3.5 mt-3 rounded-[10px] border-2 border-dashed p-4 text-center transition-colors ${
+            className={`mx-3.5 mt-3 rounded-[10px] border-2 border-dashed p-3 text-center transition-colors ${
               dropping ? 'border-violet-400 bg-violet-400/5' : 'border-white/10'}`}
           >
             <input ref={fileRef} type="file" multiple accept={ACCEPT} className="hidden"
               onChange={(e) => { if (e.target.files?.length) upload(e.target.files); }}
               aria-label="Upload documents" />
+            <p className="mb-2 text-[11px] text-zinc-500">
+              Uploading to <span className="font-semibold text-zinc-300">{uploadTargetLabel}</span>
+            </p>
             <button onClick={() => fileRef.current?.click()} disabled={uploading}
               className="inline-flex items-center gap-2 rounded-md bg-violet-400/15 px-3.5 py-2 text-[13px] font-semibold text-violet-200 hover:bg-violet-400/25 disabled:opacity-40">
               <Upload size={14} /> {uploading ? 'uploading…' : 'Upload documents'}
             </button>
-            <p className="mt-2 text-[11.5px] text-zinc-muted">
-              Drop files here or click to choose. PDF, DOCX, Markdown, text, HTML,
-              CSV and Excel, up to 25 MB each — chunks are embedded in the background.
+            <p className="mt-2 text-[11px] leading-snug text-zinc-muted">
+              Drop files here or choose. PDF, DOCX, Markdown, text, HTML, CSV,
+              Excel and PNG/JPG images, up to 25 MB. A document is switched on
+              for agent search as soon as it finishes indexing — switch it off
+              here if it should not answer. An image holds no search text: it is
+              there for the author to place in a document as a figure.
             </p>
             {note && <p role="status" className="mt-2 text-[12px] text-amber-200">{note}</p>}
           </div>
@@ -342,6 +598,7 @@ export default function Documents() {
 
           {/* Search results: retrieval only, no LLM cost. */}
           {hits && (
+            <Pane id="documents.results">
             <section className="mx-3.5 mt-3 overflow-hidden rounded-[10px] border border-white/10 bg-[#0e0e12]">
               <div className="flex items-center justify-between border-b border-white/10 px-3.5 py-2.5 text-xs font-bold">
                 SEARCH RESULTS
@@ -371,32 +628,61 @@ export default function Documents() {
                 </div>
               ))}
             </section>
+            </Pane>
           )}
 
           {/* Document list */}
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">UPLOADED</div>
           {!loaded && <div className="px-3.5"><Skel n={3} /></div>}
-          {loaded && !docs.length && !loadError && (
-            <Empty icon={<FileText size={30} />} title="No documents yet"
-              sub="Upload a file above and it becomes available to chat and research." />
+          {loaded && !scopedDocs.length && !loadError && (
+            <Empty icon={<FileText size={30} />}
+              title={folderSel === '__all__' ? 'No documents yet' : 'No documents here'}
+              sub={folderSel === '__all__'
+                ? 'Upload a file above, wait for indexing, then enable it to make it available to chat and research.'
+                : `Nothing is filed in ${selectedLabel}. Upload above or move a document here.`} />
           )}
           <div className="space-y-2 px-3.5 pb-6">
-            {docs.map((d) => (
+            {scopedDocs.map((d) => (
               <section key={d.id}
                 className={`rounded-[10px] border bg-[#0e0e12] ${sel?.id === d.id ? 'border-violet-400/60' : 'border-white/10'}`}>
                 <button onClick={() => open(d)}
                   className="flex w-full items-start gap-2.5 px-3.5 py-2.5 text-left">
                     <FileText size={15} className="mt-0.5 flex-none text-zinc-muted" />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-[13px] font-semibold">{d.filename}</div>
+                      <div
+                        className={`truncate text-[13px] font-semibold ${fileTone(d)}`}
+                        title={`${d.filename} · ${d.status}${d.enabled ? ' · enabled' : ''}${
+                          ['pending', 'parsing', 'chunking', 'embedding'].includes(d.status)
+                            ? ` · ${Math.round((d.progress || 0) * 100)}%`
+                            : ''
+                        }`}>
+                        {d.filename}
+                      </div>
                       <div className="mt-1 flex flex-wrap items-center gap-1.5">
                         <Pill tone={STATUS_TONE[d.status] || 'muted'}>{d.status}</Pill>
+                        {/* Where it came from. Aria files what she makes under
+                            the section that made it, so a library row has to
+                            say "authoring", "research", "web" or "upload" —
+                            otherwise every file looks like something the user
+                            dragged in, and neither the user nor the agent can
+                            tell what is safe to delete. */}
+                        {d.origin && d.origin !== 'upload' && (
+                          <Pill tone="info">{d.origin}</Pill>
+                        )}
+                        {d.folder_id && (
+                          <span className="inline-flex items-center gap-1 text-[11px] text-zinc-muted"
+                            title={folderNodes.find((f) => f.id === d.folder_id)?.path || d.folder_id}>
+                            <Folder size={10} />
+                            {folderNodes.find((f) => f.id === d.folder_id)?.path || 'filed'}
+                          </span>
+                        )}
                         <span className="text-[11px] text-zinc-muted">
                           {d.doc_type} · {MB(d.size_bytes)} · {d.chunk_count} chunk{d.chunk_count === 1 ? '' : 's'}
                         </span>
                       </div>
                       {/* Progress is only meaningful while indexing. */}
                       {['parsing', 'chunking', 'embedding'].includes(d.status) && d.chunk_count > 0 && (
+                        <Pane id="documents.progress">
                         <div className="mt-1.5">
                           <div className="h-1 overflow-hidden rounded-full bg-white/10">
                             <div className="h-full bg-violet-400"
@@ -406,13 +692,16 @@ export default function Documents() {
                             {d.embedded_count}/{d.chunk_count} chunks embedded
                           </div>
                         </div>
+                        </Pane>
                       )}
+                      <Pane id="documents.blocked">
                       {d.status === 'blocked' && (
                         <div className="mt-1 text-[11px] text-amber-200">
                           waiting for the embedding model — it resumes automatically
                         </div>
                       )}
                       {d.error && <div className="mt-1 text-[11px] text-red-300">{d.error}</div>}
+                      </Pane>
                     </div>
                     <Pill tone={d.enabled ? 'ok' : 'muted'}>{d.enabled ? 'in use' : 'off'}</Pill>
                   </button>
@@ -476,6 +765,20 @@ export default function Documents() {
                       <Stat k="SIZE" v={MB(detail.size_bytes)} s={detail.doc_type} />
                       <Stat k="MODEL" v={detail.embed_model || '—'} s={detail.embed_dim ? `${detail.embed_dim} dims` : 'not embedded yet'} />
                     </div>
+                    <label className="mt-3 flex items-center gap-2 text-[11px] text-zinc-400">
+                      <span className="font-bold tracking-wide text-zinc-500">FOLDER</span>
+                      <select
+                        value={detail.folder_id || ''}
+                        onChange={(e) => void moveDoc(detail, e.target.value)}
+                        disabled={busy === detail.id}
+                        aria-label="Move document to folder"
+                        className="h-7 min-w-0 flex-1 rounded border border-white/10 bg-black/40 px-2 text-xs text-zinc-200 outline-none focus:border-violet-400 disabled:opacity-50">
+                        <option value="">Unfiled</option>
+                        {folderNodes.map((f) => (
+                          <option key={f.id} value={f.id}>{f.path}</option>
+                        ))}
+                      </select>
+                    </label>
                     {!!detail.warnings?.length && (
                       <div className="mt-3 rounded-lg border border-amber-400/40 bg-amber-400/5 p-3">
                         <div className="text-[11px] font-bold text-amber-200">PARSER WARNINGS</div>
@@ -511,72 +814,22 @@ export default function Documents() {
           </div>
         )}
 
-        {/* Inline preview: the browser's own viewer renders the
-            blob URL, so PDFs get page navigation, zoom and
-            download without any extra dependency. */}
-        {preview && (
-          <div ref={previewRef} className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4"
-            onClick={closePreview} role="presentation">
-            <div role="dialog" aria-modal="true" aria-label={`Preview of ${preview.doc.filename}`}
-              onClick={(e) => e.stopPropagation()}
-              className="flex h-full w-full max-w-5xl flex-col rounded-[10px] border border-white/10 bg-[#0b0b0e]">
-              <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
-                <FileText size={15} className="text-zinc-muted" />
-                <span className="flex-1 truncate text-[14px] font-bold">{preview.doc.filename}</span>
-                <button type="button" onClick={() => downloadDoc(preview.doc)}
-                  aria-label={`Download ${preview.doc.filename}`}
-                  className="rounded border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] hover:border-violet-400">
-                  <Download size={12} className="inline" /> download
-                </button>
-                <button onClick={closePreview} aria-label="Close preview"
-                  className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5">×</button>
-              </div>
-              {/* The browser-viewer fallback is sandboxed, and this is
-                  load-bearing rather than cosmetic. preview.url is a blob:
-                  URL, so the document shares this
-                  page's own origin — an uploaded .html file would otherwise
-                  run with full same-origin privileges, read the
-                  `aria-token` meta tag out of the parent document, and issue
-                  authenticated /api/* calls as the user. .html is an
-                  accepted upload type, so this was self-inflicted stored XSS.
-
-                  `allow-same-origin` WITHOUT `allow-scripts` is the specific
-                  combination. Measured across every token set:
-                    (none)                             token readable, PDF renders
-                    ""                                 token safe,   PDF BLOCKED
-                    "allow-scripts"                    token safe,   PDF blocked
-                    "allow-same-origin"                token safe,   PDF renders
-                    "allow-scripts allow-same-origin"  token readable, PDF renders
-                  Omitting `allow-scripts` is what makes this safe: page
-                  scripts cannot run at all, so an uploaded .html cannot
-                  execute, while plugins still work so Chrome's PDF viewer is
-                  not blocked. Dropping `allow-same-origin` breaks PDFs again.
-                  DocSetup.tsx and Apps.tsx sandbox differently because they
-                  render HTML via srcDoc and a URL, never a blob. */}
-              {SERVER_PREVIEW_TYPES.has((preview.doc.doc_type || '').toLowerCase()) ? (
-                <div className="docview-frame m-3 flex min-h-0 flex-1">
-                  <Suspense fallback={
-                    <div className="p-3 text-[11.5px] text-zinc-muted">loading the preview…</div>
-                  }>
-                    <DocumentViewer source={{
-                      kind: 'document', docId: preview.doc.id,
-                      format: preview.doc.doc_type,
-                      label: preview.doc.filename,
-                    }} />
-                  </Suspense>
-                </div>
-              ) : preview.url ? (
-                <iframe src={preview.url} title={`Preview of ${preview.doc.filename}`}
-                  sandbox="allow-same-origin" referrerPolicy="no-referrer"
-                  className="min-h-0 flex-1 w-full rounded-b-[10px] bg-white" />
-              ) : (
-                <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-[12.5px] text-zinc-muted">
-                  {previewing === preview.doc.id ? 'loading the preview…' : 'No preview available.'}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+        {/* The same document window Authoring uses: centred over a blurred
+            page, with a PDF handed to the browser's own viewer so page scroll,
+            text search and zoom are the real ones. The blob sandboxing that
+            used to sit here — `allow-same-origin` without `allow-scripts`,
+            which is what stops an uploaded .html from reading the console
+            token while still letting the PDF plugin render — moved into
+            DocumentModal along with the iframe. */}
+        <DocumentModal
+          open={!!preview}
+          target={preview ? {
+            kind: 'document', docId: preview.doc.id,
+            format: preview.doc.doc_type, label: preview.doc.filename,
+          } : null}
+          onClose={closePreview}
+          onDownload={preview ? () => { void downloadDoc(preview.doc); } : undefined}
+        />
       </main>
     </div>
   );

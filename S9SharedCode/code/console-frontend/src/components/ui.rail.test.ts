@@ -11,7 +11,8 @@ import { RAIL } from './ui';
 
 const ROUTES = [
   '/console', '/runs', '/memory', '/documents', '/research', '/scheduler',
-  '/skills', '/code', '/authoring', '/apps', '/ledger', '/mission', '/settings',
+  '/skills', '/code', '/studio', '/authoring', '/apps', '/ledger', '/mission',
+  '/settings',
   '/parts', '/computer',
 ];
 

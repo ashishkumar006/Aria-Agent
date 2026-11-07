@@ -44,6 +44,7 @@ const TITLES: Record<string, string> = {
   '/mission': 'Mission',
   '/settings': 'Settings',
   '/code': 'Code',
+  '/studio': 'Studio',
   '/authoring': 'Authoring',
 };
 

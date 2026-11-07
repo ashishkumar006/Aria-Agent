@@ -149,8 +149,19 @@ def test_ee01_mcp_tool_catalogue():
     # 56 = + make_dir (BUG-035: folders were impossible) and + run_command,
     # the PowerShell escape hatch for a specific command the checker does not
     # cover (bounded + approval-gated).
+    # 63 = + the seven Blender tools registered for the Parts section.
+    # 65 = + whats_new and one earlier addition that went uncounted; re-measured
+    # against the live registry instead of derived from the history above.
+    # 66 = + schedule_wake, so a planner that decides "keep watching this" has
+    # a hand for it. Registration is unconditional; whether the tool is
+    # ADVERTISED still depends on agent.self_wake, which is off by default.
+    # 68 = + search_images and fetch_image, the supply half of `image` blocks.
     # Keeps this file in step with tests/comprehensive/test_mcp_tools.py.
-    assert len(tools) == 56, f"expected 56 tools, got {len(tools)}"
+    # 85 = + the seventeen browser verbs of slice 9. Registered always,
+    # advertised only when browser.tools is on — the same split as
+    # schedule_wake, and the reason the count moves even though the default
+    # payload does not.
+    assert len(tools) == 85, f"expected 85 tools, got {len(tools)}"
     for expected in ("run_checks", "git_inspect", "find_symbol",
                      "list_scheduled", "web_search", "read_file", "list_dir",
                      "search_knowledge", "github_query", "read_artifact",

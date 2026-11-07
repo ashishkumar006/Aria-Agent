@@ -55,6 +55,220 @@ DEFINITIONS: dict[str, dict] = {
                        "clients. Additive; the console does not use it. "
                        "GET /api/capabilities stays available either way.",
     },
+    "chat.recall_gate": {
+        "type": "bool",
+        "default": True,
+        # Scope is one prompt block on one path. It does not touch the profile
+        # block, the retrieval tools, or any run outside a plain chat turn:
+        # with this off, every turn recalls exactly as it did before.
+        "description": "Skip the memory-corpus search for a chat turn that is "
+                       "only small talk ('hi', 'thanks', 'ok'). The search is "
+                       "one query embed fanned out over every drawer including "
+                       "the document corpus, and it runs on the request path: "
+                       "2.1s warm here, 25-51s when Ollama has evicted the "
+                       "embed model, and it is spent before a greeting is "
+                       "answered. The behavioural profile block still attaches "
+                       "— only the embedding-backed recall is gated. Off = "
+                       "recall again runs on every turn, greetings included.",
+    },
+    "agent.whats_new": {
+        "type": "bool",
+        "default": True,
+        # Read-only by construction, so the blast radius is one tool and one
+        # GET. It is named anyway because every capability the agent can use is
+        # a capability someone must be able to take back.
+        "description": "The agent can ask what has changed since a moment ago "
+                       "(the `whats_new` tool and GET /api/whats-new): a bounded "
+                       "index of documents, memory, runs, apps and artifacts, "
+                       "pointers only, never contents, and never the audit or "
+                       "document memory drawers. Read-only — it changes nothing. "
+                       "Off removes the tool from the chat payload and the route "
+                       "refuses; the watermark file it writes is left alone.",
+    },
+    "agent.self_wake": {
+        "type": "bool",
+        "default": False,
+        # The one switch that grants the agent a turn it decided to take. Every
+        # other capability in this file is something the agent can do *while the
+        # user is talking*; this is the only one that lets it act later, on its
+        # own schedule, so it ships off and its blast radius is spelled out.
+        "description": "The agent may schedule its own future wake-up "
+                       "(`schedule_wake`) and the scheduler may fire those "
+                       "wakes. A wake is a poll with a reason: nothing is spent "
+                       "when the watch finds no change, and a wake that finds "
+                       "change gets a read-only turn in the conversation it was "
+                       "armed in, recorded there as Aria waking. Off means no "
+                       "new wake can be armed, existing wake rows stay stored "
+                       "but never fire, and the tool is not offered to the "
+                       "model. Wakes are one-shot and capped "
+                       "(wakes_left, a 10-minute interval floor, a 24-hour "
+                       "watch horizon), and every one is listed with a cancel "
+                       "path on the Scheduler page.",
+    },
+    "agent.delta_readonly": {
+        "type": "bool",
+        "default": True,
+        # Kept true through v1. The actions work is the only thing that should
+        # ever flip it, and it is named so that the diff widening autonomy is
+        # one obvious line rather than a silent capability creep.
+        "description": "A scheduled wake may only read, notice and report. Its "
+                       "tool set is composed from an explicit read-only "
+                       "allowlist, with one deliberate exception: it may arm "
+                       "another wake (schedule_wake), because a watch that "
+                       "cannot extend itself dies at its first unmet tick. "
+                       "Writes, sends, run_command, computer_action, document "
+                       "rendering and the handoff tools stay off the wake's "
+                       "list. Setting this false is how the later action work "
+                       "widens autonomy — do it per-tool through the gateway "
+                       "policy, not by turning this off.",
+    },
+    "agent.fold_tool_results": {
+        "type": "bool",
+        "default": True,
+        # Turn it off and every tool result stays in the prompt for the rest of
+        # the node's life, which is the behaviour that produced 283k-token
+        # researcher calls. Nothing is deleted by folding: the full text goes to
+        # the artifact store and the prompt keeps a handle plus a preview, so
+        # off is a return to the old cost profile, not a return to lost data.
+        # The destructive fallback (`_elide_oldest_tool_output`, which tells the
+        # model to re-run the call) is untouched by this switch and still guards
+        # any caller that sets an explicit context budget.
+        "description": "A tool result the node has already read is replaced in "
+                       "later turns by an artifact handle plus a preview, "
+                       "instead of being re-sent in full on every hop. The text "
+                       "is stored, not truncated. Off restores the old "
+                       "behaviour: whole results re-sent until the node is out "
+                       "of context.",
+    },
+    "agent.stop_in_nodes": {
+        "type": "bool",
+        "default": True,
+        # Stop has always been honoured BETWEEN nodes, which is the one place
+        # it never helps: a long document is a single author node making one
+        # model call per section, and a deep researcher is a single node making
+        # thirty tool hops. Off, those run to completion after the console says
+        # "stopped", keep spending, and keep holding the run's idempotency claim
+        # so re-asking the same question is refused for the length of the TTL.
+        # Nothing is stored or configured by this switch, so off is simply the
+        # old batch-boundary behaviour and leaves no residue.
+        "description": "Pressing Stop ends a run at its next own boundary — "
+                       "before the next tool hop, before the next dispatch of "
+                       "tools, before the next document section — instead of "
+                       "only between node batches. Sections and answers already "
+                       "paid for are kept and still rendered. One in-flight "
+                       "model call always finishes first; asyncio cannot "
+                       "interrupt a request already sent. Off restores the old "
+                       "behaviour: the current node runs to completion and only "
+                       "the nodes after it are skipped.",
+    },
+    "documents.image_search": {
+        "type": "bool",
+        "default": True,
+        # The one switch for the whole image-supply path: both tools refuse when
+        # it is off, so nothing is fetched, nothing is filed into Documents and
+        # no outbound image request leaves the process. Placement of images that
+        # are ALREADY stored (a figure lifted from a document the user uploaded)
+        # is untouched by it — that path fetches nothing, so switching this off
+        # must not silently cost people the pictures they own. Off leaves no
+        # residue: the author is simply not offered the tools.
+        "description": "The agent may find CC-licensed pictures (Openverse) and "
+                       "fetch one into Documents so a document can embed it: "
+                       "search_images and fetch_image. On = both tools work. Off "
+                       "= both refuse and neither is advertised, and documents "
+                       "can still use figures from the user's own uploads.",
+    },
+    "ui.authoring_focus": {
+        "type": "bool",
+        "default": True,
+        # Console-only. The route, the discussion endpoint and the stored
+        # thread are the same either way, so switching this off loses nothing
+        # and leaves no half-built page behind: /authoring/focus simply
+        # renders the normal Authoring screen.
+        "description": "Authoring offers a Focus page (/authoring/focus) that "
+                       "fills the window with only the open document on the "
+                       "left and Aria on the right — no rail, no top bar, no "
+                       "tab strip, no run list. Off removes the entry point "
+                       "and the URL falls back to the ordinary Authoring page. "
+                       "The conversation is the same thread in both layouts, "
+                       "so this never starts or ends a discussion.",
+    },
+    "ui.pane_hiding": {
+        "type": "bool",
+        "default": True,
+        # The blast radius is the console's own chrome and nothing else: no
+        # route, tool, model call or stored record changes behaviour when this
+        # flips. It is stated because a kill switch whose description overstates
+        # or understates its reach is the one thing that makes an operator
+        # afraid to use it.
+        "description": "Console users may hide or collapse the non-essential "
+                       "panes offered per view (the Layout control in a view's "
+                       "top bar). Panes never listed as offerable — navigation, "
+                       "tab strips, the primary input, every sole retry, undo "
+                       "or delete path — are not affected by this flag at all. "
+                       "Off = every pane renders as it did before and the "
+                       "Layout control disappears; stored layouts are kept but "
+                       "ignored, so switching it back on restores them. Hiding "
+                       "is per browser (localStorage 'aria.panes.v1'), not "
+                       "per user: there is no server-side preference store.",
+    },
+    "ui.code_ide": {
+        "type": "bool",
+        "default": False,
+        # Ships off, and off is not a smaller UI — it is the OLD UI. With this
+        # off, `/code` is the Code page that exists today, byte for byte, and
+        # every one of its routes resolves against the process-wide workspace
+        # rather than a session's. Turning it on adds a separate route
+        # (`/studio`) that owns its own workspace sessions, folders and buffers,
+        # and makes `/code` redirect into it. The reason it is spelled out at
+        # this length is that the two modes differ in WHERE A FILE IS WRITTEN,
+        # which is not the kind of difference an operator should discover.
+        "description": "Aria Code Studio: a full-page coding workspace at "
+                       "/studio — its own sidebar-free chrome, per-session "
+                       "folders (several projects at once), editor tabs, and "
+                       "agent review in the file rather than a separate rail. "
+                       "On also redirects the old /code page into it. Off "
+                       "leaves /code exactly as it is and the studio route "
+                       "renders the Code page, so no session workspaces are "
+                       "created and nothing writes outside the shared code "
+                       "workspace. Sessions and folders already created are "
+                       "left on disk under state/code-studio; they are simply "
+                       "not consulted.",
+    },
+    "browser.tools": {
+        "type": "bool",
+        "default": False,
+        # Off means the coding agent has NO browser verbs at all — not hidden
+        # from the popup, absent from the payload it is given — and the studio
+        # browser pane's routes answer `disabled: true` without touching a
+        # process. On is the widest door in the product, so the blast radius
+        # is spelled out: seventeen tools over ONE real Chromium per studio
+        # session, which reaches http://localhost:* and any site this machine
+        # can, holds cookies and logins between calls, and can press buttons
+        # that act in the world. The mutating half (click, fill, press,
+        # scroll, history, evaluate, open) joins the exec approval gate, so a
+        # manual-mode session still parks on every one of them.
+        "description": "Let the coding agent use the browser tools: open and "
+                       "read pages, take screenshots, see console errors and "
+                       "failed requests, wait for elements, verify a page "
+                       "after an edit, and click or type in a form. Off "
+                       "removes them from the agent's tool payload and turns "
+                       "the studio browser pane into a disabled notice. Pages "
+                       "it can reach include http://localhost:* and anything "
+                       "else this machine can resolve, so enabling it grants "
+                       "access to local services as well as the public web.",
+    },
+    "browser.headed": {
+        "type": "bool",
+        "default": False,
+        # Only consulted when a browser is STARTED: an invisible context
+        # already running is not converted into a visible one under the
+        # person's feet, because that would close the page they were looking
+        # at. `browser_status` reports `need_restart` in that case.
+        "description": "Open the agent's Chromium in a visible window instead "
+                       "of headless, so a person can watch it work on the "
+                       "screen rather than only in the studio's live view. "
+                       "Takes effect on the next browser a session starts.",
+    },
     "apps.a2ui": {
         "type": "bool",
         "default": True,
@@ -64,23 +278,35 @@ DEFINITIONS: dict[str, dict] = {
                        "nothing executable can reach the client. Turn off to "
                        "return to hand-built views only.",
     },
-    "apps.views.table": {
+    "feedback.learning": {
         "type": "bool",
         "default": True,
-        "description": "Table view available in tracker app detail. "
-                       "If all views are off, table is used as fallback.",
+        "description": "Turn thumbs votes that carry a free-text note into "
+                       "durable memory. The note is interpreted together with "
+                       "the rated answer, vote, skill and request; only a "
+                       "generalisable preference or a user-asserted factual "
+                       "correction is written. Off = votes/notes are still "
+                       "recorded and shown in the persona, but nothing is "
+                       "applied to memory automatically.",
     },
-    "apps.views.cards": {
+    "feedback.persona_autosave": {
         "type": "bool",
         "default": True,
-        "description": "Cards (tile grid) view available in tracker app "
-                       "detail. Free-tier safe: evaluated locally.",
+        "description": "After the persona is regenerated, publish "
+                       "`Persona — current.md` and `Persona — evolution.md` "
+                       "to Documents without a separate click. Off = the new "
+                       "portrait stays local until you press 'save persona "
+                       "docs'.",
     },
-    "apps.views.prefab": {
+    "persona.auto_update": {
         "type": "bool",
         "default": True,
-        "description": "PrefectHQ/prefab bundled render of tracker apps "
-                       "(spike, side-by-side). Free, offline-capable.",
+        "description": "Regenerate Aria's evolving portrait automatically "
+                       "after every four completed chat turns (and after "
+                       "feedback is applied to memory). Off = the persona "
+                       "only changes when you press 'regenerate persona'. "
+                       "The persona is an AI-written impression, not a render "
+                       "of the memory drawers.",
     },
     "memory.observations": {
         "type": "bool",

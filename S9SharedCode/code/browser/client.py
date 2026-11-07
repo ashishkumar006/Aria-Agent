@@ -54,7 +54,7 @@ class V9Client:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8109",
+        base_url: str = "http://127.0.0.1:8109",
         agent: str = "s9_browser",
         timeout: float = 120.0,
         session: Optional[str] = None,

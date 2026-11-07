@@ -109,7 +109,7 @@ describe('list reads survive a quick section switch', () => {
     try {
       await api.runsSummary(200);
       await api.runsSummary(200);
-      expect(calls).toEqual(['GET /api/runs/summary?limit=200']);
+      expect(calls).toEqual(['GET /api/runs/summary?limit=200&offset=0']);
     } finally {
       globalThis.fetch = origFetch;
     }

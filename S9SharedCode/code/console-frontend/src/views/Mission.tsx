@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Terminal } from 'lucide-react';
 import { Rail, TopBar, Empty, Stat, SkipLink } from '../components/ui';
 import { useMainId, useSectionActive } from '../components/KeepAlive';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 import { api, CONF, type FeedEvent } from '../api';
 
 const LEVELS = ['all', 'run', 'sched', 'tool', 'info', 'err'] as const;
@@ -9,6 +10,7 @@ const LEVELS = ['all', 'run', 'sched', 'tool', 'info', 'err'] as const;
 export default function Mission() {
   const mainId = useMainId();
   const active = useSectionActive();
+  const sourcesMode = usePaneMode('mission.sources');
   const [all, setAll] = useState<FeedEvent[]>([]);
   const [level, setLevel] = useState<(typeof LEVELS)[number]>('all');
   const [q, setQ] = useState('');
@@ -67,6 +69,9 @@ export default function Mission() {
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {sourcesMode === 'collapsed'
+        ? <PaneStrip id="mission.sources" label="Sources" />
+        : (
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="flex items-center justify-between px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">
           Sources
@@ -83,10 +88,13 @@ export default function Mission() {
             </button>
           ))}
         </div>
+        <Pane id="mission.note">
         <div className="mt-auto hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">poll {CONF.pollLiveMs / 1000}s · guarded</div>
+        </Pane>
       </div>
+        )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Console">
+        <TopBar crumb="Console" panes="mission">
           <span
             role="status"
             className={`rounded-full border px-2.5 py-1 text-[10.5px] font-bold ${
@@ -98,12 +106,15 @@ export default function Mission() {
           >
             {loadErr ? '● feed error' : paused ? '○ paused' : '● live'}
           </span>
+          <Pane id="mission.filter">
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…" aria-label="Filter events" className="w-44 rounded-md border border-white/10 bg-black/40 px-2.5 py-1.5 text-xs outline-none focus:border-violet-400" />
+          </Pane>
           <button onClick={() => setPaused((p) => !p)} className="flex items-center gap-1.5 rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs hover:border-violet-400">
             {paused ? <><Play size={13} /> resume</> : <><Pause size={13} /> pause</>}
           </button>
         </TopBar>
         <div className="min-h-0 flex-1 overflow-y-auto">
+          <Pane id="mission.stats">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
             {/* These count feed LINES currently held, not system totals —
                 labelling them "recent sessions / jobs armed" read as
@@ -118,6 +129,7 @@ export default function Mission() {
               tone={loadErr || counts.err ? 'bad' : 'ok'}
             />
           </div>
+          </Pane>
           {loadErr && (
             <p role="alert" className="mx-3.5 mb-3.5 rounded-[10px] border border-red-400/40 bg-red-400/5 px-3.5 py-2.5 text-[12.5px] text-red-200">
               Cannot read the event feed: {loadErr.slice(0, 180)} — the counts

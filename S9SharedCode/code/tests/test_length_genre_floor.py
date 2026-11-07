@@ -72,3 +72,15 @@ def test_no_prompt_anywhere_tells_the_model_to_stop_early():
             if "and no more" in low or "no more." in low:
                 bad.append(f"{p.name}:{lineno}: {line.strip()[:70]}")
     assert not bad, "\n".join(bad)
+
+def test_a_newsletter_is_a_publication_not_a_headline():
+    """Live: a four-page two-column newsletter shipped 354 words because no
+    genre floor matched the word. A manual got none either."""
+    floor, _ = skills.length_target(
+        "Create a document.\n\nCreate a two-column newsletter on vector DBs",
+        "author")
+    assert floor == 700, floor
+    assert skills.length_target("A manual for the payments API",
+                                "author")[0] == 1200
+    assert skills.length_target("A one-page newsletter on the outage",
+                                "author")[0] == 0

@@ -295,7 +295,8 @@ class _PlaneIndexer(Indexer):
             svc.delete_where(
                 lambda i, _d=set(doomed): i.id in _d)
         self.registry.set_status(doc_id, EMBEDDING)
-        stored = skipped_none = skipped_bounds = 0
+        skipped_none = skipped_bounds = 0
+        pending: list[MemoryRecord] = []
         for idx, vec in zip(indices, vectors):
             if vec is None:
                 skipped_none += 1
@@ -325,8 +326,11 @@ class _PlaneIndexer(Indexer):
                 embed_dim=len(vec) if vec else None,
                 principal=Principal(id="indexer", role="indexer"),
             )
-            svc._persist_embedded(rec, persist=False)
-            stored += 1
+            pending.append(rec)
+        # One store rewrite for the batch. `_persist_embedded` per chunk meant
+        # one full 86 MB serialisation each, ~4.5 s of lock per chunk, and the
+        # document searches that read the same store waited all of it out.
+        stored = svc._persist_embedded_many(pending)
         if stored:
             # One index-file write for the whole batch instead
             # of one per chunk.
@@ -538,6 +542,14 @@ def _reconcile_registry_with_plane(request: Request) -> None:
                 reg.update(doc.id, chunk_count=0, embedded_indices=[],
                            embedded_count=0, status=PENDING, error="")
                 _start_index(request, doc.id)
+        # Last, and once per pass: the rows that finished indexing before
+        # auto-enable existed. They are complete, searchable and switched off,
+        # and nothing would ever switch them on - which is what made the
+        # library look like files the agent could not read.
+        turned_on = reg.auto_enable_ready()
+        if turned_on:
+            print(f"[documents] switched on {turned_on} completed document(s) "
+                  f"that had never been switched off by hand")
     except Exception as e:                           # noqa: BLE001
         print(f"[documents] reconciliation failed: {e!r}")
 
@@ -550,6 +562,81 @@ async def documents_list(request: Request):
     # in the gateway, /health included, for the whole join.
     await asyncio.to_thread(_reconcile_registry_with_plane, request)
     return {"documents": [d.to_dict() for d in _docs().list()]}
+
+
+@_doc_router.get("/v1/documents/folders")
+async def documents_folders():
+    """Flat folder list. The client builds the tree and paths; keeping this
+    flat means adding/moving a folder never needs a second nested shape."""
+    return {"folders": [f.to_dict() for f in _docs().list_folders()]}
+
+
+@_doc_router.post("/v1/documents/folders")
+async def documents_folder_create(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be an object"})
+    try:
+        folder = _docs().create_folder(
+            str(body.get("name") or ""), str(body.get("parent_id") or ""))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return {"folder": folder.to_dict()}
+
+
+@_doc_router.patch("/v1/documents/folders/{folder_id}")
+async def documents_folder_rename(folder_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be an object"})
+    try:
+        folder = _docs().rename_folder(folder_id,
+                                       str(body.get("name") or ""))
+    except ValueError as e:
+        msg = str(e)
+        return JSONResponse(
+            status_code=404 if msg == "folder not found" else 409,
+            content={"error": msg})
+    return {"folder": folder.to_dict()}
+
+
+@_doc_router.delete("/v1/documents/folders/{folder_id}")
+async def documents_folder_delete(folder_id: str):
+    try:
+        removed = _docs().delete_folder(folder_id)
+    except ValueError as e:
+        return JSONResponse(status_code=409, content={"error": str(e)})
+    if not removed:
+        return JSONResponse(status_code=404,
+                            content={"error": "folder not found"})
+    return {"status": "ok", "id": folder_id}
+
+
+@_doc_router.post("/v1/documents/{doc_id}/folder")
+async def documents_move(doc_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be an object"})
+    try:
+        doc = _docs().move_document(doc_id, str(body.get("folder_id") or ""))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    if doc is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "no such document"})
+    return {"document": doc.to_dict()}
 
 
 class UnsupportedBytes(ValueError):
@@ -583,14 +670,22 @@ def safe_document_name(raw: str) -> str:
     return name
 
 
-def ingest_document(filename: str, data: bytes) -> dict:
+def ingest_document(filename: str, data: bytes, folder_id: str = "", *,
+                    origin: str = "", origin_ref: str = "",
+                    session_id: str = "", auto_enable: bool = True,
+                    title: str = "") -> dict:
     """Register raw bytes in the Documents store and return the doc record.
 
     The one place a document is created. The multipart upload route, the
     Telegram inbound path and the agent's save-as-document tool all go through
     here, so the filename sanitising and the 25 MB / supported-type rules
-    cannot drift between them.
-    """
+    cannot drift between them. ``folder_id`` is metadata only; chunk keys
+    remain tied to the document id, so a later move never re-indexes.
+
+    ``origin``/``origin_ref``/``session_id`` are provenance: which section made
+    this, and what it came from (an artifact handle, a URL). Without them a
+    generated report and a hand-uploaded file are the same row, and the agent
+    has no way to find the document it wrote an hour ago."""
     if not data:
         raise UnsupportedBytes("the file is empty")
     if len(data) > MAX_UPLOAD_BYTES:
@@ -604,7 +699,25 @@ def ingest_document(filename: str, data: bytes) -> dict:
     except parsers.UnsupportedDocument as e:
         raise UnsupportedBytes(str(e)) from None
     reg = _docs()
-    doc = reg.add(filename=name, doc_type=kind, size_bytes=len(data))
+    # Same bytes, same document. The agent re-derives files it already made —
+    # a re-render, a re-fetch, the same finding spilled from a second run — and
+    # each upload used to add another row with another copy of every chunk, so
+    # retrieval answered from the same source twice and the library filled with
+    # rows nobody asked for.
+    import hashlib
+    digest = hashlib.sha256(data).hexdigest()
+    same = reg.find_by_sha(digest)
+    if same is not None:
+        print(f"[documents] {filename}: bytes already stored as {same.id} "
+              f"({same.filename}) - not indexing a second copy")
+        return same.to_dict()
+    doc = reg.add(filename=name, doc_type=kind, size_bytes=len(data),
+                  folder_id=str(folder_id or ""),
+                  title=str(title or "").strip()[:200],
+                  origin=str(origin or "").strip()[:32] or "upload",
+                  origin_ref=str(origin_ref or "").strip()[:300],
+                  session_id=str(session_id or "").strip()[:80],
+                  auto_enable=bool(auto_enable), sha256=digest)
     reg.write_source(doc.id, data)
     return doc.to_dict()
 
@@ -641,6 +754,25 @@ async def documents_upload(request: Request):
     if up is None or not hasattr(up, "filename"):
         return JSONResponse(status_code=400,
                             content={"error": "a file part is required"})
+    folder_id = str(form.get("folder_id") or "").strip()
+    if folder_id and not _docs().folder_exists(folder_id):
+        return JSONResponse(status_code=400,
+                            content={"error": "folder not found"})
+    # A generated document names the folder it belongs in ("Authoring",
+    # "Research", "Web sources") rather than an id, because the caller creates
+    # these on first use. Same name, same folder — `ensure_folder` is
+    # idempotent, so a hundred reports land in one place.
+    folder_name = str(form.get("folder_name") or "").strip()
+    if folder_name:
+        folder_id = _docs().ensure_folder(folder_name, system=True).id
+    origin = str(form.get("origin") or "").strip()
+    origin_ref = str(form.get("origin_ref") or "").strip()
+    session_id = str(form.get("session_id") or "").strip()
+    # An upload is retrievable as soon as it finishes embedding. Passing
+    # `auto_enable=0` is how a caller keeps a document out of retrieval until
+    # it is enabled by hand.
+    auto_enable = str(form.get("auto_enable") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
     # The client-supplied filename is persisted verbatim and echoed
     # by every listing: strip any directory component (a "../evil"
     # name was stored as-is) and control characters, and cap the
@@ -670,7 +802,10 @@ async def documents_upload(request: Request):
                      f"({MAX_UPLOAD_BYTES // (1024 * 1024)} MB). Split the "
                      f"document or raise the limit server-side."})
     try:
-        doc = ingest_document(name, data)
+        doc = ingest_document(name, data, folder_id=folder_id, origin=origin,
+                              origin_ref=origin_ref, session_id=session_id,
+                              auto_enable=auto_enable,
+                              title=str(form.get("title") or ""))
     except UnsupportedBytes as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     # Off the event loop: _start_index joins any in-flight
@@ -710,6 +845,60 @@ async def documents_detail(doc_id: str, request: Request):
          "preview": c.text[:400]}
         for i, c in enumerate(chunks)]
     return {"document": out}
+
+
+@_doc_router.get("/v1/documents/{doc_id}/text")
+async def documents_text(doc_id: str, request: Request, start: int = 0,
+                         count: int = 24):
+    """The document's own text, in reading order — chunk by chunk.
+
+    `search_knowledge` ranks chunks by similarity to a question, which is the
+    right tool for "what does it say about X" and the wrong one for "read
+    section 4" or "summarise this end to end": a 51-chunk source returns the six
+    chunks that look most like the wording, in whatever order the ranking
+    decides, and the model never sees the rest. This route is the deterministic
+    path — the same chunker, the same indices that were embedded, in document
+    order, with the FULL text rather than the detail view's 400-character
+    preview.
+
+    `count` bounds how many chunks come back, never how much of a chunk: no
+    text is truncated here. `next_start` is where to ask from, and is absent at
+    the end, so a caller can walk a whole document without guessing sizes.
+
+    Chunking is CPU-heavy and cached; it runs in a thread like the detail
+    route's, because inline it wedged every route in the gateway including
+    `/health` while the listener stayed open.
+    """
+    reg = _docs()
+    doc = reg.get(doc_id)
+    if doc is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"no such document {doc_id}"})
+    try:
+        chunks = await asyncio.to_thread(_doc_chunks, reg, doc)
+    except Exception as e:                          # noqa: BLE001
+        return JSONResponse(status_code=500, content={
+            "error": f"could not read the stored chunks: {e}"[:200]})
+    first = max(0, int(start or 0))
+    take = max(1, min(int(count or 24), 200))
+    window = chunks[first:first + take]
+    out = {
+        "document_id": doc.id,
+        "filename": doc.filename,
+        "doc_type": doc.doc_type,
+        "status": doc.status,
+        "total_chunks": len(chunks),
+        "start": first,
+        "chunks": [
+            {"index": first + i, "kind": c.kind,
+             "heading_path": list(c.heading_path), "page": c.page,
+             "words": len(c.text.split()), "text": c.text}
+            for i, c in enumerate(window)],
+    }
+    nxt = first + len(window)
+    if nxt < len(chunks):
+        out["next_start"] = nxt
+    return out
 
 
 # Upload media types the console's inline preview can hand to the
@@ -768,6 +957,32 @@ async def documents_preview(doc_id: str, max_pages: int = 12):
     return JSONResponse(content=out)
 
 
+@_doc_router.get("/v1/documents/{doc_id}/figures")
+async def documents_figures(doc_id: str):
+    """The embedded rasters an upload contains, as (page, index) handles.
+
+    An author can only place a figure it can name, and no model can guess
+    `page`/`index` — so without this list the `image` block is unreachable in
+    practice even though the renderer supports it. Every handle returned here
+    resolves through docgen's own extractor, so a figure the model copies is
+    either drawn or dropped, never swapped for a different one. The scan reads
+    image headers rather than pixels, which keeps a 300-page scanned book a
+    directory listing instead of a decode, and it runs off the event loop."""
+    reg = _docs()
+    doc = reg.get(doc_id)
+    if doc is None:
+        return JSONResponse(status_code=404,
+                            content={"error": f"no such document {doc_id}"})
+    path = reg.source_path(doc_id)
+    if path is None or not path.is_file():
+        return JSONResponse(status_code=404,
+                            content={"error": "source file is missing"})
+    import docgen
+    figures = await asyncio.to_thread(docgen.figures_in, path)
+    return {"document_id": doc_id, "filename": doc.filename,
+            "figures": figures}
+
+
 @_doc_router.get("/v1/documents/{doc_id}/source")
 async def documents_source(doc_id: str, request: Request):
     """Serve the stored upload bytes for the console's preview.
@@ -790,6 +1005,12 @@ async def documents_source(doc_id: str, request: Request):
                             content={"error": "source file is missing"})
     size = path.stat().st_size
     ctype = _SOURCE_CONTENT_TYPES.get(doc.doc_type, "application/octet-stream")
+    if doc.doc_type == "image":
+        # One registry type, two real formats: the console can only show the
+        # preview if the media type matches the bytes it is handed.
+        with path.open("rb") as fh:
+            head = fh.read(4)
+        ctype = "image/png" if head == b"\x89PNG" else "image/jpeg"
     rng = (request.headers.get("range") or "").strip()
     if rng.startswith("bytes="):
         m = re.fullmatch(r"(\d*)-(\d*)", rng[6:].strip())

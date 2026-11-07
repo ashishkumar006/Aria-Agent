@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway V9 · Users</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #12161f; --panel-2: #171c28;
+    --border: #232a38; --border-soft: #1b2130;
+    --text: #e7eaf1; --muted: #8b93a5; --faint: #5b6376;
+    --accent: #7c6cf0; --accent-dim: rgba(124,108,240,.14);
+    --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); margin: 0; }
+  a { color: var(--blue); }
+  main { padding: 22px; max-width: 1180px; margin: 0 auto 60px; }
+  section.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin: 16px 0; overflow: hidden; }
+  .card-head { padding: 13px 18px; border-bottom: 1px solid var(--border-soft); display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .card-head p { margin: 2px 0 0; font-size: 12px; color: var(--muted); max-width: 720px; }
+  .card-body { padding: 14px 18px 18px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+  input, select { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 7px; font: 13px var(--sans); }
+  input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  button { background: var(--accent); border: 1px solid transparent; color: #fff; padding: 8px 14px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--text); font-weight: 500; }
+  button.danger { background: transparent; border-color: #5a2323; color: #ff9a9a; }
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 11px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+  .badge.on { color: var(--green); border-color: #234026; background: rgba(63,185,80,.08); }
+  .badge.off { color: var(--red); border-color: #5a2323; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .err { color: #ff9a9a; font-size: 12.5px; white-space: pre-wrap; }
+  .user { border: 1px solid var(--border-soft); border-radius: 9px; padding: 13px 15px; margin: 10px 0; background: rgba(255,255,255,.012); }
+  .user-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .user-head b { font-size: 13.5px; }
+  .keyrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 7px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
+  .mono { font-family: var(--mono); }
+  .token-once { margin-top: 10px; padding: 12px 14px; border: 1px solid #3a5a2a; background: rgba(63,185,80,.08); border-radius: 8px; }
+  .token-once code { display: block; margin: 7px 0; padding: 9px 11px; background: #0d1118; border-radius: 6px; color: #b9f6c2; word-break: break-all; font-family: var(--mono); }
+  .grid { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 10px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } main { padding: 14px; } }
+</style>
+<link rel="stylesheet" href="/static/console-theme.css">
+</head>
+<body>
+<aside class="side">
+  <div class="side-brand"><span class="bolt">⚡</span><span class="lbl">LLM Gateway <span class="v">V9</span></span></div>
+  <div class="side-group">Operate</div>
+  <a href="/" class="side-item"><span class="ico">◈</span><span class="lbl">Overview</span></a>
+  <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/users.html" class="side-item active"><span class="ico">◉</span><span class="lbl">Users</span></a>
+  <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
+  <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
+  <div class="side-group">Docs</div>
+  <a href="/help" class="side-item"><span class="ico">?</span><span class="lbl">Help</span></a>
+  <a href="/static/architecture.html" class="side-item"><span class="ico">▲</span><span class="lbl">Architecture</span></a>
+  <div class="side-foot"><span class="up">●</span> gateway local</div>
+</aside>
+<div class="page">
+<div class="topbar"><div class="title">Users &amp; keys</div><div class="spacer"></div><span class="badge" id="count">—</span></div>
+<main>
+  <section class="card">
+    <div class="card-head">
+      <div><h2>New user</h2>
+        <p>A user gets their own token and their own provider keys. The agent presents the
+          token on every call; the gateway bills and rate-limits that call against this
+          user's keys, never the operator's. The token is shown once.</p></div>
+    </div>
+    <div class="card-body">
+      <div class="row">
+        <div style="flex:1;min-width:220px"><label for="new-name">Name</label>
+          <input id="new-name" placeholder="e.g. Ashish" autocomplete="off"></div>
+        <button id="create">Create user</button>
+      </div>
+      <div id="create-out"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Users</h2>
+      <p>Provider keys are encrypted at rest and shown masked. A user with no keys cannot
+        make model calls — it is an error, not a silent fallback to the operator pool.</p></div>
+      <div class="side"><button class="ghost" id="refresh">Refresh</button></div>
+    </div>
+    <div class="card-body" id="users"><div class="hint">Loading…</div></div>
+  </section>
+</main>
+</div>
+
+<script>
+'use strict';
+let PROVIDERS = ['gemini','kilo'];
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let users = [];
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  let data = {};
+  try { data = await r.json(); } catch (e) { data = {}; }
+  if (!r.ok) throw new Error(data.detail ? String(data.detail) : (data.error || ('HTTP ' + r.status)));
+  return data;
+}
+
+async function loadProviders() {
+  try {
+    const d = await api('GET', '/v1/users/providers');
+    if (Array.isArray(d.providers) && d.providers.length) PROVIDERS = d.providers;
+  } catch (e) { /* keep the fallback */ }
+}
+
+async function load() {
+  const box = document.getElementById('users');
+  try {
+    const data = await api('GET', '/v1/users');
+    users = data.users || [];
+    document.getElementById('count').textContent = users.length + ' user' + (users.length === 1 ? '' : 's');
+    box.innerHTML = users.length ? users.map(renderUser).join('') : '<div class="hint">No users yet. Create one above.</div>';
+  } catch (e) {
+    box.innerHTML = '<div class="err">' + esc(e.message) + '</div>';
+    document.getElementById('count').textContent = 'error';
+  }
+}
+
+function renderUser(u) {
+  const keys = (u.keys || []).map(k => `
+    <div class="keyrow">
+      <span class="badge">${esc(k.provider)}</span>
+      <span class="mono">${esc(k.masked)}</span>
+      <span class="hint">${esc(k.label || 'no label')}</span>
+      <button class="danger" onclick="removeKey('${esc(u.id)}','${esc(k.id)}')">Remove</button>
+    </div>`).join('');
+  return `
+  <div class="user">
+    <div class="user-head">
+      <div><b>${esc(u.name)}</b> <span class="hint mono">${esc(u.id)}</span>
+        <span class="badge ${u.disabled ? 'off' : 'on'}">${u.disabled ? 'disabled' : 'active'}</span>
+        <span class="hint">token ${esc(u.token_hint || '—')}</span></div>
+      <div class="row" style="gap:6px">
+        <button class="ghost" onclick="rotate('${esc(u.id)}')">Rotate token</button>
+        <button class="ghost" onclick="toggle('${esc(u.id)}', ${u.disabled ? 'false' : 'true'})">${u.disabled ? 'Enable' : 'Disable'}</button>
+        <button class="danger" onclick="removeUser('${esc(u.id)}','${esc(u.name)}')">Delete</button>
+      </div>
+    </div>
+    <div style="margin-top:10px">${keys || '<div class="hint">No provider keys yet — this user cannot make model calls.</div>'}</div>
+    <div class="grid" style="margin-top:10px">
+      <div><label>Provider</label><select id="p-${esc(u.id)}">${PROVIDERS.map(p => `<option>${p}</option>`).join('') || '<option value="">none wired</option>'}</select></div>
+      <div><label>Label</label><input id="l-${esc(u.id)}" placeholder="work / personal"></div>
+      <div><label>API key</label><input id="k-${esc(u.id)}" type="password" placeholder="paste key" autocomplete="off"></div>
+    </div>
+    <div class="row" style="margin-top:8px"><button onclick="addKey('${esc(u.id)}')">Add key</button></div>
+    <div id="msg-${esc(u.id)}"></div>
+  </div>`;
+}
+
+function showToken(token, who) {
+  return `<div class="token-once"><b>Token for ${esc(who)} — copy it now.</b>
+    <div class="hint">It is stored hashed and cannot be shown again. Paste it into Aria → Settings → Gateway account.</div>
+    <code id="new-token">${esc(token)}</code>
+    <button class="ghost" onclick="copyToken()">Copy</button></div>`;
+}
+
+function copyToken() {
+  const el = document.getElementById('new-token');
+  if (!el) return;
+  navigator.clipboard?.writeText(el.textContent);
+}
+
+document.getElementById('create').onclick = async () => {
+  const out = document.getElementById('create-out');
+  const name = document.getElementById('new-name').value.trim();
+  if (!name) { out.innerHTML = '<div class="err">Give the user a name.</div>'; return; }
+  try {
+    const data = await api('POST', '/v1/users', { name });
+    out.innerHTML = showToken(data.token, data.user.name);
+    document.getElementById('new-name').value = '';
+    await load();
+  } catch (e) { out.innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
+};
+
+document.getElementById('refresh').onclick = load;
+
+async function toggle(id, disabled) {
+  try { await api('PATCH', '/v1/users/' + id, { disabled }); await load(); }
+  catch (e) { alert(e.message); }
+}
+
+async function rotate(id) {
+  if (!confirm('Rotate this token? The old token stops working immediately.')) return;
+  try {
+    const data = await api('POST', '/v1/users/' + id + '/token');
+    document.getElementById('users').insertAdjacentHTML('afterbegin',
+      showToken(data.token, data.user.name));
+    await load();
+  } catch (e) { alert(e.message); }
+}
+
+async function removeUser(id, name) {
+  if (!confirm('Delete ' + name + ' and all their saved keys?')) return;
+  try { await api('DELETE', '/v1/users/' + id); await load(); }
+  catch (e) { alert(e.message); }
+}
+
+async function addKey(id) {
+  const provider = document.getElementById('p-' + id).value;
+  const label = document.getElementById('l-' + id).value.trim();
+  const key = document.getElementById('k-' + id).value;
+  const msg = document.getElementById('msg-' + id);
+  try {
+    await api('POST', '/v1/users/' + id + '/keys', { provider, key, label });
+    document.getElementById('k-' + id).value = '';
+    msg.innerHTML = '<div class="hint">Key saved.</div>';
+    await load();
+  } catch (e) { msg.innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
+}
+
+async function removeKey(uid, kid) {
+  if (!confirm('Remove this key? Calls will fail if it was the last one.')) return;
+  try { await api('DELETE', '/v1/users/' + uid + '/keys/' + kid); await load(); }
+  catch (e) { alert(e.message); }
+}
+
+loadProviders().then(load);
+</script>
+</body>
+</html>

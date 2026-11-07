@@ -438,17 +438,107 @@ defect-finding pass over the highest-traffic journeys, **not** the full
 
 ### Verification commands and results
 
-- Frontend: `npx tsc --noEmit` clean; `npx --yes vitest run src` → **97 passed**
-  (18 files); `npm run build` clean. Served bundle:
-  `dist/assets/index-DSewBoDW.js`.
+- Frontend: `npx tsc --noEmit` clean; `npx --yes vitest run src` → **101 passed**
+  (19 files); `npm run build` clean. Served bundle:
+  `dist/assets/index-DIwodGwX.js`.
 - Backend targeted: `tests/test_health_probe.py` +
   `tests/test_agent_server_api.py` → 35 passed;
   `tests/test_agent_gateway_auth_v2.py` + `tests/test_health_probe.py` → 45
   passed.
-- Backend full: `uv run python -m pytest tests/ -q` → **1813 passed, 39
-  skipped** (416 s).
-- Gateway full: `uv run python -m pytest -q` → **1222 passed, 2 skipped**
-  (236 s).
+- Backend full: `uv run python -m pytest tests/ -q` → **1833 passed, 39 skipped**
+  (429 s). The two mid-run failures from checkpoint 2 (`test_memory_service`
+  classifier-downgrade and the `test_recovery_budget` source-staleness flake)
+  are resolved: the test was corrected for the `I like tea` → fact downgrade,
+  and `flow.py` is no longer edited mid-suite. The clean final run is 1833
+  passed (4 more tests than checkpoint 2), green and unflaked.
+- Gateway full: `uv run python -m pytest -q` → **1227 passed, 2 skipped**
+  (321 s) — re-run after the filter-before-slice fix, with the two new
+  `test_memory.py` regressions: `test_hide_superseded_is_applied_before_the_page_limit`
+  and `test_kind_filter_is_applied_before_the_page_limit`.
+
+### Memory repair (gateway state)
+
+- `state/memory.backup-20261029-110609` and `state/memory.backup-20261029-111007`
+  hold the pre- and inter-repair snapshots; all repairs are superseding, not
+  deleting — retired rows are linked to `purged:query-log-2026-10-29` /
+  `purged:profile-probes-2026-10-29` and stay in the store for review.
+- Profile drawer live: **113 → 10**. The 7 purged rows were test/probe
+  observations (`Test observation at …`) and one-off task inversions stored as
+  traits — notably `prefers very long and detailed responses` (seen 5), extracted
+  from a single request for a long essay. The two durable standing preferences
+  (`prefers publication dates on every claim` seen 74; `prefers no emojis`
+  seen 28) survive.
+- Fact drawer live: **400 → 7** — 4 facts (`The gateway listens on 8109…`,
+  `When a button silently does nothing…`, `favors yellow as a favorite color`,
+  `Remember the number 4711` seen 4) and 3 preferences (the console QA rule +
+  the two dashboard preferences kept). 351 `source=user_query` query-log rows and
+  39 task-request preferences were superseded.
+- Live verification after restart: `/api/memory/stats` total **2631**
+  `{tool_outcome: 2614, preference: 3, fact: 4, observation: 10}`, excluding
+  `document`/`audit`; `/api/memory?kinds=preference` → 3; `drawers=fact&hide_superseded=true`
+  → 7; offset pages are disjoint, gap-free across the live window, and `has_more`
+  is correct at the last page.
+
+### Checkpoint 4 — feedback → persona personalisation loop (slice 1+2+3)
+
+- **`/api/feedback` generalized**: GET scoped by `node_id` *or* `msg_id`
+  (chat assistant turns have no DAG node id, so they are keyed by the turn's
+  stable `sig`); POST accepts `msg_id` + free-text `note` (280-char cap); rejects
+  a vote with neither id (400). Note is stored as `msg_id` feedback for the
+  persona cross-check to read.
+- **`/api/profile/persona`**: live markdown render of preferences + behaviour
+  observations + feedback notes. Persona is a *derived view*, not a second store.
+- **`/api/profile/persona/sync`**: `POST /api/profile/persona/sync?dry_run=true`
+  (default) classifies each feedback note through the same `detect_preference()`
+  gate a live turn uses — `I prefer metric units` → preference, `your last reply
+  was too long` → fact — without touching memory. `?dry_run=false` lifts the
+  proposed items via `remember_preference`/`add_fact`. Idempotent: notes already
+  present as a raw fact/preference are skipped.
+- **`/api/profile/persona/document`**: persists `Persona — current.md`
+  (overwrite prior same-named doc) and `Persona — evolution.md` (append-only
+  dated section). Both use `_gw_auth_headers()` (not `_gw_headers`) and pass
+  `test_no_gateway_call_site_builds_a_client_without_the_token`.
+- **Frontend**: `<Feedback>` thumbs + free-text "add note" attached to every
+  settled assistant chat turn (`m.sig` keyed); Memory view gains a `browse |
+  persona` tab switcher (instant swap, no transition); `api.ts` carries
+  `feedbackGet/Post(msgId?, note?)` and `profilePersona/Sync/Document`.
+- Live state: `feedback.jsonl` retains the real user note `i want you to be
+  jovial` (vote 1); the x-probe (276-`x`) was purged. `POST .../sync?dry_run=true`
+  proposes 1 action item (the real note, classified as a preference); dry-run
+  touches nothing. Persona documents written live: `Persona — current.md` +
+  `Persona — evolution.md`.
+- Tests: 4 new API-validation cases (`test_feedback_msg_id_scope_and_note`,
+  `test_persona_endpoints_render_without_gateway`,
+  `test_persona_sync_dry_run_classifies_a_note`,
+  `test_persona_sync_dry_run_does_not_write`); frontend unchanged from checkpoint 3
+  (101 passed, tsc clean, build clean).
+- Targeted backend: `test_agent_gateway_auth_v2.py + test_api_validation.py +
+  test_agent_server_api.py + test_memory_integration.py +
+  test_memory_comprehensive.py + test_memory_service.py` → **226 passed**.
+- Note: the first full-suite run after this checkpoint hit one regression —
+  `test_no_gateway_call_site_builds_a_client_without_the_token` — because the
+  persona document endpoints used `_gw_headers` (from `mcp_server`) instead of
+  the in-file `_gw_auth_headers` the guard recognises. Fixed (`_gw_auth_headers`
+  at all 4 call sites); the auth test now passes.
+
+### Clean-state wipe test (E2E from zeroed memory)
+
+- Full backup of `state/memory/` drawers + `memory.json` + `feedback.jsonl` +
+  `chat_threads.json` taken and restored.
+- All `memory.json` files emptied to `[]`; FAISS indexes left intact (removing
+  them crashed the gateway on restart — empty `memory.json` is the correct wipe).
+- Post-restart: `/api/memory/stats` → `kinds={}, total=0`; `/api/memory?limit=10`
+  → 0 items; `/api/profile/persona` shows `_No feedback notes recorded_`.
+- Chat → `/api/chat` (SSE, `run_kind: chat`) settled in ~5s:
+  "Paris is the capital and largest city of France."
+- POST `/api/feedback` with `msg_id=<computed sig>` + vote 1 + note
+  "I prefer publication dates on every claim you make" → `200 {status: ok, vote: 1}`.
+- Personaw immediately shows the note in its **"Your feedback notes"** section.
+- POST `/api/profile/persona/sync?dry_run=true` proposes exactly 1 item:
+  `kind=preference, text="I prefer publication dates..."` — `dry_run=True`, no write.
+- Persona documents written live (`Persona — current.md` + `Persona — evolution.md`).
+- State fully restored; post-restore stats match pre-wipe (`preference:3, fact:4,
+  observation:10`). `feedback.jsonl` retains only the real user note.
 
 ### Known issues and accepted behavior
 

@@ -106,9 +106,10 @@ def test_the_prompt_carries_the_catalog_so_the_model_is_not_left_guessing():
     assert "show runs by skill" in user
 
 
-def test_the_prompt_states_the_read_only_constraint():
+def test_the_prompt_states_the_input_and_action_constraint():
     system, _user = S.generation_prompt("x")
-    assert "no text input" in system.lower()
+    assert "collect user input" in system.lower()
+    assert "action" in system.lower()
     assert "rejected" in system.lower()
 
 

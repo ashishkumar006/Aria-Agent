@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from adaptors.http import shared as pooled_http
+
 
 from . import _MissingKey, _fail, _need
 
@@ -21,13 +23,13 @@ CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 
 
 def _get_events(token: str, params: dict):
-    with httpx.Client(timeout=20, follow_redirects=True) as client:
+    with pooled_http(20.0) as client:
         return client.get(CALENDAR_URL, params=params,
                           headers={"Authorization": f"Bearer {token}"})
 
 
 def _post_event(token: str, event: dict):
-    with httpx.Client(timeout=20, follow_redirects=True) as client:
+    with pooled_http(20.0) as client:
         return client.post(CALENDAR_URL, json=event,
                            headers={"Authorization": f"Bearer {token}"})
 
@@ -112,7 +114,7 @@ def refresh(*, write_env: bool = True) -> dict[str, Any]:
                 "error": "GOOGLE_CALENDAR_REFRESH_TOKEN / GOOGLE_CALENDAR_CLIENT_ID / "
                          "GOOGLE_CALENDAR_CLIENT_SECRET not set"}
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with pooled_http(20.0) as client:
             r = client.post("https://oauth2.googleapis.com/token", data={
                 "client_id": vals["GOOGLE_CALENDAR_CLIENT_ID"],
                 "client_secret": vals["GOOGLE_CALENDAR_CLIENT_SECRET"],

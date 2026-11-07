@@ -99,6 +99,7 @@
   <div class="side-group">Operate</div>
   <a href="/" class="side-item active"><span class="ico">◈</span><span class="lbl">Overview</span></a>
   <a href="/static/connections.html" class="side-item"><span class="ico">✦</span><span class="lbl">Connections</span></a>
+  <a href="/static/users.html" class="side-item"><span class="ico">◉</span><span class="lbl">Users</span></a>
   <a href="/static/system.html" class="side-item"><span class="ico">⚙</span><span class="lbl">System</span></a>
   <a href="/static/ledger.html" class="side-item"><span class="ico">▤</span><span class="lbl">Ledger</span></a>
   <div class="side-group">Docs</div>
@@ -181,7 +182,7 @@
       <table id="calls-table">
         <thead>
           <tr><th>Time</th><th>Role</th><th>Provider</th><th>Model</th><th>Status</th>
-          <th>In</th><th>Out</th><th>Tier</th><th>Tools</th><th>Latency</th><th>Override</th><th>Error / Attempts</th></tr>
+          <th>In</th><th>Out</th><th>Tk/s</th><th>Tier</th><th>Tools</th><th>Latency</th><th>Override</th><th>Error / Attempts</th></tr>
         </thead>
         <tbody></tbody>
       </table>
@@ -425,7 +426,7 @@ async function loadCalls() {
       : `<span class="pill ok">worker</span>`;
     const tier = c.router_decision ? `<span class="badge">${escH(c.router_decision)}</span>` : '—';
     tr.innerHTML = `<td>${dt}</td><td>${roleBadge}</td><td class="prov">${escH(c.provider)}</td><td>${escH(c.model)}</td>
-      <td class="${c.status === 'ok' ? 'ok' : 'err'}">${escH(c.status)}</td><td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td>
+      <td class="${c.status === 'ok' ? 'ok' : 'err'}">${escH(c.status)}</td><td>${c.input_tokens || 0}</td><td>${c.output_tokens || 0}</td><td title="generated tokens (output + thinking) per second">${window.tpsCell(c)}</td>
       <td>${tier}</td><td>${c.tool_calls || 0}${c.tool_dialect ? ' <span class="badge">'+escH(c.tool_dialect)+'</span>' : ''}</td>
       <td class="${(c.latency_ms || 0) > 5000 ? 'err' : ((c.latency_ms || 0) > 1500 ? 'warn' : 'ok')}">${c.latency_ms}ms</td><td>${escH(c.override || '—')}</td>
       <td class="err-msg" title="${escH((c.error || '') + (c.attempted ? ' | attempted: ' + c.attempted : ''))}">${escH(c.error || (c.attempted || '—'))}</td>`;

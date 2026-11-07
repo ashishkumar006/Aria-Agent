@@ -146,8 +146,7 @@ def test_the_chat_prompt_speaks_the_catalog_and_nothing_else():
     for real in ("Column", "Row", "Card", "Text", "KeyValue", "Table",
                  "Action", "DataList"):
         assert real in prompt, real
-    for phantom in ("TextField", "Dropdown", "Checkbox", "Slider",
-                    "onPress", '"type"', "catalogId"):
+    for phantom in ("TextField", "Dropdown", "onPress", '"type"', "catalogId"):
         assert phantom not in prompt, phantom
     # The action payload is part of the contract the server validates.
     assert "args" in prompt

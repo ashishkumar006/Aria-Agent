@@ -19,7 +19,13 @@ from .errors import EmptyMeshError, MeshIntegrityError, MeshTooLargeError
 # Default resource budget. 2M triangles is ~24 MB of index data and analyses in
 # a few seconds; beyond that the request is a denial-of-service vector against
 # a single-process server, not a part.
-DEFAULT_MAX_VERTICES = 2_000_000
+# Binary STL stores three private vertices per triangle (it has no index
+# buffer), so a mesh at the face cap arrives with up to 3x that many raw
+# vertices. Capping both independently at 2M rejected a valid 1.11M-triangle
+# STL as "3,336,126 vertices exceeds the limit" — a format artefact, not a
+# mesh defect. The vertex ceiling is therefore the non-indexed upper bound of
+# the face ceiling; the byte cap still bounds the upload.
+DEFAULT_MAX_VERTICES = 3 * 2_000_000
 DEFAULT_MAX_FACES = 2_000_000
 DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 

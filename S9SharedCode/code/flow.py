@@ -28,12 +28,12 @@ import networkx as nx
 
 import memory as memory_svc
 import turnlog
-from gateway import ensure_gateway
+from gateway import cancel_scope, ensure_gateway
 from persistence import SessionStore
 from skills import ROOT as _SROOT
 from recovery import RecoveryDecision, handle_critic_verdict, plan_recovery
 from schemas import AgentResult, NodeState
-from skills import SkillRegistry, run_skill
+from skills import SkillRegistry, run_skill, DOCUMENT_INTENT_RE
 
 # There is no cap on how many researcher nodes a plan may contain, and no cap
 # on how many facets the planner may list. The planner is told it decides, that
@@ -66,8 +66,9 @@ MAX_CONCURRENCY = 8
 # call safely, and a half-killed tool could leave side effects). It tells the
 # NEXT invocation for the same skill how much of its allowance it has already
 # spent, so the model synthesises from what it has instead of starting a fourth
-# fetch. That is the cheap, safe half of the problem; the expensive half
-# (hard cancellation) is deliberately not attempted here.
+# fetch. That is the cheap, safe half of the problem. The other half is the
+# operator's Stop, which is honoured cooperatively at every boundary a node
+# controls — see `_stop_in_nodes`.
 NODE_BUDGET_S: dict[str, float] = {
     "researcher": 150.0,  # parallel fetches plus a multi-page write-up
     "browser": 120.0,     # a real page interaction is legitimately slow
@@ -82,6 +83,35 @@ NODE_BUDGET_S: dict[str, float] = {
     "default": 90.0,
 }
 BUDGET_WARN_RATIO = 0.7
+
+
+def _stop_in_nodes() -> bool:
+    """Whether a node must notice Stop before its next call.
+
+    The Executor has always honoured Stop between dispatch batches, which is
+    useless for the runs people actually press Stop on: a long document is ONE
+    author node making 160 section calls, and a researcher is one node making
+    thirty tool hops. The batch boundary only ever arrives after all of them,
+    so the run kept billing for minutes after the console said "stopped" and
+    kept holding its idempotency claim, which made a resubmit of the same
+    question answer "an identical run is already in progress".
+
+    Off, the predicate is never published to the node at all, so the tool loop
+    and the section writer see no cancel scope and behave exactly as they did
+    before. There is nothing else to unwind: nothing is stored, filed or
+    configured by this switch.
+    """
+    try:
+        from flags import is_enabled
+        return bool(is_enabled("agent.stop_in_nodes", True))
+    except Exception as e:
+        # Fail toward the behaviour that has always existed, but say so: a
+        # kill switch that silently reads as off makes a dead feature look
+        # configured for weeks.
+        print(f"[flow] could not read agent.stop_in_nodes ({e!r}); Stop will "
+              f"only be honoured between node batches — check "
+              f"flags.py/state/flags.json")
+        return False
 
 
 # BaseExceptionGroup is Python 3.11+. On older interpreters the tuple matches
@@ -214,7 +244,7 @@ class Graph:
         for _idx, spec in enumerate(result.successors):
             label = (spec.metadata or {}).get("label")
             new_id = self.add_node(spec.skill, inputs=[],
-                                   metadata=spec.metadata)
+                                   metadata=spec.merged())
             added.append(new_id)
             idx_to_id[str(_idx)] = new_id
             # Map BOTH the explicit metadata.label AND the skill name to the
@@ -328,10 +358,95 @@ class Graph:
 _RESEARCH_SKILLS = ("retriever", "researcher", "browser", "distiller",
                     "summariser")
 _AUTHORING_SKILLS = ("author", "deck")
+# The only skill that hands `sandbox_executor` something it can run. An
+# executor scheduled without one of these above it is a node that cannot
+# succeed — see `ensure_sandbox_has_code`.
+_CODE_PRODUCING_SKILLS = ("coder",)
 
 # Sessions whose research plan has already been stripped of authoring nodes.
 # A second planner node (a recovery replan) must not re-run the rewrite.
 _RESEARCH_TEXT_ONLY_SESSIONS: set[str] = set()
+
+
+# Where a produced artifact is filed in the user's Documents library, and what
+# origin it carries, lives with the store itself (`artifacts.ARTIFACT_FILING`)
+# so the orchestrator and the skills layer cannot drift onto different folder
+# names for the same output.
+
+
+def _research_findings_text(out: dict) -> str:
+    """A researcher's whole deliverable, as one readable document.
+
+    The pages it read are already filed under "Web sources", but what the node
+    *decided mattered* — the write-up, its sources, its caveats and the conflicts
+    it noticed — lived only inside this run's node result. Measured on a live
+    pair of runs: four researcher nodes produced 3.6k, 7.3k, 17.8k and 19.1k
+    characters of findings and none of it was retrievable afterwards, so the next
+    question re-researched the same topic from the web.
+
+    The question rides with the first block rather than standing alone: the
+    chunker splits on blank lines, and a header of its own becomes a chunk that
+    matches every query and answers none."""
+    q = str(out.get("question") or "").strip()
+    findings = out.get("findings") or out.get("text") or ""
+    if not isinstance(findings, str):
+        findings = json.dumps(findings, indent=2, default=str)
+    blocks = []
+    head = q[:300] if q else "research findings"
+    first = (findings or "").strip()
+    if not first:
+        return ""
+    blocks.append(f"{head}\n{first}")
+    srcs = out.get("sources") or []
+    if isinstance(srcs, list) and srcs:
+        lines = ["", "Sources:"]
+        for i, s in enumerate(srcs, 1):
+            if isinstance(s, dict):
+                title = str(s.get("title") or "").strip() or "(untitled)"
+                url = str(s.get("url") or s.get("link") or "").strip()
+                lines.append(f"{i}. {title}" + (f" — {url}" if url else ""))
+            else:
+                lines.append(f"{i}. {s}")
+        blocks.append("\n".join(lines))
+    for key, label in (("caveats", "Caveats"), ("conflicts", "Conflicts")):
+        val = out.get(key)
+        if val and (not isinstance(val, list) or any(str(x).strip() for x in val)):
+            text = val if isinstance(val, str) else "\n".join(
+                f"- {x}" for x in val)
+            blocks.append(f"{label}:\n{text}")
+    return "\n\n".join(blocks).strip()
+
+
+def file_research_findings(nid: str, out: dict, sid: str) -> str:
+    """Store and index one researcher's findings. Fail-soft: an unfiled write-up
+    is a lost convenience, never a reason to fail the node that made it."""
+    text = _research_findings_text(out or {})
+    if not text:
+        return ""
+    try:
+        import artifacts as _arts
+        q = str((out or {}).get("question") or "").strip()
+        art = _arts.put(text.encode("utf-8"), content_type="text/plain",
+                        source=f"researcher:{q}"[:200],
+                        descriptor=(q or "research findings")[:200])
+        slug = re.sub(r"[^\w\s.-]", " ", q or "findings")
+        slug = re.sub(r"\s+", "-", slug.strip())[:70].strip("-.") or "findings"
+        did = _arts.register_with_documents(
+            art, origin="research", folder_name="Research",
+            title=(q or "research findings")[:200],
+            session_id=str(sid or ""), filename=f"research-{slug}.txt")
+        if did:
+            print(f"  -> {nid}: findings ({len(text):,} chars) filed in "
+                  f"Research as {did}")
+        else:
+            print(f"  -> {nid}: findings stored as {art} but not indexed "
+                  f"(the gateway may be away)")
+        return did
+    except Exception as e:
+        print(f"  -> {nid}: could not file findings: "
+              f"{type(e).__name__}: {e}"[:160])
+        return ""
+
 
 
 def ensure_research_is_text_only(graph: Graph, session_id: str = "") -> list[str]:
@@ -384,6 +499,72 @@ def ensure_research_is_text_only(graph: Graph, session_id: str = "") -> list[str
         graph.g.remove_node(nid)
         changed.append(nid)
     return changed
+
+
+def ensure_sandbox_has_code(graph: Graph) -> list[str]:
+    """Drop a `sandbox_executor` node that no `coder` feeds.
+
+    Live failure: asked "What is 25 * 4? Answer with just the number." the
+    planner emitted `planner -> sandbox_executor -> formatter`. The executor
+    takes `code` from an upstream coder result (see `skills.run_skill`), so with
+    only USER_QUERY above it there is nothing to run and the node fails
+    instantly with "no code in upstream coder output". The run then re-planned
+    TWICE into the same impossible shape — three planner nodes, two dead
+    executors, 59.4 s — and told the user "I am unable to provide an answer to
+    your...".
+
+    The planner is a model and will occasionally reach for a tool it has no
+    input for; the graph never had to make that legal. So the shape is enforced
+    here: an orphan executor is removed and its consumers read its
+    predecessors directly, which leaves the formatter to answer from the query —
+    the right answer, one hop, no paid failure.
+
+    Returns the ids removed, for logging and tests.
+    """
+    removed: list[str] = []
+    for nid in list(graph.g.nodes):
+        if graph.g.nodes[nid]["skill"] != "sandbox_executor":
+            continue
+        # Is there a code producer anywhere above this node?
+        seen: set[str] = set()
+        stack = list(graph.g.predecessors(nid))
+        fed = False
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if graph.g.nodes[cur]["skill"] in _CODE_PRODUCING_SKILLS:
+                fed = True
+                break
+            stack.extend(graph.g.predecessors(cur))
+        if fed:
+            continue
+        preds = list(graph.g.predecessors(nid))
+        for s in list(graph.g.successors(nid)):
+            ins = list(graph.g.nodes[s].get("inputs") or [])
+            new: list[str] = []
+            for i in ins:
+                if i == nid:
+                    for p in preds:
+                        if p not in new:
+                            new.append(p)
+                elif i not in new:
+                    new.append(i)
+            if not new:
+                # Nothing above it fed it, so feed it the question. A formatter
+                # left with an empty INPUTS list has no query to answer, which
+                # is how a corrected plan would end up shipping the same empty
+                # reply the impossible plan did.
+                new = ["USER_QUERY"]
+            graph.g.nodes[s]["inputs"] = new
+            graph.g.remove_edge(nid, s)
+            for p in preds:
+                if p in graph.g.nodes:
+                    graph.g.add_edge(p, s)
+        graph.g.remove_node(nid)
+        removed.append(nid)
+    return removed
 
 
 def _consumers_have_other_evidence(graph: Graph, nid: str) -> bool:
@@ -678,6 +859,7 @@ def ensure_authoring_research(graph: Graph, query: str,
         # Facets come from the planner's own research_plan when it wrote one,
         # so the rewrite reinforces the plan instead of inventing a new topic.
         facets: list[str] = []
+        hints: list[str] = []
         try:
             for _pnid in graph.g.nodes:
                 if graph.g.nodes[_pnid]["skill"] != "planner":
@@ -687,18 +869,29 @@ def ensure_authoring_research(graph: Graph, query: str,
                        else {}).get("research_plan")
                 if isinstance(_rp, dict):
                     facets = [str(f) for f in (_rp.get("facets") or []) if f]
+                    # The hints used to be only STORED (in the run rollup, so
+                    # the console could show them) and never handed to a
+                    # worker — which made planner.md's "source_hints steer tool
+                    # choice" a promise to a channel that went nowhere. A
+                    # researcher cannot see the plan, so this is the only way a
+                    # hint can reach the one node that picks the sources.
+                    hints = [str(h) for h in (_rp.get("source_hints") or []) if h]
         except Exception:
             facets = []
 # No facet cap: the planner decided, and every facet it emitted becomes
         # a researcher. MAX_NODES bounds a runaway loop and MAX_CONCURRENCY
-        # bounds the wave size; neither drops a node from the plan.
+        # bounds the wave size; neither drops a node from the plan. The
+        # length-aware fleet budget is delivered to the planner as a run note
+        # (see `_authoring_run_note`), so a one-page memo is planned with one
+        # researcher instead of being silently trimmed here.
         facets = facets or _fallback_facets(query)
 
         workers: list[str] = []
         for i, facet in enumerate(facets):
-            w = graph.add_node("researcher", inputs=[ret],
-                               metadata={"question": facet,
-                                         "label": f"research{i + 1}"})
+            _meta: dict = {"question": facet, "label": f"research{i + 1}"}
+            if hints:
+                _meta["source_hints"] = hints[:6]
+            w = graph.add_node("researcher", inputs=[ret], metadata=_meta)
             workers.append(w)
             added.append(w)
             edges.append((ret, w))
@@ -753,10 +946,11 @@ def _safe_remember(query: str, sid: str) -> None:
 # stream's `done` event so the console can build download cards WITHOUT
 # parsing the answer text: the formatter legitimately rewrites the receipt
 # as prose, and any handle in it was not reliably preserved.
-_DOCUMENT_INTENT_RE = re.compile(
-    r"create a document|produce a (pdf|pptx|docx|xlsx|word|excel|deck)"
-    r"|make a (pdf|pptx|docx|xlsx)|render a (pdf|pptx|docx|xlsx)",
-    re.I)
+#
+# The pattern lives in skills.py now, because the worker-side research-effort
+# cap has to answer the SAME question and used to keep its own copy — keyed on
+# a literal prefix the classifier here did not use.
+_DOCUMENT_INTENT_RE = DOCUMENT_INTENT_RE
 
 
 def take_produced_files(session_id: str) -> list[dict]:
@@ -818,6 +1012,12 @@ def take_produced_files(session_id: str) -> list[dict]:
                         "bytes": e.get("bytes"),
                         "blocks": e.get("blocks"),
                         "stats": e.get("stats") or {},
+                        # The Documents entry these bytes were indexed into.
+                        # Rebuilding the row from named keys dropped it, so a
+                        # reattached run showed a file the console could
+                        # download but not discuss — the binding exists in the
+                        # sidecar and had no way to reach the browser.
+                        "document_id": str(e.get("document_id") or ""),
                         "cost": cost})
         return out
     except Exception:
@@ -1224,13 +1424,41 @@ class Executor:
             ready = graph.ready_nodes()
             if not ready and not graph.has_running():
                 break
-            # Bound BOTH the batch and the projected total. The cap check must
-            # use the batch actually dispatched, not the full ready set: a
-            # planner that emits 9 nodes with MAX_CONCURRENCY=8 would
-            # otherwise see
-            # `executed + 5 > MAX_NODES` on the first round, skip every node,
-            # and spin without ever advancing.
-            if executed_count + len(ready) > MAX_NODES:
+            # Bounded fan-out. Every ready node was gathered at once, so a
+            # planner that emitted 20 facets would open 20 concurrent LLM
+            # calls and blow through the provider's rate limit. Deferring a
+            # node requires leaving it PENDING, so this is computed BEFORE the
+            # running marks below - and before the cap check, because the cap
+            # has to be tested against the batch actually dispatched.
+            #
+            # Authoring used to be capped at 2 here: four researchers hitting
+            # the SAME provider at once produced four empty replies in one live
+            # run, then a recovery planner and a thinner document. That cap is
+            # removed at the operator's instruction, and the reason it is safe
+            # to remove is not that the empty replies stopped happening — it is
+            # that they were a *single-provider* problem. Each node now carries
+            # one route affinity (see `gateway.node_scope`), so a node keeps its
+            # own provider across hops while different nodes are picked by load
+            # and spread across the key pool. Eight concurrent researchers
+            # become eight different rate windows instead of eight collisions on
+            # one, which is strictly gentler than the four-that-collapsed case.
+            _batch_limit = MAX_CONCURRENCY
+            batch = ready[:_batch_limit]
+            if len(ready) > _batch_limit:
+                print(f"[flow] batch limited to {_batch_limit}; "
+                      f"{len(ready) - _batch_limit} node(s) deferred")
+
+            # Bound the projected total against the batch, not the full ready
+            # set. Testing `executed + len(ready)` was the bug this comment used
+            # to warn about: a planner emitting 9 nodes with
+            # MAX_CONCURRENCY=8 could see the cap trip on the first round, skip
+            # every node, and spin without ever advancing.
+            #
+            # MAX_NODES is a runaway-loop guard, not a content limit: it bounds
+            # the graph the recovery planner could grow, never the fleet the
+            # planner asked for. The fleet itself is uncapped - one researcher
+            # per facet, however many facets there are.
+            if executed_count + len(batch) > MAX_NODES:
                 print(f"[flow] node cap {MAX_NODES} hit at {executed_count}; "
                       f"stopping")
                 # Mark the un-run nodes skipped. They were left `pending` on
@@ -1243,16 +1471,6 @@ class Executor:
                 store.write_graph(graph.g)
                 break
 
-            # Bounded fan-out. Every ready node was gathered at once, so a
-            # planner that emitted 20 facets would open 20 concurrent LLM
-            # calls and blow through the provider's rate limit. Deferring a
-            # node requires leaving it PENDING, so this must be computed
-            # before the running marks below.
-            batch = ready[:MAX_CONCURRENCY]
-            if len(ready) > MAX_CONCURRENCY:
-                print(f"[flow] batch limited to {MAX_CONCURRENCY}; "
-                      f"{len(ready) - MAX_CONCURRENCY} node(s) deferred")
-
             # Mark ONLY the dispatched batch as running. Marking the whole
             # ready set left deferred nodes stuck in `running` with nothing
             # executing them: has_running() stayed true, the scheduler kept
@@ -1260,6 +1478,32 @@ class Executor:
             for nid in batch:
                 graph.mark(nid, "running")
             store.write_graph(graph.g)
+
+            # Narration. A run used to show only `working… 40s elapsed` between
+            # completions, so a forty-second planner call and a forty-second
+            # six-way fan-out looked identical and the reader could not tell
+            # whether anything was happening. This says which nodes started and
+            # what each was told to produce, taken from the node's own brief —
+            # the same `QUESTION:` the skill is about to receive.
+            #
+            # Deliberately derived, not model-generated. A worker asked to
+            # narrate itself costs a call, arrives late, and can describe work
+            # it has not done; the goal the planner already wrote is both
+            # truthful and free. Printed through stdout so it rides the existing
+            # log stream — no new channel to keep in step.
+            for nid in batch:
+                _n = graph.g.nodes[nid]
+                _meta = _n.get("metadata") or {}
+                _brief = str(_meta.get("question") or _meta.get("goal")
+                             or _meta.get("action") or "").strip()
+                if not _brief:
+                    _brief = str(query).strip()
+                _brief = " ".join(_brief.split())
+                if len(_brief) > 110:
+                    _brief = _brief[:110].rstrip() + "…"
+                print(f"[{nid}] {_n['skill']:18s} running · {_brief}"
+                      if _brief else
+                      f"[{nid}] {_n['skill']:18s} running")
 
             # return_exceptions=True: one sibling raising CancelledError /
             # BaseException must not abort the whole fan-out batch. Results
@@ -1280,7 +1524,7 @@ class Executor:
                 self._run_one(nid, graph, sid, query, store, memory_hits,
                               prior_turns, policy_notes,
                               _node_note(nid),
-                              doc_setup)
+                              doc_setup, should_cancel)
                 for nid in batch],
                                             return_exceptions=True)
 
@@ -1320,6 +1564,21 @@ class Executor:
                       f"{graph.g.nodes[nid]['status']:8s} "
                       f"({result.elapsed_s:.1f}s)"
                       + (f"  err={result.error[:80]}" if result.error else ""))
+                # A research node's own write-up is filed as soon as it
+                # finishes — the pages it read are already in "Web sources", but
+                # the distillation was unreachable the moment the run ended.
+                # Keyed on the OUTPUT, not the skill name: the planner routes
+                # facets to `researcher`, `retriever` or whatever it invents, and
+                # a name test here once crashed the whole run by reading a local
+                # that is only bound on the exception path. A node that returns
+                # findings gets them filed; `retriever` returns
+                # {chunks, found, summary} and is correctly left alone, since its
+                # chunks already live in indexed documents.
+                _out = getattr(result, "output", None)
+                if (result.success and isinstance(_out, dict)
+                        and str(_out.get("findings") or "").strip()):
+                    await asyncio.to_thread(
+                        file_research_findings, nid, _out, session_id)
 
             # PASS 2 — act on the outcomes. Every mark happened in pass 1, so
             # each decision below (absorb vs replan, and the recovery
@@ -1361,6 +1620,16 @@ class Executor:
                         _rec_md = graph.g.nodes[nid].get("metadata") or {}
                         _is_rec = bool(_rec_md.get("recovers")
                                        or _rec_md.get("recovers_all"))
+                        # An executor with no coder above it can only fail.
+                        # Remove it BEFORE the guards below, so the plan that
+                        # reaches the rest of the run is one the graph can
+                        # actually execute.
+                        _orphans = ensure_sandbox_has_code(graph)
+                        if _orphans:
+                            print(f"[{nid}] impossible plan corrected: removed "
+                                  f"sandbox_executor {_orphans} with no coder "
+                                  f"upstream")
+                            store.write_graph(graph.g)
                         # Research answers in the transcript. Strip any
                         # author/deck node the planner reached for BEFORE the
                         # authoring guard, so a research run cannot be turned
@@ -1441,6 +1710,27 @@ class Executor:
                             except Exception as e:
                                 print(f"[{nid}] research plan not stored: {e!r}")
                 else:
+                    if should_cancel is not None and should_cancel():
+                        # A node that came back short because the operator
+                        # pressed Stop is not a failure to recover FROM: the
+                        # branch below would add a replanner for exactly the
+                        # work that was just called off, and count the skill
+                        # toward the failure caps, for a run nobody wants any
+                        # more. Mark it the way the batch boundary marks
+                        # everything else and move on.
+                        graph.mark(nid, "skipped", error="stopped by operator")
+                        store.write_node(NodeState(
+                            node_id=nid, skill=graph.g.nodes[nid]["skill"],
+                            status="skipped",
+                            inputs=graph.g.nodes[nid]["inputs"],
+                            result=result, prompt_sent=prompt,
+                            started_at=time.time() - float(
+                                getattr(result, "elapsed_s", 0.0) or 0.0),
+                            completed_at=time.time(),
+                        ))
+                        print(f"  -> {nid} skipped (stopped by operator, "
+                              f"skill={graph.g.nodes[nid]['skill']})")
+                        continue
                     failed_skill = graph.g.nodes[nid]["skill"]
                     skill_failures[failed_skill] = (
                         skill_failures.get(failed_skill, 0) + 1)
@@ -1457,7 +1747,15 @@ class Executor:
                         # marked ready (ready_nodes only unblocks when all
                         # predecessors are "complete" OR "skipped"). A 503
                         # must NOT silently kill an entire downstream branch.
-                        graph.mark(nid, "skipped")
+                        #
+                        # …and it must not kill one silently either. The reason
+                        # lived only in the printed line and in `result`, so a
+                        # facet that lost its researcher showed up as `skipped`
+                        # with an empty error, and the run looked clean while
+                        # one section of the document went unwritten.
+                        graph.mark(nid, "skipped", error=(
+                            (result.error or "").strip()[:500]
+                            or f"recovery skipped: {decision.reason}"))
                         store.write_node(NodeState(
                             node_id=nid, skill=graph.g.nodes[nid]["skill"],
                             status="skipped",
@@ -1653,7 +1951,7 @@ class Executor:
                         formatter_answer = (
                             f"(the {fallback_skill} step finished but returned no "
                             f"readable answer; raw output follows) "
-                            + json.dumps(fallback_output)[:1500]
+                            + json.dumps(fallback_output)
                         )
 
         if critic_fail_cap_hit:
@@ -1688,6 +1986,15 @@ class Executor:
             if status == "skipped" and _replacement_answered(graph, nid):
                 continue
             if isinstance(res, AgentResult) and not res.success:
+                # A node whose call was cut short by Stop is not a hole in the
+                # answer either. It arrives here as `failed` with
+                # "stopped by the operator" as its error, and without this gate
+                # a person who pressed Stop was told their own run was
+                # incomplete — the same reason the branch below skips a
+                # cancelled run's skipped nodes, and one the node-status check
+                # two lines down already honoured while this one did not.
+                if should_cancel is not None and should_cancel():
+                    continue
                 failed.append(f"{d.get('skill', '?')}: "
                               f"{str(res.error or 'failed')[:120]}")
                 continue
@@ -1853,6 +2160,39 @@ class Executor:
             produced = kept
             _ = multi
         if produced:
+            # Every document the run delivered is registered in the gateway's
+            # Documents plane — parsed, chunked, embedded, filed under the
+            # section that made it, and linked to the artifact it came from.
+            # Until now an artifact was inert bytes: nothing could search it,
+            # so the next turn re-fetched the web or re-rendered the file to
+            # answer a question about something it had already produced.
+            # Fail-soft by design — a document that could not be indexed is
+            # still delivered, still downloadable, still listed.
+            import artifacts as _arts
+            for p in produced:
+                folder, origin = _arts.filing_for(str(p.get("skill") or ""))
+                try:
+                    doc_id = await asyncio.to_thread(
+                        _arts.register_with_documents, p["artifact"],
+                        origin=origin, folder_name=folder,
+                        title=str(p.get("filename") or "")[:200],
+                        # The name the run delivered, not the descriptor the
+                        # renderer invented. Passing only `title` let the
+                        # gateway fall back to the descriptor, so one file was
+                        # `Global-Solar-Market-Briefing-2026.pdf` in the download
+                        # and `Global Solar Market Briefing 2026 (pdf).pdf` in
+                        # Documents — two names for the same deliverable, and the
+                        # library is the one the agent reads.
+                        filename=str(p.get("filename") or ""),
+                        session_id=str(sid or ""))
+                    if doc_id:
+                        p["document_id"] = doc_id
+                    else:
+                        print(f"  -> {p['artifact']}: rendered but not indexed "
+                              f"into Documents (the file is still downloadable)")
+                except Exception as e:
+                    print(f"  -> could not index {p['artifact']}: "
+                          f"{type(e).__name__}: {e}"[:160])
             try:
                 import json as _json
                 _p = store.graph_path.parent / "produced_files.json"
@@ -1952,6 +2292,7 @@ class Executor:
         policy_notes: list | None = None,
         budget_note: str = "",
         doc_setup: dict | None = None,
+        should_cancel=None,
         ) -> tuple[str, AgentResult, str]:
         skill_name = graph.g.nodes[nid]["skill"]
         skill = self.registry.get(skill_name)
@@ -1960,13 +2301,30 @@ class Executor:
                                     inputs=graph.g.nodes[nid]["inputs"],
                                     started_at=time.time()))
         try:
-            result, prompt = await run_skill(skill, nid, graph.g.nodes, sid, query, fr,
-                                              memory_hits=memory_hits,
-                                              prior_turns=prior_turns,
-                                              policy_notes=policy_notes,
-                                              doc_setup=doc_setup,
-                                              budget_note=budget_note,
-                                              doc_ids=self._doc_ids)
+            # One affinity per node, so every LLM call the node makes — the tool
+            # loop's hops, an author's empty-reply retry, a researcher's
+            # sectioned write-ups — is routed to the same provider and reads the
+            # same provider's prompt cache. See `gateway.node_scope`; nested
+            # calls inherit it from the context, so no skill had to change.
+            #
+            # `cancel_scope` rides the same mechanism for the same reason: the
+            # operator's Stop is decided out here and honoured in there, at each
+            # node's own call boundaries (see `_stop_in_nodes`).
+            from gateway import node_scope as _node_scope
+            # The switch is honoured HERE, at the one place a predicate is ever
+            # published, rather than at the call site that happens to pass one:
+            # off then means no node anywhere can see a Stop, not "the batch
+            # loop forgot to hand one over".
+            with _node_scope(f"{sid}:{nid}"), cancel_scope(
+                    should_cancel if _stop_in_nodes() else None):
+                result, prompt = await run_skill(
+                    skill, nid, graph.g.nodes, sid, query, fr,
+                    memory_hits=memory_hits,
+                    prior_turns=prior_turns,
+                    policy_notes=policy_notes,
+                    doc_setup=doc_setup,
+                    budget_note=budget_note,
+                    doc_ids=self._doc_ids)
         except Exception as e:  # pragma: no cover - dispatcher fault path
             result = AgentResult(success=False, agent_name=skill_name,
                                  error=f"exception: {_readable_exc(e)}")

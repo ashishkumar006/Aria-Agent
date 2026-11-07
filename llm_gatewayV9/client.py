@@ -23,18 +23,33 @@ from typing import Any, Optional
 DEFAULT_URL = os.getenv("LLM_GATEWAY_V9_URL", "http://localhost:8109")
 
 
+def _user_token() -> str:
+    """The calling user's gateway token, if this process has one.
+
+    The agent sets `ARIA_GATEWAY_USER_TOKEN_FILE` to its own state file; the
+    token is re-read on every request so rotating it in Settings takes effect
+    without restarting the agent. Reading a file is deliberate: a token in
+    argv or the environment leaks through process listings.
+    """
+    tok = (os.getenv("ARIA_GATEWAY_USER_TOKEN") or "").strip()
+    if tok:
+        return tok
+    path = (os.getenv("ARIA_GATEWAY_USER_TOKEN_FILE") or "").strip()
+    if not path:
+        return ""
+    try:
+        from pathlib import Path
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _auth_headers() -> dict:
     """Headers for the gateway's authenticated surface.
 
-    Every `/v1/*` route requires `X-Gateway-Token`. The server used to accept
-    unauthenticated calls on all of them, which let any local process wipe
-    memory, reload policy and spend real money - so this client now has to
-    present the shared token. It is read the same way the server writes it:
-    `GATEWAY_V9_TOKEN`, else `state/gateway.token`, which the server publishes
-    at start-up.
-
-    Returns `{}` rather than raising when no token is available, so the failure
-    is an explicit 401 from the server instead of an import-time crash.
+    `X-Gateway-Token` is the operator/transport credential.
+    `X-Aria-User-Token`, when present, tells the gateway WHOSE provider keys
+    to use; the operator token alone keeps the shared pool.
     """
     tok = (os.getenv("GATEWAY_V9_TOKEN") or "").strip()
     if not tok:
@@ -44,7 +59,11 @@ def _auth_headers() -> dict:
             tok = p.read_text(encoding="utf-8").strip()
         except OSError:
             tok = ""
-    return {"X-Gateway-Token": tok} if tok else {}
+    headers = {"X-Gateway-Token": tok} if tok else {}
+    user = _user_token()
+    if user:
+        headers["X-Aria-User-Token"] = user
+    return headers
 
 
 def _raise_for_status(r: httpx.Response) -> None:
@@ -91,7 +110,12 @@ class LLM:
     def __init__(self, base_url: str = DEFAULT_URL, timeout: float = 600):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.headers = _auth_headers()
+
+    @property
+    def headers(self) -> dict:
+        # Dynamic: a rotated user token must apply to the next call, and the
+        # gateway token can be republished by a restart.
+        return _auth_headers()
 
     def chat(self, prompt: str = None, *,
              messages: Optional[list] = None,
@@ -106,6 +130,7 @@ class LLM:
              auto_route: Optional[str] = None,
              agent: Optional[str] = None,
              session: Optional[str] = None,
+             route_affinity: Optional[str] = None,
              stream: bool = False) -> dict:
         body = {
             "prompt": prompt, "messages": messages, "system": system,
@@ -116,6 +141,7 @@ class LLM:
             "response_format": response_format,
             "auto_route": auto_route,
             "agent": agent, "session": session,
+            "route_affinity": route_affinity,
         }
         body = {k: v for k, v in body.items() if v is not None}
         r = httpx.post(f"{self.base_url}/v1/chat", json=body, timeout=self.timeout, headers=self.headers)

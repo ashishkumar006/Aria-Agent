@@ -9,6 +9,8 @@
      Revert review afterwards; the editor's own Save pays a confirm of its own.
    * Edits live in this browser tab (and localStorage, so a reload does not
      lose them). A dirty tab can be reverted to what the agent actually serves.
+     Save to disk (Ctrl+S, toolbar or command palette) shows a diff first and
+     writes only after that review.
    * There is no language server: no diagnostics, completion or go-to-definition.
      The Problems panel says so instead of showing a fake zero.
 
@@ -34,12 +36,16 @@ import {
 import { Rail, TopBar, Empty, Pill, SkipLink } from '../components/ui';
 import { useFocusTrap } from '../lib/a11y';
 import { useMainId, useSectionActive } from '../components/KeepAlive';
+import { useNavigate } from 'react-router-dom';
+import { useCodeIdeFlag } from '../lib/studioSession';
 import { parseUnifiedMarks, type DiffMarks } from '../lib/diffMarks';
 import { renderMarkdown } from '../components/markdown';
 import MonacoEditor, {
   type CaretInfo, type EditorHandle, type EditorOp,
 } from '../components/MonacoEditor';
-import AgentPanel from '../components/AgentPanel';
+import AgentPanel, { type ApprovalMode } from '../components/AgentPanel';
+import { ChangesRail } from '../components/ChangesRail';
+import type { CodeAgentChange } from '../api';
 import { EditPermissionDialog, type PendingEdit } from '../components/EditPermissionDialog';
 import TerminalDock, { type TerminalStatus } from '../components/TerminalDock';
 import {
@@ -75,6 +81,22 @@ const AGENT_MIN = 264;
 const AGENT_MAX = 560;
 const AGENT_DEFAULT = 360;
 const AGENT_STORE = 'aria.code.agentWidth';
+/* Which panes this view shows, remembered across reloads.
+
+   These toggles already existed and already worked — explorer, agent, minimap,
+   wrap and outline were all settable — but only the agent's *width* and the
+   chosen surface survived a reload. So every reload silently reopened the
+   explorer and reset the layout a user had deliberately arranged, which is the
+   same complaint as a preview that forgets its zoom.
+
+   `zen` is deliberately NOT in here. It unmounts the top bar and the tab strip,
+   so a stale `true` restored at the wrong moment is the one layout state that
+   genuinely looks like a broken app. */
+const UI_STORE = 'aria.code.ui.v1';
+type UiPrefs = { explorerOn?: boolean; agentOn?: boolean; minimapOn?: boolean; wrap?: boolean; outlineOn?: boolean };
+function readUi(): UiPrefs {
+  try { return JSON.parse(localStorage.getItem(UI_STORE) || '{}') as UiPrefs; } catch { return {}; }
+}
 function agentCap(vw: number) {
   return Math.max(AGENT_MIN, Math.min(AGENT_MAX, vw - 800));
 }
@@ -875,6 +897,17 @@ function Palette({ mode, files, truncated, onPick, onClose }: {
 export default function Code() {
   const mainId = useMainId();
   const sectionActive = useSectionActive();
+  /* `/code` redirects into the studio when the flag is on — but ONLY while this
+     section is the visible one. KeepAlive leaves this component mounted after
+     you navigate away, so an unconditional redirect effect would yank the user
+     to /studio from whichever page they had actually gone to read. That is the
+     keep-alive footgun, and it is the reason the guard is on the active
+     section rather than on a location string. */
+  const navigate = useNavigate();
+  const { on: studioOn } = useCodeIdeFlag();
+  useEffect(() => {
+    if (sectionActive && studioOn) navigate('/studio', { replace: true });
+  }, [sectionActive, studioOn, navigate]);
   const [panes, setPanes] = useState<Pane[]>([]);
   /* The active tab is tracked by PATH, not by index. It was an index, and
      `open()` appended the new pane then set the active index to `active + 1`
@@ -883,13 +916,13 @@ export default function Code() {
      pane invisible: no editor, no textarea, just a tab that looked broken. */
   const [activePath, setActivePath] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>(() => loadDrafts());
-  const [explorerOn, setExplorerOn] = useState(true);
+  const [explorerOn, setExplorerOn] = useState(() => readUi().explorerOn ?? true);
   /* The agent is a pane, not a fixture: on a laptop it was taking more width
      than the editor it comments on (252px of editor at 1024 wide). Collapsible
      from the top bar, open by default only when there is room for both, and
      never on the stacked layout - below `lg` it used to stack UNDER the editor
      and, once toggled on, leave Monaco five pixels tall. */
-  const [agentOn, setAgentOn] = useState(() => window.innerWidth >= 1280);
+  const [agentOn, setAgentOn] = useState(() => readUi().agentOn ?? window.innerWidth >= 1280);
   /* Drag-resizable, remembered across reloads. Stored as a raw number: the
      clamp is applied on read so a window that shrank since last time cannot
      restore a width that eats the editor. */
@@ -899,8 +932,8 @@ export default function Code() {
   });
   /* Same reasoning as the agent: a 60px minimap leaves a 250px editor with
      almost no code. It stays available from the status bar. */
-  const [minimapOn, setMinimapOn] = useState(() => window.innerWidth >= 1280);
-  const [wrap, setWrap] = useState(false);
+  const [minimapOn, setMinimapOn] = useState(() => readUi().minimapOn ?? window.innerWidth >= 1280);
+  const [wrap, setWrap] = useState(() => readUi().wrap ?? false);
   const [zen, setZen] = useState(false);
   const [palette, setPalette] = useState<'file' | 'cmd' | null>(null);
   const [goto, setGoto] = useState<string | null>(null);
@@ -923,7 +956,7 @@ export default function Code() {
      open must say so instead of silently missing files. */
   const [filesTruncated, setFilesTruncated] = useState(false);
   const [folded, setFolded] = useState(0);
-  const [outlineOn, setOutlineOn] = useState(false);
+  const [outlineOn, setOutlineOn] = useState(() => readUi().outlineOn ?? false);
   /* Go-to-definition / find-references / rename. The editor becomes an IDE the
      moment the caret can ask where a symbol lives; everything below backs that
      with the AST the agent's own tools use. */
@@ -984,6 +1017,48 @@ export default function Code() {
      expensive model you did not mean to use. */
   const [aiModel, setAiModel] = useState(
     () => localStorage.getItem('aria.code.model') ?? '');
+  /* Ask is the default: a coding agent that can rewrite files without a
+     gate is not a safe default. Auto-edit applies writes immediately with the
+     existing Keep/Revert review; commands still ask. Auto-all drops that last
+     gate too — the user has opted into the agent running the project's checks
+     on its own, which is the only way a build-fix loop stops stalling on a
+     prompt every few seconds. Read-only hides every write/exec tool. */
+  /* Two surfaces in one section. `ide` is the files-first editor, exactly as
+     it has always been; `agent` is the thread-first surface where the
+     transcript owns the window and the agent's changes sit in a rail. Neither
+     is a mode of the other — the IDE keeps its explorer, tabs and status bar
+     untouched, because debugging a file and directing an agent are different
+     jobs and neither should have to borrow the other's chrome. */
+  const [surface, setSurface] = useState<'ide' | 'agent'>(() => {
+    try {
+      return localStorage.getItem('aria.code.surface') === 'agent' ? 'agent' : 'ide';
+    } catch { return 'ide'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('aria.code.surface', surface); }
+    catch { /* private mode: the choice just does not persist */ }
+  }, [surface]);
+  /* The rail shows the diff, not just the marks, so keep the server's own
+     change records rather than re-deriving them from the editor decorations. */
+  const [agentChanges, setAgentChanges] = useState<CodeAgentChange[]>([]);
+
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(() => {
+    try {
+      const saved = localStorage.getItem('aria.code.approval');
+      return saved === 'auto-edit' || saved === 'auto-all'
+        || saved === 'read-only' ? saved : 'ask';
+    } catch { return 'ask'; }
+  });
+  /* Identity of THIS agent session. It is what "always allow this command" is
+     bound to, so a standing approval cannot authorise a different session's
+     command — and it dies with the page rather than outliving the run that
+     earned it. */
+  const [codeSession] = useState<string>(() =>
+    `cs-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`);
+  useEffect(() => {
+    try { localStorage.setItem('aria.code.approval', approvalMode); }
+    catch { /* private mode */ }
+  }, [approvalMode]);
   /* A write the agent is parked on, waiting for a decision. The run cannot
      proceed until this clears, which is the whole point: the diff has to be on
      screen BEFORE the file can change. */
@@ -1002,6 +1077,15 @@ export default function Code() {
       localStorage.setItem(AGENT_STORE, String(Math.round(agentW)));
     } catch { /* private mode: the width still holds for this session */ }
   }, [agentW]);
+  /* And remember which panes the user arranged. Writing the defaults on first
+     mount is harmless — the read falls back to the same values anyway. */
+  useEffect(() => {
+    try {
+      localStorage.setItem(UI_STORE, JSON.stringify({
+        explorerOn, agentOn, minimapOn, wrap, outlineOn,
+      } satisfies UiPrefs));
+    } catch { /* private mode: the layout still holds for this session */ }
+  }, [explorerOn, agentOn, minimapOn, wrap, outlineOn]);
   useEffect(() => {
     const onResize = () => setAgentW((w) => clampAgentW(w));
     window.addEventListener('resize', onResize);
@@ -1062,7 +1146,10 @@ export default function Code() {
      matching by tool name FIFO is what keeps the marks on the right file. A
      refused/failed write consumes its slot too, so it cannot be applied to a
      later successful call of the same tool. */
-  const pendingWrites = useRef<{ path: string; tool: string; marks: DiffMarks }[]>([]);
+  /* `diff` rides along so the Changes rail can show hunks once the write is
+     confirmed — the marks alone are line numbers, and a hunk needs its text. */
+  const pendingWrites = useRef<{ path: string; tool: string; marks: DiffMarks;
+                                 diff: string }[]>([]);
   /* Markdown preview: VS Code's Open Preview, as a toggle. Applies to the
      active pane only while it is a markdown file. */
   const [previewMd, setPreviewMd] = useState(false);
@@ -1114,6 +1201,18 @@ export default function Code() {
     setNote(m);
     window.setTimeout(() => setNote((n) => (n === m ? null : n)), 2200);
   }, []);
+
+  /* One entry point for every save gesture. Ctrl+S, the toolbar button and
+     the command palette all open the same review; a clean file says so
+     instead of showing a 0/0 diff. */
+  const openSaveReview = useCallback(() => {
+    if (!pane) return;
+    if (!dirty) {
+      flash(`${pane.path} already matches disk - nothing to save`);
+      return;
+    }
+    setSaveDiff({ open: true, confirm: false, note: null, error: null });
+  }, [pane, dirty, flash]);
 
   /* Persist drafts so a reload keeps unsaved work — DEBOUNCED:
      every keystroke used to serialise the entire draft map (every
@@ -1503,7 +1602,7 @@ const runProjectChecks = useCallback(async () => {
   /*  commands  */
   const CMDS: { id: string; label: string; run: () => void }[] = useMemo(() => [
     { id: 'file.quickOpen', label: 'Go to File', run: () => setPalette('file') },
-    { id: 'file.save', label: 'Save (browser draft only)', run: () => flash('nothing is written to disk — this is a browser draft') },
+    { id: 'file.save', label: 'Save to Disk (review first)', run: openSaveReview },
     { id: 'file.revert', label: 'Revert File to Disk Contents', run: () => {
       if (!pane) return;
       if (pane.body === pane.base) { flash('no local changes to revert'); return; }
@@ -1553,7 +1652,7 @@ const runProjectChecks = useCallback(async () => {
         () => flash('clipboard blocked by the browser'),
       );
     } },
-  ], [doRedo, doUndo, edit, flash, lineOps, pane, replaceRange]);
+  ], [doRedo, doUndo, edit, flash, lineOps, openSaveReview, pane, replaceRange]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1663,7 +1762,7 @@ const runProjectChecks = useCallback(async () => {
          looked at before anything reaches the disk. */
       if (mod && e.key.toLowerCase() === 's' && !e.shiftKey) {
         e.preventDefault();
-        setSaveDiff({ open: true, confirm: false, note: null, error: null });
+        openSaveReview();
         return;
       }
       if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) {
@@ -1683,11 +1782,6 @@ const runProjectChecks = useCallback(async () => {
         e.preventDefault(); setFind((f) => ({ ...f, open: true })); return;
       }
       if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); setGoto(''); return; }
-      if (mod && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        flash('nothing is written to disk — this is a browser draft');
-        return;
-      }
       if (mod && e.key.toLowerCase() === 'w' && panes.length) {
         e.preventDefault(); close(active); return;
       }
@@ -1733,8 +1827,8 @@ const runProjectChecks = useCallback(async () => {
   window.addEventListener('keydown', onKey, true);
   return () => window.removeEventListener('keydown', onKey, true);
 }, [active, body, close, cursor.line, doRedo, doUndo,
-    find.open, flash, goto, lang, lineOps, offsetOf, outline, palette, panes.length, saveDiff.open,
-    replaceRange, search.open, shortcuts, syncCursor]);
+    find.open, flash, goto, lang, lineOps, offsetOf, openSaveReview, outline, palette,
+    panes.length, saveDiff.open, replaceRange, search.open, shortcuts, syncCursor]);
 
   /* The caret's scroll-into-view is Monaco's job. The hand-written version
      below measured a scroll container that no longer exists. */
@@ -1781,10 +1875,11 @@ const runProjectChecks = useCallback(async () => {
      happens when the write LANDS on disk (its tool_result frame), not here:
      this POST returns as soon as the decision is recorded, and reloading
      immediately could read the pre-write bytes. */
-  const decideEdit = useCallback(async (id: string, approve: boolean) => {
+  const decideEdit = useCallback(async (id: string, approve: boolean,
+                                        remember = false) => {
     setEditBusy(true);
     try {
-      await api.codePermission(id, approve);
+      await api.codePermission(id, approve, remember);
       setPendingEdit(null);
     } catch { /* a 404 means the run already moved on; close either way */ }
     finally { setEditBusy(false); }
@@ -1836,6 +1931,27 @@ const runProjectChecks = useCallback(async () => {
     }
   }, [pane, body, dirty, saving, checkedIn, flash]);
 
+  /* Re-read the agent's unreviewed changes after a hunk goes back. The editor
+     decorations come from the same diffs, so a partial revert that only
+     refreshed the rail would leave green/red marks describing lines that are
+     no longer there. */
+  const reloadChanges = useCallback(() => {
+    const ac = new AbortController();
+    api.codeChanges(ac.signal).then((r) => {
+      const list = r?.changes ?? [];
+      setAgentChanges(list);
+      setAgentMarks((m) => {
+        const next: Record<string, DiffMarks> = {};
+        for (const c of list) {
+          if (c.path) next[c.path] = parseUnifiedMarks(String(c.diff || ''));
+        }
+        // Keep any session-local mark the server has not reported yet.
+        for (const k of Object.keys(m)) if (!(k in next)) next[k] = m[k];
+        return next;
+      });
+    }).catch(() => undefined);
+  }, []);
+
   /* Keep one file's agent change: the bytes stay exactly as they are on disk,
      only the review marks go. */
   const keepChange = useCallback(async (path: string) => {
@@ -1848,6 +1964,7 @@ const runProjectChecks = useCallback(async () => {
         delete next[path];
         return next;
       });
+      setAgentChanges((cs) => cs.filter((c) => c.path !== path));
       flash(`kept ${path} as the agent left it`);
     } catch (e) {
       /* Keep only clears the marks once the snapshot is actually gone. The
@@ -1872,6 +1989,7 @@ const runProjectChecks = useCallback(async () => {
           delete next[path];
           return next;
         });
+        setAgentChanges((cs) => cs.filter((c) => c.path !== path));
         setStale(null);
         refreshFromDisk();
         if (r.deleted) {
@@ -1899,7 +2017,12 @@ const runProjectChecks = useCallback(async () => {
     let live = true;
     const ac = new AbortController();
     api.codeChanges(ac.signal).then((r) => {
-      if (!live || !r?.changes?.length) return;
+      if (!live) return;
+      const list = r?.changes ?? [];
+      /* Set it even when empty: the alternative is a rail that still shows a
+         file the user has already kept or reverted elsewhere. */
+      setAgentChanges(list);
+      if (!list.length) return;
       setAgentMarks((m) => {
         const next = { ...m };
         for (const c of r.changes!) {
@@ -1914,8 +2037,9 @@ const runProjectChecks = useCallback(async () => {
   }, []);
 
   /* One switch for both the splitter and the pane. Zen hides the agent with
-     the rest of the chrome - the mode exists to give the file the screen. */
-  const agentOpen = agentOn && !zen;
+     the rest of the chrome - the mode exists to give the file the screen.
+     The agent surface always shows it, and takes the width the editor had. */
+  const agentOpen = (agentOn && !zen) || surface === 'agent';
 
   return (
     /* `.ide` scopes the editor palette (index.css): graphite chrome, a denser
@@ -1933,8 +2057,28 @@ const runProjectChecks = useCallback(async () => {
                 its state is the one thing here that changes the layout; on
                 the stacked layout it opens the panel over the editor rather
                 than under it. */}
+            {/* Which job this window is for. Two labels, not a menu: the
+                choice changes the whole layout, so it has to be visible and
+                one click wide. */}
+            <div role="group" aria-label="Code surface"
+                 className="flex flex-none items-center overflow-hidden rounded border border-white/10">
+              {(['ide', 'agent'] as const).map((s) => (
+                <button key={s} type="button" aria-pressed={surface === s}
+                        onClick={() => setSurface(s)}
+                        title={s === 'ide'
+                          ? 'The editor: explorer, tabs, terminal, status bar'
+                          : 'The agent: the thread owns the window, changes sit in a rail'}
+                        className={`px-1.5 py-0.5 text-[11px] transition-colors ${
+                          surface === s
+                            ? 'bg-white/[0.09] text-zinc-100'
+                            : 'text-zinc-500 hover:text-zinc-300'}`}>
+                  {s === 'ide' ? 'IDE' : 'Agent'}
+                </button>
+              ))}
+            </div>
             <button type="button" onClick={() => setAgentOn((v) => !v)}
               aria-pressed={agentOn}
+              hidden={surface === 'agent'}
               title={agentOn ? 'Hide the agent panel' : 'Show the agent panel'}
               className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors ${
                 agentOn
@@ -1957,7 +2101,7 @@ const runProjectChecks = useCallback(async () => {
             document sideways. */}
         <div className="relative flex min-h-0 flex-1 flex-col lg:flex-row">
           {/* Explorer */}
-          {!zen && explorerOn && (
+          {!zen && explorerOn && surface === 'ide' && (
             <aside aria-label="Explorer"
               className="flex max-h-[34vh] w-full flex-none flex-col border-b border-glass-border bg-surface-0 lg:max-h-none lg:w-[232px] lg:border-b-0 lg:border-r xl:w-[260px]">
               <Explorer
@@ -1970,7 +2114,9 @@ const runProjectChecks = useCallback(async () => {
             </aside>
           )}
 
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className={surface === 'agent'
+            ? 'hidden'
+            : 'flex min-h-0 min-w-0 flex-1 flex-col'}>
             {/* Tabs */}
             {!zen && (
               <div role="tablist" aria-label="Open editors"
@@ -2052,7 +2198,7 @@ const runProjectChecks = useCallback(async () => {
                     </>
                   )}
                   {dirty && (
-                    <button type="button" onClick={() => setSaveDiff((s) => ({ ...s, open: true }))}
+                    <button type="button" onClick={openSaveReview}
                       title="Save to disk (Ctrl+S)"
                       aria-label="Save to disk"
                       className="flex h-[18px] w-[18px] items-center justify-center rounded text-amber-300/90 hover:bg-glass-hover hover:text-amber-200">
@@ -2444,9 +2590,11 @@ const runProjectChecks = useCallback(async () => {
               <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-glass-border transition-colors group-hover:bg-accent/50" />
             </div>
           )}
-          <div className={agentOpen
-            ? 'absolute inset-0 z-30 flex w-full min-h-0 min-w-0 flex-none bg-surface-0 lg:static lg:z-auto lg:w-[var(--agent-w)]'
-            : 'hidden'}
+          <div className={surface === 'agent'
+            ? 'flex min-h-0 min-w-0 flex-1 flex-col bg-surface-0'
+            : agentOpen
+              ? 'absolute inset-0 z-30 flex w-full min-h-0 min-w-0 flex-none bg-surface-0 lg:static lg:z-auto lg:w-[var(--agent-w)]'
+              : 'hidden'}
             style={{ '--agent-w': `${agentW}px` } as CSSProperties}>
             <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-surface-0">
             {/* No second "AGENT" bar above the panel's own header: the header
@@ -2457,7 +2605,11 @@ const runProjectChecks = useCallback(async () => {
               body={body}
               model={aiModel}
               onModelChange={setAiModel}
-              onAsk={async (q, hist, onStep, onMeta, signal, onText, extra) => {
+              approvalMode={approvalMode}
+              onApprovalModeChange={setApprovalMode}
+              tabs={surface === 'agent'}
+              onAsk={async (q, hist, onStep, onMeta, signal, onText, extra,
+                            onReset) => {
                 let answer = '';
                 /* A run that ends without `done` is a broken stream, not a
                    finished answer. The server always sends done on a clean
@@ -2473,10 +2625,40 @@ const runProjectChecks = useCallback(async () => {
                 let thinkBuf = '';
                 let thinkN = 0;
                 const closeThink = () => { thinkRow = null; thinkBuf = ''; };
+                const context = {
+                  tabs: panes.map((p) => p.path),
+                  diagnostics: problems.map((p) => ({
+                    path: pane?.path || '', line: p.line, col: p.col,
+                    message: p.message,
+                  })),
+                };
                 for await (const f of api.codeAgentStream(
                   q, pane?.path ?? '', body, hist, signal,
-                  aiModel || undefined, undefined, extra, true)) {
-                  if (f.type === 'delta' && f.text) {
+                  aiModel || undefined, undefined, extra,
+                  approvalMode === 'auto-edit' || approvalMode === 'auto-all',
+                  approvalMode === 'read-only',
+                  context,
+                  approvalMode === 'auto-all',
+                  codeSession)) {
+                  if (f.type === 'plan' && Array.isArray(f.steps)) {
+                    closeThink();
+                    onStep({ label: 'plan', kind: 'plan', plan: f.steps });
+                  } else if (f.type === 'verify') {
+                    closeThink();
+                    onStep({
+                      label: 'verify',
+                      detail: f.ok
+                        ? `passed · ${f.checked ?? 0} check(s)`
+                        : (f.error || 'verification failed'),
+                      kind: f.ok ? 'ok' : 'err',
+                    });
+                    if (f.retry) {
+                      onReset?.();
+                      answer = '';
+                    }
+                  } else if (f.type === 'status' && f.text) {
+                    onStep({ label: 'status', detail: f.text, kind: 'status' });
+                  } else if (f.type === 'delta' && f.text) {
                     closeThink();
                     answer += f.text;
                     onText?.(f.text);
@@ -2504,6 +2686,14 @@ const runProjectChecks = useCallback(async () => {
                          collapsed and re-expanded it by hand.) */
                       refreshFromDisk();
                       setAgentMarks((m) => ({ ...m, [w.path]: w.marks }));
+                      /* The rail is the agent surface's only view of what is
+                         unreviewed, and the mount-time fetch cannot see a write
+                         that happens after the page opened. Record it here, at
+                         the moment the tool result says it really landed. */
+                      setAgentChanges((cs) => [
+                        ...cs.filter((c) => c.path !== w.path),
+                        { path: w.path, tool: w.tool, diff: w.diff },
+                      ]);
                       setSyncPath(w.path);
                     }
                     onStep({ id: f.id, label: f.name ?? 'tool',
@@ -2520,6 +2710,7 @@ const runProjectChecks = useCallback(async () => {
                         path: String(f.path || ''),
                         tool: String(f.tool || ''),
                         marks: parseUnifiedMarks(String(f.diff || '')),
+                        diff: String(f.diff || ''),
                       });
                     }
                   } else if (f.type === 'permission') {
@@ -2534,15 +2725,24 @@ const runProjectChecks = useCallback(async () => {
                         path: String(f.path || ''),
                         tool: String(f.tool || ''),
                         marks: parseUnifiedMarks(String(f.diff || '')),
+                        diff: String(f.diff || ''),
                       });
                     }
                     setPendingEdit({
                       id: String(f.id || ''), tool: String(f.tool || 'write'),
                       summary: String(f.summary || ''), diff: String(f.diff || ''),
+                      rememberable: f.rememberable === true,
                     });
                     onStep({ id: f.id, label: f.tool ?? 'write',
                              detail: f.summary ?? 'waiting for your approval',
                              kind: 'ask' });
+                  } else if (f.type === 'exec' && f.standing) {
+                    /* A command the operator already stood up for this session.
+                       It runs, but it says so on the transcript: a standing
+                       approval must never look like a silent one. */
+                    onStep({ label: String(f.tool ?? 'run_command'),
+                             detail: `${String(f.summary || '')} (allowed earlier this session)`,
+                             kind: 'call' });
                   } else if (f.type === 'thinking' && f.text) {
                     if (thinkRow === null) { thinkRow = `think-${thinkN++}`; thinkBuf = f.text; }
                     else thinkBuf += f.text;
@@ -2588,6 +2788,32 @@ const runProjectChecks = useCallback(async () => {
             />
           </div>
           </div>
+
+          {/* The agent surface's right column. On the IDE surface the same
+              information lives in the editor's status strip, where it belongs
+              because you are looking at the file; here the transcript owns the
+              window, so the changes need their own place — with a per-hunk
+              undo, because one wrong edit in a four-file turn should not cost
+              the user the other three. */}
+          {surface === 'agent' && (
+            <ChangesRail
+              changes={agentChanges}
+              busy={reviewBusy ? (agentChanges[0]?.path ?? null) : null}
+              onKeep={(p) => void keepChange(p)}
+              onRevert={(p) => void revertChange(p)}
+              onResolved={(p) => {
+                setAgentChanges((cs) => cs.filter((c) => c.path !== p));
+                setAgentMarks((m) => {
+                  if (!(p in m)) return m;
+                  const next = { ...m };
+                  delete next[p];
+                  return next;
+                });
+              }}
+              onChanged={reloadChanges}
+              onOpen={(p) => { setSurface('ide'); void open(p); }}
+            />
+          )}
         </div>
 
         {/* Stale-source notice */}
@@ -2611,7 +2837,7 @@ const runProjectChecks = useCallback(async () => {
             about every file here; printing them cost attention every second
             and told the user nothing they could act on. The problems count
             lives on the Problems tab directly above, so it is not repeated. */}
-        <div className="ide-status flex flex-none items-center gap-x-3 overflow-hidden whitespace-nowrap border-t border-glass-border bg-surface-0 px-3 py-0.5 text-[10.5px] text-zinc-muted">
+        <div className={`ide-status flex flex-none items-center gap-x-3 overflow-hidden whitespace-nowrap border-t border-glass-border bg-surface-0 px-3 py-0.5 text-[10.5px] text-zinc-muted${surface === 'agent' ? ' hidden' : ''}`}>
           <span className="hidden flex-none items-center gap-1 text-zinc-500 xl:flex"
                 title="The coding agent writes straight to the workspace; every change is marked in the editor and can be kept or reverted per file afterwards.">
             <ShieldQuestion size={10} /> agent writes
@@ -2726,7 +2952,7 @@ const SHORTCUTS: string[][] = [
   ['Ctrl+F', 'Find in file'],
   ['Ctrl+G', 'Go to line / column'],
   ['Ctrl+,', 'This list'],
-  ['Ctrl+S', 'Nothing — drafts are browser-only'],
+  ['Ctrl+S', 'Review and save to disk'],
   ['Ctrl+W', 'Close tab'],
   ['Ctrl+Tab', 'Next tab'],
   ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],

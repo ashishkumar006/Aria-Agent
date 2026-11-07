@@ -147,10 +147,32 @@ def surface_for(app: dict[str, Any]) -> dict[str, Any]:
     # Built from what is actually created: badge, spark and err are conditional,
     # so a hard-coded child list referenced components that were never emitted
     # and the surface failed validation on every app.
-    children: list[str] = ["title", "m"]
+    children: list[str] = ["title", "sub"]
 
+    # The stack this replaced was one flat Column of five siblings, which is
+    # why every app looked the same and none of them looked designed: the
+    # app's own name at body-text size (no `variant`), three metric cards
+    # touching a data table touching a sparkline, with nothing grouping them.
+    # The catalog already has Section, Grid and Text's `variant`; the surface
+    # just never used them. So: a heading, a caption that carries the count
+    # instead of gluing it into the title with a hyphen, an Overview section
+    # holding the metrics and the trend, and the items table in its own
+    # section under a subtitle that says how big it is.
     add({"id": "title", "component": "Text",
-         "text": f"{title} - {len(items)} item(s)"})
+         "text": title, "variant": "heading"})
+    add({"id": "sub", "component": "Text",
+         "text": (f"{len(items)} item{'s' if len(items) != 1 else ''}"
+                  + (f" · {added_n} added since last refresh" if added_n else "")
+                  + ("" if error else " · up to date")),
+         "variant": "caption"})
+    if error:
+        # The source failed. Say so IN the surface, and above the data rather
+        # than under it — a dead feed that renders an empty table below looks
+        # exactly like an app with nothing in it.
+        add({"id": "err", "component": "Callout", "tone": "bad",
+             "title": "Last refresh failed", "text": error})
+        children.append("err")
+
     add({"id": "m", "component": "MetricRow",
          "children": ["m_items", "m_added", "m_removed"]})
     add({"id": "m_items", "component": "KeyValue",
@@ -160,27 +182,28 @@ def surface_for(app: dict[str, Any]) -> dict[str, Any]:
     add({"id": "m_removed", "component": "KeyValue",
          "label": "removed", "value": str(len(removed))})
 
+    overview: list[str] = ["m"]
     if added_n:
         add({"id": "badge", "component": "Badge", "text": f"{added_n} new"})
-        children.append("badge")
+        overview.append("badge")
+    if len(series) > 1:
+        add({"id": "spark", "component": "Sparkline",
+             "series": series, "label": "items per refresh"})
+        overview.append("spark")
+    add({"id": "s_overview", "component": "Section", "title": "Overview",
+         "children": overview, "gap": "normal"})
+    children.append("s_overview")
 
     add({"id": "table", "component": "Table",
          "columns": cols, "rows": rows,
          "rowKey": str(id_field), "searchable": True, "paginated": True,
          "emptyText": "No items. Refresh to fetch."})
-    children.append("table")
-    if len(series) > 1:
-        add({"id": "spark", "component": "Sparkline",
-             "series": series, "label": "items per refresh"})
-        children.append("spark")
-    if error:
-        # The source failed. Say so IN the surface rather than leaving the
-        # board looking like an app that simply has no items - which is what a
-        # dead feed looks like next to a real empty one.
-        add({"id": "err", "component": "Card", "title": "Last refresh failed",
-             "child": "err_text"})
-        add({"id": "err_text", "component": "Text", "text": error})
-        children.append("err")
+    add({"id": "s_items", "component": "Section", "title": "Items",
+         "subtitle": (f"{min(len(items), MAX_TABLE_ROWS)} of {len(items)} rows"
+                      if len(items) > MAX_TABLE_ROWS else
+                      f"{len(items)} row{'s' if len(items) != 1 else ''}"),
+         "children": ["table"], "gap": "tight"})
+    children.append("s_items")
 
     # `root` is appended last so it can close over the real child list.
     add({"id": "root", "component": "Column", "children": children,
@@ -199,14 +222,46 @@ def surface_for(app: dict[str, Any]) -> dict[str, Any]:
 
 
 def validated_surface(app: dict[str, Any]) -> dict[str, Any]:
-    """`surface_for` plus catalog validation.
+    """The surface to show for one app.
 
-    The builder is the trusted path, but it still goes through the same
-    validator a model-generated surface does - so the Apps board is exercising
-    the validator continuously, and a bug in the builder fails here loudly
-    instead of reaching the console as an unrenderable surface.
+    An `a2ui` app was DESIGNED: the builder asked a model for a layout, and what
+    it returned was validated and stored on the spec (`get_app` hands it up as
+    `app["surface"]`). This function used to ignore that field completely and
+    rebuild the deterministic tracker board from the app's spec fields, so a
+    "Reading Goals Dashboard" built as three sections, three gauges and a weekly
+    callout reached the console as `items / added / removed` over an empty
+    two-column table. Every layout the agent made was discarded at read time —
+    which is the real reason the app layouts looked bad: the one you were shown
+    was not the one that was built.
+
+    So the app's own surface wins. The tracker board stays what a tracker or
+    JSON-feed app renders, and the fallback for an a2ui app whose stored surface
+    no longer validates — and that substitution is said in `notes`, not hidden.
     """
+    own = app.get("surface")
+    fallback_note = ""
+    if (isinstance(own, dict) and isinstance(own.get("components"), list)
+            and own["components"]):
+        try:
+            comps = _cat.validate_components(own["components"])
+        except _cat.CatalogError as e:
+            fallback_note = (
+                "the app's own surface no longer validates "
+                f"({str(e)[:120]}); showing the tracker view instead")
+        else:
+            return {
+                "surface": {
+                    "surfaceId": str(own.get("surfaceId") or f"app:{app.get('id')}"),
+                    "catalogId": own.get("catalogId") or _cat.CATALOG_ID,
+                    "rootComponent": own.get("rootComponent") or "root",
+                    "data": own.get("data") or {},
+                    "components": comps,
+                },
+                "notes": [],
+            }
     out = surface_for(app)
     out["surface"]["components"] = _cat.validate_components(
         out["surface"]["components"])
+    if fallback_note:
+        out["notes"] = list(out.get("notes") or []) + [fallback_note]
     return out

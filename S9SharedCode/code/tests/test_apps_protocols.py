@@ -92,10 +92,20 @@ def test_the_history_becomes_a_sparkline_series():
 
 
 def test_a_dead_source_is_stated_in_the_surface():
-    """A failed refresh must not look like an app that simply has no items."""
+    """A failed refresh must not look like an app that simply has no items.
+
+    Asserted on the callout's own fields rather than on a child Text, because the
+    error moved above the data: a dead feed rendered *below* an empty table is
+    indistinguishable from an app with nothing in it.
+    """
     s = _a2.validated_surface(_app(error="GITHUB_TOKEN expired"))["surface"]
-    err = _by_id(s, "err_text")
+    err = _by_id(s, "err")
+    assert err["component"] == "Callout"
+    assert err["props"]["tone"] == "bad"
     assert "GITHUB_TOKEN expired" in err["props"]["text"]
+    # And before the table, so the reader sees the reason before the blank rows.
+    ids = [c["id"] for c in s["components"]]
+    assert ids.index("err") < ids.index("table"), "the error sits under the data"
     # And the last good rows are still shown, so the board is not blanked.
     assert len(_by_id(s, "table")["props"]["rows"]) == 2
 

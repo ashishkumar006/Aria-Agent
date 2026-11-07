@@ -35,10 +35,19 @@ SUPPORTED = {
     ".tsv": "csv",
     ".xlsx": "xlsx",
     ".xlsm": "xlsx",
+    # An upload is also a figure source: `docgen` lifts an embedded raster out
+    # of a stored document by (page, index), and a bare image is one figure on
+    # one page. These carry no text, so they never surface in a search — they
+    # exist so a generated document can place the user's own picture. Only the
+    # two formats the renderer can embed without converting are accepted, so an
+    # upload that lists as a figure really can be drawn.
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
 }
 
 SUPPORTED_HUMAN = ("PDF", "DOCX", "Markdown", "plain text", "HTML",
-                   "CSV/TSV", "Excel (xlsx)")
+                   "CSV/TSV", "Excel (xlsx)", "PNG/JPG image (as a figure)")
 
 # The gateway's embed endpoint rejects anything over this per input.
 MAX_CHUNK_CHARS = 8000
@@ -80,7 +89,7 @@ def parse(filename: str, data: bytes) -> ParseResult:
     fn = {
         "pdf": parse_pdf, "docx": parse_docx, "md": parse_markdown,
         "txt": parse_text, "html": parse_html, "csv": parse_csv,
-        "xlsx": parse_xlsx,
+        "xlsx": parse_xlsx, "image": parse_image,
     }[kind]
     res = fn(data)
     res.doc_type = kind
@@ -741,6 +750,20 @@ def _blocks_from_text(text: str, page: int | None = None) -> list[Block]:
 
 
 # ── plain text / markdown ────────────────────────────────────────────────────
+
+def parse_image(data: bytes) -> ParseResult:
+    """A bare image: nothing to index, one figure an author can place.
+
+    The magic bytes are checked even though the extension routed here, because
+    a mislabelled file would store cleanly and then silently yield no figure
+    when a document asked for it. The warning is the point of the upload: it
+    says what the document can and cannot do with it."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n" and data[:2] != b"\xff\xd8":
+        raise UnsupportedDocument("that image (not a PNG or JPEG stream)")
+    return ParseResult(warnings=[
+        "an image has no text to search; it is available to a generated "
+        "document as a figure handle (page 1, index 0)"])
+
 
 def parse_text(data: bytes) -> ParseResult:
     return ParseResult(blocks=_blocks_from_text(_dec(data)))

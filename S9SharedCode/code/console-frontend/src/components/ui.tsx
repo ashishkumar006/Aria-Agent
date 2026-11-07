@@ -7,11 +7,11 @@ import { Link, useLocation } from 'react-router-dom';
 import { motion } from 'motion/react';
 import {
   Zap, MessageSquare, Play, Database, Search, CalendarDays, Package,
-  LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2, FileOutput,
+  LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2, FileOutput, Braces,
   TriangleAlert, Boxes, Monitor, PanelLeftClose, PanelLeftOpen,
 } from 'lucide-react';
-import { api, CONF } from '../api';
 import { openCommandPalette } from '../lib/palette';
+import { LayoutMenu } from '../lib/panes';
 import { prefetchSection } from '../lib/prefetch';
 import { useSectionActive } from './KeepAlive';
 
@@ -26,16 +26,36 @@ type HealthState = { up: boolean; checked: boolean; refresh: (fresh?: boolean) =
 
 const HealthCtx = createContext<HealthState | null>(null);
 
+/** Consecutive failed polls before the console says the gateway is down.
+ *
+ *  One blip used to be enough, and the gateway genuinely blips: its /health
+ *  shares one event loop with the ledger's sqlite writes, so a spike over the
+ *  probe budget produced a false "unreachable" that cleared on the next poll
+ *  fifteen seconds later. The user saw a wall of amber text for a healthy
+ *  system. A real outage is not fixed by waiting one more poll interval, so the
+ *  cost of two strikes is small and the cost of one is not.
+ *
+ *  A manual Retry (fresh=true) is decisive on a single failure — someone who
+ *  clicked the button asked us to check now, not to average. */
+const HEALTH_STREAK = 2;
+
 export function HealthProvider({ children }: { children: ReactNode }) {
+  // Starts optimistic and unchecked: the banner needs `checked`, so nothing
+  // can be claimed about the gateway before the first real verdict.
   const [state, setState] = useState<{ up: boolean; checked: boolean }>(
-    { up: false, checked: false });
+    { up: true, checked: false });
+  const misses = useRef(0);
   const tick = useCallback(async (fresh = false) => {
+    let ok = false;
     try {
       const h = await api.health(fresh);
-      setState({ up: h.gateway_up !== false, checked: true });
+      ok = h.gateway_up !== false;
     } catch {
-      setState({ up: false, checked: true });
+      ok = false;
     }
+    misses.current = ok ? 0 : misses.current + 1;
+    if (ok) setState({ up: true, checked: true });
+    else if (fresh || misses.current >= HEALTH_STREAK) setState({ up: false, checked: true });
   }, []);
   useEffect(() => {
     void tick();
@@ -94,6 +114,7 @@ export const RAIL: { group: string; items: { to: string; label: string; icon: Re
     { to: '/scheduler', label: 'Scheduler', icon: <CalendarDays size={16} /> },
     { to: '/skills', label: 'Skills', icon: <Package size={16} /> },
     { to: '/code', label: 'Code', icon: <Code2 size={16} /> },
+    { to: '/studio', label: 'Studio', icon: <Braces size={16} /> },
     { to: '/authoring', label: 'Authoring', icon: <FileOutput size={16} /> },
   ]},
   { group: 'Insight', items: [
@@ -377,7 +398,15 @@ export const Rail = memo(function Rail() {
   );
 });
 
-export const TopBar = memo(function TopBar({ crumb, children }: { crumb: string; children?: ReactNode }) {
+export const TopBar = memo(function TopBar({ crumb, children, panes }: {
+  crumb: string;
+  children?: ReactNode;
+  /** This view's pane-registry slug. Renders the Layout control, which is the
+   *  only restore path for a hidden pane, so it is mounted by the top bar and
+   *  never by a <Pane> — a feature must not be able to hide its own escape
+   *  hatch. Views that register nothing pass nothing. */
+  panes?: string;
+}) {
   /* Every view renders a TopBar, so this is the one place that can give each
      route an identity. `document.title` was the static "Aria · Research" on
      all fifteen routes, so a screen reader, a bookmark and the browser tab
@@ -425,7 +454,10 @@ export const TopBar = memo(function TopBar({ crumb, children }: { crumb: string;
         <span className="flex-none text-zinc-muted lg:hidden">/</span>
         <span className="max-w-[46vw] truncate text-zinc-200 sm:max-w-[280px]">{crumb}</span>
       </span>
-      <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">{children}</div>
+      <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
+        {panes && <LayoutMenu view={panes} />}
+        {children}
+      </div>
     </div>
   );
 });
@@ -463,55 +495,10 @@ export const Stat = memo(function Stat({ k, v, s, tone, accent, loading }: {
   );
 });
 
-export const Empty = memo(function Empty({ icon, title, sub }: { icon?: ReactNode; title: string; sub?: string }) {
-  return (
-    <div className="animate-fade-in-up px-5 py-14 text-center">
-      <div className="mb-3 flex justify-center text-zinc-muted animate-pulse-glow">
-        {icon || <SearchX size={32} />}
-      </div>
-      <div className="text-sm font-bold text-zinc-300">{title}</div>
-      {sub && <div className="mx-auto mt-1.5 max-w-[360px] text-xs leading-relaxed text-zinc-muted">{sub}</div>}
-    </div>
-  );
-});
-
-export const Skel = memo(function Skel({ n = 3 }: { n?: number }) {
-  return (
-    <div className="space-y-2 p-2.5 stagger">
-      {Array.from({ length: n }).map((_, i) => (
-        <div key={i} className="instrument-card p-3">
-          <div className="shimmer h-2.5 w-4/5 rounded-md" />
-          <div className="shimmer mt-2 h-2.5 w-3/5 rounded-md" />
-        </div>
-      ))}
-    </div>
-  );
-});
-
-export const Pill = memo(function Pill({ tone, children }: { tone: 'ok' | 'err' | 'warn' | 'info' | 'muted'; children: ReactNode }) {
-  const map = {
-    ok: 'border-ok/30 bg-ok-dim text-ok',
-    err: 'border-danger/30 bg-danger-dim text-danger',
-    warn: 'border-warn/30 bg-warn-dim text-warn',
-    info: 'border-info/30 bg-info-dim text-info',
-    muted: 'border-glass-border bg-glass text-zinc-400',
-  } as const;
-
-  const dotMap = {
-    ok: 'bg-ok',
-    err: 'bg-danger',
-    warn: 'bg-warn',
-    info: 'bg-info',
-    muted: 'bg-zinc-500',
-  } as const;
-
-  return (
-    <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-1 text-[10.5px] font-bold ${map[tone]}`}>
-      <span className={`h-1.5 w-1.5 rounded-full ${dotMap[tone]}`} />
-      {children}
-    </span>
-  );
-});
+/* Empty / Skel / Pill live in primitives.tsx so the rail-free studio can share
+   them without importing this module (which exports the Rail). Re-exported
+   here so every existing console import keeps working. */
+export { Empty, Skel, Pill } from './primitives';
 
 /* First focusable element on every page: a keyboard or screen-reader
    user can jump straight to the view content instead of tabbing

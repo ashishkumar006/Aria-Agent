@@ -3,6 +3,7 @@ import { Receipt } from 'lucide-react';
 import { Rail, TopBar, Empty, Skel, Stat, SkipLink } from '../components/ui';
 import { useMainId, useActivePoll, useSectionActive } from '../components/KeepAlive';
 import { api, CONF, displayTopic, type SkillRow, type TurnRow } from '../api';
+import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
 export default function Ledger() {
   const mainId = useMainId();
@@ -188,6 +189,22 @@ export default function Ledger() {
     }
   }, [scope, appliedCid]);
 
+  /* `useActivePoll` only refetches immediately when the view has been hidden
+     for a whole cadence window. A scope change is not idle time: the numbers
+     it just labelled "in this conversation" are still all-time totals until
+     the next poll. Fetch now on every scope/id change; the first mount is
+     already covered by the poll hook. */
+  const lastScopeKey = useRef('');
+  useEffect(() => {
+    const key = `${scope}|${appliedCid}`;
+    /* StrictMode runs mount effects twice; the key makes the second pass a
+       no-op while still fetching on every real scope change. */
+    if (lastScopeKey.current === key) return;
+    const changed = lastScopeKey.current !== '';
+    lastScopeKey.current = key;
+    if (changed) void load();
+  }, [scope, appliedCid, load]);
+
   useActivePoll(load, CONF.pollSlowMs);
 
   const applyScope = (s: 'all' | 'one') => {
@@ -196,10 +213,20 @@ export default function Ledger() {
     else setAppliedCid(cid.trim());
   };
 
+  /* Two blocks here are too large to wrap in place — the Scope column and the
+     node-reliability section — so their mode is read at the top level (these
+     are hooks) and applied at the block's two boundaries instead. The JSX in
+     between stays byte for byte. */
+  const scopeMode = usePaneMode('ledger.scope');
+  const reliabilityMode = usePaneMode('ledger.reliability');
+
   return (
     <div className="flex h-full flex-col lg:flex-row">
       <SkipLink />
       <Rail />
+      {scopeMode === 'collapsed'
+        ? <PaneStrip id="ledger.scope" label="Scope" />
+        : (
       <div className="flex w-full max-h-[34vh] flex-none flex-col border-b border-white/10 bg-[#0b0b0e] lg:max-h-none lg:w-[248px] lg:border-b-0 lg:border-r">
         <div className="px-3.5 pb-2 pt-3.5 text-xs font-bold tracking-wide">Scope</div>
         <div className="space-y-2 px-2.5">
@@ -242,10 +269,13 @@ export default function Ledger() {
             </>
           )}
         </div>
+        <Pane id="ledger.note">
         <div className="mt-auto hidden border-t border-white/10 px-3.5 py-2.5 text-[11px] text-zinc-muted lg:block">refresh {CONF.pollSlowMs / 1000}s</div>
+        </Pane>
       </div>
+        )}
       <main id={mainId} tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
-        <TopBar crumb="Ledger" />
+        <TopBar crumb="Ledger" panes="ledger" />
         <div className="min-h-0 flex-1 overflow-y-auto">
           {/* A failed refresh with rows still on screen used to
               look like success — the table read as current while
@@ -264,6 +294,7 @@ export default function Ledger() {
               the difference between a missing number and a wrong one.
               Likewise "lifetime" was hardcoded under a single-conversation
               scope, and "with spend" counted rows that all read $0.0000. */}
+          <Pane id="ledger.stats">
           <div className="flex flex-wrap gap-2.5 p-3.5 pb-0">
             <Stat
               k="SPEND"
@@ -278,6 +309,7 @@ export default function Ledger() {
               s={scopedCid ? 'in this conversation' : 'recorded (most recent 200)'}
               loading={!loaded} />
           </div>
+          </Pane>
           {/* ── NODE RELIABILITY ──────────────────────────────────────────
               Spend alone cannot tell you whether the work happened. This
               section answers the question a spend table hides: of the nodes a
@@ -289,6 +321,10 @@ export default function Ledger() {
               fixed vocabulary because free-text errors do not aggregate: 65
               author failures looked like 65 problems until they were grouped,
               and they were three. */}
+          {reliabilityMode === 'collapsed'
+            ? <PaneStrip id="ledger.reliability" label="Node reliability" />
+            : (
+          <>
           <div className="px-3.5 pb-1 pt-5 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">
             NODE RELIABILITY
             {nodeHealth && (
@@ -365,6 +401,8 @@ export default function Ledger() {
               </div>
             )}
           </section>
+          </>
+            )}
 
           <div className="px-3.5 pb-1 pt-5 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">SPEND BY SKILL</div>
           <section className="mx-3.5 overflow-x-auto rounded-[10px] border border-white/10 bg-[#0e0e12]">
@@ -394,6 +432,8 @@ export default function Ledger() {
               </table>
             )}
           </section>
+          <Pane id="ledger.turns">
+          <>
           <div className="px-3.5 pb-1 pt-4 text-[10.5px] font-bold tracking-[0.14em] text-zinc-muted">TURN HISTORY</div>
           <section className="mx-3.5 mb-3.5 overflow-x-auto rounded-[10px] border border-white/10 bg-[#0e0e12]">
             <table className="w-full min-w-[560px] border-collapse text-[12.5px]">
@@ -418,6 +458,8 @@ export default function Ledger() {
               </tbody>
             </table>
           </section>
+          </>
+          </Pane>
         </div>
       </main>
     </div>

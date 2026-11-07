@@ -323,6 +323,50 @@ def test_references_accept_plain_strings_untouched():
     assert "Smith, J. (2020). A title. Somewhere." in text
 
 
+def test_numbered_styles_keep_a_web_reference_url():
+    """'[1] feature flags. Web.' named no source a reader could open: the URL
+    was accepted and then dropped by every numbered style."""
+    ref = {"type": "web", "title": "feature flags vs configuration",
+           "url": "https://posthog.com/x", "container": "posthog.com"}
+    for style in ("ieee", "vancouver", "ama"):
+        out = L.format_reference(ref, L.CITATION_STYLES[style], 1)
+        assert "https://posthog.com/x" in out, (style, out)
+        assert ". Web." not in out, (style, out)
+
+
+def test_a_short_document_does_not_get_a_separate_references_page():
+    """A one-page memo rendered as three pages - body, a stranded tail, then
+    references - because the list always began with a page break."""
+    import pymupdf
+    blob, _n, _c = docgen.generate("pdf", {
+        "title": "Memo",
+        "style": "memo",
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "Proposal"},
+            {"type": "paragraph", "text": "Short body. " * 20}],
+        "references": [{"type": "web", "title": "Source",
+                        "url": "https://example.com/a"}],
+    })
+    doc = pymupdf.open(stream=blob, filetype="pdf")
+    assert doc.page_count == 1, [p.get_text() for p in doc]
+
+
+def test_a_long_report_still_starts_references_on_a_new_page():
+    import pymupdf
+    blob, _n, _c = docgen.generate("pdf", {
+        "title": "Report",
+        "blocks": [
+            {"type": "heading", "level": 1, "text": f"Section {i}"}
+            for i in range(1, 4)] + [
+            {"type": "paragraph", "text": "Body. " * 40}],
+        "references": [{"type": "web", "title": "Source",
+                        "url": "https://example.com/a"}],
+    })
+    doc = pymupdf.open(stream=blob, filetype="pdf")
+    assert "References" in doc[-1].get_text()
+    assert "References" not in doc[0].get_text()
+
+
 def test_a_reference_list_never_invents_fields():
     """A bare string must not acquire an author or a year it never had."""
     out = L.build_reference_list(
@@ -430,3 +474,16 @@ def test_paper_sizes_are_all_root_two():
             # B5 is 176x250 where root(2)*176 = 248.9. Allow the rounding
             # the standard itself introduces.
             assert abs(h - expected) <= max(1.0, w * 0.01), (name, w, h, expected)
+
+def test_an_untitled_cover_does_not_crash_the_renderer():
+    """`_norm_blocks` referenced a `title` that was not in scope, so a cover
+    block with no title made /v1/docgen return 500. Live: an author retried
+    five times and died with "NameError: name 'title' is not defined"."""
+    import pymupdf
+    blob, _n, _c = docgen.generate("pdf", {
+        "title": "Document Title",
+        "blocks": [{"type": "cover", "subtitle": "October 2026"},
+                   {"type": "paragraph", "text": "Body. " * 30}]})
+    text = "\n".join(p.get_text() for p in
+                     pymupdf.open(stream=blob, filetype="pdf"))
+    assert "Document Title" in text

@@ -187,7 +187,7 @@ def _is_useful_extract(content: str, goal: str) -> bool:
 class BrowserSkill:
     NAME = "browser"
 
-    def __init__(self, *, gateway_url: str = "http://localhost:8109",
+    def __init__(self, *, gateway_url: str = "http://127.0.0.1:8109",
                  agent_tag: str = "browser",
                  a11y_provider_pin: str | None = "gemini",
                  vision_provider_pin: str | None = None,

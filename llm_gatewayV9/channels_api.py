@@ -537,7 +537,7 @@ async def spend(session: Optional[str] = None, agent: Optional[str] = None):
 
 
 # ── control plane (out-of-band, localhost-first) ──────────────────────────
-def _loopback_only(request: Request) -> None:
+def _loopback_only(request: Request, *, allow_remote: bool = False) -> None:
     import os
     # Trusts request.client.host, which is correct for direct localhost
     # binds. Behind a reverse proxy this sees the proxy's IP instead — do
@@ -546,7 +546,15 @@ def _loopback_only(request: Request) -> None:
     host = (request.client.host if request.client else "")
     if host in ("127.0.0.1", "::1", "localhost"):
         return
-    if os.getenv("GLC_KILL_ALLOW_REMOTE") == "1":
+    # `GLC_KILL_ALLOW_REMOTE` is the emergency-stop escape hatch: an operator
+    # who is not at the machine must still be able to pull the plug. It used to
+    # be read here, which is shared by every loopback-gated route, so setting it
+    # for the kill switch ALSO opened key writes, pool writes, pairing, trust and
+    # the deploy probes to any network peer holding the gateway token — a
+    # credential plus a remote address was enough to rewrite the provider key
+    # set. The escape hatch now belongs to the kill route alone, by argument, so
+    # it cannot leak to a caller that did not ask for it.
+    if allow_remote and os.getenv("GLC_KILL_ALLOW_REMOTE") == "1":
         return
     raise HTTPException(403, "control plane is loopback-only")
 
@@ -651,10 +659,11 @@ async def control_pair(body: dict, request: Request):
 @router.post("/v1/control/kill")
 async def control_kill(request: Request):
     """Emergency stop. Disabled unless ARIA_ENABLE_KILL=1 (deliberate opt-in);
-    always loopback-only. Stops the gateway process; supervisors restart it."""
+    loopback-only unless `GLC_KILL_ALLOW_REMOTE=1` explicitly arms a remote
+    stop. Stops the gateway process; supervisors restart it."""
     import os
     import signal
-    _loopback_only(request)
+    _loopback_only(request, allow_remote=True)
     if os.getenv("ARIA_ENABLE_KILL") != "1":
         raise HTTPException(403, "kill switch disabled (set ARIA_ENABLE_KILL=1 to arm)")
     try:
@@ -684,9 +693,19 @@ async def config_keys():
             key_count = 0
         pools[provider] = {"count": key_count, "members": members}
     return {"keys": [
-        {"name": k, "set": bool(os.getenv(k))}
+        {"name": k, "set": _key_present(k)}
         for k in sorted(ALLOWED_KEYS)
     ], "pools": pools}
+
+
+def _key_present(name: str) -> bool:
+    try:
+        import secret_vault
+        if name in secret_vault.PROVIDER_KEY_VARS:
+            return secret_vault.present(name)
+    except Exception:
+        pass
+    return bool(os.getenv(name))
 
 
 class KeysBody(BaseModel):
@@ -728,17 +747,17 @@ PROVIDER_POOLS: dict[str, tuple[str, str]] = {
 def _pool_key_count(provider: str) -> int:
     """Number of KEYS in a provider's pool (not members: one Gemini key
     yields two members, gemini + gemini35lite). Count only, never values."""
-    import providers as _providers
+    import secret_vault
     single, plural = PROVIDER_POOLS[provider]
-    return len(_providers._key_list(single, plural))
+    return len(secret_vault.values_for(single, plural))
 
 
 def _pool_members(provider: str) -> list[str]:
     """Ordered pool member names for a provider (canonical + siblings),
     derived from env WITHOUT exposing values. Count only."""
-    import providers as _providers
+    import secret_vault
     single, plural = PROVIDER_POOLS[provider]
-    keys = _providers._key_list(single, plural)
+    keys = secret_vault.values_for(single, plural)
     members = [provider if i == 1 else f"{provider}-{i}" for i in range(1, len(keys) + 1)]
     if provider == "gemini":
         # Gemini keys yield a gemini + gemini35lite pair each.
@@ -780,11 +799,33 @@ async def control_keys(body: KeysBody, request: Request):
         _write_env_keys(clean)
     except Exception as e:
         raise HTTPException(500, f"failed to write .env: {type(e).__name__}")
-    for k, v in clean.items():
-        os.environ[k] = v
+    # Provider keys go into the vault, not the process environment; the
+    # dashboard's counts and presence flags read the vault. Channel and
+    # integration keys still need their env vars at call time.
+    try:
+        import secret_vault
+        provider_pairs = {k: v for k, v in clean.items()
+                          if k in secret_vault.PROVIDER_KEY_VARS}
+        if provider_pairs:
+            secret_vault.remember(provider_pairs)
+            secret_vault.scrub_again(provider_pairs.keys())
+        for k, v in clean.items():
+            if k not in secret_vault.PROVIDER_KEY_VARS:
+                os.environ[k] = v
+    except Exception:
+        for k, v in clean.items():
+            os.environ[k] = v
     try:
         db.log_call(provider="control", model="keys", status="ok",
                     call_role="control", agent="operator")
+    except Exception:
+        pass
+    try:
+        import security_audit
+        security_audit.record(
+            "admin_key_write", actor="operator",
+            ip=str(getattr(request.client, "host", "") or "")[:80],
+            target=",".join(sorted(clean.keys())))
     except Exception:
         pass
     return {"status": "ok", "saved": sorted(clean.keys()),
@@ -834,11 +875,39 @@ async def control_pool(body: PoolBody, request: Request):
         _write_env_keys(pairs)
     except Exception as e:
         raise HTTPException(500, f"failed to write .env: {type(e).__name__}")
-    os.environ[single] = clean[0]
-    if len(clean) > 1:
-        os.environ[plural] = ",".join(clean[1:])
-    else:
-        os.environ.pop(plural, None)
+    # Same rule as /v1/control/keys: a provider key must not live in
+    # `os.environ`, because the gateway process is shared with every channel
+    # adapter and writing it back here would re-open the one-line read that
+    # `secret_vault.capture_and_scrub()` closed. The vault is the store; the
+    # environment stays clean.
+    #
+    # `forget` is the half that used to be missing. Shrinking a pool to one key
+    # clears the PLURAL variable from .env and the environment, but the vault
+    # still answered for it, so `/v1/config/keys` kept reporting a sibling that
+    # the operator had just removed - and a withdrawn credential still read as
+    # present.
+    try:
+        import secret_vault
+        if single in secret_vault.PROVIDER_KEY_VARS:
+            secret_vault.remember({single: clean[0]})
+            secret_vault.scrub_again((single,))
+            if len(clean) > 1:
+                secret_vault.remember({plural: ",".join(clean[1:])})
+                secret_vault.scrub_again((plural,))
+            else:
+                secret_vault.forget((plural,))
+        else:
+            os.environ[single] = clean[0]
+            if len(clean) > 1:
+                os.environ[plural] = ",".join(clean[1:])
+            else:
+                os.environ.pop(plural, None)
+    except Exception:
+        os.environ[single] = clean[0]
+        if len(clean) > 1:
+            os.environ[plural] = ",".join(clean[1:])
+        else:
+            os.environ.pop(plural, None)
     try:
         db.log_call(provider="control", model="pool", status="ok",
                     call_role="control", agent="operator")

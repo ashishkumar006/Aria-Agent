@@ -358,3 +358,15 @@ def test_every_chat_entry_point_uses_the_same_list():
         "a chat endpoint is still hardcoding its own tool list")
     assert src.count('"gmail_query", "github_query", "slack_history"') == 1, (
         "the chat tool list is spelled out somewhere other than the definition")
+
+
+def test_chat_has_no_fixed_tool_hop_cap():
+    """A 6-hop ceiling made a legitimate multi-tool turn end in "(empty
+    answer)". Both chat paths pass max_hops=0 (no fixed ceiling); the loop's
+    repeat-stall guard and context budget still bound a real runaway."""
+    import inspect
+    src = inspect.getsource(agent_server)
+    # The one-shot and streaming calls both carry it.
+    assert src.count("max_hops=0,") >= 2, src.count("max_hops=0,")
+    # And neither chat call fell back to the old default.
+    assert "max_hops=MAX_TOOL_HOPS" not in src

@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 class ToolRegistration(unittest.TestCase):
     """mcp_server.mcp registers all tools."""
 
-    def test_49_tools_registered(self):
+    def test_tool_count_is_exactly_the_measured_catalogue(self):
         """Was 40. get_time and currency_convert were removed as redundant
         with the model's own clock and arithmetic — each was an extra round
         trip for a trivial question. read_artifact was then added so a node
@@ -64,7 +64,30 @@ class ToolRegistration(unittest.TestCase):
         # 56 = 54 + make_dir + run_command. make_dir completes the file-tool
         # set; run_command is the PowerShell escape hatch, bounded by
         # sandbox.py and guarded/audited in mcp_server.
-        self.assertEqual(len(tools), 56)
+        # 63 = 56 + the seven Blender tools that give Parts full access to a
+        # live Blender session: status, catalog, part_op, rna_get, rna_set,
+        # part_render and the approval-gated python escape hatch.
+        # 65, re-measured rather than inferred: `whats_new` (the change delta a
+        # self-wake reads) is one addition, and the number had already drifted
+        # before anyone noticed. That drift is the argument for keeping this an
+        # equality — a count nobody re-measures stops meaning anything.
+        # 66 = + `schedule_wake`: without it, only the chat path could arm a
+        # self-wake, so a planner that decided "keep watching this" had no
+        # hands — the capability existed in the product and was invisible to
+        # the one skill that was supposed to reach for it.
+        # 68 = + `search_images` and `fetch_image`. The `image` block could
+        # always be rendered; there was no way to obtain an image, so every
+        # web-researched document was text-and-charts by default rather than
+        # by choice.
+        # 85 = + the seventeen browser verbs (open, status, snapshot, read,
+        # screenshot, click, fill, press, scroll, history, wait, console,
+        # network, tab, evaluate, verify, close). Registration is
+        # unconditional; whether they reach a tool payload still depends on
+        # browser.tools, exactly as schedule_wake's does on agent.self_wake.
+        # This pin sat three counts behind for a whole slice — which is the
+        # failure mode an equality test exists to catch, and the reason the
+        # number is only ever re-measured, never derived.
+        self.assertEqual(len(tools), 85)
 
     def test_redundant_tools_are_gone(self):
         """They must not linger in the catalog or in the tool payload, or the

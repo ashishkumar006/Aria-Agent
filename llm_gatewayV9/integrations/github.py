@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from adaptors.http import shared as pooled_http
+
 
 from . import _MissingKey, _fail, _need
 
@@ -21,7 +23,7 @@ def query(*, api_method: str, owner: str = "", repo: str = "",
     headers = {"Authorization": f"Bearer {token}",
                "Accept": "application/vnd.github+json"}
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with pooled_http(20.0) as client:
             if api_method == "list_repos":
                 r = client.get("https://api.github.com/user/repos", headers=headers)
                 r.raise_for_status()

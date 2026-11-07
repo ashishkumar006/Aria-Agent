@@ -37,6 +37,24 @@ def test_gateway_url_is_ipv4_literal_not_localhost():
     assert "127.0.0.1" in gateway.GATEWAY_URL
 
 
+def test_every_gateway_call_site_is_ipv4():
+    """`gateway.py` was fixed first; the rest of the process kept its own
+    defaults and paid the penalty again. The studio cost footer took 2.05s on
+    an already-warm pool because `_session_cost_breakdown` dialled
+    `localhost`, and `browser/skill.py` — which `skills.py` constructs without
+    passing a URL — defaulted to it too. So the pin has to cover the call
+    sites, not just the one constant."""
+    assert "localhost" not in mcp._GW, f"mcp_server._GW={mcp._GW!r}"
+
+    root = pathlib.Path(gateway.__file__).resolve().parent
+    runtime = ["agent_server.py", "mcp_server.py", "notify.py",
+               "skills.py", "browser/client.py", "browser/skill.py"]
+    for name in runtime:
+        src = (root / name).read_text(encoding="utf-8")
+        assert "http://localhost:8109" not in src, (
+            f"{name} still defaults a gateway call to `localhost:8109`")
+
+
 def test_gateway_calls_share_one_pooled_client():
     """`httpx.get(...)` builds a Client per call — a fresh SSL context and CA
     bundle read every time (~1s here). One pooled keep-alive client is the

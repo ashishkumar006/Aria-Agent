@@ -43,7 +43,7 @@ def test_connection_failure_ends_the_probe(monkeypatch):
             calls.append(url)
             raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(gateway, "_client", lambda: Refused())
+    monkeypatch.setattr(gateway, "_probe_client", lambda: Refused())
     assert gateway._is_up() is False
     assert len(calls) == 1, f"probed all {len(calls)} paths after a refused connect"
 
@@ -58,9 +58,29 @@ def test_http_failure_falls_through_to_the_next_path(monkeypatch):
             calls.append(url)
             return responses.pop(0)
 
-    monkeypatch.setattr(gateway, "_client", lambda: OldGateway())
+    monkeypatch.setattr(gateway, "_probe_client", lambda: OldGateway())
     assert gateway._is_up() is True
     assert len(calls) == 2
+
+
+def test_the_probe_borrows_nothing_from_the_traffic_pool(monkeypatch):
+    """A liveness check that needs a socket from the pool it is checking is the
+    bug that made a busy gateway look dead: 16 pooled connections held by a
+    120 s upload and a 600 s vision call left none for `/health`, the probe
+    raised PoolTimeout — which is not a ConnectError — and the console said
+    "unreachable" while the gateway answered real requests in 269 ms."""
+
+    class Saturated:
+        def get(self, url, timeout=None):
+            raise httpx.PoolTimeout("no connection available")
+
+    class Listening:
+        def get(self, url, timeout=None):
+            return httpx.Response(200)
+
+    monkeypatch.setattr(gateway, "_client", lambda: Saturated())
+    monkeypatch.setattr(gateway, "_probe_client", lambda: Listening())
+    assert gateway._is_up() is True
 
 
 def test_health_reports_a_stale_value_as_down(monkeypatch):

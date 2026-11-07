@@ -45,7 +45,7 @@ retriever:
   # remember_preference because a correction often arrives mid-retrieval
   # ("no, I always want the publication date") and that turn is the only
   # place it was said out loud.
-  tools_allowed: [search_knowledge, recall_preferences, remember_preference]
+  tools_allowed: [search_knowledge, read_document, recall_preferences, remember_preference]
   temperature: 0.2         # retrieval is mostly deterministic
   # Chunk previews are the raw material the Formatter expands on, so this
   # must hold enough of them to answer from.
@@ -132,7 +132,14 @@ summariser:
 critic:
   prompt: prompts/critic.md
   temperature: 0.0         # pass/fail; we want determinism
-  max_tokens: 500
+  # 500 was the last persona still on the pre-raising number, and the one
+  # TEST_PLAN_EXECUTION.md records as changed to 1500 while the YAML never
+  # got it. It matters more than it looks: the Critic now holds read_artifact
+  # and judges the WHOLE upstream output, and a `fail` rationale is required
+  # to be specific so the recovery plan can be targeted. A JSON cut mid-token
+  # parses as nothing, which reads as a broken node and sends the run into a
+  # replan loop for a defect that never existed.
+  max_tokens: 1500
   # The Critic is auto-inserted on every outgoing edge of a `critic: true`
   # skill and is handed that node's output verbatim. It had NO tools, so the
   # moment the INPUTS spill started working (it never had — the spill loop
@@ -166,7 +173,12 @@ author:
   # only thing that stops a document being written from nothing when the
   # upstream researchers failed or were skipped, and it was used 31 times.
   # Everything else is gone.
-  tools_allowed: [render_document, read_artifact, web_search]
+  # search_images + fetch_image are the SUPPLY half of `image` blocks. The
+  # renderer could always embed a figure and the author was shown its handle, but
+  # the only source was a document the user had uploaded — so a report built from
+  # web research was text-and-charts by default, not by choice.
+  tools_allowed: [render_document, read_artifact, web_search,
+                  search_images, fetch_image]
   temperature: 0.35        # structure must be exact; prose can breathe
   # A whole document's worth of blocks. The default 2048 truncated the
   # `blocks` array mid-document, which the renderer then renders as a
@@ -189,8 +201,9 @@ deck:
   # Same reasoning as author, and the measurement agrees: deck called
   # render_document 42 times and web_search 5, and nothing else at all. The
   # fetch_url / search_knowledge / recall_preferences it carried were never
-  # called once.
-  tools_allowed: [render_document, read_artifact, web_search]
+  # called once. Image supply included for the same reason as `author`.
+  tools_allowed: [render_document, read_artifact, web_search,
+                  search_images, fetch_image]
   temperature: 0.4         # slide phrasing wants a little range
   # Raised to the provider ceiling, same reasoning as author: a deck's
   # `blocks` carry the same JSON overhead as a document's.
@@ -249,6 +262,11 @@ coder:
 
 browser:
   prompt: prompts/browser.md
+  # The browser's switches are NOT here. `browser.tools` and `browser.headed`
+  # are defined in flags.py, because the operator's kill switch has to work
+  # from the Apps page with a config service unreachable, and a second source
+  # for the same boolean is how a surface ends up half-enabled — agent tools
+  # granted while the pane refuses them.
   # The Browser skill does not go through the standard LLM-call dispatch.
   # It owns its own cascade (HTML extract → a11y text → vision SoM) and
   # routes each layer's gateway call internally. temperature / max_tokens
@@ -279,7 +297,17 @@ action:
                   # and check_channel() before picking a delivery target. It
                   # could not: neither was in this list, so the instruction
                   # was a description of a capability the node did not have.
-                  list_channels, check_channel, save_as_document]
+                  #
+                  # THE SAME BUG RECURRED. whats_new and schedule_wake were
+                  # written into prompts/action.md and registered in MCP and in
+                  # _TOOL_CATALOG, but never granted here — so the action node
+                  # was told in prose it had hands and given no schema to use
+                  # them. tests/test_prompt_truth.py now checks this grant
+                  # direction, because "documented" and "reachable" are two
+                  # different facts and only the second one is load-bearing.
+                  # schedule_wake stays behind agent.self_wake at the tool.
+                  list_channels, check_channel, save_as_document,
+                  whats_new, schedule_wake]
   temperature: 0.2
   max_tokens: 1500
   description: |
@@ -318,3 +346,63 @@ computer:
     would do. Sensitive commands return status 'pending' and wait for the
     user to approve in the UI. Use only when the user explicitly asks the
     agent to operate their computer.
+
+# Section skills. These are driven by the DAG, not the lightweight chat:
+# their tools live in the agent process because they share the persistent
+# parts/app stores and the job registry. Tools are fenced by this allowlist.
+part_analyst:
+  prompt: prompts/part_analyst.md
+  tools_allowed: [parts_list, part_get, part_analyse, part_set_view]
+  temperature: 0.1
+  max_tokens: 6000
+  description: |
+    Inspects one saved part version and reports its verdict, issues and
+    measured metrics. Read-only; never repairs, optimises or changes the
+    current version.
+
+part_engineer:
+  prompt: prompts/part_engineer.md
+  tools_allowed: [parts_list, part_get, part_analyse, part_repair,
+                  part_optimise, part_start_loop, part_job_status,
+                  part_cancel_job, part_export, part_set_view]
+  temperature: 0.2
+  max_tokens: 8000
+  description: |
+    Plans and executes measured mesh changes (repair, one pass, or a
+    bounded optimise loop) and saves every result as a new version. Never
+    invents metrics or version ids; reports the tools' real output.
+
+app_worker:
+  prompt: prompts/app_worker.md
+  tools_allowed: [app_list, app_get, app_build, app_action]
+  temperature: 0.2
+  max_tokens: 8000
+  description: |
+    Builds or changes a console A2UI app through the app tools. The app
+    builder owns the surface; this skill never invents components.
+
+# Deterministic section node used by the Apps endpoints. It skips the planner
+# and the extra LLM turn: the node metadata carries the build/action request
+# and `run_skill` invokes the existing app builder directly, still inside a
+# persisted DAG run.
+app_builder:
+  prompt: prompts/app_builder_skill.md
+  tools_allowed: []
+  temperature: 0.0
+  max_tokens: 200
+  description: |
+    Deterministic single-node DAG skill for Apps build/action requests. Used
+    by the Apps endpoints; the app builder owns the surface design.
+
+# Blender-class section skill: the bridge catalog is the source of truth for
+# operators and parameters. The headless worker and live GUI share one bridge.
+part_blender:
+  prompt: prompts/part_blender.md
+  tools_allowed: [blender_status, blender_catalog, blender_part_op,
+                  blender_part_render, blender_rna_get, blender_rna_set,
+                  blender_python]
+  temperature: 0.2
+  max_tokens: 9000
+  description: |
+    Runs real Blender operators, renders, RNA edits and Python (when enabled)
+    on a saved part, saving every successful mesh change as a new version.

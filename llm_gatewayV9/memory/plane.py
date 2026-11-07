@@ -66,6 +66,15 @@ WORKING_TTL_MINUTES = 60
 MAX_PAYLOAD_BYTES = 100_000
 
 
+# Deadline for the ONE query embed a merged recall needs. The embedder's own
+# socket timeout is 60s, which made a cold Ollama the caller's problem: of
+# 15,917 recorded searches the median was 1.4s, 1,164 passed 20s and the worst
+# hit 78.5s — and a two-character "hi" paid 35.5s of that. Keyword recall
+# answers in milliseconds without a vector, so this trades a slow search for a
+# shallower one rather than making a stranger wait.
+QUERY_EMBED_BUDGET_S = 8.0
+
+
 def _check_payload_size(value: dict | None,
                         arguments: dict | None = None) -> None:
     import json as _json
@@ -386,16 +395,28 @@ class MemoryPlane:
     async def _query_vector(self, query: str) -> list[float] | None:
         if self._embed is None:
             return None
+        # The recall HTTP route awaits this, so the embedder's own 60s socket
+        # timeout was the user-visible timeout: 1,164 of 15,917 recorded
+        # searches passed 20s, the worst at 78.5s, and the median sat at 1.4s
+        # because nomic-embed-text is fast when Ollama has it resident and
+        # takes 30-40s when it does not. Keyword recall answers in milliseconds
+        # without a vector, so a search that cannot embed in time now degrades
+        # to it instead of stalling the caller.
         try:
-            res = await self._embed(query, "retrieval_query")
-            if not res:
-                return None
-            if hasattr(res, "get") and hasattr(res, "keys"):
-                return list(res.get("embedding") or []) or None
-            return list(res)
+            res = await asyncio.wait_for(
+                self._embed(query, "retrieval_query"), QUERY_EMBED_BUDGET_S)
+        except asyncio.TimeoutError:
+            print(f"[memory] query embed exceeded {QUERY_EMBED_BUDGET_S}s; "
+                  "keyword-only recall")
+            return None
         except Exception as e:
             print(f"[memory] query embed failed ({e!r}); keyword-only recall")
             return None
+        if not res:
+            return None
+        if hasattr(res, "get") and hasattr(res, "keys"):
+            return list(res.get("embedding") or []) or None
+        return list(res)
 
     def _sources(self, drawers: list[str] | None
                  ) -> tuple[list[MemoryService], bool]:
@@ -475,7 +496,7 @@ class MemoryPlane:
                 query, history, kinds=kinds, top_k=per,
                 session_id=session_id, qvec=qvec)
         seen: set[str] = set()
-        out: list[MemoryRecord] = []
+        picked: list[MemoryRecord] = []
         versions = self._doc_versions()
         for hit in merged + legacy_hits:
             if hit.id in seen:
@@ -493,19 +514,34 @@ class MemoryPlane:
                     and hit.doc.doc_id:
                 if hit.doc.doc_id not in doc_ids:
                     continue
-            out.append(self._with_neighbors(hit) if hit.drawer == "document"
-                       else hit)
-            if len(out) >= top_k:
+            picked.append(hit)
+            if len(picked) >= top_k:
                 break
-        return out
+        if not any(h.drawer == "document" for h in picked):
+            return picked
+        # Neighbour previews used to re-load the document store once per hit —
+        # eight hits is eight reads of an 86 MB drawer, and during an indexing
+        # run each one also re-parses it, because a save invalidates the cache.
+        # One read now serves the whole result.
+        doc_records = self.drawers["document"].store.load()
+        return [self._with_neighbors(h, doc_records)
+                if h.drawer == "document" else h for h in picked]
 
-    def _with_neighbors(self, hit: MemoryRecord) -> MemoryRecord:
+    def _with_neighbors(self, hit: MemoryRecord,
+                        records: list[MemoryRecord] | None = None
+                        ) -> MemoryRecord:
         """Attach adjacent-chunk previews (same doc + version, index±1) to
         a document hit — downstream synthesis gets context without another
-        round trip. Returns a COPY; stored records are never mutated."""
+        round trip. Returns a COPY; stored records are never mutated.
+
+        `records` is the drawer, read once by the caller. Left to read it
+        itself it did so once per hit, and each read of an 86 MB store is a
+        re-parse whenever an indexing write has invalidated the cache."""
         if not hit.doc or not hit.doc.doc_id:
             return hit
-        spans = [r for r in self.drawers["document"].store.load()
+        spans = [r for r in (records
+                             if records is not None
+                             else self.drawers["document"].store.load())
                  if r.doc and r.doc.doc_id == hit.doc.doc_id
                  and r.doc.version == hit.doc.version
                  and abs(r.doc.chunk_index - hit.doc.chunk_index) == 1]

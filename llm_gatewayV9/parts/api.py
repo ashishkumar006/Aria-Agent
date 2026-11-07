@@ -77,12 +77,26 @@ async def _analyse(
     slicer: bool,
     scale: float,
     max_bytes: int,
+    weld_only: bool = False,
 ) -> dict:
-    """Shared body for both endpoints."""
+    """Shared body for both endpoints.
+
+    `weld_only` measures the mesh after the STL weld pass and nothing else.
+    Binary STL stores no shared vertices, so a perfectly good re-export
+    otherwise reports hundreds of boundary edges and coincident vertices —
+    a format artefact, not a defect. The report still shows the weld step in
+    `repair`, so the caller can see exactly what was normalised.
+    """
     from channels_api import _loopback_only
 
     _loopback_only(request)
-    options = RepairOptions()
+    options = (RepairOptions(
+        weld=True, fix_normals=False,
+        drop_degenerate_faces=False, drop_duplicate_faces=False,
+        drop_unreferenced_vertices=False, watertight=False)
+        if weld_only else RepairOptions())
+    if weld_only:
+        repair = True
     slicer_fn = slicer_callable() if slicer else None
     try:
         # The read cap lives inside the try on purpose: it raises the same
@@ -149,11 +163,17 @@ async def analyse(
     slicer: bool = False,
     scale: float = 1.0,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    weld_only: bool = False,
 ):
-    """Repair then measure. `slicer=true` adds a PrusaSlicer run (slow)."""
+    """Repair then measure. `slicer=true` adds a PrusaSlicer run (slow).
+
+    `weld_only=true` is the mesh-library default: normalise the format's
+    duplicate vertices, then measure, without claiming defects that only exist
+    because STL has no index buffer.
+    """
     return await _analyse(
         request, file, repair=repair, slicer=slicer,
-        scale=scale, max_bytes=max_bytes,
+        scale=scale, max_bytes=max_bytes, weld_only=weld_only,
     )
 
 

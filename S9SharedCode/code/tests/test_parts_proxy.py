@@ -28,7 +28,16 @@ def client(monkeypatch):
 
 
 def _install_fake(monkeypatch, payload, status=200):
-    """Replace httpx.AsyncClient with a recorder returning `payload`."""
+    """Replace httpx.AsyncClient with a recorder returning `payload`.
+
+    The token is recorded from EITHER place it can arrive. It used to be set on
+    the client at construction; the gateway clients are pooled now (building an
+    httpx client costs 230-590 ms here, and it used to happen on every proxy
+    call), so the shared client carries no headers and authorization goes on
+    each request. Recording both keeps the assertion honest - it still fails if
+    the token is missing - instead of passing because it looked in a place the
+    code no longer uses.
+    """
     seen = {"calls": [], "headers": {}}
 
     class _Resp:
@@ -44,6 +53,11 @@ def _install_fake(monkeypatch, payload, status=200):
         def __init__(self, *a, **kw):
             seen["headers"] = dict(kw.get("headers") or {})
 
+        def _note(self, kw):
+            h = kw.get("headers")
+            if h:
+                seen["headers"] = {**seen["headers"], **dict(h)}
+
         async def __aenter__(self):
             return self
 
@@ -51,12 +65,15 @@ def _install_fake(monkeypatch, payload, status=200):
             return False
 
         async def get(self, url, **kw):
+            self._note(kw)
             seen["calls"].append(("GET", url, None))
             return _Resp()
 
         async def post(self, url, files=None, json=None, **kw):
+            self._note(kw)
             seen["calls"].append(("POST", url, files))
             return _Resp()
+
 
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", _Client)

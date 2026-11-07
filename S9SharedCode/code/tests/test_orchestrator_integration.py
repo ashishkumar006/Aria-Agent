@@ -136,9 +136,69 @@ def test_fanout_three_researchers():
     assert len(formatters) == 4, [c[0] for c in fake.calls]
 
 
-# ── 3. transient failure is classified and skipped ──────────────────────────
+def test_a_completed_researcher_files_its_findings(monkeypatch):
+    """The filing hook sits on the node-completion path, which runs for EVERY
+    skill — so it must read the skill name from the graph.
 
-def test_recovery_retries_then_skips_transient():
+    It originally referenced a local that is only bound on the exception path,
+    and the first completed node of a live research run died with
+    `cannot access local variable 'skill_name'`. Nothing in this suite covered
+    it, because no test had a researcher node reach the completion loop with the
+    hook installed. That is the gap this closes, in both directions."""
+    calls: list = []
+    monkeypatch.setattr(
+        flow, "file_research_findings",
+        lambda nid, out, sid: calls.append((nid, out, sid)) or "doc-x")
+    script = {
+        "planner": _planner_reply([
+            {"skill": "researcher", "inputs": [],
+             "metadata": {"label": "r1", "question": "grid storage costs"}},
+            {"skill": "formatter", "inputs": ["n:r1"], "metadata": {}},
+        ]),
+        "researcher": {"question": "grid storage costs",
+                       "findings": "LCAS fell 18% as cell prices dropped.",
+                       "sources": [{"title": "Storage index",
+                                    "url": "https://s.dev/idx"}]},
+        "formatter": {"final_answer": "Storage got cheaper."},
+    }
+    answer, _ = _run("Why did grid storage economics change?", script,
+                     session_id="t-orch-file")
+    assert answer.strip() == "Storage got cheaper."
+    assert calls, "the researcher finished and nothing was filed"
+    nid, out, sid = calls[0]
+    assert out.get("findings") == "LCAS fell 18% as cell prices dropped."
+    assert sid == "t-orch-file"
+
+
+def test_a_memory_retriever_node_is_not_refiled_as_research(monkeypatch):
+    """`retriever` answers from chunks that are ALREADY indexed. Filing its
+    summary would put a paraphrase of the library back into the library, and a
+    second search would find the copy instead of the source.
+
+    The filing hook is keyed on the output shape for this reason: the planner
+    chooses which research-shaped skill a facet gets, and only the ones that
+    return `findings` have produced something new to keep."""
+    calls: list = []
+    monkeypatch.setattr(
+        flow, "file_research_findings",
+        lambda nid, out, sid: calls.append((nid, out, sid)) or "doc-y")
+    script = {
+        "planner": _planner_reply([
+            {"skill": "retriever", "inputs": [],
+             "metadata": {"label": "t1", "question": "what do I know about RAG"}},
+            {"skill": "formatter", "inputs": ["n:t1"], "metadata": {}},
+        ]),
+        "retriever": {"found": True, "chunks": ["rag chunk"],
+                      "summary": "You already stored a chunk about RAG."},
+        "formatter": {"final_answer": "Here is what you knew."},
+    }
+    answer, _ = _run("What do I know about RAG?", script,
+                     session_id="t-orch-retrieve")
+    assert answer.strip() == "Here is what you knew."
+    assert calls == [], f"a recall node was filed as new research: {calls}"
+
+
+# ── 3. transient failure is classified and skipped ──────────────────────────def test_recovery_retries_then_skips_transient():
     """A researcher that fails with a transient 503 is classified by
     recovery.py as `transient` and SKIPPED immediately (the gateway owns
     retries; the orchestrator must not re-plan on top of a 503). The node

@@ -186,8 +186,12 @@ async def test_the_cache_strip_retry_keeps_the_inline_system(monkeypatch):
     monkeypatch.setattr(P, "httpx", type("H", (), {"AsyncClient": _Client}))
     g = _gemini_with_cache()
 
+    # Sized to clear the provider's cache gate: upstream measures the minimum
+    # in tokens (1024) and the adapter only asks when the block could plausibly
+    # be granted, so a short block would never reach the strip-and-retry path
+    # this test exists to cover.
     await g.chat(MESSAGES, max_tokens=32,
-                 system_blocks=[{"text": "S" * 4000, "cache": True}])
+                 system_blocks=[{"text": "S" * 8000, "cache": True}])
 
     assert len(sent) == 2, sent
     for i, body in enumerate(sent):

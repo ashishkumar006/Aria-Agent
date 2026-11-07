@@ -143,6 +143,14 @@ def fake_memory(monkeypatch):
     monkeypatch.setattr(mem, "clear",
                         lambda session_id=None, drawers=None,
                         older_than=None: None)
+    # The enabled-document allowlist is a registry read, and flow.py drops the
+    # `document` drawer when it comes back empty. Left unstubbed, this suite was
+    # asking the LIVE gateway how many documents the user happens to have
+    # enabled — it passed while the library was full and went red the moment it
+    # was emptied, which is a fixture breaking its own "no network, ever"
+    # promise, not a regression in the code under test.
+    monkeypatch.setattr("agent_server._gw_enabled_doc_ids",
+                        lambda: {"doc-stub"})
     return fake
 
 
@@ -317,3 +325,36 @@ class TestMemoryContinuity:
         assert "never email passwords" in combined
         # ...while memory hits stay excluded from the formatter.
         assert "MEMORY HITS" not in combined
+
+    def test_conversation_history_reaches_the_formatter(self):
+        """History is NOT memory, and folding the two guards together broke it.
+
+        Live transcript: turn 1 the agent correctly explained self-wake; turn 2,
+        "what is this self wake capability?", it said "I do not have access to
+        any conversation history"; turn 3 it invented Kubernetes CronJobs to
+        paper over the gap. The planner HAD the history every time — but the
+        planner emits node goals, and the `formatter` writes the sentence the
+        user reads. `formatter` sat in `_MEMORY_EXCLUDED_SKILLS`, and the
+        transcript injection lived inside that same `else`, so the one skill
+        that answers follow-up questions was the one skill denied the thread.
+
+        A follow-up like "what is this X you just mentioned?" is the ordinary
+        shape of a conversation, not an edge case.
+        """
+        import skills as S
+        turns = [{"q": "can you wake yourself up after a fixed time?",
+                  "a": "Self-wake is built in but off via agent.self_wake.",
+                  "ts": 1.0}]
+        hits = [{"id": "m1", "text": "favorite composer is Mozart",
+                 "drawer": "fact", "score": 0.9, "source": "x", "keywords": []}]
+        reg = S.SkillRegistry()
+        for name in ("formatter", "coder", "critic", "distiller",
+                     "summariser", "sandbox_executor"):
+            out = S.render_prompt(reg.get(name), "what is this self wake thing?",
+                                  [], None, memory_hits=hits, prior_turns=turns)
+            assert "CONVERSATION HISTORY" in out, (
+                f"{name} writes or judges user-facing text but cannot see the "
+                f"thread it is answering in")
+            # The contamination guard is unchanged and stays intact.
+            assert "MEMORY HITS" not in out, (
+                f"{name} must stay scoped: global memory is not its input")

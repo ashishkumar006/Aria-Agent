@@ -81,7 +81,7 @@ def test_chat_refuses_empty_conversation():
 def test_chat_batch_inherits_the_guard():
     """chat_batch delegates per item to chat(), so it must inherit the 400."""
     src = (HERE / "main.py").read_text(encoding="utf-8")
-    assert "await chat(call)" in src
+    assert "await chat(call, request)" in src
 
 
 # --------------------------------------------------------------------------

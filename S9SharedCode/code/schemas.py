@@ -64,6 +64,15 @@ class Artifact(BaseModel):
     source: str
     descriptor: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # The document this artifact was indexed into in the gateway's Documents
+    # store. Bytes in `state/artifacts` are otherwise inert: nothing can search
+    # them, and the agent that produced them cannot re-read them on the next
+    # turn. This id is the way back to the chunked, embedded copy.
+    document_id: str = ""
+    # Which section made it ("authoring", "research", "web", …) and for which
+    # run, so a stored artifact can be found again by origin alone.
+    origin: str = ""
+    session_id: str = ""
 
 
 # ── Goals & Observations ────────────────────────────────────────────────────
@@ -115,6 +124,31 @@ class NodeSpec(BaseModel):
     skill: str
     inputs: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+    # The planner prompt tells the model to write these on the node, and
+    # Pydantic was discarding all three: an undeclared top-level field is
+    # dropped in silence, so `metadata` came back empty for every sibling,
+    # `researcher` found no `question`, and six facet-scoped researchers each
+    # got the same run-level USER_QUERY. Declared now, and folded into
+    # `metadata` by `merged()` — which is the only channel skills read.
+    goal: str = ""
+    question: str = ""
+    depth: str = ""
+    label: str = ""
+
+    def merged(self) -> dict:
+        """`metadata`, with the declared top-level fields folded in.
+
+        Explicit metadata wins, so a plan that already spells `metadata.question`
+        keeps working unchanged."""
+        out = dict(self.metadata or {})
+        for key, val in (("goal", self.goal), ("depth", self.depth),
+                         ("label", self.label)):
+            if val and not out.get(key):
+                out[key] = val
+        q = self.question or self.goal
+        if q and not out.get("question"):
+            out["question"] = q
+        return out
 
 
 # Session 9: structured failure taxonomy for the Browser skill. Other skills

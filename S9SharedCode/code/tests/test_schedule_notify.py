@@ -258,3 +258,93 @@ def test_a_zero_budget_thread_is_never_nudged(ack_store):
         data["sch-1"]["last_agent_msg"] = time.time() - 9999
         ack._save(data)
     assert ack.due_for_nudge() == []
+
+
+# ── the message is the nudge discriminator, by contract ────────────────────
+def test_a_message_makes_it_a_nudge_however_work_shaped_the_query_reads():
+    """`schedule_task` documents `message` as THE nudge discriminator, and this
+    pins that no field-presence heuristic quietly redefines it.
+
+    The live row that motivated changing this — `sch-1d2034f0`, query
+    `whats_new surfaces=documents`, message "Checking for new documents...",
+    delivered the promise and ran nothing — is a real and bad outcome. But
+    making a non-empty query force a run does not fix it: every pure reminder
+    also stores a query ("take a break and refocus" is one), so that rule sent
+    every nudge through planner -> researcher -> formatter and billed four or
+    five model calls to say "stretch". `tests/test_reminder_routing.py` is the
+    suite that proved it, and it is the reason the discriminator is the message
+    and nothing else.
+
+    The ambiguity is therefore a CREATION-time choice the model must make, and
+    it is documented in three places that now agree: the tool docstring,
+    `prompts/action.md`, and `_platform_capabilities`. If you want a stronger
+    guarantee, the place to build it is the tool's response (say plainly "no
+    task will run"), not the fire path.
+    """
+    import scheduler as s
+    # A message wins, even over an instruction-shaped query. That IS the nudge.
+    assert s._is_nudge_only({"query": "whats_new surfaces=documents",
+                             "notify_policy": {"message": "Checking..."}}) is True
+    # A pure reminder is free.
+    assert s._is_nudge_only({"query": "",
+                             "notify_policy": {"message": "Stretch."}}) is True
+    # Whitespace is not a message; that job still runs.
+    assert s._is_nudge_only({"query": "check the weather",
+                             "notify_policy": {"message": "   "}}) is False
+    # No message at all: the query is the work and the DAG runs.
+    assert s._is_nudge_only({"query": "check the weather",
+                             "notify_policy": {}}) is False
+
+
+def test_the_delivered_message_carries_the_answer_too(tmp_path, monkeypatch):
+    """A job that runs delivers what it FOUND.
+
+    The defect this guards is `text = custom or (answer, query)` on the channel
+    branch: when a message was present it replaced the result, so even a run
+    that genuinely happened was reported to the user as the sentence that had
+    promised it. Under the nudge contract a message means the job did not run,
+    so the reachable case is the one below — no message, a real run — and what
+    must arrive is the answer.
+    """
+    import scheduler as s
+    import json as _json
+    monkeypatch.setattr(s, "_SCHED_PATH", tmp_path / "schedules.json")
+    monkeypatch.setattr(s, "_LOG_PATH", tmp_path / "scheduler.log")
+    s._SCHEDULES.clear()
+    s._HEAP.clear()
+    sid = s.schedule("summarise the new documents", "in 1 hour",
+                     channel="telegram")
+    spec = dict(s._SCHEDULES[sid])
+    spec["query"] = "summarise the new documents"
+
+    ran: list = []
+    delivered: list = []
+
+    class _FakeExec:
+        def run(self, query, **kw):
+            # A real coroutine, because `_fire` drives it with asyncio.run.
+            # Stubbing asyncio.run itself would have "passed" this test
+            # without proving the run path is the one that executes.
+            ran.append(query)
+
+            async def _answer():
+                return "Two documents arrived: solar and wind."
+
+            return _answer()
+
+    import flow
+    monkeypatch.setattr(flow, "Executor", _FakeExec)
+    monkeypatch.setattr(s, "_deliver",
+                        lambda s_, ch, text, sess, fu="": delivered.append((ch, text)))
+    monkeypatch.setattr(s, "_record", lambda *a, **k: None)
+
+    s._fire(sid, spec)
+
+    assert ran == ["summarise the new documents"], (
+        "a job with no authored message must run its query")
+    assert delivered, "nothing was delivered"
+    ch, text = delivered[0]
+    assert "Two documents arrived" in text, (
+        f"the answer was dropped: {text!r}")
+    assert not s._is_nudge_only(spec), (
+        "a job with no message must not be classified as a nudge")

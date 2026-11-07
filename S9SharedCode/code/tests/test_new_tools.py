@@ -547,9 +547,11 @@ class TestWiring:
     def test_allowed_names_resolve(self):
         cfg = yaml.safe_load(
             (ROOT / "agent_config.yaml").read_text(encoding="utf-8"))
+        import local_tools
+        known = set(_TOOL_CATALOG) | set(local_tools.LOCAL_TOOL_NAMES)
         for skill, conf in cfg.items():
             for t in (conf or {}).get("tools_allowed") or []:
-                assert t in _TOOL_CATALOG, f"skill '{skill}' allows unknown tool '{t}'"
+                assert t in known, f"skill '{skill}' allows unknown tool '{t}'"
 
     def test_new_tools_reachable_by_a_skill(self):
         cfg = yaml.safe_load(

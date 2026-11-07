@@ -20,6 +20,33 @@
   }
   window.toast = toast;
 
+  /* ---------- token rate ----------
+     Tokens/second for one call, formatted in one place so the two calls
+     tables cannot drift apart on what "slow" means. `output_tps` counts
+     output PLUS thinking tokens over latency: a one-token answer preceded by
+     180 thinking tokens is a fast call, and dividing by `output_tokens` alone
+     is what made those rows read as 0.01 tok/s with nothing to explain them.
+     A missing rate renders as a bare dash, the way a missing override already
+     does — not as "0.0", which would claim the model generated nothing rather
+     than that the column did not exist when the row was written. */
+  const TPS_WARN = 8, TPS_SLOW = 3;
+  function tpsCell(c) {
+    const r = Number(c && c.output_tps);
+    if (!isFinite(r) || r <= 0) return '—';
+    const cls = r < TPS_SLOW ? 'err' : (r < TPS_WARN ? 'warn' : 'ok');
+    const th = Number(c.thinking_tokens) || 0;
+    return `<span class="${cls}">${r.toFixed(1)}</span>` +
+      (th ? ` <span class="badge" title="thinking tokens, included in this rate">+${th}thk</span>` : '');
+  }
+  function tpsText(c) {
+    const r = Number(c && c.output_tps);
+    const th = Number(c.thinking_tokens) || 0;
+    return `${isFinite(r) && r > 0 ? r.toFixed(1) + ' tk/s' : 'tk/s —'}` +
+      (th ? ` thinking=${th}` : '');
+  }
+  window.tpsCell = tpsCell;
+  window.tpsText = tpsText;
+
   /* ---------- command palette ---------- */
   let overlay = null, input = null, list = null, items = [], sel = 0;
 

@@ -14,7 +14,7 @@ import pytest
 SPEC_REPLY = json.dumps({
     "title": "Aqueducts", "format": "pdf",
     "blocks": [{"type": "heading", "level": 1, "text": "Findings"},
-               {"type": "paragraph", "text": "Body. " * 40}],
+               {"type": "paragraph", "text": "Body. " * 150}],
 })
 
 SETUP = {"format": "docx", "page_size": "letter", "orientation": "landscape",
@@ -33,7 +33,7 @@ def _capture_render(monkeypatch, seen):
         return {"ok": True, "artifact": "art:0123456789abcdef",
                 "filename": "x.docx", "format": kw.get("format", "pdf"),
                 "bytes": 100, "blocks": len(kw.get("blocks") or []),
-                "stats": {"words": 10, "sections": 1,
+                "stats": {"words": 151, "sections": 1,
                           "format": kw.get("format", "pdf")}}
 
     monkeypatch.setattr(mcp_server, "render_document", _fake)
@@ -90,10 +90,10 @@ def test_the_tool_call_path_honours_the_setup(monkeypatch):
         if cb:
             cb("render_document", {"format": "pdf", "title": "T",
                                    "blocks": [{"type": "paragraph",
-                                               "text": "x"}]},
+                                               "text": "x " * 160}]},
                True, json.dumps({"ok": True, "artifact": "art:0123456789abcdef",
                                  "filename": "t.pdf", "format": "pdf",
-                                 "stats": {"words": 5}}),
+                                 "stats": {"words": 160}}),
                0.2)
             # `args` is the very dict the dispatcher will read.
             captured.update(kw and {} or {})

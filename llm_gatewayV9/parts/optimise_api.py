@@ -29,6 +29,8 @@ from . import optimise as O
 from .export import to_binary_stl
 from .mesh import DEFAULT_MAX_BYTES, Mesh
 from .report import analyse_part
+from .repair import APPLIED, RepairOptions, repair_mesh
+from .preview import fast_preview
 from .errors import PartError
 
 
@@ -178,6 +180,76 @@ async def optimise_part(
     return body
 
 
+@router.post("/v1/parts/metrics")
+async def part_metrics(
+    request: Request,
+    file: UploadFile = File(...),
+    scale: float = 1.0,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+):
+    """Measure the uploaded mesh without shipping render buffers.
+
+    `/geometry` decimates to keep the viewer payload bounded, so its metrics
+    describe the preview, not the uploaded part. The library needs the real
+    upload's counts and volume; this endpoint returns only those.
+    """
+    mesh = await _load(request, file, scale, max_bytes)
+    metrics = await run_in_threadpool(O.measure, mesh)
+    return {
+        "schema_version": "1",
+        "source_format": mesh.source_format,
+        "metrics": metrics.to_dict(),
+        "objective": round(O.score(metrics), 6),
+    }
+
+
+@router.post("/v1/parts/repair")
+async def repair_part(
+    request: Request,
+    file: UploadFile = File(...),
+    scale: float = 1.0,
+    watertight: bool = True,
+    fix_normals: bool = True,
+    weld: bool = True,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+):
+    """Repair a mesh and return the repaired STL, not just a report.
+
+    `/analyse` reports what a repair *would* do; without the bytes a client can
+    only describe the fix, never keep it. This endpoint is the one operation
+    that both measures the repair and hands back the result, so the agent can
+    store it as a version.
+    """
+    mesh = await _load(request, file, scale, max_bytes, weld=False)
+    before = await run_in_threadpool(O.measure, mesh)
+    opts = RepairOptions(
+        weld=weld,
+        fix_normals=fix_normals,
+        watertight=watertight,
+        drop_degenerate_faces=True,
+        drop_duplicate_faces=True,
+        drop_unreferenced_vertices=True,
+    )
+    try:
+        result = await run_in_threadpool(repair_mesh, mesh, opts)
+    except PartError as exc:
+        raise HTTPException(422, detail={
+            "code": exc.code, "message": exc.message}) from exc
+    after = await run_in_threadpool(O.measure, result.mesh)
+    changed = any(s.status == APPLIED and s.changed > 0 for s in result.steps)
+    return {
+        "schema_version": "1",
+        "pass": "repair",
+        "changed": changed,
+        "steps": [s.to_dict() for s in result.steps],
+        "metrics_before": before.to_dict(),
+        "metrics_after": after.to_dict(),
+        "objective_before": round(O.score(before), 6),
+        "objective_after": round(O.score(after), 6),
+        "result_stl_base64": _stl_b64(result.mesh) if changed else None,
+    }
+
+
 @router.post("/v1/parts/geometry")
 async def part_geometry(
     request: Request,
@@ -192,20 +264,41 @@ async def part_geometry(
     or a base64 string: that is the form a WebGL buffer wants, and it keeps
     the payload inspectable in a client test.
     """
-    mesh = await _load(request, file, scale, max_bytes)
-
+    # Large previews skip the full repair weld: vertex clustering merges the
+    # STL's duplicated corners for free, and repairing first cost ~5s on a
+    # million-face scan before any preview work began.
+    mesh = await _load(request, file, scale, max_bytes, weld=False)
     limit = int(max_faces or MAX_RENDER_FACES)
     metrics = O.measure(mesh)
 
+    def _weld(m):
+        fixed = repair_mesh(m, RepairOptions(weld=True, fix_normals=False))
+        return getattr(fixed, "mesh", None) or m
+
     if metrics.faces > limit:
-        res = await run_in_threadpool(O.decimate, mesh, limit)
-        if res.changed:
-            mesh = res.mesh
-            metrics = O.measure(mesh)
-            note = f"decimated from {res.before.faces} to {metrics.faces} faces"
+        original_faces = metrics.faces
+        if metrics.faces > 300_000:
+            mesh, changed = await run_in_threadpool(fast_preview, mesh, limit)
+            if changed:
+                metrics = O.measure(mesh)
+                note = (f"preview simplified from {original_faces} to "
+                        f"{metrics.faces} faces")
+            else:
+                note = "preview unchanged"
         else:
-            note = res.note
+            mesh = await run_in_threadpool(_weld, mesh)
+            metrics = O.measure(mesh)
+            res = await run_in_threadpool(O.decimate, mesh, limit)
+            if res.changed:
+                mesh = res.mesh
+                metrics = O.measure(mesh)
+                note = f"decimated from {res.before.faces} to {metrics.faces} faces"
+            else:
+                note = res.note
     else:
+        # Normal-size payloads keep the indexed form the viewer expects.
+        mesh = await run_in_threadpool(_weld, mesh)
+        metrics = O.measure(mesh)
         note = "as uploaded"
 
     if metrics.faces > MAX_RENDER_FACES:

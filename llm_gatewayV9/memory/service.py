@@ -386,10 +386,35 @@ class MemoryService:
                     self.index.persist()
         return item
 
+    def _persist_embedded_many(self, items: list[MemoryRecord]) -> int:
+        """Batch sibling of `_persist_embedded(..., persist=False)`.
+
+        One store rewrite for the whole batch instead of one per record — the
+        document indexer's 16-chunk batch used to cost 16 full 86 MB
+        serialisations, each holding the store lock for ~4.5 s, which is what
+        made a search wait 35 s. FAISS adds stay per record (they are
+        in-memory); the caller flushes the index file once with
+        `persist_index()`.
+        """
+        if not items:
+            return 0
+        for it in items:
+            if it.embedding is not None and it.kind in EMBEDDABLE_KINDS:
+                self._check_dim(it.embedding)
+        self.store.append_many(items)
+        if self.index is not None:
+            with self._write_lock:
+                with self._persist_lock:
+                    for it in items:
+                        if (it.embedding is not None
+                                and it.kind in EMBEDDABLE_KINDS):
+                            self.index.add(it.id, it.embedding)
+        return len(items)
+
     def persist_index(self) -> None:
         """Flush the in-memory FAISS index to disk. Call once
-        after a bulk `_persist_embedded(..., persist=False)`
-        loop; a no-op when no index is loaded."""
+        after a bulk `_persist_embedded(..., persist=False)` or a
+        `_persist_embedded_many` loop; a no-op when no index is loaded."""
         if self.index is None:
             return
         with self._persist_lock:
