@@ -97,5 +97,107 @@ class TestAppFromGoal:
         assert _app_from_goal("") is None
 
 
+# ── the judge gets a factual action history (it is otherwise stateless) ──────
+
+class TestJudgeHistory:
+    def _capture(self, history):
+        seen = {}
+
+        def fake_chat(system, user, schema):
+            seen["user"] = user
+            return {"verdict": "done"}
+
+        sk = ComputerUseSkill(llm_chat=fake_chat, llm_vision=None)
+        sk._judge_a11y("goal", "[0] Button x", 1, "app", None, history=history)
+        return seen["user"]
+
+    def test_history_is_included(self):
+        u = self._capture(["click 5 -> ok", "type 12 -> ok"])
+        assert "HISTORY" in u
+        assert "click 5 -> ok" in u
+        assert "type 12 -> ok" in u
+
+    def test_no_history_no_block(self):
+        assert "HISTORY" not in self._capture([])
+
+
+# ── a mid-run re-acquire must NOT relaunch an already-running app ────────────
+
+class TestAcquireNoRelaunch:
+    def test_disallowed_launch_does_not_relaunch(self, monkeypatch):
+        import computer_use.engine as E
+        calls = []
+
+        class _FD:
+            def __call__(self, tool, args=None, timeout=60):
+                calls.append(tool)
+                if tool == "get_accessibility_tree":
+                    return {"windows": [{"pid": 1, "window_id": 99,
+                                         "title": "Calculator"}]}
+                return {"ok": True, "apps": []}
+
+        orig = E.daemon.call
+        E.daemon.call = _FD()
+        try:
+            sk = ComputerUseSkill(llm_chat=lambda *a, **k: None, llm_vision=None)
+            sk.safety.mode = "live"
+            sk.safety.needs_approval = lambda *a, **k: False
+            pid, _wid = sk._acquire_target("notepad", allow_launch=False)
+        finally:
+            E.daemon.call = orig
+        # The point: it must NOT relaunch. (It may fall back to an existing
+        # window, but it must not spawn a new one.)
+        assert "launch_app" not in calls, "relaunched despite allow_launch=False"
+
+
+# ── change-detection settle (wait for the tree to update, not a fixed sleep) ──
+
+class TestWaitForTreeChange:
+    def test_returns_after_change_and_stabilize(self, monkeypatch):
+        import computer_use.engine as E
+        seq = [{"tree_markdown": "OLD"}, {"tree_markdown": "NEW"},
+               {"tree_markdown": "NEW"}]
+        calls = {"n": 0}
+
+        class _FD:
+            def __call__(self, tool, args=None, timeout=60):
+                if tool == "get_window_state":
+                    i = min(calls["n"], len(seq) - 1)
+                    calls["n"] += 1
+                    return seq[i]
+                return {"ok": True}
+
+        orig = E.daemon.call
+        E.daemon.call = _FD()
+        monkeypatch.setattr(E.time, "sleep", lambda *a, **k: None)
+        try:
+            sk = ComputerUseSkill(llm_chat=lambda *a, **k: None, llm_vision=None)
+            sk._wait_for_tree_change(1, 99, {"tree_markdown": "OLD"}, cap_polls=10)
+        finally:
+            E.daemon.call = orig
+        assert calls["n"] >= 3, calls["n"]  # old, new, new(stable)
+
+    def test_caps_when_no_change(self, monkeypatch):
+        import computer_use.engine as E
+        calls = {"n": 0}
+
+        class _FD:
+            def __call__(self, tool, args=None, timeout=60):
+                if tool == "get_window_state":
+                    calls["n"] += 1
+                    return {"tree_markdown": "SAME"}
+                return {"ok": True}
+
+        orig = E.daemon.call
+        E.daemon.call = _FD()
+        monkeypatch.setattr(E.time, "sleep", lambda *a, **k: None)
+        try:
+            sk = ComputerUseSkill(llm_chat=lambda *a, **k: None, llm_vision=None)
+            sk._wait_for_tree_change(1, 99, {"tree_markdown": "SAME"}, cap_polls=5)
+        finally:
+            E.daemon.call = orig
+        assert calls["n"] == 5, "should poll to the cap then give up"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

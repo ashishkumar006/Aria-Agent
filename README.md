@@ -2,7 +2,7 @@
 
 Aria is a self-hosted AI agent — an AI gateway, an agent server with a DAG orchestrator, and a web console. It runs on your machine, uses your own model keys (or runs fully local), and is built to carry out real work across the tools you already use, not just hold a conversation.
 
-This document explains, in full, what Aria is, what it can do, how the pieces fit together, how to run it, and where its limits are. The module-by-module engineering detail lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+This document explains, in full, what Aria is, what it can do, how the pieces fit together, how to run it, how to verify it, and where its limits are. The module-by-module engineering detail lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
@@ -22,13 +22,18 @@ This document explains, in full, what Aria is, what it can do, how the pieces fi
    - [Model Lab](#model-lab)
    - [3D parts](#3d-parts)
 3. [How it works](#how-it-works)
+   - [The agent loop](#the-agent-loop)
+   - [Tools and the gateway](#tools-and-the-gateway)
+   - [Models and routing](#models-and-routing)
+   - [Reliability: empty completions and recovery](#reliability-empty-completions-and-recovery)
 4. [The agents](#the-agents)
 5. [The console](#the-console)
 6. [Running Aria](#running-aria)
-7. [Security and privacy](#security-and-privacy)
-8. [Design principles](#design-principles)
-9. [Current limitations](#current-limitations)
-10. [Project layout](#project-layout)
+7. [Verifying Aria](#verifying-aria)
+8. [Security and privacy](#security-and-privacy)
+9. [Design principles](#design-principles)
+10. [Current limitations](#current-limitations)
+11. [Project layout](#project-layout)
 
 ---
 
@@ -75,10 +80,10 @@ Grounding is per-conversation and controllable: a document can be enabled or dis
 Research is a pipeline, not a single "search and summarize" call:
 
 1. The **planner** turns the question into a plan with several angles (facets).
-2. The work is **fanned out across multiple researcher agents in parallel**, each covering a different angle and reading multiple live sources.
+2. The work is **fanned out across multiple researcher agents in parallel**, each covering a different angle and reading multiple live sources (web search, fetch, arXiv, Wikipedia, OpenAlex, news, PDF, tables, Wayback).
 3. A **distiller** consolidates the findings into one structured report, recording conflicts and caveats rather than smoothing them over.
 
-Because the researchers run in parallel and the report is assembled from their actual findings, a broad question gets broad coverage instead of a thin paragraph. Each researcher files its findings as a document in the Research section, so the evidence is durable and searchable afterward.
+Because the researchers run in parallel and the report is assembled from their actual findings, a broad question gets broad coverage instead of a thin paragraph. Each researcher files its findings as a document in the Research section, so the evidence is durable and searchable afterward. A **critic** node can be inserted to review a distiller's output and send it back for another pass.
 
 ### Authoring (documents)
 
@@ -89,7 +94,7 @@ Aria produces real files, not descriptions of files. Ask for a report, deck, or 
 3. Stores the bytes in a content-addressed artifact store.
 4. Returns a receipt and file list taken from the renderer, never from the model's own claim.
 
-The result is a real download with a preview, not text in the chat that you have to reformat. A model that claims an artifact it did not produce is treated as untrusted: only an id the store can resolve is ever shown or linked, so a download button never appears for a file that does not exist.
+The result is a real download with a preview, not text in the chat that you have to reformat. A model that claims an artifact it did not produce is treated as untrusted: only an id the store can resolve is ever shown or linked, so a download button never appears for a file that does not exist. The authoring node always has research above it — a document is written from findings, not from nothing.
 
 ### Studio (the coding workspace)
 
@@ -100,29 +105,29 @@ Studio is a full coding agent and workspace, separate from the sandboxed coder u
 - **Every change is reviewable.** Writes are snapshotted; changes appear as hunks you Keep or Revert, and every change sits in a checkpoint you can restore. A run is an object with an id, a status, a cost, and a JSONL transcript — so it can be stopped, listed, and replayed, not just watched live in one tab.
 - **It can verify visually.** With the browser tools enabled, the coder can open the app it just changed and check the result rather than describe what it expects.
 
-The Studio coder is a distinct agent from the DAG's sandbox coder. Today the main agent delegates to the sandbox coder; delegating to the Studio coder is the next integration.
+The Studio coder is a distinct agent from the DAG's sandbox coder. The DAG's `coder` skill writes into a throwaway sandbox; the `studio_coder` skill delegates a task to the full Studio coding agent against the session's real project roots. The system prompt for the Studio coder is `prompts/studio_coder.md`, re-read when its mtime changes (edits apply on the next message, no restart).
 
 ### Channels and integrations
 
-Aria connects to external services through the gateway, which holds the credentials and enforces policy:
+Aria connects to external services through the gateway, which holds the credentials and enforces policy. The full channel set:
 
-- **Gmail** — send email (with attachments), search and read mail.
-- **Google Calendar** — read the schedule, create events.
+- **Email** — Gmail (send with attachments, search, read) and **Zoho Mail** (send, query, reply, mark, move, delete, folders) on a custom domain.
+- **Google Calendar** and **Zoho Calendar** — read the schedule, create/list events.
 - **GitHub** — list repositories, read code, manage issues and pull requests.
 - **Notion** — read and write pages and databases.
-- **Telegram, Discord, Slack** — send messages and read history.
-- **Web search** — search and fetch pages.
+- **Chat** — Telegram, Discord, Slack, **Zoho Cliq**, **Google Chat**; plus **Bluesky**, **Mastodon**, and **ntfy** (phone push) for broadcast.
+- **Web search** — search and fetch pages (Tavily primary, DuckDuckGo fallback).
 
-The action agent loads only the channels a task needs (progressive disclosure), so a request that touches two services only pays for those two. A single instruction can span several — "summarize my unread email, check my calendar, and post the action items to Slack" — and the planner orchestrates the chain.
+The action agent loads only the channels a task needs (**progressive disclosure**: it starts with core tools and calls `load_tool_bundle("<channel>")` to append that channel's schemas mid-run), so a request that touches two services only pays for those two. A single instruction can span several — "summarize my unread email, check my calendar, and post the action items to Slack" — and the planner orchestrates the chain. The action prompt tells the model to call `list_channels()` / `check_channel()` before choosing a delivery target, so it only offers what is actually configured.
 
-The channel layer is built to extend: alongside the wired channels, the gateway already models **WhatsApp, Signal, Matrix, Microsoft Teams, LINE, Twilio (SMS/voice), and generic IMAP/SMTP** — health-probed and documented, lighting up as they are configured and given agent tools.
+The channel layer is built to extend. Adding a channel touches one place per concern — an **adaptor** (`llm_gatewayV9/adaptors/<name>/`), an **integration** (`llm_gatewayV9/integrations/<name>.py`), a **dispatch** route, an **MCP tool**, a **bundle** in `skills.py`, a **grant** in `agent_config.yaml`, and **key docs** in `key_info.py` — so a credential lives in exactly one process. The gateway already models **WhatsApp (Meta/Twilio), Signal, Matrix, Microsoft Teams, LINE, generic IMAP/SMTP, webhooks, and a local mic** alongside the wired set, health-probed and lighting up as they are configured.
 
 ### Two-way channel chat
 
 A channel is not only outbound. Aria can be **talked to** over Telegram, Gmail, or Slack:
 
 - A poller (Telegram long-poll; Gmail unread-mail poll; Slack DM/channel read) receives the message.
-- It is verified, trust-checked (only an owner/paired sender gets a turn), and turned into a normal chat turn.
+- It is verified, trust-checked (only an owner/paired sender gets a turn), and turned into a normal chat turn — the full DAG runs (`run_kind="chat"`), so the channel gets the same behaviour as the console.
 - The reply goes back on the same channel, as a real conversation with its own stable thread.
 
 So you can start a conversation from your phone or your inbox, not only from the console — and the reply arrives where you asked.
@@ -139,7 +144,7 @@ When a wake fires, if the session produced research, the most recent findings ar
 
 ### Computer use
 
-With the desktop agent enabled, Aria can control the computer: open applications, click, type, and read the screen. This is for automating GUI tasks, verifying a change visually, or driving a tool that has no API. It is gated by an approval allowlist and defaults to a dry-run mode, so nothing sensitive happens without a human. Some actions (like screenshots) require a reviewed risk classification before they run.
+With the desktop agent enabled, Aria can control the computer: open applications, click, type, and read the screen. This is for automating GUI tasks, verifying a change visually, or driving a tool that has no API. It is a perception-driven cascade (gated shell → accessibility tree → vision), gated by an approval allowlist and defaulting to a dry-run mode, so nothing sensitive happens without a human. Some actions (like screenshots) require a reviewed risk classification before they run. The judge/vision model defaults to a fast model and can be overridden by environment variable.
 
 ### Model Lab
 
@@ -147,7 +152,7 @@ Model Lab is a showcase for a 124M-parameter language model trained from scratch
 
 ### 3D parts
 
-Aria can load, measure, validate, and repair 3D meshes (STL, OBJ, 3MF, PLY) and report what is wrong with them — for 3D-printing and CAD workflows. (This capability is gateway-side; wiring it into the agent is future work.)
+Aria can load, measure, validate, and repair 3D meshes (STL, OBJ, 3MF, PLY) and report what is wrong with them — non-manifold edges, holes, inconsistent normals — for 3D-printing and CAD workflows, with a headless worker and a live Blender bridge sharing one catalog.
 
 ---
 
@@ -163,11 +168,20 @@ The graph is persisted to disk (the graph plus per-node results), which is what 
 
 Tool-using skills run a tool loop: the model calls a tool, the harness dispatches it, the result is returned, and the model continues until it produces an answer. Channel tools are thin forwarders to the gateway (`/v1/integrations/{service}/{op}`), where credentials live and policy is applied. This is why the agent never holds a secret and why a channel's configuration is the gateway's to report.
 
-The action skill uses **progressive disclosure**: it starts with core tools and calls `load_tool_bundle("<channel>")` to append that channel's schemas mid-run, so a task only pays for the channels it names.
+The tool payload a skill sees is built from `agent_config.yaml`'s `tools_allowed` filtered against the catalog in `skills.py` — a tool that is not in the catalog is dropped loudly rather than silently advertised. A test (`tests/test_prompt_truth.py`) fails if a prompt names a tool the payload does not carry, because "documented" and "reachable" are two different facts and only the second is load-bearing.
 
 ### Models and routing
 
-The gateway routes each call to a model. It evaluates the requested model's capabilities, fails over across providers when one is unavailable or rate-limited, and pins a node's hops to one provider for prompt-cache reuse. This keeps a long tool-using run both reliable and reasonably priced, and it lets the operator favor free or cheap backends while keeping a cross-vendor backstop.
+The gateway routes each call to a model. It evaluates the requested model's capabilities, fails over across providers when one is unavailable or rate-limited, and pins a node's hops to one provider for prompt-cache reuse. This keeps a long tool-using run both reliable and reasonably priced, and it lets the operator favor free or cheap backends while keeping a cross-vendor backstop. Spend is capped per call, per agent, and per session, and recorded in a ledger.
+
+### Reliability: empty completions and recovery
+
+Two failure modes are handled explicitly, because they are common on free model tiers:
+
+- **Empty completions (HTTP 200, zero text, zero tool calls).** The gateway treats an empty completion as a *failed* call, not a success: it retries the same provider (up to twice) and then fails over to the next provider. Only when the whole pool is momentarily empty does an empty reach the agent.
+- **Unusable JSON from a skill.** Every JSON-contract skill (coder, researcher, planner, author, formatter, action, …) that returns empty or malformed JSON gets **one corrective call back to the gateway** — a regenerate with its own schema quoted back — instead of being skipped. A node that still cannot produce usable output is marked failed, and the executor **re-plans around it** (splicing in a recovery subgraph and rewiring waiting nodes) rather than sinking the run.
+
+The net effect: a single bad step — a rate-limited model, a malformed reply — degrades one node, not the whole task, and the run reports honestly what is missing rather than dressing it up as success.
 
 ---
 
@@ -187,15 +201,16 @@ A skill is one role the orchestrator can dispatch. Each has its own prompt and t
 - **researcher** — gathers live evidence from the web and files its findings as documents.
 
 **Authoring**
-- **author** — writes and renders real documents (PDF, DOCX, etc.).
+- **author** — writes and renders real documents (PDF, DOCX, XLSX, etc.).
 - **deck** — renders slide decks.
 
 **Coding and interaction**
 - **coder** — writes and changes code in a sandbox; the Studio coder is the full-workspace counterpart.
+- **studio_coder** — delegates a coding task to the Studio coding agent against the session's real project.
 - **sandbox_executor** — runs code the coder produced.
-- **browser** — drives a real browser to inspect a page.
+- **browser** — drives a real browser to inspect a page (four-layer cascade: extract → deterministic → a11y → vision).
 - **computer** — controls the desktop (gated).
-- **vision_file** — understands an image or screenshot.
+- **vision_file** — understands a local image or screenshot.
 
 **Action**
 - **action** — side effects in the world: send email (with attachments), post to channels, create calendar events, schedule tasks, and continue a goal in a future turn.
@@ -247,14 +262,50 @@ cd S9SharedCode/code && uv sync && uv run agent_server.py   # :8500
 
 Copy `.env.example` to `.env` and fill in whichever provider keys you have — the gateway fails over across what is configured and runs on local models alone. Then open the console at `http://127.0.0.1:8500`.
 
-Verify a restart actually took effect:
+### Helper scripts (Windows / PowerShell)
+
+- `start_aria.ps1` starts both services (re-running reuses whatever is already listening, waits for health, opens the console). `-NoBrowser` skips the browser; `-ComputerUseMode live` enables live computer use.
+- `stop_aria.ps1` stops the listeners on both ports.
+
+```
+powershell -ExecutionPolicy Bypass -File start_aria.ps1 -NoBrowser
+powershell -ExecutionPolicy Bypass -File stop_aria.ps1
+```
+
+### Verify a restart actually took effect
 
 ```
 curl -s localhost:8500/api/health     # gateway_up must be true
 curl -s localhost:8109/health         # gateway liveness
 ```
 
-The agent and gateway must both be restarted to pick up backend changes; a running process keeps its loaded credentials and code until restarted.
+The agent and gateway must both be restarted to pick up backend changes; a running process keeps its loaded credentials and code until restarted. To restart: kill the listener on the port, then start fresh — never assume a restart happened; verify with `/api/health` (agent) and the gateway `/health`.
+
+---
+
+## Verifying Aria
+
+Run the checks after any backend or frontend change. The exact commands matter — the shims resolve the wrong interpreter otherwise.
+
+```
+# Agent tests (from S9SharedCode/code — NOT bare `uv run pytest`)
+cd S9SharedCode/code
+uv run python -m pytest tests/ -q
+
+# Gateway tests (from llm_gatewayV9 — NOT `tests/`; most suites live outside it)
+cd llm_gatewayV9
+uv run python -m pytest -q
+
+# Frontend (from console-frontend)
+cd S9SharedCode/code/console-frontend
+npx tsc --noEmit
+npm run build
+
+# Live health
+curl -s localhost:8500/api/health      # gateway_up: true
+```
+
+`S9SharedCode/code/TEST.md` is the Studio verification checklist — read it before changing a Studio surface and add to it when you add one. Scratch E2E/visual scripts live outside the repo and are deleted after the run they verify.
 
 ---
 
@@ -265,7 +316,7 @@ The agent and gateway must both be restarted to pick up backend changes; a runni
 - **File tools are confined** to the session's declared folders; paths that escape are refused, and an unreadable workspace is empty rather than inherited.
 - **Commands and writes are approval-gated**, and every command attempt is written to an audit log.
 - **Code execution is resource-bounded** — wall-clock timeout that kills the whole process tree, memory and process limits, and a credential-scrubbed environment. It is a resource boundary, not a hardened container; network access is possible, which is why commands are approval-gated.
-- **Secrets are never committed**; only `.env.example` templates are tracked.
+- **Secrets are never committed**; only `.env.example` templates are tracked. (`.env` files are additionally protected from being read by tooling.)
 
 ## Design principles
 
@@ -273,22 +324,25 @@ The agent and gateway must both be restarted to pick up backend changes; a runni
 - **Resilience.** A failed node triggers a re-plan rather than sinking the run; a single bad step does not end the task.
 - **Fail-closed on trust.** An unpaired sender gets no agent turn; an unreadable workspace is empty, not inherited.
 - **Cost-awareness.** Free/cheap backends are preferred, failover is automatic, and spend is capped per call, per agent, and per session.
+- **Lean prompts, model decides.** Prompts carry methodology and capability tables, not per-case instructions; the model chooses the route, and generic causes are fixed rather than task-special-cased.
 
 ## Current limitations
 
-- The main agent delegates to the sandbox coder, not yet the Studio coder.
+- The main agent delegates to the sandbox coder by default; the `studio_coder` node exists for real-project edits but is not yet the default path for every coding goal.
 - Inbound chat is wired for Telegram, Gmail, and Slack; other channels are outbound-only.
-- Computer use is gated (some actions need a risk classification) and defaults to dry-run.
+- Computer use is gated (some actions need a risk classification) and defaults to dry-run; GUI reliability on some apps is still being hardened.
 - The self-poll watch (`schedule_wake`) is behind a flag (off by default); time/email continuations (`schedule_self`) are always available.
-- The 3D parts module is gateway-side and not yet wired into the agent.
-- The free-tier models can intermittently return empty completions; the system retries and fails over, but a stronger model is more reliable.
+- The 3D parts module is partly gateway-side; not every capability is wired into the agent yet.
+- Free-tier models can intermittently return empty completions; the gateway retries and fails over, and the agent repairs unusable JSON, but a stronger model is more reliable under heavy bursts.
 
 ## Project layout
 
-- `S9SharedCode/code/` — the agent server, skills, executor, MCP tools, the pollers, and the React console (`console-frontend/`).
-- `llm_gatewayV9/` — the gateway: providers, channels, integrations, document generation, memory plane, policy.
-- `agent-desktop/` — an optional Electron shell over the same console.
-- `docs/ARCHITECTURE.md` — module-by-module technical detail.
+- `S9SharedCode/code/` — the agent server (`agent_server.py`), skills and executor (`skills.py`, `flow.py`), MCP tools, the pollers, computer-use, and the React console (`console-frontend/`).
+- `llm_gatewayV9/` — the gateway: providers, channels/adaptors, integrations, document generation, memory plane, policy.
+- `agent-desktop/` — an optional Electron shell over the same console (`build_desktop.ps1` at the repo root builds the portable app).
+- `docs/` — deep-dive docs: `ARCHITECTURE.md` (module-by-module), `NEW_CHANNELS.md`, `DOCUMENT_FORMATS.md`, `STUDIO_OPENCODE_PARITY.md`, and more.
+- `start_aria.ps1` / `stop_aria.ps1` — start/stop both services.
+- `AGENTS.md` — working rules for agents in this repo (layout, services, verify loop).
 
 ---
 

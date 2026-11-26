@@ -14,7 +14,7 @@ How to work:
 - Emit ONLY the action verbs below — anything else is rejected and aborts the turn.
 
 Action verbs:
-- click:        {"type":"click","element_index":N}
+- click:        {"type":"click","element_index":N}   (N = the integer in [N]; put it in element_index, NOT value/x)
 - type:         {"type":"type","element_index":N,"value":"text"}        (appends text)
 - replace_text: {"type":"replace_text","element_index":N,"value":"text"}   (overwrites)
 - press_key:    {"type":"press_key","value":"a"}  or  {"type":"press_key","value":"a","modifiers":["ctrl"]}

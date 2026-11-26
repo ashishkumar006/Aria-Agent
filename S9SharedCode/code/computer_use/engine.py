@@ -43,7 +43,8 @@ from .daemon import PreconditionError, DaemonError
 ROOT = Path(__file__).resolve().parent.parent
 
 # NOTE: the L2b/L3 model choice lives in skills.py (_COMPUTER_JUDGE_MODEL /
-# _COMPUTER_VISION_MODEL, defaulting to "" = gateway failover routing).
+# _COMPUTER_VISION_MODEL, defaulting to gemini-3.5-flash-lite — it drives
+# dialogs reliably where the weaker free model escalated). An env override wins.
 # Earlier revisions kept separate defaults here ("gemini-3.1-flash-lite")
 # that were never read — the engine only calls the injected llm_chat /
 # llm_vision callables — so they were removed to end the drift.
@@ -268,6 +269,9 @@ class ComputerUseSkill:
         last_shot_mime = "image/png"
         last_act = None
         last_act_ok = False
+        # Factual log of what this run has done (oldest first), shown to the
+        # judge each turn so the otherwise-stateless judge knows what happened.
+        history: list[str] = []
         # Generic loop-guard: track consecutive identical actions (any type).
         last_act_key: str | None = None
         repeat_count = 0
@@ -316,30 +320,49 @@ class ComputerUseSkill:
 
             # STALE WINDOW GUARD: cua-driver returns only {"text": ...} (no
             # tree_markdown / elements / snapshot_id) when the cached
-            # window_id is stale (window closed or id changed). Re-acquire
-            # the target before treating the empty tree as "still settling".
+            # window_id is stale (window closed or id changed) OR the window is
+            # still POPULATING after a launch. Re-scan with a settle first; only
+            # re-acquire if it is genuinely gone, and re-acquire WITHOUT
+            # relaunching (allow_launch=False) — relaunching an already-running
+            # app closes and reopens it (the taskbar flicker) and restarts the
+            # wait, so a slow-launching window looped forever.
             if not (state.get("tree_markdown") or state.get("elements")
                     or state.get("snapshot_id")):
-                trace.append("stale window_id → re-acquiring target")
-                new_pid, new_wid = self._acquire_target(app_hint)
-                if new_pid is not None:
-                    trace.append(f"re-acquired pid={new_pid} window={new_wid}")
-                    pid, window_id = new_pid, new_wid
-                    # Re-scan with the fresh window_id.
+                for _settle in range(3):
+                    time.sleep(1.0)
                     try:
                         state = daemon.call("get_window_state",
                                             {"pid": pid, "window_id": window_id,
                                              "include_screenshot": True}, timeout=30)
                     except Exception:
                         state = None
-                    if state is None or not (state.get("tree_markdown")
-                                            or state.get("elements")
-                                            or state.get("snapshot_id")):
-                        return self._done(False, "no-target",
+                    if state and (state.get("tree_markdown")
+                                  or state.get("elements")
+                                  or state.get("snapshot_id")):
+                        break
+                if not (state and (state.get("tree_markdown")
+                                   or state.get("elements")
+                                   or state.get("snapshot_id"))):
+                    trace.append("stale window_id → re-acquiring (no relaunch)")
+                    new_pid, new_wid = self._acquire_target(app_hint, allow_launch=False)
+                    if new_pid is not None:
+                        trace.append(f"re-acquired pid={new_pid} window={new_wid}")
+                        pid, window_id = new_pid, new_wid
+                        # Re-scan with the fresh window_id.
+                        try:
+                            state = daemon.call("get_window_state",
+                                                {"pid": pid, "window_id": window_id,
+                                                 "include_screenshot": True}, timeout=30)
+                        except Exception:
+                            state = None
+                        if state is None or not (state.get("tree_markdown")
+                                                or state.get("elements")
+                                                or state.get("snapshot_id")):
+                            return self._done(False, "no-target",
                                               trace=trace,
                                               error="target window unavailable")
-                else:
-                    return self._done(False, "no-target", trace=trace,
+                    else:
+                        return self._done(False, "no-target", trace=trace,
                                           error="target window unavailable")
 
             tree_md = state.get("tree_markdown") or ""
@@ -477,11 +500,13 @@ class ComputerUseSkill:
                 continue
 
             # L2b judgment call (cheap text model).
-            # Pre-filter the AX tree by goal keywords to bound the LLM context
-            # (charter §10: biggest cost knob is perception interpretation).
-            filtered = layers.filter_ax_markdown(tree_md, max_chars=60000)
+            # FILTER REMOVED (test): send the FULL tree so the model sees the
+            # editor's value in full (the length-based filter truncated it, so
+            # the model couldn't confirm the typed text landed and re-typed).
+            filtered = tree_md
             judge = self._judge_a11y(goal, filtered, pid, app_hint or "app", last_act,
-                                   vision_ctx=getattr(self, "_last_vision", ""))
+                                   vision_ctx=getattr(self, "_last_vision", ""),
+                                   history=history)
             if judge is None:
                 l2b_failures += 1
                 trace.append("L2b judge returned no action")
@@ -537,6 +562,27 @@ class ComputerUseSkill:
 
             # ACT (Invariant 2: re-scan happens next loop iteration)
             act = judge.get("action", {})
+            # VALIDATE the action against its type. A click with no target (no
+    # int element_index and no x/y) would no-op and loop — the model sometimes
+    # mis-fills the schema (e.g. value="element_index", x:1). Re-ask once with
+    # the same tree; if it is still targetless, skip the dispatch and re-scan.
+            if (act.get("type") == "click"
+                    and not isinstance(act.get("element_index"), int)
+                    and not ("x" in act and "y" in act)):
+                trace.append("malformed click (no target) -> re-asking judge")
+                _re = self._judge_a11y(goal, filtered, pid, app_hint or "app",
+                                       last_act,
+                                       vision_ctx=getattr(self, "_last_vision", ""),
+                                       history=history)
+                _new = (_re or {}).get("action")
+                if _new:
+                    act = _new
+                if (act.get("type") == "click"
+                        and not isinstance(act.get("element_index"), int)
+                        and not ("x" in act and "y" in act)):
+                    trace.append("still targetless click -> skip dispatch, re-scan")
+                    self._last_dispatch_error = "click had no target (element_index / x,y)"
+                    continue
             # ANTI-TOGGLE GUARD: only for CLICK actions. If the judge emits
             # the SAME click twice in a row (e.g. clicking Play, then Play
             # again after it already toggled to Pause), the goal is already
@@ -576,6 +622,14 @@ class ComputerUseSkill:
                                        turn_state=state)
             last_act, last_act_ok = act, ok
             trace.append(f"act {act.get('type')} -> {'ok' if ok else 'fail'}")
+            _hkey = act.get('element_index', act.get('value', act.get('keys', '')))
+            history.append(f"{act.get('type')} {_hkey} -> {'ok' if ok else 'fail'}")
+            if ok:
+                # The target's AX tree LAGS the action (~100ms native to ~1-2s
+                # heavy). Instead of a fixed sleep (a guess that's too short for
+                # heavy apps), poll until the tree actually CHANGES from the
+                # pre-action one and stabilizes — then the next scan is current.
+                self._wait_for_tree_change(pid, window_id, state)
             if not ok:
                 # Pass the structured reason (daemon error text), not a bare
                 # "action failed" — recovery.handle branches on substrings
@@ -705,7 +759,7 @@ class ComputerUseSkill:
                                           f"error: {type(e).__name__}")
             return False
 
-    def _acquire_target(self, app_hint: str | None):
+    def _acquire_target(self, app_hint: str | None, allow_launch: bool = True):
         """Find or launch the target app; return (pid, window_id).
 
         GENERAL launch cascade (no per-app hardcoding):
@@ -778,7 +832,7 @@ class ComputerUseSkill:
         #    installed app, incl. Store/pinned). 3) vision-locate the icon on
         #    the desktop and click it. Re-scan after each attempt; only fall
         #    back to the first window if every launch path fails.
-        if target is None and app_hint:
+        if target is None and app_hint and allow_launch:
             if self.safety.mode == "dry-run":
                 # DRY-RUN: `launch_app` and the OS-shell start are
                 # real launches (they spawn processes); only the
@@ -813,6 +867,11 @@ class ComputerUseSkill:
             except Exception:
                 pass
         if target is None:
+            if not allow_launch:
+                # Mid-run re-acquire: do NOT fall back to a random window
+                # (that would hand the stale-window guard the wrong app). If
+                # the target isn't in the tree, report none and let it re-scan.
+                return None, None
             target = wins[0]
         pid = target.get("pid")
         window_id = target.get("window_id")
@@ -843,17 +902,20 @@ class ComputerUseSkill:
     # ── L2b judgment (cheap text LLM) ────────────────────
     def _judge_a11y(self, goal: str, tree_md: str, pid: int, app_name: str,
                     last_act: dict | None = None,
-                    vision_ctx: str = "") -> dict | None:
+                    vision_ctx: str = "", history: list[str] | None = None) -> dict | None:
         if self._llm_chat is None:
             return None
         user = P.USER_A11Y_TEMPLATE.format(goal=goal, app_name=app_name, pid=pid,
                                            tree_markdown=tree_md)
-        if last_act:
-            user += ("\n\nNOTE: your previous action was "
-                     f"{last_act.get('type')} {last_act.get('element_index', last_act.get('value',''))}. "
-                     "It did NOT complete the goal. Choose a DIFFERENT next action "
-                     "(do not repeat the same element), or set verdict=done if the goal "
-                     "is already met by what is on screen.")
+        # The judge is stateless per turn (goal + current tree only). A factual
+        # HISTORY of what this run has already done gives it the context it
+        # lacks — "opened the File menu", "typed the filename" — so it advances
+        # instead of repeating. This is a log, NOT a "you failed" nudge.
+        if history:
+            hist = "\n".join(f"- {h}" for h in history[-12:])
+            user += ("\n\nHISTORY (what you have already done this run, oldest "
+                     "first):\n" + hist + "\nUse it to avoid repeating a step and "
+                     "to decide the next one.")
         if vision_ctx:
             user += (f"\n\nVISION LAYER: {vision_ctx}. The screen changed after that; "
                      "re-read the tree above before deciding.")
@@ -1095,6 +1157,51 @@ class ComputerUseSkill:
                     "click", args, f"error: {type(e).__name__}")
                 return ComputerResult(False, "L3", error=str(e))
         return ComputerResult(False, "L3", error="vision returned no clickable target")
+
+    # ── change-detection settle (replace fixed sleeps) ──────
+    @staticmethod
+    def _state_sig(state) -> str:
+        """A content signature of the AX tree (ignores the per-scan snapshot_id,
+        which changes every call). Two scans with the same visible tree hash the
+        same; a real UI change hashes differently."""
+        md = str((state or {}).get("tree_markdown") or "")
+        if not md:
+            return ""
+        import hashlib
+        return hashlib.md5(md.encode("utf-8", "replace")).hexdigest()
+
+    def _wait_for_tree_change(self, pid, window_id, prev_state, *,
+                              cap_polls: int = 15, interval: float = 0.15) -> None:
+        """After an action, poll the AX tree until it CHANGES from the pre-action
+        state and stabilizes (same content twice), instead of a fixed sleep.
+
+        Fast apps flip in ~100ms; heavy apps take 1-2s — this waits for the real
+        change rather than guessing. Caps out so a no-op action can't hang. Uses
+        include_screenshot=False (the tree is all we need to detect change; the
+        next full scan still captures the screenshot).
+        """
+        prev_sig = self._state_sig(prev_state)
+        last_sig = prev_sig
+        stable = 0
+        for _ in range(cap_polls):
+            time.sleep(interval)
+            try:
+                ns = daemon.call("get_window_state",
+                                 {"pid": pid, "window_id": window_id,
+                                  "include_screenshot": False}, timeout=20)
+            except Exception:
+                return
+            if not ns:
+                continue
+            sig = self._state_sig(ns)
+            if sig == last_sig:
+                stable += 1
+            else:
+                last_sig = sig
+                stable = 0
+            # changed from the pre-action tree AND held for 2 polls -> ready
+            if sig != prev_sig and stable >= 1:
+                return
 
     # ── action dispatch (cua-driver primitives) ─────────
     def _dispatch_action(self, pid: int, window_id, act: dict,

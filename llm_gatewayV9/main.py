@@ -1476,7 +1476,7 @@ async def chat(req: ChatRequest, request: Request):
             # so the failover ladder tries the next model.
             while not str(result.get("text") or "").strip() \
                     and not (result.get("tool_calls") or []):
-                if empty_retries >= 1:
+                if empty_retries >= 2:
                     raise P.ProviderError(
                         f"{name} returned an empty completion "
                         f"(0 text, 0 tool calls)", retryable=True)

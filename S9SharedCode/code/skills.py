@@ -40,13 +40,18 @@ from schemas import AgentResult, NodeSpec
 import os
 import threading
 
-# BUG-FIX (E): default to "" (not a concrete model) so the gateway's
-# agent_routing.yaml + failover ladder picks a working provider. An explicit
-# COMPUTER_USE_JUDGE_MODEL / COMPUTER_USE_VISION_MODEL env override is still
-# honoured. The previous non-empty default hard-pinned a single model and
-# silently disabled failover for the entire computer-use skill.
-_COMPUTER_JUDGE_MODEL = os.environ.get("COMPUTER_USE_JUDGE_MODEL") or ""
-_COMPUTER_VISION_MODEL = os.environ.get("COMPUTER_USE_VISION_MODEL") or ""
+# Default the computer-use judge + vision to gemini-3.5-flash-lite: it reliably
+# drives dialogs (open / save-as / pickers) where the weaker free model escalated
+# instead of acting (observed live: it saw "Save as" in the tree and escalated;
+# gemini-3.5-flash-lite clicked it and completed the save). An explicit
+# COMPUTER_USE_JUDGE_MODEL / COMPUTER_USE_VISION_MODEL env override still wins.
+_COMPUTER_JUDGE_MODEL = os.environ.get("COMPUTER_USE_JUDGE_MODEL") or "gemini-3.5-flash-lite"
+_COMPUTER_VISION_MODEL = os.environ.get("COMPUTER_USE_VISION_MODEL") or "gemini-3.5-flash-lite"
+# Reasoning level for the judge. Medium: it has to reason about dialog state
+# (what's open, what to click next) — the default (unset -> effectively off)
+# made it escalate with a full tree and re-type completed steps. Env
+# COMPUTER_USE_REASONING overrides (e.g. "low" to save tokens, "high" to go deep).
+_COMPUTER_REASONING = os.environ.get("COMPUTER_USE_REASONING") or "medium"
 
 # Cost ledger: track per-run LLM calls for the computer skill (charter §10).
 # The V9 gateway already records usage; this is a lightweight in-process
@@ -127,17 +132,18 @@ def _v9_judge_chat(system: str, user: str, schema: dict) -> dict | None:
     then to free-form JSON extraction — so a picky provider schema doesn't
     silently turn a valid answer into None.
 
-    NOTE: we do NOT pin `model=` here. The gateway's agent_routing.yaml +
-    failover ladder picks a working provider for agent="computer", so a
-    single rate-limited provider (e.g. Gemini free-tier) doesn't kill the run.
-    An explicit COMPUTER_USE_JUDGE_MODEL env override is still honoured.
+    NOTE: we pin `model=` to gemini-3.5-flash-lite by default (env
+    COMPUTER_USE_JUDGE_MODEL overrides) — it reliably drives dialogs where the
+    weaker free model escalated instead of acting. The gateway still fails over
+    if the pinned model is unavailable.
     """
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": user}]
-    # Only pin a model if the operator explicitly set one; otherwise let the
-    # gateway route (failover across providers).
+    # Pin the judge model (default gemini-3.5-flash-lite; env overrides). The
+    # gateway still fails over if it is unavailable.
     model_kw = {"model": _COMPUTER_JUDGE_MODEL} if _COMPUTER_JUDGE_MODEL else {}
-    common = dict(agent="computer", max_tokens=800, temperature=0.0, **model_kw)
+    common = dict(agent="computer", max_tokens=800, temperature=0.0,
+                  reasoning=_COMPUTER_REASONING, **model_kw)
     # 1) strict schema
     try:
         reply = LLM().chat(messages=messages,
@@ -6956,10 +6962,12 @@ policy_notes: list | None = None,
                 reply["output_tokens"] = int(reply.get("output_tokens") or 0) + _to
                 print(f"[skills] {skill.name}: JSON fixed by lightweight model "
                       f"({_why})")
-        # 2. Still unusable (a prose reply, or the fix failed): one regenerate
-        #    call with the contract's own schema quoted back.
+        # 2. Still unusable (empty, prose, or the fix failed): one regenerate
+        #    call with the contract's own schema quoted back. Fires even when the
+    #    reply carried an error/empty-completion — that is exactly the case a
+    #    corrective call fixes (the old `not reply.get("error")` gate skipped it).
         if (not parsed and skill.name in _JSON_CONTRACT_SKILLS
-                and not _authoritative and not reply.get("error")):
+                and not _authoritative):
             _fixed, _ti, _to = await _repair_json_reply(
                 skill, rendered, _raw, _why, session_id)
             if _fixed:
