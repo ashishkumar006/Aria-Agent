@@ -38,6 +38,32 @@ about fifteen seconds.
   slide; past that it is two slides.
 - Open with what the audience should take away, close with it again.
 
+## Design
+
+The renderer owns the visual system, so you do not hand-place colour: every
+deck gets one accent palette, a tinted paper background, a gradient cover
+panel, themed fonts and full-colour section dividers. Your job is to give it
+something worth designing.
+
+- Pick `style` for the mood; the palette and type follow it. `brief` for a
+  pitch or board deck, `technical` for an engineering talk, `academic` for a
+  lecture or research talk, `manual` for training, `report` otherwise.
+- Open each major part with a divider: a `heading` level 1 with NO body
+  blocks. The renderer turns it into a full-accent slide with the part name
+  in white. Two or three dividers give a long deck its rhythm.
+- Reach for `stats` whenever a slide is ABOUT numbers: three or four large
+  figures with short labels read in one glance, where the same numbers buried
+  in bullets read as a report. Put the figure in `value` and the meaning in
+  `label` ("401", "W/m·K — copper").
+- Reach for `columns` when two or three things are being compared in words
+  rather than numbers. Side by side, the eye reads across in parallel; as
+  three bullets it reads as a list.
+- Vary the furniture. A chart for a trend, `stats` for headline numbers, a
+  `table` for a precise comparison, `columns` for parallel points, an `image`
+  for a real visual, a `quote` for a voice. A deck that is bullets on every
+  slide reads as a report that was converted, not designed. Two bullet slides
+  in a row is the most you want before changing the register.
+
 ## The exact `blocks` shape
 
 `render_document` renders the blocks you send and IGNORES any type it does
@@ -51,6 +77,17 @@ speaker notes came out as eleven blank slides. Use these shapes verbatim:
   different thing and is dropped.
 - `{"type": "numbers", "items": ["step 1", "step 2"]}` — numbered list.
 - `{"type": "table", "header": ["Col A", "Col B"], "rows": [["a1", "b1"]]}`
+- `{"type": "stats", "items": [
+    {"value": "401 W/m·K", "label": "copper conductivity"},
+    {"value": "5.67e-8", "label": "Stefan–Boltzmann σ"}]}`
+  — one to four large figures with a short label each. `value` is the number
+  (units welcome); `label` says what it means. Use it for the figures the
+  slide is actually about.
+- `{"type": "columns", "items": [
+    {"title": "Option A", "body": "one or two sentences"},
+    {"title": "Option B", "body": "one or two sentences"}]}`
+  — two or three parallel points, rendered side by side. Use it for a
+  comparison that is conceptual rather than numeric.
 - `{"type": "chart", "kind": "bar|line|pie", "title": "...",
   "categories": ["Q1", "Q2"],
   "series": [{"name": "IVF", "data": [94, 91]}], "caption": "..."}`

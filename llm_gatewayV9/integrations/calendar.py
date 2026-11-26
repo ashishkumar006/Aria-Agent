@@ -114,6 +114,7 @@ def refresh(*, write_env: bool = True) -> dict[str, Any]:
                 "error": "GOOGLE_CALENDAR_REFRESH_TOKEN / GOOGLE_CALENDAR_CLIENT_ID / "
                          "GOOGLE_CALENDAR_CLIENT_SECRET not set"}
     try:
+        r = None
         with pooled_http(20.0) as client:
             r = client.post("https://oauth2.googleapis.com/token", data={
                 "client_id": vals["GOOGLE_CALENDAR_CLIENT_ID"],
@@ -127,7 +128,13 @@ def refresh(*, write_env: bool = True) -> dict[str, Any]:
         if not new_token:
             return {"ok": False, "error": f"no access_token in response: {resp}"}
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        detail = ""
+        try:
+            detail = (r.text[:200] if r is not None else "")
+        except Exception:
+            detail = ""
+        return {"ok": False,
+                "error": f"{type(e).__name__}: {e}" + (f" | {detail}" if detail else "")}
     if write_env:
         try:
             text = GW_ENV.read_text(encoding="utf-8") if GW_ENV.exists() else ""

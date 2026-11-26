@@ -24,6 +24,18 @@ rules:
       get_time, get_weather, currency_convert]}
     action: allow
 
+  # All first-class integration channels: any op allowed for paired/owner.
+  # The channel tools dispatch to the gateway as "<service>_<op>"
+  # (gmail_send, calendar_list, notion_call, github_list_repos, ...), so the
+  # stale tool-id list above misses them and they fall through to default-deny
+  # — which in dry-run reported "verdict deny" on calls that actually ran and
+  # made the agent report working channels as blocked. Match on channel.
+  - id: paired-channels-allow
+    when: {trust: paired, channel: [gmail, zoho_mail, calendar, github, notion,
+      telegram, discord, slack, websearch, ntfy, zoho_cliq, bluesky,
+      mastodon, google_chat]}
+    action: allow
+
   - id: paired-destructive-needs-approval
     when: {trust: paired, tool: [run_command, write_file, computer_action,
       schedule_task, kill_app]}

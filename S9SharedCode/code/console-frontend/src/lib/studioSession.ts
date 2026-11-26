@@ -75,6 +75,24 @@ export const joinPath = (root: string, rel: string): string =>
 
 export const baseName = (p: string): string => (p || '').split('/').pop() || p;
 
+/** A session's display name, one rule for every surface that shows one.
+ *
+ *  The session tabs used to read `label || 'Untitled session'` while the
+ *  switcher fell back to the folder it works in — so one row of the UI said
+ *  "kvstore" and the row above it said "Untitled session" ten times. The
+ *  folder is the thing that actually distinguishes two sessions, so it is the
+ *  fallback, and only a session with no folder is untitled. */
+export function sessionName(s: { label?: string; paths?: string[] }): string {
+  const label = (s.label || '').trim();
+  if (label) return label;
+  const paths = (s.paths || [])
+    .map((p) => p.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || p)
+    .filter(Boolean);
+  if (paths.length === 1) return paths[0];
+  if (paths.length > 1) return `${paths[0]} +${paths.length - 1}`;
+  return 'Untitled session';
+}
+
 /** Monaco's language id for a path. Driven by the extension and nothing else:
  *  the server sends a `language` field that is derived from the same thing, and
  *  a buffer opened before that response lands (or after it fails) still has to
@@ -202,6 +220,8 @@ export function useStudioSessions(sid: string): {
   }, [sid, reload]);
 
   const archive = useCallback(async (target: string, archived: boolean) => {
+    // Optimistic: the tab disappears on the click, not after the round-trip.
+    setSessions((list) => (archived ? list.filter((s) => s.sid !== target) : list));
     try { await api.studioSessionArchive(target, archived); } catch { /* as above */ }
     void reload();
   }, [reload]);
@@ -222,10 +242,12 @@ export function useStudioRuns(sid: string): {
   reload: () => Promise<void>;
   watch: () => void;
   stop: (id: string) => Promise<string>;
+  loading: boolean;
 } {
   const [runs, setRuns] = useState<StudioRun[]>([]);
   const [live, setLive] = useState(0);
   const [waiting, setWaiting] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
   const ctrl = useRef<AbortController | null>(null);
 
   const reload = useCallback(async () => {
@@ -235,6 +257,7 @@ export function useStudioRuns(sid: string): {
       setLive(got?.live ?? 0);
       setWaiting(got?.waiting || []);
     } catch { /* the list keeps what it had; a failed read is not an empty one */ }
+    finally { setLoading(false); }
   }, [sid]);
 
   const watch = useCallback(() => {
@@ -258,11 +281,24 @@ export function useStudioRuns(sid: string): {
             setRuns((s.runs || []) as unknown as StudioRun[]);
           }
         } catch { /* closed, or the server ended the window */ }
-        if (c.signal.aborted || sawLive) return;
+        if (c.signal.aborted || sawLive) {
+          /* The stream ended — whether the zero frame reached us or the
+             connection closed before it, the badge must not say "1 agent"
+             over a finished session. Reload the authoritative list. */
+          setLive(0);
+          void reload();
+          return;
+        }
         await new Promise((r) => setTimeout(r, 1200));
       }
+      /* Every window closed with the run already done on the server's side —
+         a fast fail (e.g. the gateway refused before any poll saw live>0).
+         Without this the badge reads "1 agent" over a finished session and
+         the session panel's context meter never sees the finished run. */
+      setLive(0);
+      void reload();
     })();
-  }, [sid]);
+  }, [sid, reload]);
 
   useEffect(() => {
     void reload();
@@ -275,7 +311,7 @@ export function useStudioRuns(sid: string): {
     return r?.error || '';
   }, [sid, reload]);
 
-  return { runs, live, waiting, reload, watch, stop };
+  return { runs, live, waiting, reload, watch, stop, loading };
 }
 
 /** `ui.code_ide`, read once per mount. One flag decides both halves of the

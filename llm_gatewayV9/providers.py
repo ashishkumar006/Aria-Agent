@@ -592,8 +592,13 @@ class OpenAICompatProvider(BaseProvider):
                     "arguments": args,
                 })
             usage = d.get("usage") or {}
+            # Cache hits arrive nested under prompt_tokens_details (OpenAI
+            # shape) OR at usage.cached_tokens (Cohere's shape, which the
+            # OpenAI-compat proxy vends for north-mini-code). Read both;
+            # a zero on one side cannot erase a positive on the other.
             details = usage.get("prompt_tokens_details") or {}
-            cache_read = details.get("cached_tokens", 0) or 0
+            cache_read = max(int(details.get("cached_tokens") or 0),
+                             int(usage.get("cached_tokens") or 0))
             stop = choice.get("finish_reason") or "stop"
             stop_norm = "tool_use" if tool_calls_out else (
                 "max_tokens" if stop == "length" else "end_turn"
@@ -627,6 +632,11 @@ class OpenAICompatProvider(BaseProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": True,
+            # OpenAI-compatible streams do not carry usage unless this is set;
+            # without it the gateway logs char-count ESTIMATES as token usage,
+            # which is what made every kilo/north-mini-code row look like the
+            # model never cached anything (it did, silently, on kilo's side).
+            "stream_options": {"include_usage": True},
         }
         if tools:
             body["tools"] = self._translate_tools(tools)
@@ -664,6 +674,11 @@ class OpenAICompatProvider(BaseProvider):
                             yield "[[REASONING_DELTA]] " + json.dumps(_rc)
                         if delta.get("tool_calls"):
                             yield "[[TOOL_CALL_DELTA]] " + json.dumps(delta["tool_calls"])
+                        usage = d.get("usage")
+                        if usage:
+                            # Final usage frame (choices may be empty) — the
+                            # only place a streaming provider reports tokens.
+                            yield "[[USAGE]] " + json.dumps(usage)
                     except Exception:
                         continue
 

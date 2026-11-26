@@ -78,8 +78,48 @@ class TestGmail:
             lambda m, url, **kw: kit.FakeResp(200, {"id": "m9"}))
         r = g.send_email(to="a@b.c", subject="s", body="b")
         assert r == {"ok": True, "to": "a@b.c", "subject": "s",
-                     "id": "m9", "thread_id": None}
+                     "id": "m9", "thread_id": None, "attached": False,
+                     "attachment_count": 0, "attachment_name": ""}
         assert box["client"].calls[0]["url"].endswith("messages/send")
+
+    def test_send_with_attachment(self, monkeypatch):
+        import base64
+        import integrations.gmail as g
+
+        monkeypatch.setenv("GMAIL_TOKEN", "tok")
+        box = _patch_client(
+            monkeypatch,
+            lambda m, url, **kw: kit.FakeResp(200, {"id": "m10"}))
+        r = g.send_email(to="a@b.c", subject="s", body="see attached",
+                         attachment_b64=base64.b64encode(b"file bytes").decode(),
+                         attachment_name="report.pdf")
+        assert r["ok"] is True and r["attached"] is True
+        assert r["attachment_name"] == "report.pdf"
+        # The raw MIME message must actually carry the attachment.
+        raw = base64.urlsafe_b64decode(
+            box["client"].calls[0]["json"]["raw"] + "===").decode("utf-8", "replace")
+        assert "report.pdf" in raw
+
+    def test_send_with_multiple_attachments(self, monkeypatch):
+        import base64
+        import integrations.gmail as g
+
+        monkeypatch.setenv("GMAIL_TOKEN", "tok")
+        box = _patch_client(
+            monkeypatch,
+            lambda m, url, **kw: kit.FakeResp(200, {"id": "m11"}))
+        r = g.send_email(to="a@b.c", subject="s", body="package",
+                         attachments=[
+                             {"name": "report.pdf",
+                              "data_b64": base64.b64encode(b"pdf").decode()},
+                             {"name": "deck.pptx",
+                              "data_b64": base64.b64encode(b"pptx").decode()},
+                         ])
+        assert r["ok"] is True and r["attached"] is True
+        assert r["attachment_count"] == 2
+        raw = base64.urlsafe_b64decode(
+            box["client"].calls[0]["json"]["raw"] + "===").decode("utf-8", "replace")
+        assert "report.pdf" in raw and "deck.pptx" in raw
 
     def test_query_list(self, monkeypatch):
         import integrations.gmail as g

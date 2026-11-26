@@ -356,7 +356,11 @@ def test_step_6_the_run_is_listed_replayable_and_costed(project, live_turn,
         kinds = [f["t"] for f in replay["frames"]]
         assert "started" in kinds and "done" in kinds, kinds
         started = next(f for f in replay["frames"] if f["t"] == "started")
-        assert started["max_hops"] > 0 and started["gateway_session"]\
+        # The agent used to default to a 60-hop cap; the user removed it. The
+        # contract is now "no default ceiling" — 0 — with the stop button and
+        # the stall guards as the caps. Pinned so the default can't silently
+        # creep back up.
+        assert started["max_hops"] == 0 and started["gateway_session"]\
             .startswith("code-run-"), started
         monkeypatch.setattr(A, "_session_cost_breakdown",
                             lambda s: {"code": {"usd": 0.0031, "in_tok": 500,

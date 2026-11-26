@@ -271,8 +271,13 @@ def _norm_chart(b: dict) -> dict | None:
     kind = {"column": "bar", "vertical_bar": "bar", "vbar": "bar",
             "hbar": "bar", "horizontal_bar": "bar",
             "donut": "pie", "doughnut": "pie",
-            "trend": "line"}.get(kind, kind)
-    if kind not in ("bar", "line", "pie"):
+            "trend": "line",
+            "point": "scatter", "points": "scatter", "xy": "scatter",
+            "stacked_area": "area", "stackedarea": "area"}.get(kind, kind)
+    # matplotlib draws bar/line/pie/scatter/area. The vector reportlab path
+    # handles bar/line/pie; scatter and area fall back to the matplotlib PNG
+    # (see the PDF chart branch), which is why they are allowed here.
+    if kind not in ("bar", "line", "pie", "scatter", "area"):
         kind = "bar"
 
     cats_raw = b.get("categories") or b.get("labels") or b.get("x") or []
@@ -370,6 +375,101 @@ def _image_dims(data: bytes) -> tuple[int, int]:
     return 0, 0
 
 
+def _embeddable_raster(blob: bytes, hint: str) -> tuple[bytes, str] | None:
+    """Bytes the renderer can embed, as (blob, ext). PNG/JPEG pass through
+    untouched (no decode); other rasters (GIF/BMP/TIFF/WebP) are converted to
+    PNG with Pillow. Vector metafiles (EMF/WMF) have no raster renderer here,
+    so they are skipped rather than listed as a figure that cannot be drawn."""
+    if not blob or len(blob) > MAX_IMAGE_BYTES:
+        return None
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return blob, "png"
+    if blob[:2] == b"\xff\xd8":
+        return blob, "jpeg"
+    if (hint or "").lower() in ("emf", "wmf"):
+        return None
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(blob))
+        im = im.convert("RGBA" if im.mode in ("P", "LA", "RGBA") else "RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        out = buf.getvalue()
+        return (out, "png") if len(out) <= MAX_IMAGE_BYTES else None
+    except Exception:
+        return None
+
+
+def _office_figures(raw: bytes) -> list[tuple[int, int, bytes, str]]:
+    """Embedded rasters in a DOCX/PPTX as (page, index, bytes, ext).
+
+    One enumeration shared by `figures_in` and `_extract_figure`, so a listed
+    handle always lifts and an out-of-range one is dropped, never clamped.
+    PPTX pages are slides (matching the text parser); DOCX has no fixed
+    pagination, so its images are one page in package order."""
+    if raw[:4] != b"PK\x03\x04":
+        return []
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        names = set(zf.namelist())
+    except Exception:
+        return []
+    is_pptx = "ppt/presentation.xml" in names
+    is_docx = "word/document.xml" in names
+    if not (is_pptx or is_docx):
+        return []
+    out: list[tuple[int, int, bytes, str]] = []
+    if is_pptx:
+        try:
+            from pptx import Presentation
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
+            prs = Presentation(io.BytesIO(raw))
+
+            def walk(shapes, acc):
+                for sh in shapes:
+                    try:
+                        st = sh.shape_type
+                    except Exception:
+                        st = None
+                    if st == MSO_SHAPE_TYPE.GROUP:
+                        walk(sh.shapes, acc)
+                        continue
+                    if st != MSO_SHAPE_TYPE.PICTURE:
+                        continue
+                    try:
+                        img = sh.image
+                        got = _embeddable_raster(img.blob, img.ext)
+                    except Exception:
+                        continue
+                    if got:
+                        acc.append(got)
+
+            for n, slide in enumerate(prs.slides, 1):
+                acc: list[tuple[bytes, str]] = []
+                walk(slide.shapes, acc)
+                for i, (blob, ext) in enumerate(acc):
+                    out.append((n, i, blob, ext))
+            return out
+        except Exception:
+            out = []                      # fall back to the media folder
+    media = sorted(n for n in names
+                   if n.startswith(("word/media/", "ppt/media/")))
+    idx = 0
+    for n in media:
+        try:
+            blob = zf.read(n)
+        except Exception:
+            continue
+        got = _embeddable_raster(blob, n.rsplit(".", 1)[-1])
+        if not got:
+            continue
+        b, ext = got
+        out.append((1, idx, b, ext))
+        idx += 1
+    return out
+
+
 def figures_in(path: pathlib.Path) -> list[dict]:
     """Every reusable figure in a stored document, as (page, index) handles.
 
@@ -388,7 +488,13 @@ def figures_in(path: pathlib.Path) -> list[dict]:
             w, h = _image_dims(raw)
             return [{"page": 1, "index": 0, "ext": ext, "bytes": len(raw),
                      "width": w, "height": h}]
-        return []
+        # DOCX/PPTX: the same enumeration _extract_figure resolves against.
+        out: list[dict] = []
+        for page, index, blob, ext in _office_figures(raw):
+            w, h = _image_dims(blob)
+            out.append({"page": page, "index": index, "ext": ext,
+                        "bytes": len(blob), "width": w, "height": h})
+        return out
     try:
         from pypdf import PdfReader
     except Exception:
@@ -398,7 +504,16 @@ def figures_in(path: pathlib.Path) -> list[dict]:
     except Exception:
         return []
     out: list[dict] = []
-    for n, page in enumerate(reader.pages, 1):
+    try:
+        pages = list(reader.pages)
+    except Exception:
+        # `PdfReader(str(path))` is lazy: a file with a valid header but no
+        # Root object OPENS and only throws when the page tree is walked. That
+        # raised out of this function and 500'd /v1/documents/{id}/figures -
+        # one broken upload took the whole figure listing down instead of
+        # reporting "no figures", which the caller already handles.
+        return []
+    for n, page in enumerate(pages, 1):
         try:
             imgs = list(page.images)
         except Exception:
@@ -438,6 +553,11 @@ def _extract_figure(path: pathlib.Path, page: int, index: int = 0):
         if raw[:8] == b"\x89PNG\r\n\x1a\n" or raw[:2] == b"\xff\xd8":
             ext = "png" if raw[:8] == b"\x89PNG\r\n\x1a\n" else "jpeg"
             return raw, ext
+        want_page = int(page or 1)
+        want_idx = int(index or 0)
+        for p, i, blob, ext in _office_figures(raw):
+            if p == want_page and i == want_idx:
+                return blob, ext
         return None
     try:
         from pypdf import PdfReader
@@ -478,8 +598,26 @@ def _norm_image(b: dict) -> dict | None:
     # normalised again). Without this the second pass saw no "document" key,
     # resolved nothing, and DROPPED the figure - so normalisation was not
     # idempotent and any re-entry silently lost every image.
-    if isinstance(b.get("data"), (bytes, bytearray)) and b.get("data"):
-        return {"type": "image", "data": bytes(b["data"]),
+    _data = b.get("data")
+    if isinstance(_data, str) and _data.strip():
+        # A base64 image, inlined by the agent for an `art:` handle or a
+        # sandbox path (the gateway is a separate process and cannot read
+        # either). Decode it here; a bad payload is ignored, not fatal.
+        import base64 as _b64
+        try:
+            _blob = _b64.b64decode(_data, validate=False)
+        except Exception:
+            _blob = b""
+        if _blob:
+            return {"type": "image", "data": _blob,
+                    "ext": _as_text(b.get("ext"), 8) or "png",
+                    "page": int(_num(b.get("page"), 1) or 1),
+                    "caption": _as_text(b.get("caption"), 300),
+                    "width_mm": min(170.0, max(40.0, _num(b.get("width_mm"), 150.0)
+                                               or 150.0)),
+                    "alt": _as_text(b.get("alt") or b.get("caption"), 300)}
+    if isinstance(_data, (bytes, bytearray)) and _data:
+        return {"type": "image", "data": bytes(_data),
                 "ext": b.get("ext") or "png",
                 "page": int(_num(b.get("page"), 1) or 1),
                 "caption": b.get("caption") or "",
@@ -612,6 +750,48 @@ def _norm_blocks(raw: Any, doc_title: str = "") -> list[dict]:
             txt = _as_text(b.get("text") or b.get("items"))
             if txt:
                 out.append({"type": "note", "text": txt})
+        elif kind == "callout":
+            # A titled, shaded box - the "KEY INSIGHT" / "EXAM ALERT" panel a
+            # study document uses to break the wall of prose.
+            txt = _as_text(b.get("text") or b.get("body"))
+            title = _as_text(b.get("title") or b.get("label"), 60)
+            tone = str(b.get("tone") or "insight").strip().lower()
+            if txt or title:
+                out.append({"type": "callout", "title": title or "Note",
+                            "text": txt, "tone": tone})
+        elif kind == "stats":
+            raw = b.get("items") or b.get("stats") or b.get("values")
+            items = []
+            for it in (raw if isinstance(raw, list) else []):
+                if isinstance(it, dict):
+                    v = _as_text(it.get("value") or it.get("number"), 40)
+                    lab = _as_text(it.get("label") or it.get("caption"), 120)
+                    if v or lab:
+                        items.append({"value": v, "label": lab})
+                elif it:
+                    items.append({"value": _as_text(it, 40), "label": ""})
+            if items:
+                out.append({"type": "stats", "items": items[:4]})
+            else:
+                _note_drop(kind, "no stat items")
+        elif kind == "columns":
+            raw = b.get("items") or b.get("columns") or b.get("cards")
+            cols = []
+            for it in (raw if isinstance(raw, list) else []):
+                if not isinstance(it, dict):
+                    if it:
+                        cols.append({"title": "", "body": _as_text(it)})
+                    continue
+                cols.append({
+                    "title": _as_text(it.get("title") or it.get("heading"), 80),
+                    "body": _as_text(it.get("text") or it.get("body")
+                                     or it.get("description"), 400),
+                })
+            cols = [c for c in cols if c["title"] or c["body"]]
+            if cols:
+                out.append({"type": "columns", "items": cols[:3]})
+            else:
+                _note_drop(kind, "no columns")
         else:
             # Previously this branch did not exist: an unrecognised type was
             # dropped with no trace, so a deck whose blocks were all
@@ -657,6 +837,20 @@ _BLOCK_ALIASES: dict[str, str] = {
     "notes": "note",
     "speaker_note": "note",
     "speaker_notes": "note",
+    "stats": "stats",
+    "stat": "stats",
+    "kpi": "stats",
+    "kpis": "stats",
+    "numbers_row": "stats",
+    "callout": "callout",
+    "insight": "callout",
+    "alert": "callout",
+    "box": "callout",
+    "aside": "callout",
+    "columns": "columns",
+    "cards": "columns",
+    "cards_row": "columns",
+    "cols": "columns",
 }
 
 # What a caller - usually an LLM - should send. `format` notes where a block
@@ -675,17 +869,38 @@ BLOCK_SCHEMA: list[dict] = [
     {"type": "bullets", "items": ["string"], "format": "all"},
     {"type": "numbers", "items": ["string"], "format": "all"},
     {"type": "quote", "text": "string", "format": "all"},
-    {"type": "chart", "kind": "bar | line | pie",
+    {"type": "chart", "kind": "bar | line | pie | scatter | area",
      "categories": ["string"],
      "series": [{"name": "string", "data": [1, 2, 3]}],
      "title": "string", "format": "vector in pdf, NATIVE editable chart "
-                                  "in pptx, data table in docx"},
+                                  "in pptx, data table in docx; scatter/area are "
+                                  "rendered by matplotlib in every format"},
     {"type": "image", "document": "<uploaded doc id>", "page": 1,
      "caption": "string", "width_mm": 140, "format": "all",
-     "note": "A figure lifted from a document the USER uploaded. There is no "
-             "URL fetching - use only `document` ids that already exist."},
+     "note": "A figure lifted from a document the USER uploaded, OR a plot you "
+     "produced: pass `document` (an uploaded doc id), `artifact` (an `art:` "
+     "handle from render_document/save_as_document), or `path` (a sandbox file, "
+     "e.g. a matplotlib/matlab PNG). There is no URL fetching."},
     {"type": "table", "header": ["string"], "rows": [["string"]],
      "format": "all"},
+    {"type": "stats",
+     "items": [{"value": "42 GW", "label": "installed capacity"}],
+     "format": "pptx (big-number cards); pdf prints them as a short list",
+     "note": "One to four large figures with a short label each. Use for the "
+             "numbers a slide is actually about, instead of burying them in "
+             "bullets."},
+    {"type": "columns",
+     "items": [{"title": "Option A", "body": "one or two sentences"}],
+     "format": "pptx (two or three side-by-side cards); pdf as sections",
+     "note": "Two or three parallel points read across at once - the right "
+             "layout for a comparison that is not purely numeric."},
+    {"type": "callout", "title": "Key insight",
+     "text": "the one sentence the reader must remember",
+     "tone": "insight | warning",
+     "format": "all",
+     "note": "A titled, tinted box that breaks a wall of prose. Use once or "
+             "twice per document for the conclusion or the trap, never as a "
+             "replacement for a paragraph."},
     {"type": "note", "text": "string", "format": "pptx speaker notes"},
     {"type": "pagebreak", "format": "pdf, pptx"},
 ]
@@ -838,6 +1053,175 @@ def _norm_references(raw: Any) -> list[dict]:
     return out
 
 
+def _wants_latex(spec: dict) -> bool:
+    """Did the caller ask for real typesetting?
+
+    Both spellings are accepted because two different callers exist: the agent
+    (which sets `typeset`) and a direct API client (which sets `engine`).
+    """
+    for key in ("engine", "typeset"):
+        if str(spec.get(key) or "").strip().lower() in ("latex", "tex",
+                                                        "tectonic", "xelatex"):
+            return True
+    return False
+
+
+def _chart_png(block: dict, *, dpi: int = 200, width_in: float = 7.2,
+               height_in: float = 3.5) -> bytes | None:
+    """Draw a chart block with matplotlib and return PNG bytes.
+
+    Why matplotlib at all, when reportlab already draws vector charts: the
+    LaTeX path needs a file it can `\\includegraphics`, and a document with
+    charts should look like one document rather than two renderers' work. On
+    this path the chart is raster at 200 dpi, which is print quality at the
+    column width and costs ~60 KB.
+
+    Returns None when matplotlib is unavailable or the block has nothing
+    plottable - the caller keeps the vector path in that case.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    cats = [str(c) for c in (block.get("categories") or [])]
+    series = [s for s in (block.get("series") or [])
+              if isinstance(s, dict) and s.get("data")]
+    if not cats or not series:
+        return None
+    kind = str(block.get("chart") or "bar")
+    is_pie = kind == "pie"
+    accent = "#5b4bd6"
+    palette = ["#5b4bd6", "#9c8ef0", "#2f9e7c", "#c97b2b",
+               "#7a1f4b", "#2b4a7d", "#8a6a1f", "#5c5c66"]
+    fig, ax = plt.subplots(figsize=(width_in, height_in), dpi=dpi)
+    try:
+        if is_pie:
+            vals = [max(0.0, float(v)) for v in series[0]["data"]]
+            n = min(len(vals), len(cats))
+            if sum(vals[:n]) <= 0:
+                return None
+            ax.pie(vals[:n], labels=cats[:n], autopct="%1.0f%%",
+                   colors=palette[:n], startangle=90,
+                   wedgeprops={"linewidth": 0.6, "edgecolor": "white"},
+                   textprops={"fontsize": 9})
+            ax.axis("equal")
+        elif kind == "line":
+            xs = list(range(len(cats)))
+            for i, s in enumerate(series[:6]):
+                ys = [float(v) for v in s["data"][:len(cats)]]
+                ax.plot(xs, ys, marker="o", markersize=3.4, linewidth=1.9,
+                        color=palette[i % len(palette)],
+                        label=str(s.get("name") or f"series {i + 1}"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(cats, rotation=0, fontsize=8.5)
+        elif kind == "scatter":
+            # Points, not a connected line: the right matplotlib plot for a
+            # relationship with no order (x vs y), which bar/line/pie cannot
+            # express. Categories give the x labels; each series is one cloud.
+            xs = list(range(len(cats)))
+            for i, s in enumerate(series[:6]):
+                ys = [float(v) for v in s["data"][:len(cats)]]
+                pts = min(len(xs), len(ys))
+                ax.scatter(xs[:pts], ys[:pts], s=26,
+                           color=palette[i % len(palette)],
+                           label=str(s.get("name") or f"series {i + 1}"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(cats, rotation=0, fontsize=8.5)
+        elif kind == "area":
+            # A filled line: volume/magnitude over an ordered axis.
+            xs = list(range(len(cats)))
+            for i, s in enumerate(series[:6]):
+                ys = [float(v) for v in s["data"][:len(cats)]]
+                ax.fill_between(xs, ys, color=palette[i % len(palette)],
+                                alpha=0.45, linewidth=0)
+                ax.plot(xs, ys, color=palette[i % len(palette)], linewidth=1.6,
+                        label=str(s.get("name") or f"series {i + 1}"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(cats, rotation=0, fontsize=8.5)
+        else:
+            xs = list(range(len(cats)))
+            n = len(series[:6])
+            bw = 0.78 / max(1, n)
+            for i, s in enumerate(series[:6]):
+                ys = [float(v) for v in s["data"][:len(cats)]]
+                offs = [x - 0.39 + bw * (i + 0.5) for x in xs]
+                ax.bar(offs, ys, width=bw,
+                       color=palette[i % len(palette)],
+                       label=str(s.get("name") or f"series {i + 1}"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(cats, fontsize=8.5)
+        if kind != "pie":
+            ax.set_title(str(block.get("title") or ""), fontsize=10.5,
+                         color="#111114", pad=9)
+            ax.grid(axis="y", color="#e2e2ea", linewidth=0.7)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_color("#c9c9d4")
+            ax.tick_params(colors="#3a3a44", labelsize=8.5)
+            if len(series) > 1 or any(s.get("name") for s in series):
+                ax.legend(frameon=False, fontsize=8.5, loc="upper center",
+                          bbox_to_anchor=(0.5, -0.13), ncol=min(4, len(series)))
+                fig.tight_layout(rect=(0, 0.04, 1, 1))
+            fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, facecolor="white",
+                    bbox_inches="tight", pad_inches=0.12)
+        return buf.getvalue()
+    finally:
+        plt.close(fig)
+
+
+def _build_pdf_latex(spec: dict) -> tuple[bytes, str] | None:
+    """The LaTeX path. Returns None when it cannot be used.
+
+    None is not an error: a caller that asked for LaTeX on a machine with no
+    engine must still get a document, so the caller falls back to the
+    reportlab renderer. A TeX COMPILE failure is different - that is a bug in
+    the generated source, and it falls back too, but it says so loudly.
+    """
+    try:
+        import docgen_latex as _tex
+    except Exception:
+        return None
+    ok, why = _tex.available()
+    if not ok:
+        print(f"[docgen] latex requested but unavailable ({why}); "
+              f"using the reportlab renderer")
+        return None
+    title = _as_text(spec.get("title"))
+    blocks = _norm_blocks(spec.get("blocks"), title)
+    if not title and not blocks:
+        raise DocGenError("nothing to render: give a title or some blocks")
+    # Figures: charts are drawn by matplotlib, images come from the user's
+    # uploads (already resolved to bytes by _norm_image).
+    figures: dict[int, tuple[bytes, str]] = {}
+    for i, b in enumerate(blocks):
+        if b["type"] == "chart":
+            png = _chart_png(b)
+            if png:
+                figures[i] = (png, "png")
+        elif b["type"] == "image" and b.get("data"):
+            figures[i] = (bytes(b["data"]), b.get("ext") or "png")
+    refs: list[str] = []
+    _refs = _norm_references(spec.get("references"))
+    if _refs:
+        import doclayout as _lay
+        refs = _lay.build_reference_list(
+            _refs, _lay.resolve_citation(spec.get("citation_style")))
+    try:
+        data = _tex.render(dict(spec), blocks, refs, figures)
+    except Exception as e:
+        print(f"[docgen] latex render failed ({e}); falling back to reportlab")
+        return None
+    if not data:
+        return None
+    return data, _safe_filename(title, "pdf")
+
+
 def build_pdf(spec: dict) -> tuple[bytes, str]:
     """Render a report.
 
@@ -846,9 +1230,17 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
     hanging indent, a "quote" that was just smaller grey text, table rows with
     no vertical padding, and no page numbers anywhere. Rendering it and
     LOOKING at it is what caught all of that; the shapes below are the result.
+
+    A spec that asks for `engine: latex` is typeset by `docgen_latex` instead:
+    real maths, numbered equations and TeX hyphenation. Everything else keeps
+    the reportlab path below, unchanged.
     """
+    if _wants_latex(spec):
+        got = _build_pdf_latex(spec)
+        if got is not None:
+            return got
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
@@ -946,11 +1338,27 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         author=_as_text(spec.get("author"), 120) or "")
 
     ss = getSampleStyleSheet()
-    st_title = ParagraphStyle("t", parent=ss["Title"], fontName="Helvetica-Bold",
-                              fontSize=19, leading=23, spaceAfter=4,
-                              textColor=INK, alignment=TA_LEFT)
+    # Visual chrome for the style, if it declares one. Styles without it (the
+    # original ten) keep the plain left-aligned black-on-white look exactly as
+    # before - the keys default to the old behaviour.
+    _chrome = dict(_style.get("chrome") or {})
+
+    def _chrome_val(key, default):
+        return _chrome.get(key, default)
+
+    _masthead = _chrome_val("masthead", "left")
+    _title_align = (TA_CENTER if _masthead in ("centred", "band",
+                                              "cover_band") else TA_LEFT)
+    _title_color = (colors.HexColor(str(_chrome_val("cover_ink", "#ffffff")))
+                    if _masthead == "cover_band" else INK)
+    st_title = ParagraphStyle(
+        "t", parent=ss["Title"], fontName=F_BOLD,
+        fontSize=float(_chrome_val("title_size", 19)),
+        leading=float(_chrome_val("title_size", 19)) * 1.22,
+        spaceAfter=4, textColor=_title_color, alignment=_title_align)
     st_sub = ParagraphStyle("s", parent=ss["Normal"], fontSize=10.5, leading=14,
-                            textColor=MUTED, spaceAfter=2)
+                            textColor=MUTED, spaceAfter=2,
+                            alignment=_title_align)
     st_byline = ParagraphStyle("by", parent=st_sub, spaceAfter=10)
 
     def _furniture(canv, document):
@@ -995,7 +1403,31 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         # never saw anything to elide and the header just stopped mid-word.
         # `_fit` is the single authority on how much actually fits.
         hdr = _as_text(spec.get("running_header"), 400) or title
-        if pg > 1 and hdr:
+        # The coursework cover: the band now carries its own title block (a
+        # full-bleed table), so only the eyebrow rule is drawn here.
+        if pg == 1 and _masthead == "cover_band":
+            canv.setFillColor(ACCENT)
+            canv.setStrokeColor(ACCENT)
+            canv.setLineWidth(1.6)
+            canv.line(ML, _page[1] - 22 * mm, ML + 26 * mm,
+                      _page[1] - 22 * mm)
+        elif pg > 1 and hdr and _chrome_val("running", "plain") == "split":
+            # A two-part running head: the document on the left in muted ink,
+            # the part name in the accent on the right, a hairline under both.
+            canv.setFont(F_BODY, 7.8)
+            canv.setFillColor(MUTED)
+            left_txt = _fit(hdr, F_BODY, 7.8,
+                            (_page[0] - ML - MR) * 0.58)
+            canv.drawString(ML, _page[1] - 13 * mm, left_txt)
+            canv.setFillColor(ACCENT)
+            right_txt = _fit(str(_chrome_val("running_right", "Study Reference")),
+                             F_BOLD, 7.8, (_page[0] - ML - MR) * 0.38)
+            canv.drawRightString(_page[0] - MR, _page[1] - 13 * mm, right_txt)
+            canv.setStrokeColor(RULE)
+            canv.setLineWidth(0.5)
+            canv.line(ML, _page[1] - 14.6 * mm, _page[0] - MR,
+                      _page[1] - 14.6 * mm)
+        elif pg > 1 and hdr:
             canv.setFont("Helvetica", 7.6)
             canv.setFillColor(colors.HexColor("#8b8b96"))
             canv.drawString(ML, _page[1] - 13 * mm,
@@ -1016,10 +1448,11 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         canv.drawRightString(_page[0] - MR, y - 2 * mm, page_label)
         canv.restoreState()
     st_h1 = ParagraphStyle("h1", parent=ss["Heading1"], fontName=F_BOLD,
-                               fontSize=round(BODY * SCALE, 1),
-                               leading=round(BODY * SCALE * 1.22, 1),
+                               fontSize=round(BODY * float(_chrome_val("h1_size", SCALE)), 1),
+                               leading=round(BODY * float(_chrome_val("h1_size", SCALE)) * 1.22, 1),
                                spaceBefore=round(LEAD, 1), spaceAfter=round(LEAD * 0.34, 1),
-                               textColor=INK, keepWithNext=1)
+                               textColor=(ACCENT if _chrome_val("heading_color", "ink") == "accent"
+                                          else INK), keepWithNext=1)
     st_h2 = ParagraphStyle("h2", parent=ss["Heading2"], fontName=F_BOLD,
                                fontSize=round(BODY * (SCALE - 0.12), 1),
                                leading=round(BODY * (SCALE - 0.12) * 1.22, 1),
@@ -1060,6 +1493,24 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
                                  allowWidows=0, allowOrphans=0)
     st_cellh = ParagraphStyle("ch", parent=st_cell, fontName=F_BOLD,
                                   textColor=colors.white)
+    # Stat cards on paper: a large accent figure over a small muted label.
+    st_statv = ParagraphStyle("statv", parent=st_p, fontName=F_BOLD,
+                              fontSize=round(BODY * 1.9, 1),
+                              leading=round(BODY * 2.1, 1),
+                              spaceAfter=2, textColor=ACCENT)
+    st_statc = ParagraphStyle("statc", parent=st_p, fontName=F_BODY,
+                              fontSize=round(BODY * 0.84, 1),
+                              leading=round(BODY * 1.05, 1),
+                              spaceAfter=0, textColor=MUTED)
+    # Hairline + tint used by the stat row; derived from the accent so one
+    # palette governs the whole document.
+    _ar, _ag, _ab = ACCENT.red, ACCENT.green, ACCENT.blue
+    _stat_line = colors.Color(_ar + (1 - _ar) * 0.72,
+                              _ag + (1 - _ag) * 0.72,
+                              _ab + (1 - _ab) * 0.72)
+    _stat_tint = colors.Color(_ar + (1 - _ar) * 0.93,
+                              _ag + (1 - _ag) * 0.93,
+                              _ab + (1 - _ab) * 0.93)
     st_cellk = ParagraphStyle("ck", parent=st_cell, fontName=F_BOLD)
     st_foot = ParagraphStyle("f", parent=ss["Normal"], fontName=F_BODY,
                                  fontSize=8, leading=9.6, textColor=MUTED)
@@ -1154,6 +1605,98 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         # the sentence itself on the next.
         return [KeepTogether([t]), Spacer(1, 8)]
 
+    def _callout(b):
+        """A titled, tinted box: the study-document 'KEY INSIGHT' panel.
+
+        Built as ONE two-row table (title row, body row) so the tint, the
+        border and the spacing belong to the same object. Nesting one table
+        inside another left the tint short of the border and the body text
+        overhanging the frame."""
+        title = _as_text(b.get("title")) or "Note"
+        body = _as_text(b.get("text"))
+        tone = str(b.get("tone") or "insight").lower()
+        bar = colors.HexColor("#b3261e") if tone in ("warning", "danger",
+                                                    "alert") else ACCENT
+        o, g_, bl = bar.red, bar.green, bar.blue
+        tint = colors.Color(o + (1 - o) * 0.94, g_ + (1 - g_) * 0.94,
+                            bl + (1 - bl) * 0.94)
+        pad = 8
+        head = Paragraph(_rich(title.upper()), ParagraphStyle(
+            "cot", parent=st_h3, fontName=F_BOLD,
+            fontSize=round(BODY * 0.80, 1), textColor=colors.white,
+            spaceBefore=0, spaceAfter=0))
+        rows = [[head]]
+        if body:
+            rows.append([Paragraph(_rich(body), ParagraphStyle(
+                "cob", parent=st_p, fontSize=round(BODY * 0.97, 1),
+                spaceAfter=0, textColor=colors.HexColor("#23232c")))])
+        t = Table(rows, colWidths=[avail_w])
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), bar),
+            ("BOX", (0, 0), (-1, -1), 0.8, bar),
+            ("LEFTPADDING", (0, 0), (-1, -1), pad),
+            ("RIGHTPADDING", (0, 0), (-1, -1), pad),
+            ("TOPPADDING", (0, 0), (-1, 0), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+        ]
+        if body:
+            style += [
+                ("BACKGROUND", (0, 1), (-1, -1), tint),
+                ("TOPPADDING", (0, 1), (-1, -1), pad),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), pad),
+            ]
+        t.setStyle(TableStyle(style))
+        return [KeepTogether([t]), Spacer(1, 9)]
+
+    def _stats(b):
+        """Big-number callouts as a bordered, tinted row on paper."""
+        items = b.get("items") or []
+        if not items:
+            return None
+        n = max(1, len(items))
+        widths = [avail_w / n] * n
+        vals = [Paragraph(_rich(str(it.get("value") or "")), st_statv)
+                for it in items]
+        labs = [Paragraph(_rich(str(it.get("label") or "")), st_statc)
+                for it in items]
+        t = Table([vals, labs], colWidths=widths)
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BOX", (0, 0), (-1, -1), 0.6, _stat_line),
+            ("INNERGRID", (0, 0), (-1, -1), 0.6, _stat_line),
+            ("BACKGROUND", (0, 0), (-1, -1), _stat_tint),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, 0), 9),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 0),
+            ("TOPPADDING", (0, 1), (-1, 1), 0),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 9),
+        ]))
+        return [t, Spacer(1, 9)]
+
+    def _columns(b):
+        """Two or three parallel points as side-by-side, ruled columns."""
+        items = b.get("items") or []
+        if not items:
+            return None
+        n = max(1, len(items))
+        widths = [avail_w / n] * n
+        head = [Paragraph(_rich(str(c.get("title") or "")), st_h3) for c in items]
+        bodies = []
+        for c in items:
+            bodies.append(Paragraph(_rich(str(c.get("body") or "")), st_p))
+        t = Table([head, bodies], colWidths=widths)
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEABOVE", (0, 0), (-1, 0), 1.4, ACCENT),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, 0), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
+            ("TOPPADDING", (0, 1), (-1, 1), 0),
+        ]))
+        return [t, Spacer(1, 9)]
+
     def _table(b):
         head = b.get("header")
         data = []
@@ -1215,6 +1758,34 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
         cats = b["categories"]
         series = b["series"]
         kind = b["chart"]
+        if kind in ("scatter", "area"):
+            # reportlab has no scatter/area chart; render with matplotlib and
+            # embed the PNG (the same engine the LaTeX and OOXML paths use), so
+            # a scatter/area is a real plot rather than an empty axis.
+            png = _chart_png(b)
+            if png:
+                from reportlab.platypus import Image as RLImage
+                from PIL import Image as PILImage
+                try:
+                    with PILImage.open(io.BytesIO(png)) as im:
+                        iw, ih = im.size
+                    out = []
+                    if b.get("title"):
+                        out.append(Paragraph(_rich(b["title"]), st_h3))
+                    w = avail_w
+                    h = w * ih / iw
+                    if h > 300:
+                        h = 300
+                        w = h * iw / ih
+                    flow = RLImage(io.BytesIO(png), width=w, height=h)
+                    flow.hAlign = "CENTER"
+                    out.append(flow)
+                    if b.get("caption"):
+                        out.append(Paragraph(_rich(b["caption"]), st_cap))
+                    out.append(Spacer(1, 9))
+                    return out
+                except Exception:
+                    pass
         w = avail_w
         h = 150.0 if kind == "pie" else (170.0 if kind == "line" else 190.0)
         pad = 34.0
@@ -1389,6 +1960,12 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
             return out
         if t == "table":
             return _table(b)
+        if t == "callout":
+            return _callout(b)
+        if t == "stats":
+            return _stats(b)
+        if t == "columns":
+            return _columns(b)
         return None
 
     story = []
@@ -1409,23 +1986,86 @@ def build_pdf(spec: dict) -> tuple[bytes, str]:
             story.append(Paragraph(_rich(line), st_coverm))
         story.append(PageBreak())
     elif title:
-        story.append(Paragraph(_rich(title), st_title))
-        rule = Table([[""]], colWidths=[34 * mm], rowHeights=[1.6])
-        rule.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), ACCENT),
-                                  ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                                  ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                                  ("TOPPADDING", (0, 0), (-1, -1), 0),
-                                  ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
-        # reportlab centres a narrow table by default, which floated the rule
-        # into the middle of the page beside the title.
-        rule.hAlign = "LEFT"
-        story.append(rule)
-        story.append(Spacer(1, 7))
+        # Masthead. `cover_band` paints a full-bleed block behind white display
+        # type; `band` sits the title under a full-width rule; `centred` sets a
+        # centred title with a short rule underneath. The page furniture draws
+        # the band (it needs the page canvas), so here we only reserve space.
+        _mt = _chrome_val("masthead", "left")
+        if _mt == "cover_band":
+            # The band owns the whole first page: a full-bleed navy block with
+            # the eyebrow, the display title and the subtitle set into it. Those
+            # three lines are drawn as a table whose background IS the band, so
+            # the type sits inside the colour instead of on white below it.
+            _ink = colors.HexColor(str(_chrome_val("cover_ink", "#ffffff")))
+            _band_h = float(_chrome_val("band_h", 78)) * mm
+            _eyebrow = Paragraph(
+                _rich(_as_text(spec.get("running_header"), 200)
+                      or title.upper()),
+                ParagraphStyle("cbe", parent=st_sub, fontName=F_BOLD,
+                               fontSize=8.5, leading=11, textColor=ACCENT,
+                               alignment=TA_LEFT))
+            _ttl = Paragraph(_rich(title), ParagraphStyle(
+                "cbt", parent=st_title, fontSize=float(
+                    _chrome_val("title_size", 24)),
+                leading=float(_chrome_val("title_size", 24)) * 1.16,
+                textColor=_ink, alignment=TA_LEFT, spaceAfter=0))
+            _sub = _as_text(spec.get("subtitle"), 300)
+            _cells = [[_eyebrow], [_ttl]]
+            if _sub:
+                _cells.append([Paragraph(_rich(_sub), ParagraphStyle(
+                    "cbs", parent=st_sub, fontSize=11, leading=15,
+                    textColor=colors.Color(0.78, 0.80, 0.85),
+                    alignment=TA_LEFT))])
+            _block = Table(_cells, colWidths=[_page[0] - ML - MR])
+            _block.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(
+                    str(_chrome_val("cover_band", "#16233c")))),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, 0), 22),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                ("TOPPADDING", (0, 1), (-1, 1), 0),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+                ("TOPPADDING", (0, -1), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, -1), (-1, -1), 18),
+            ]))
+            story.append(_block)
+            story.append(Spacer(1, 10))
+        elif _mt == "band":
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(_rich(title), st_title))
+            story.append(Spacer(1, 4))
+            _band = Table([[""]], colWidths=[_page[0] - ML - MR],
+                          rowHeights=[1.4])
+            _band.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), ACCENT),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+            _band.hAlign = "LEFT"
+            story.append(_band)
+            story.append(Spacer(1, 6))
+        else:
+            story.append(Paragraph(_rich(title), st_title))
+            _rule_w = 34 * mm
+            rule = Table([[""]], colWidths=[_rule_w], rowHeights=[1.6])
+            rule.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), ACCENT),
+                                      ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                      ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                                      ("TOPPADDING", (0, 0), (-1, -1), 0),
+                                      ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+            # reportlab centres a narrow table by default, which floated the
+            # rule into the middle of the page beside the title.
+            rule.hAlign = ("CENTER" if _title_align == TA_CENTER else "LEFT")
+            story.append(rule)
+            story.append(Spacer(1, 7))
     sub = _as_text(spec.get("subtitle"), 300)
-    if sub and not has_cover:
+    if sub and not has_cover and _masthead != "cover_band":
         story.append(Paragraph(_rich(sub), st_sub))
     au = _as_text(spec.get("author"), 120)
-    if au and not has_cover:
+    if au and not has_cover and _masthead != "cover_band":
         story.append(Paragraph(_rich(au), st_byline))
     elif (sub or au) and not has_cover:
         story.append(Spacer(1, 10))
@@ -1718,6 +2358,14 @@ _FONT_SAFE = {
     "∅": "empty", "⋯": "...", "⟹": "=>", "⟺": "<=>",
     "✓": "yes", "✔": "yes", "✗": "no", "✘": "no",
     "─": "-", "━": "-", "│": "|", "┃": "|",
+    # cp1252 carries only ¹ ² ³. The remaining superscript digits and the
+    # superscript sign are NOT in it, and an unmapped glyph drew as a solid
+    # block - `W/m²·K⁴` reached the page as "W/m²·K■". Fall back to caret
+    # notation, which is unambiguous and always drawable.
+    "⁰": "^0", "¹": "^1", "²": "^2", "³": "^3", "⁴": "^4", "⁵": "^5",
+    "⁶": "^6", "⁷": "^7", "⁸": "^8", "⁹": "^9", "⁻": "^-", "⁺": "^+",
+    "₀": "_0", "₁": "_1", "₂": "_2", "₃": "_3", "₄": "_4", "₅": "_5",
+    "₆": "_6", "₇": "_7", "₈": "_8", "₉": "_9",
 }
 
 
@@ -1961,8 +2609,11 @@ def _pptx_chart(slide, b: dict, left, top, width, advance, deck=None) -> None:
                     r.font.color.rgb = ink
         else:
             ch.has_title = False
-        ch.has_legend = len(b["series"]) > 1 or bool(
-            (b["series"][0] or {}).get("name"))
+        # A single-series chart names itself with its title and its data
+        # labels; a legend repeating that one name is noise (it was the loudest
+        # amateur tell on every bar chart). A legend earns its space only when
+        # there are two or more series to tell apart.
+        ch.has_legend = len(b["series"]) > 1
         if ch.has_legend:
             ch.legend.position = XL_LEGEND_POSITION.BOTTOM
             ch.legend.include_in_layout = False
@@ -1971,6 +2622,17 @@ def _pptx_chart(slide, b: dict, left, top, width, advance, deck=None) -> None:
                 ch.legend.font.color.rgb = muted
             except Exception:
                 pass
+    except Exception:
+        pass
+
+    try:
+        # A chart dropped on tinted paper must not carry its own white card:
+        # the stock white plot area reads as a pasted screenshot next to the
+        # rest of the deck. Make the chart and plot canvases transparent so
+        # the slide's paper shows through, and drop Office's frame around it.
+        ch.chart_area.format.fill.background()
+        ch.chart_area.format.line.fill.background()
+        ch.plots[0].format.fill.background()
     except Exception:
         pass
 
@@ -2015,6 +2677,19 @@ def _pptx_chart(slide, b: dict, left, top, width, advance, deck=None) -> None:
                     dl.show_percentage = True
             except Exception:
                 pass
+        elif kind == "bar":
+            # A clustered bar with no numbers on it makes the reader estimate
+            # every value from a gridline. With few enough points, print them.
+            points = sum(len(s["data"]) for s in b["series"])
+            if points <= 12:
+                try:
+                    plot.has_data_labels = True
+                    dl = plot.data_labels
+                    dl.font.size = Pt(10)
+                    dl.font.color.rgb = ink
+                    dl.show_value = True
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -2162,19 +2837,132 @@ def _md_tokens(s: str):
 
 
 def _pptx_text_height(text, width_emu, size_pt, leading_mult: float = 1.22,
-                      pad_pt: float = 4.0, em: float = 0.50) -> int:
+                      pad_pt: float = 4.0, em: float = 0.50,
+                      line_em: float = 1.22) -> int:
     """Height of `text` laid out in a `width_emu` column, in EMU.
 
-    Calibri/Helvetica average about half an em per character — the same estimate
-    the PDF measure uses. This is what lets one slide hold six bullets and
-    another hold two, instead of every block costing a fixed 0.62in.
+    Words are wrapped the way a renderer does it - greedily, at spaces - not by
+    dividing characters by a fixed count. The old char-count model was wrong
+    exactly where it mattered: "Grid-Scale Battery Storage: Engineering Outlook
+    2026" measured two lines because 52 chars fit 2 x 26, but Georgia Bold
+    wraps it to THREE, and the accent rule under the title was then drawn
+    straight through the last one. Word widths come from `em`, the average
+    advance per character for the face being measured.
+
+    `line_em` is the FONT's own line height (ascent + descent), which is not
+    the same number as the paragraph's spacing multiplier. Georgia measures
+    1.14em and Segoe UI 1.34em, so a two-line value in a stat card is ~2.3x
+    its point size tall, not 2.0x - treating them as equal is what let
+    "$210-430/kWh" print over its own label.
     """
     w_in = max(1.0, width_emu / _PPTX_IN)
-    cpl = max(8, int(w_in * 72 / (size_pt * em)))
+    limit = w_in * 72.0                      # usable points on one line
+    cw = max(0.05, float(em)) * float(size_pt)   # one character, in points
     lines = 0
     for raw in str(text or "").split("\n"):
-        lines += max(1, -(-len(raw) // cpl))
-    return _pptx_in((lines * size_pt * leading_mult + pad_pt) / 72.0)
+        words = raw.split()
+        if not words:
+            lines += 1
+            continue
+        n = 1
+        cur = 0.0
+        for w in words:
+            ww = len(w) * cw
+            if ww > limit:
+                # A single token wider than the column breaks mid-word, which
+                # is what a renderer does with "$210-430/kWh" in a quarter-
+                # width card. Counting it as one line put its second line
+                # straight through the label below.
+                if cur:
+                    n += 1
+                n += int(ww // limit)
+                cur = ww % limit
+                continue
+            if cur and cur + cw * 1.0 + ww > limit:   # space + word overflows
+                n += 1
+                cur = ww
+            else:
+                cur += (cw if cur else 0.0) + ww
+        lines += n
+    # Each line occupies the font's line height scaled by the spacing
+    # multiplier; the last line still needs its own glyph box, which is why the
+    # line height is multiplied rather than added once.
+    per_line = size_pt * max(float(leading_mult), float(line_em))
+    return _pptx_in((lines * per_line + pad_pt) / 72.0)
+
+
+def _pptx_theme(prs, deck) -> None:
+    """Rewrite the stock Office theme to the deck's own palette and type.
+
+    Every run is already coloured and fonted explicitly, but placeholders,
+    speaker notes, and PowerPoint's own colour/font pickers INHERIT the theme.
+    A deck that looks right on the slide yet carries Calibri/4F81BD underneath
+    still edits like a stock template — the accent you pick is not the accent
+    the chart editor or the text highlighter offers. This is what makes the
+    whole file cohere around one palette instead of the accent plus whatever
+    Office happened to ship.
+    """
+    from lxml import etree
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+    def q(t):
+        return f"{{{ns}}}{t}"
+
+    def hexs(rgb):
+        return "%02X%02X%02X" % tuple(rgb)
+
+    try:
+        master = prs.slide_masters[0]
+    except Exception:
+        return
+    part = None
+    for rel in master.part.rels.values():
+        if rel.reltype.endswith("/theme"):
+            part = rel.target_part
+            break
+    if part is None:
+        return
+    try:
+        root = etree.fromstring(part.blob)
+    except Exception:
+        return
+    cs = root.find(".//" + q("clrScheme"))
+    if cs is not None:
+        cs.set("name", "Aria")
+        series = deck.series
+        white = _pptx_rgb("FFFFFF")
+        mapping = {
+            "dk1": deck.ink, "lt1": white,
+            "dk2": deck.dark, "lt2": deck.tint,
+            "accent1": deck.accent,
+            "accent2": series[1], "accent3": series[2],
+            "accent4": series[3], "accent5": series[4],
+            "accent6": series[5],
+            "hlink": deck.accent, "folHlink": deck.dark,
+        }
+        for tag, rgb in mapping.items():
+            el = cs.find(q(tag))
+            if el is None:
+                continue
+            for ch in list(el):
+                el.remove(ch)
+            etree.SubElement(el, q("srgbClr"), {"val": hexs(rgb)})
+    fs = root.find(".//" + q("fontScheme"))
+    if fs is not None:
+        fs.set("name", "Aria")
+        for tag, face in (("majorFont", deck.head_font),
+                          ("minorFont", deck.body_font)):
+            f = fs.find(q(tag))
+            if f is None:
+                continue
+            latin = f.find(q("latin"))
+            if latin is not None:
+                latin.set("typeface", face)
+    try:
+        part._blob = etree.tostring(root, xml_declaration=True,
+                                    encoding="UTF-8", standalone=True)
+    except Exception:
+        pass
 
 
 class _Deck:
@@ -2203,6 +2991,10 @@ class _Deck:
         self.soft = _pptx_mix(self.accent, white, 0.72)
         self.dark = _pptx_mix(self.accent, black, 0.30)
         self.series = _pptx_series(self.accent)
+        # Paper is a whisper of the accent so content slides are not stark
+        # white; pale is text/lines that sit ON the accent (section dividers).
+        self.paper = _pptx_mix(self.accent, white, 0.93)
+        self.pale = _pptx_mix(self.accent, white, 0.80)
         self.band = _pptx_in(0.09)
         self.rule_h = _pptx_in(0.045)
         # A deck in Calibri Light is a deck in the default font: the type pairing
@@ -2211,11 +3003,28 @@ class _Deck:
         # Light never does.
         fam = str(style.get("family") or "sans").lower()
         if fam == "serif":
-            self.head_font, self.body_font, self.em = "Georgia", "Georgia", 0.50
+            self.head_font, self.body_font = "Georgia", "Georgia"
+            # Georgia is a WIDE face: measured against the installed font, its
+            # bold averages 0.536em per character and its regular 0.50em. The
+            # serif branch used to inherit the sans defaults, so every serif
+            # title was measured ~8% too narrow and wrapped one line more than
+            # the box allowed - the accent rule then struck through it.
+            self.em = 0.52
+            self.head_em = 0.56
+            # Georgia: ascent 0.92 + descent 0.22 = 1.14em
+            self.line_em = 1.14
         else:
             self.head_font = "Segoe UI Semibold"
             self.body_font = "Segoe UI"
             self.em = 0.53
+            # A semibold head is ~9% wider per character than the regular body
+            # this estimate was calibrated on. Measuring titles with the body
+            # factor under-counted their lines: a cover title estimated at two
+            # lines wrapped to three and the accent rule was drawn straight
+            # through the last one.
+            self.head_em = 0.58
+            # Segoe UI: ascent 1.08 + descent 0.26 = 1.34em
+            self.line_em = 1.34
         self.card = False
         self.footer_h = _pptx_in(0.40)
         self.bottom = self.H - self.footer_h - _pptx_in(0.26)
@@ -2225,6 +3034,8 @@ class _Deck:
         self.top = 0
         self.wrote = False
         self.spread = 0
+        # slack a single card block may absorb (see balance/card_only)
+        self.grow = 0
 
     # ── layouts ───────────────────────────────────────────────────────────
     def _layout(self, name: str, fallback: int):
@@ -2244,13 +3055,22 @@ class _Deck:
         except Exception:
             return self.prs.slide_layouts[6]
 
-    def add(self, layout_name: str, fallback: int, band=None):
+    def add(self, layout_name: str, fallback: int, band=None, bg=None):
         s = self.prs.slides.add_slide(self._layout(layout_name, fallback))
         self.count += 1
         self.cur = s
         self.top = _pptx_in(0.5)
         self.wrote = False
         self.spread = 0
+        self.grow = 0
+        # A deck on stark white reads as a converted document. Every slide
+        # carries a whisper of the accent as paper; the cover and the section
+        # dividers pass their own background to override it.
+        try:
+            s.background.fill.solid()
+            s.background.fill.fore_color.rgb = self.paper if bg is None else bg
+        except Exception:
+            pass
         self.edge = self.band if band is None else int(band)
         if self.edge:
             # One accent edge down every slide: the deck then reads as one
@@ -2271,6 +3091,11 @@ class _Deck:
     def _box(self, left, top, width, height):
         tb = self.cur.shapes.add_textbox(left, top, width, height)
         tb.text_frame.word_wrap = True
+        # PowerPoint insets a text frame 0.1in per side by default, so text
+        # wraps ~0.2in narrower than the box. The measurement used the box
+        # width, which is how a title estimated at two lines rendered three.
+        tb.text_frame.margin_left = 0
+        tb.text_frame.margin_right = 0
         return tb
 
     def _write(self, para, text, size, color=None, bold=False, italic=False,
@@ -2321,17 +3146,18 @@ class _Deck:
             pass
         return sh
 
-    def footer(self):
+    def footer(self, light=False):
         if self.count <= 1 or not self.running:
             return
         from pptx.util import Pt
+        txt = self.pale if light else self.muted
         self.rule(self.mx, self.H - self.footer_h - _pptx_in(0.20),
                   self.cw - _pptx_in(0.8), thick=_pptx_in(0.018),
                   color=self.soft)
         tb = self._box(self.mx, self.H - self.footer_h - _pptx_in(0.06),
                        self.cw - _pptx_in(0.8), self.footer_h)
         self._write(tb.text_frame.paragraphs[0], self.running, 9,
-                    color=self.muted)
+                    color=txt)
         n = self._box(self.W - self.mx - _pptx_in(0.8),
                       self.H - self.footer_h - _pptx_in(0.06), _pptx_in(0.8),
                       self.footer_h)
@@ -2341,7 +3167,7 @@ class _Deck:
             p.alignment = PP_ALIGN.RIGHT
         except Exception:
             pass
-        self._write(p, str(self.count), 9, color=self.muted)
+        self._write(p, str(self.count), 9, color=txt)
         del Pt
 
     # ── slides ────────────────────────────────────────────────────────────
@@ -2353,20 +3179,36 @@ class _Deck:
         # accent panel holds the right third and the text sits in what is left
         # of it, so the deck reads as designed before a word is legible.
         panel = int(self.W * 0.30)
-        for shape, col in ((s.shapes.add_shape(MSO_SHAPE.RECTANGLE,
-                                                self.W - panel, 0, panel,
-                                                self.H), self.accent),
-                           (s.shapes.add_shape(MSO_SHAPE.RECTANGLE,
-                                               self.W - panel, 0,
-                                               _pptx_in(0.14), self.H),
-                            self.dark)):
+        face = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, self.W - panel, 0,
+                                  panel, self.H)
+        try:
+            # A gradient panel reads as designed; a flat rectangle reads as a
+            # colour swatch. The accent at the top settles into its own dark
+            # at the foot, so the cover has depth before a word is legible.
+            face.fill.gradient()
+            stops = face.fill.gradient_stops
+            stops[0].color.rgb = self.accent
+            stops[1].color.rgb = self.dark
+            face.fill.gradient_angle = 90.0
+            face.line.fill.background()
+            face.shadow.inherit = False
+        except Exception:
             try:
-                shape.fill.solid()
-                shape.fill.fore_color.rgb = col
-                shape.line.fill.background()
-                shape.shadow.inherit = False
+                face.fill.solid()
+                face.fill.fore_color.rgb = self.accent
+                face.line.fill.background()
+                face.shadow.inherit = False
             except Exception:
                 pass
+        edge = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, self.W - panel, 0,
+                                  _pptx_in(0.14), self.H)
+        try:
+            edge.fill.solid()
+            edge.fill.fore_color.rgb = self.dark
+            edge.line.fill.background()
+            edge.shadow.inherit = False
+        except Exception:
+            pass
         left = self.mx
         width = self.W - panel - left - _pptx_in(0.7)
         top = int(self.H * 0.32)
@@ -2374,9 +3216,10 @@ class _Deck:
         # steps down until the title fits two.
         size = self.TITLE
         while (size > 26 and self._m(title, width, size, 1.05,
-                                               pad_pt=2.0) > _pptx_in(1.45)):
+                                               pad_pt=2.0,
+                                               em=self.head_em) > _pptx_in(1.45)):
             size -= 2
-        h = self._m(title, width, size, 1.05, pad_pt=2.0)
+        h = self._m(title, width, size, 1.05, pad_pt=2.0, em=self.head_em)
         ph = self._title_placeholder()
         if ph is not None:
             ph.left, ph.top = left, top
@@ -2416,10 +3259,59 @@ class _Deck:
                             subtitle, 17, color=self.muted,
                             align=PP_ALIGN.LEFT, line_spacing=1.15)
         self._drop_empty_placeholders()
-        # A hairline near the foot: the cover's lower half was empty white from
-        # the subtitle down, and one rule across it closes the composition.
-        self.rule(left, self.H - _pptx_in(1.1), width, thick=_pptx_in(0.02),
-                  color=self.soft)
+        # A hairline near the foot closes the cover's lower half. It must stop
+        # at the accent panel: drawn across the full text width it used to run
+        # INTO the panel and hang under the white right-hand edge.
+        self.rule(left, self.H - _pptx_in(1.1),
+                  min(width, self.W - panel - left - _pptx_in(0.5)),
+                  thick=_pptx_in(0.02), color=self.soft)
+        return s
+
+    def section_slide(self, heading):
+        """A section divider: a heading with no body of its own.
+
+        These used to render as a near-empty content slide — a title and a rule
+        at the top of a white canvas with the bottom two-thirds blank. A divider
+        is a composition: full accent, white title, a large faint numeral. It is
+        the rhythm a polished deck uses to say "new part" without a word the
+        author did not write, and it is the third layout the renderer reaches
+        for instead of Title Slide / Title Only on every page.
+        """
+        from pptx.enum.text import PP_ALIGN
+        s = self.add("Section Header", 2, band=0, bg=self.accent)
+        text = _as_text(heading)
+        left, width = self.mx, self.cw
+        white = _pptx_rgb("FFFFFF")
+        # A large faint numeral in the top corner: the section's own number,
+        # lighter than the accent so it reads as a watermark, not a headline.
+        num = self._box(self.W - self.mx - _pptx_in(2.2), _pptx_in(0.45),
+                        _pptx_in(2.2), _pptx_in(1.5))
+        self._write(num.text_frame.paragraphs[0], f"{self.count - 1:02d}", 66,
+                    color=_pptx_mix(self.accent, white, 0.30), bold=True,
+                    align=PP_ALIGN.RIGHT, font=self.head_font)
+        size = 40
+        while (size > 28
+               and self._m(text, width, size, 1.1, pad_pt=2.0,
+                           em=self.head_em) > _pptx_in(2.4)):
+            size -= 2
+        h = self._m(text, width, size, 1.1, pad_pt=2.0, em=self.head_em)
+        top = int(self.H * 0.42) - h // 2
+        ph = self._title_placeholder()
+        if ph is not None:
+            ph.left, ph.top, ph.width, ph.height = left, top, width, h
+            self._write(ph.text_frame.paragraphs[0], text, size, color=white,
+                        bold=True, align=PP_ALIGN.LEFT, line_spacing=1.1,
+                        font=self.head_font)
+        else:
+            self._write(self._box(left, top, width, h).text_frame.paragraphs[0],
+                        text, size, color=white, bold=True,
+                        align=PP_ALIGN.LEFT, line_spacing=1.1,
+                        font=self.head_font)
+        self.wrote = True
+        self.rule(left, top + h + _pptx_in(0.20), _pptx_in(2.2),
+                  color=self.pale, thick=_pptx_in(0.06))
+        self._drop_empty_placeholders()
+        self.footer(light=True)
         return s
 
     def _placeholders(self):
@@ -2432,6 +3324,14 @@ class _Deck:
         for p in self._placeholders():
             try:
                 if int(p.placeholder_format.idx) == 0:
+                    # Placeholders carry the layout's own insets (0.1in per
+                    # side, plus extra leading). The measured height assumes
+                    # the full width, so a title sized to fit wrapped one line
+                    # more than planned and its rule cut through the text.
+                    p.text_frame.margin_left = 0
+                    p.text_frame.margin_right = 0
+                    p.text_frame.margin_top = 0
+                    p.text_frame.margin_bottom = 0
                     return p
             except Exception:
                 continue
@@ -2515,6 +3415,28 @@ class _Deck:
             elif t == "image":
                 total += _pptx_in(4.4) + (_pptx_in(0.34)
                                           if b.get("caption") else 0)
+            elif t == "stats":
+                # Measured the same way stat_cards sizes itself, so `balance`
+                # does not reserve 1.78in for a row that is actually taller.
+                gap = _pptx_in(0.22)
+                n = max(1, len(b["items"]))
+                w = (self.cw - gap * (n - 1)) // n
+                inner = w - _pptx_in(0.32)
+                vh = max(self._m(it["value"], inner, 30, 0.95, pad_pt=2.0,
+                                 em=self.head_em) for it in b["items"])
+                lh = max((self._m(it.get("label") or "", inner, 12, 1.1)
+                          for it in b["items"]), default=0)
+                total += vh + lh + _pptx_in(0.32) + _pptx_in(0.16)
+            elif t == "columns":
+                pad = _pptx_in(0.22)
+                n = max(1, len(b["items"]))
+                gap = _pptx_in(0.26)
+                w = (self.cw - gap * (n - 1)) // n
+                body = max((self._m(c.get("body") or "", w - 2 * pad,
+                                    self.BODY - 3, 1.12)
+                            for c in b["items"]), default=0)
+                total += max(body + _pptx_in(0.84) + 2 * pad, _pptx_in(1.5)) \
+                    + _pptx_in(0.16)
         return total
 
     def balance(self, pend):
@@ -2528,9 +3450,32 @@ class _Deck:
         if slack <= _pptx_in(0.6):
             self.spread = 0
             return
+        if self.card_only(pend):
+            # One self-contained block: there are no inter-block gaps to grow,
+            # so give the block a share of the slack to fill vertically. The
+            # renderers read `self.grow` as extra card height / column height.
+            # Three stat cards or three columns pinned to the top third of a
+            # 7.5in canvas is the "unfinished slide" look the user reports:
+            # the block is allowed to take most of the body height, and the
+            # slack above it is spent on a drop so the group sits optically
+            # centred rather than stuck to the rule.
+            self.grow = min(int(slack * 0.80), _pptx_in(2.6))
+            self.top += min(int(slack * 0.26), _pptx_in(0.90))
+            self.spread = 0
+            return
+        self.grow = 0
+        on_face = [b for b in pend if b["type"] != "note"]
+        if (len(on_face) == 1
+                and on_face[0]["type"] in ("quote", "paragraph")):
+            # A pull quote alone on a slide is a composition, not a line of
+            # text near the ceiling: drop it toward the optical centre and
+            # leave the air below.
+            self.spread = 0
+            self.top += min(int(slack * 0.38), _pptx_in(2.0))
+            return
         gaps = self.gap_count(pend)
-        self.top += min(int(slack * 0.15), _pptx_in(0.40))
-        self.spread = min(int(slack * 0.60) // max(1, gaps), _pptx_in(0.30))
+        self.top += min(int(slack * 0.18), _pptx_in(0.55))
+        self.spread = min(int(slack * 0.62) // max(1, gaps), _pptx_in(0.42))
 
     def gap_count(self, pend) -> int:
         n = 0
@@ -2539,9 +3484,21 @@ class _Deck:
             if t in ("bullets", "numbers"):
                 n += max(1, len(b["items"]) - 1)
             elif t in ("paragraph", "quote", "heading", "table", "chart",
-                       "image"):
+                       "image", "stats", "columns", "callout"):
                 n += 1
         return max(1, n)
+
+    def card_only(self, pend) -> bool:
+        """True when the slide is one block that draws its own fixed box.
+
+        `balance` grows the *gaps* between blocks; a single stats row or a
+        single set of columns has no gaps to grow, so the whole slack went
+        unused and the cards sat in the top third of an otherwise empty slide.
+        For these, the block itself is allowed to grow into the space.
+        """
+        on_face = [b for b in pend if b["type"] != "note"]
+        return len(on_face) == 1 and on_face[0]["type"] in (
+            "stats", "columns", "callout")
 
     def slide_for(self, heading, continued=False, pend=None):
         """A content slide: real title placeholder, measured, with its rule."""
@@ -2551,7 +3508,8 @@ class _Deck:
                         if (continued and heading) else heading)
         if text:
             tw = int(self.cw * 0.86)
-            h = self._m(text, tw, self.HEAD, 1.12, pad_pt=2.0)
+            h = self._m(text, tw, self.HEAD, 1.12, pad_pt=2.0,
+                        em=self.head_em)
             ph = self._title_placeholder()
             if ph is not None:
                 ph.left, ph.top = self.mx, self.top
@@ -2565,7 +3523,10 @@ class _Deck:
                                       h).text_frame.paragraphs[0], text,
                             self.HEAD, color=self.ink, bold=True,
                             align=PP_ALIGN.LEFT, line_spacing=1.12)
-            self.top += h
+            # A little air between the last baseline and the rule: the box
+            # bottom is where the descender sits, and a rule flush against it
+            # reads as a strikethrough on a two-line title.
+            self.top += h + _pptx_in(0.10)
             self.rule(self.mx, self.top, _pptx_in(1.5))
             self.top += self.rule_h + _pptx_in(0.28)
         else:
@@ -2584,9 +3545,11 @@ class _Deck:
         return s
 
     # ── content, each measured ────────────────────────────────────────────
-    def _m(self, text, width_emu, size_pt, leading_mult=1.22, pad_pt=4.0):
+    def _m(self, text, width_emu, size_pt, leading_mult=1.22, pad_pt=4.0,
+           em=None):
         return _pptx_text_height(text, width_emu, size_pt, leading_mult, pad_pt,
-                                 em=self.em)
+                                 em=self.em if em is None else em,
+                                 line_em=getattr(self, "line_em", 1.22))
 
     def _index(self, title_top, title_h):
         """The slide's own number, large and faint in the title band.
@@ -2637,6 +3600,211 @@ class _Deck:
         return True
 
     CARD_PAD = _pptx_in(0.26)
+
+    def stat_cards(self, items, force=False) -> bool:
+        """Big-number callouts across the slide width.
+
+        A deck of bullets reads as a converted report; a row of large figures
+        with small labels is the single most recognisable "designed deck"
+        move. Each card is a tinted panel with the number in the accent and
+        the label beneath it in muted ink."""
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+        from pptx.util import Pt
+        n = max(1, len(items))
+        gap = _pptx_in(0.22)
+        w = (self.cw - gap * (n - 1)) // n
+        pad = _pptx_in(0.16)
+        inner_w = w - 2 * pad
+        # Measure the value at its real size: "$210-430/kWh" wraps to two lines
+        # in a quarter-width card, and a fixed 0.72in slot let the second line
+        # print straight over its own label ("2025 ... x86"). Both the card
+        # height and the label's offset now come from the same measurement.
+        # ONE size for the row: a stats band whose figures are set at
+        # different sizes reads as an accident. Shrink until the longest value
+        # fits, then set every card at that size.
+        size = 34
+        while size > 20 and max(
+                self._m(it["value"], inner_w, size, 0.95, pad_pt=2.0,
+                        em=self.head_em) for it in items) > _pptx_in(1.10):
+            size -= 2
+        val_sizes = [size] * len(items)
+        val_hs = [self._m(it["value"], inner_w, size, 0.95, pad_pt=2.0,
+                          em=self.head_em) for it in items]
+        label_hs = [self._m(it.get("label") or "", inner_w, 12, 1.1)
+                    if it.get("label") else 0 for it in items]
+        # All labels start at the same Y, after the TALLEST value in the row.
+        # Placing each label straight under its own value left a two-line
+        # figure's label sitting far below its neighbours' - a row of cards is
+        # read across, so their labels have to line up.
+        val_slot = max(val_hs)
+        content_h = max(v + l for v, l in zip(val_hs, label_hs)) + 2 * pad
+        # A stats row is a band of numbers, not a panel: a share of spare
+        # height is fine, but growing it to fill a whole slide leaves three
+        # inches of empty tint under every label. Cap the growth and centre
+        # the content inside whatever height the card ends up with.
+        h = content_h + min(int(getattr(self, "grow", 0)), _pptx_in(1.30))
+        if h > self.room() and not force:
+            return False
+        top = self.top
+        for i, it in enumerate(items):
+            x = self.mx + i * (w + gap)
+            card = self.cur.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                             x, top, w, h)
+            try:
+                card.adjustments[0] = 0.08
+                card.fill.solid()
+                card.fill.fore_color.rgb = self.tint
+                card.line.color.rgb = self.soft
+                card.line.width = Pt(0.75)
+                card.shadow.inherit = False
+            except Exception:
+                pass
+            # Value: large, accent, semibold. Label: small, muted, wrapped.
+            # Everything sits centred in the card rather than pinned to its top.
+            inner_h = val_slot + (label_hs[i] if it.get("label") else 0)
+            y0 = top + max(pad, (h - inner_h) // 2)
+            vb = self._box(x + pad, y0, inner_w, val_hs[i])
+            vb.text_frame.word_wrap = True
+            try:
+                vb.text_frame.vertical_anchor = MSO_ANCHOR.TOP
+            except Exception:
+                pass
+            self._write(vb.text_frame.paragraphs[0], it["value"],
+                        val_sizes[i],
+                        color=self.accent, bold=True, align=PP_ALIGN.LEFT,
+                        line_spacing=0.95, font=self.head_font)
+            if it.get("label"):
+                lb = self._box(x + pad, y0 + val_slot, inner_w,
+                               label_hs[i])
+                lb.text_frame.word_wrap = True
+                self._write(lb.text_frame.paragraphs[0], it["label"], 12,
+                            color=self.muted, align=PP_ALIGN.LEFT,
+                            line_spacing=1.1)
+        self.top += h + _pptx_in(0.16) + self.spread
+        return True
+
+    def callout(self, title, text, tone=None, force=False) -> bool:
+        """A titled, tinted panel - the deck's 'KEY INSIGHT' band."""
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import PP_ALIGN
+        from pptx.util import Pt
+        title = str(title or "Note")
+        body = str(text or "")
+        warn = str(tone or "").lower() in ("warning", "danger", "alert")
+        bar = _pptx_rgb("B3261E") if warn else self.accent
+        inner_w = self.cw - _pptx_in(0.5)
+        body_h = self._m(body, inner_w, self.BODY - 3, 1.14) if body else 0
+        h = _pptx_in(0.50) + body_h + _pptx_in(0.30)
+        if h > self.room() and not force:
+            return False
+        card = self.cur.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                         self.mx, self.top, self.cw, h)
+        try:
+            card.adjustments[0] = 0.06
+            card.fill.solid()
+            card.fill.fore_color.rgb = _pptx_mix(bar, _pptx_rgb("FFFFFF"), 0.94)
+            card.line.color.rgb = bar
+            card.line.width = Pt(0.9)
+            card.shadow.inherit = False
+        except Exception:
+            pass
+        band = self.cur.shapes.add_shape(MSO_SHAPE.RECTANGLE, self.mx,
+                                         self.top, self.cw, _pptx_in(0.42))
+        try:
+            band.fill.solid()
+            band.fill.fore_color.rgb = bar
+            band.line.fill.background()
+            band.shadow.inherit = False
+        except Exception:
+            pass
+        tb = self._box(self.mx + _pptx_in(0.16), self.top + _pptx_in(0.05),
+                       self.cw - _pptx_in(0.32), _pptx_in(0.32))
+        self._write(tb.text_frame.paragraphs[0], title.upper(), 11,
+                    color=_pptx_rgb("FFFFFF"), bold=True,
+                    align=PP_ALIGN.LEFT, font=self.head_font)
+        if body:
+            bb = self._box(self.mx + _pptx_in(0.18),
+                           self.top + _pptx_in(0.50), inner_w, body_h)
+            bb.text_frame.word_wrap = True
+            self._write(bb.text_frame.paragraphs[0], body, self.BODY - 3,
+                        color=self.ink, align=PP_ALIGN.LEFT,
+                        line_spacing=1.14)
+        self.top += h + _pptx_in(0.16) + self.spread
+        return True
+
+    def column_cards(self, items, force=False) -> bool:
+        """Two or three side-by-side columns, each a titled card.
+
+        This is the layout for "compare these three things" that does not force
+        a table: the eye reads across in parallel, which is the point. A single
+        card takes the full width; two split evenly with a gutter; three use the
+        deck's own three-up rhythm."""
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import PP_ALIGN
+        from pptx.util import Pt
+        n = max(1, len(items))
+        gap = _pptx_in(0.26)
+        w = (self.cw - gap * (n - 1)) // n
+        pad = _pptx_in(0.22)
+        inner_w = w - 2 * pad
+        # The title is measured, not assumed to be one line: "Long-Duration:
+        # Flow" wraps in a third-width card, and a fixed 0.40in slot for it put
+        # the body on top of the title's second line and spilled text past the
+        # card's bottom edge.
+        title_h = [self._m(c.get("title") or "", inner_w, self.BODY - 1, 1.05,
+                           pad_pt=2.0, em=self.head_em)
+                   for c in items]
+        body_h = [self._m(c.get("body") or "", inner_w, self.BODY - 3, 1.12)
+                  for c in items]
+        h = max(max(t + b for t, b in zip(title_h, body_h)) + 2 * pad,
+                _pptx_in(1.5))
+        h += int(getattr(self, "grow", 0))
+        if h > self.room() and not force:
+            return False
+        top = self.top
+        for i, c in enumerate(items):
+            x = self.mx + i * (w + gap)
+            card = self.cur.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                             x, top, w, h)
+            try:
+                card.adjustments[0] = 0.06
+                card.fill.solid()
+                card.fill.fore_color.rgb = _pptx_rgb("FFFFFF")
+                card.line.color.rgb = self.soft
+                card.line.width = Pt(0.75)
+                card.shadow.inherit = False
+            except Exception:
+                pass
+            # An accent bar down the card's inner edge ties the three columns to
+            # the deck without a heavy fill.
+            bar = self.cur.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, top,
+                                            _pptx_in(0.055), h)
+            try:
+                bar.fill.solid()
+                bar.fill.fore_color.rgb = self.accent
+                bar.line.fill.background()
+                bar.shadow.inherit = False
+            except Exception:
+                pass
+            y = top + pad
+            if c.get("title"):
+                th = title_h[i]
+                tb = self._box(x + pad, y, inner_w, th)
+                self._write(tb.text_frame.paragraphs[0], c["title"],
+                            self.BODY - 1, color=self.dark, bold=True,
+                            align=PP_ALIGN.LEFT, line_spacing=1.05,
+                            font=self.head_font)
+                y += th + _pptx_in(0.04)
+            if c.get("body"):
+                bb = self._box(x + pad, y, inner_w,
+                               max(_pptx_in(0.3), h - (y - top) - pad + _pptx_in(0.1)))
+                bb.text_frame.word_wrap = True
+                self._write(bb.text_frame.paragraphs[0], c["body"],
+                            self.BODY - 3, color=self.ink,
+                            align=PP_ALIGN.LEFT, line_spacing=1.12)
+        self.top += h + _pptx_in(0.16) + self.spread
+        return True
 
     def list_inner(self) -> int:
         return self.cw - _pptx_in(0.38) - (2 * self.CARD_PAD if self.card else 0)
@@ -2814,6 +3982,29 @@ class _Deck:
                 r.height = row_h
             except Exception:
                 pass
+        # Own the table's lines. The blank layout's default table style draws
+        # a full grid, and a grid line lands INSIDE the cell's text band: a
+        # live deck showed a vertical rule running through "Index | Memory"
+        # in the header and through every figure in the right-hand column.
+        # Fills (a tinted band per row, an accent header) carry the structure;
+        # no rule is drawn anywhere.
+        _no_line = {"a:lnL": {}, "a:lnR": {}, "a:lnT": {}, "a:lnB": {}}
+
+        def _clear_borders(cell):
+            try:
+                tcPr = cell._tc.get_or_add_tcPr()
+                for tag in ("a:lnL", "a:lnR", "a:lnT", "a:lnB"):
+                    for old in tcPr.findall(
+                            "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+                            + tag.split(":")[1]):
+                        tcPr.remove(old)
+                from lxml import etree
+                ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+                for tag in ("lnL", "lnR", "lnT", "lnB"):
+                    el = etree.SubElement(tcPr, f"{{{ns}}}{tag}", w="0")
+                    etree.SubElement(el, f"{{{ns}}}noFill")
+            except Exception:
+                pass
         numeric = []
         for ci in range(cols):
             vals = [row[ci] for row in rows if ci < len(row) and str(row[ci]).strip()]
@@ -2823,6 +4014,7 @@ class _Deck:
 
         def place(cell, text, size, color, bold=False, align=None):
             cell.text = ""
+            _clear_borders(cell)
             try:
                 cell.vertical_anchor = MSO_ANCHOR.MIDDLE
                 cell.margin_left = _pptx_in(0.12)
@@ -2913,6 +4105,9 @@ def build_pptx(spec: dict) -> tuple[bytes, str]:
     prs.slide_height = Emu(int(_sh_in * _PPTX_IN))
     deck = _Deck(prs, _lay.resolve_style(spec.get("style")),
                  running_title=title)
+    # The theme is the deck's palette and type underneath every explicit run:
+    # placeholders, notes and PowerPoint's own pickers inherit it.
+    _pptx_theme(prs, deck)
 
     def _norm_key(s):
         return re.sub(r"[\W_]+", " ", _strip_md(s or "").lower()).strip()
@@ -2978,6 +4173,19 @@ def build_pptx(spec: dict) -> tuple[bytes, str]:
                 if not deck.media(t, b):
                     return i, None
                 wrote = True
+            elif t == "stats":
+                if not deck.stat_cards(b["items"], force=not wrote):
+                    return i, None
+                wrote = True
+            elif t == "callout":
+                if not deck.callout(b.get("title"), b.get("text"),
+                                    b.get("tone"), force=not wrote):
+                    return i, None
+                wrote = True
+            elif t == "columns":
+                if not deck.column_cards(b["items"], force=not wrote):
+                    return i, None
+                wrote = True
             elif t == "note":
                 if not deck.note(b["text"]):
                     deck.paragraph(b["text"], force=True)
@@ -3003,6 +4211,15 @@ def build_pptx(spec: dict) -> tuple[bytes, str]:
             if not pend:
                 return
         sections_done += 1
+        # A heading with no body of its own is a section divider, not a
+        # near-empty content slide: full accent, white title. Speaker notes
+        # still land on the notes page.
+        if heading and not [x for x in pend if x["type"] != "note"]:
+            deck.section_slide(heading)
+            for x in pend:
+                if x["type"] == "note":
+                    deck.note(x["text"])
+            return
         first = True
         guard = 0
         while True:
@@ -3278,6 +4495,36 @@ def build_docx(spec: dict) -> tuple[bytes, str]:
                 for ci, c in enumerate(row[:cols]):
                     cells[ci].text = _strip_md(c)
             d.add_paragraph()
+        elif t == "callout":
+            # Word has no shaded-band primitive in python-docx, so the titled
+            # box becomes a bold title paragraph plus its body - the words
+            # survive, which is what matters on paper.
+            p = d.add_paragraph()
+            r = p.add_run(_strip_md(b.get("title") or "Note").upper())
+            r.font.bold = True
+            r.font.size = Pt(9.5)
+            if b.get("text"):
+                d.add_paragraph(_strip_md(b["text"]))
+            d.add_paragraph()
+        elif t == "stats":
+            # No cards on paper: the figures still need to be read, so they
+            # become one emphasised line each rather than vanishing.
+            for it in b["items"]:
+                p = d.add_paragraph()
+                if it.get("value"):
+                    r = p.add_run(_strip_md(it["value"]) + "  ")
+                    r.font.bold = True
+                    r.font.size = Pt(16)
+                if it.get("label"):
+                    p.add_run(_strip_md(it["label"]))
+            d.add_paragraph()
+        elif t == "columns":
+            for c in b["items"]:
+                if c.get("title"):
+                    d.add_heading(_strip_md(c["title"]), level=3)
+                if c.get("body"):
+                    d.add_paragraph(_strip_md(c["body"]))
+            d.add_paragraph()
 
     # Same reference list as the PDF, so the two formats of one request
     # carry the same sources.
@@ -3410,6 +4657,27 @@ BUILDERS = {
     "xlsx": (build_xlsx,
              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
 }
+
+# Markdown / HTML / CSV / JSON / EPUB are serialisations of the SAME block
+# model, so they live in docgen_markup and are small, dependency-free writers.
+# Merged in here so `generate(fmt, spec)` and the schema pick them up with no
+# change to a layout engine. If the import fails (it should not - stdlib only),
+# the four office formats still work.
+try:
+    import docgen_markup as _markup
+    BUILDERS.update(_markup.BUILDERS)
+except Exception as _e:  # pragma: no cover - defensive
+    print(f"[docgen] markup writers unavailable: {_e!r}")
+
+# Typst is an alternative typesetter (PDF) and a slide engine. It needs the
+# `typst` package, which bundles the compiler; if it is missing the builders
+# still register and raise an actionable error only when used, so a missing
+# optional dependency never breaks the office formats.
+try:
+    import docgen_typst as _typst
+    BUILDERS.update(_typst.BUILDERS)
+except Exception as _e:  # pragma: no cover - defensive
+    print(f"[docgen] typst writer unavailable: {_e!r}")
 MAX_BYTES = 25 * 1024 * 1024
 
 

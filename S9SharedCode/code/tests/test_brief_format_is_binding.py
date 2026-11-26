@@ -123,3 +123,121 @@ def test_the_detected_format_reaches_a_real_tool_call(monkeypatch):
     assert seen.get("format") == "pptx", (
         "the brief's format request did not reach the renderer: "
         f"{seen.get('format')!r}")
+
+
+def test_the_planners_engine_reaches_a_real_tool_call(monkeypatch):
+    """The planner's `metadata.engine` must be FORCED onto render_document, not
+    only change the prompt. Without this a planner-chosen LaTeX engine changed
+    the instructions but the model could still render native - and native
+    prints `\\sqrt` as literal markup."""
+    import asyncio
+    import mcp_runner
+    import mcp_server
+
+    seen = {}
+
+    def _fake(**kw):
+        seen.update(kw)
+        return {"ok": True, "artifact": "art:0123456789abcdef",
+                "filename": "x.pdf", "format": kw.get("format"),
+                "bytes": 10, "blocks": 1,
+                "stats": {"words": 10, "sections": 1, "format": kw.get("format")}}
+
+    async def fake_reply(**kw):
+        args = {"title": "T", "blocks": [
+            {"type": "heading", "level": 1, "text": "H"},
+            {"type": "paragraph", "text": "P"}]}
+        prep = kw.get("prepare_fn")
+        if prep:
+            args = prep("render_document", args) or args
+        got = _fake(**args)
+        on_outcome = kw.get("on_outcome")
+        if on_outcome:
+            on_outcome("render_document", args, True, json.dumps(got), 0.0)
+        return {"text": json.dumps({"filename": got["filename"],
+                                    "sections": ["a"]}),
+                "provider": "t", "tool_calls": []}
+
+    skill = skills.SkillRegistry().get("author")
+    orig_r, orig_t = mcp_server.render_document, mcp_runner.run_with_tools
+    mcp_server.render_document = _fake
+    mcp_runner.run_with_tools = fake_reply
+    nodes = {"n:1": {"skill": "author", "inputs": {}, "status": "running",
+                     "metadata": {"format": "pdf", "engine": "latex"}}}
+    try:
+        asyncio.run(skills.run_skill(
+            skill, "n:1", nodes, "s8-t",
+            "Write a long technical PDF with mathematics.", None))
+    finally:
+        mcp_server.render_document = orig_r
+        mcp_runner.run_with_tools = orig_t
+
+    assert seen, "render_document was never called"
+    assert seen.get("typeset") == "latex", (
+        "the planner's LaTeX engine did not reach the renderer: "
+        f"{seen.get('typeset')!r}")
+
+
+def test_an_explicit_latex_request_is_detected():
+    assert skills._latex_requested_in("Typeset it with LaTeX.")
+    assert skills._latex_requested_in("Write it as a LaTeX PDF.")
+    assert skills._latex_requested_in("Use the latex engine for the equations.")
+    assert skills._latex_requested_in("Render with tectonic.")
+
+
+def test_a_passing_latex_mention_does_not_force_the_engine():
+    assert not skills._latex_requested_in("Compare LaTeX and native rendering.")
+    assert not skills._latex_requested_in("Why does LaTeX fail on this macro?")
+    assert not skills._latex_requested_in("A report on the history of TeX.")
+
+
+def test_an_explicit_latex_request_forces_the_engine_without_planner_metadata(
+        monkeypatch):
+    """The live failure: the planner wrote "typeset with LaTeX" in the goal but
+    left `metadata.engine` empty, so the document rendered with ReportLab. The
+    user's explicit request must win even when the planner omits the field."""
+    import asyncio
+    import mcp_runner
+    import mcp_server
+
+    seen = {}
+
+    def _fake(**kw):
+        seen.update(kw)
+        return {"ok": True, "artifact": "art:0123456789abcdef",
+                "filename": "x.pdf", "format": kw.get("format"),
+                "bytes": 10, "blocks": 1,
+                "stats": {"words": 10, "sections": 1, "format": kw.get("format")}}
+
+    async def fake_reply(**kw):
+        args = {"title": "T", "blocks": [
+            {"type": "heading", "level": 1, "text": "H"},
+            {"type": "paragraph", "text": "P"}]}
+        prep = kw.get("prepare_fn")
+        if prep:
+            args = prep("render_document", args) or args
+        got = _fake(**args)
+        on_outcome = kw.get("on_outcome")
+        if on_outcome:
+            on_outcome("render_document", args, True, json.dumps(got), 0.0)
+        return {"text": json.dumps({"filename": got["filename"],
+                                    "sections": ["a"]}),
+                "provider": "t", "tool_calls": []}
+
+    skill = skills.SkillRegistry().get("author")
+    orig_r, orig_t = mcp_server.render_document, mcp_runner.run_with_tools
+    mcp_server.render_document = _fake
+    mcp_runner.run_with_tools = fake_reply
+    # No metadata at all - exactly what the live planner produced.
+    nodes = {"n:1": {"skill": "author", "inputs": {}, "status": "running"}}
+    try:
+        asyncio.run(skills.run_skill(
+            skill, "n:1", nodes, "s8-t",
+            "Write a technical PDF with equations. Typeset it with LaTeX.", None))
+    finally:
+        mcp_server.render_document = orig_r
+        mcp_runner.run_with_tools = orig_t
+
+    assert seen.get("typeset") == "latex", (
+        "an explicit LaTeX request did not force the engine: "
+        f"{seen.get('typeset')!r}")

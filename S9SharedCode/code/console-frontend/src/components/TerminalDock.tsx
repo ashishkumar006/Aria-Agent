@@ -52,7 +52,7 @@ function TerminalSession({ visible, nonce, onStatus, cwd, sid }: {
     if (!host) return;
     const term = new Xterm({
       fontFamily: FONT,
-      fontSize: 12.5,
+      fontSize: 16,
       lineHeight: 1.2,
       cursorBlink: true,
       scrollback: 5000,

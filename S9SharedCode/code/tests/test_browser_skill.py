@@ -19,8 +19,11 @@ sys.path.insert(0, str(ROOT))
 
 from browser.skill import (  # noqa: E402
     BrowserSkill,
+    _derive_start_url,
     _extract,
+    _is_http_url,
     _is_useful_extract,
+    _resolve_url,
     detect_gateway_block,
 )
 from schemas import NodeSpec  # noqa: E402
@@ -129,3 +132,40 @@ class TestBrowserSkillInit:
     # covered by test_live_integration.py. A bad URL currently lets a Playwright
     # DNS error propagate (Layer 2b does not fail-soft on page.goto failure) —
     # acceptable for the deterministic suite; tracked as a robustness gap.
+
+
+# ── goal → starting URL (planner-emitted browser node) ───────────────────────
+# A real run planned `{"skill": "browser", "goal": "Go to Amazon, search for
+# …", "inputs": ["USER_QUERY"]}` with no metadata.url. The skill read inputs[0]
+# as the URL, navigated to the literal "USER_QUERY", and every layer failed with
+# "Cannot navigate to invalid URL" — the node was skipped. The destination lives
+# in the goal; these lock the resolution that prevents the skip.
+
+class TestGoalToUrl:
+    def test_user_query_token_is_never_a_url(self):
+        node = NodeSpec(skill="browser", inputs=["USER_QUERY"], metadata={})
+        assert not _is_http_url(_resolve_url(node))
+
+    def test_named_site_in_goal_derives_homepage(self):
+        assert _derive_start_url(
+            "Go to Amazon, search for best-rated quantum physics books"
+        ) == "https://www.amazon.com"
+
+    def test_explicit_url_input_is_used_verbatim(self):
+        node = NodeSpec(skill="browser",
+                        inputs=["https://example.com/a"], metadata={})
+        assert _resolve_url(node) == "https://example.com/a"
+        assert _is_http_url(_resolve_url(node))
+
+    def test_metadata_url_wins_over_goal(self):
+        node = NodeSpec(skill="browser", inputs=["USER_QUERY"],
+                        metadata={"url": "https://docs.python.org/3/"})
+        assert _resolve_url(node) == "https://docs.python.org/3/"
+
+    def test_no_site_falls_back_to_search(self):
+        u = _derive_start_url("find me the best pizza near me")
+        assert u.startswith("https://html.duckduckgo.com/html/?q=")
+        assert "find" not in u and "me+the" not in u
+
+    def test_empty_goal_derives_nothing(self):
+        assert _derive_start_url("") == ""

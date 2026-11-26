@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { caretToken, checksToRows, mentionTokens } from './Composer';
+import { caretToken, checksSummary, checksToRows, mentionTokens } from './Composer';
 
 /* The composer's two derived functions, tested because both decide what the
  * agent is handed and neither can be seen in a screenshot: a popup that opens
@@ -99,6 +99,28 @@ describe('checksToRows', () => {
     expect(rows[0].message).toContain('not installed');
   });
 
+  /* The counter next to the composer means "things are wrong". A passing
+     pytest prints two lines of stdout, and turning those into rows made a green
+     run read "2 problems" — the fastest way to teach someone to ignore it. */
+  it('reports nothing for a check that passed', () => {
+    const rows = checksToRows({
+      ok: true, checks_run: 1,
+      results: [{ tool: 'pytest', ok: true, exit_code: 0,
+                  stdout: '..\n4 passed in 0.1s\n' }],
+    } as never);
+    expect(rows).toEqual([]);
+  });
+
+  it('still reports a failure line when a check fails', () => {
+    const rows = checksToRows({
+      ok: false, checks_run: 1,
+      results: [{ tool: 'pytest', ok: false, exit_code: 1,
+                  stdout: '', stderr: 'FAILED test_x.py::test_y - assert 1 == 2' }],
+    } as never);
+    expect(rows[0].severity).toBe('error');
+    expect(rows[0].message).toContain('test_y');
+  });
+
   it('caps at twelve rows and never invents a row from silence', () => {
     const many = Array.from({ length: 30 }, (_x, i) => `line ${i}`);
     const rows = checksToRows({
@@ -109,5 +131,41 @@ describe('checksToRows', () => {
     expect(rows.length).toBeLessThanOrEqual(12);
     expect(checksToRows({ ok: true, checks_run: 0, results: [] } as never))
       .toEqual([]);
+  });
+});
+
+/* The summary is the one line a person reads instead of the output. "No checks
+ * were runnable · all runnable checks passed" is two true clauses that add up to
+ * a lie, so the verdict clause is dropped when nothing ran. */
+describe('checksSummary', () => {
+  it('says what passed when checks ran', () => {
+    expect(checksSummary({
+      ok: true, checks_run: 2,
+      results: [{ tool: 'pytest', ok: true }, { tool: 'tsc', ok: true }],
+    } as never)).toContain('2 check(s) ran · all runnable checks passed');
+  });
+
+  it('names the failing tool', () => {
+    expect(checksSummary({
+      ok: false, checks_run: 2,
+      results: [{ tool: 'pytest', ok: false }, { tool: 'tsc', ok: true }],
+    } as never)).toContain('failed: pytest');
+  });
+
+  it('refuses to call a run with no checker a pass', () => {
+    const s = checksSummary({ ok: false, checks_run: 0, results: [],
+                              error: 'no checker detected' } as never);
+    expect(s).toContain('no checks were runnable');
+    expect(s).not.toContain('passed');
+    expect(s).toContain('no checker detected');
+  });
+
+  it('does not claim a pass when every checker is missing', () => {
+    const s = checksSummary({
+      ok: false, checks_run: 0,
+      results: [{ tool: 'pytest', ok: false, available: false }],
+    } as never);
+    expect(s).toContain('not installed: pytest');
+    expect(s).not.toContain('all runnable checks passed');
   });
 });

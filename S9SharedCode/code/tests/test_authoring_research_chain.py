@@ -152,6 +152,15 @@ def test_the_planner_prompt_says_the_same_thing():
     assert "never emit `author`/`deck` straight from `user_query`" in md.lower()
 
 
+def test_the_planner_prompt_makes_the_format_explicit():
+    """The required format is the planner's choice, carried in metadata — not
+    inferred by the author. A node with no `metadata.format` is how a PDF
+    request became a deck (or the reverse)."""
+    md = open("prompts/planner.md", encoding="utf-8").read()
+    assert "metadata.format" in md
+    assert "EVERY author/deck node" in md
+
+
 def test_the_author_prompt_demands_grounding_in_its_inputs():
     md = open("prompts/author.md", encoding="utf-8").read().lower()
     assert "upstream" in md or "inputs" in md, \

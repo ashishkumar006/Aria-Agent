@@ -63,6 +63,109 @@
   --shadow-glow-ok: 0 0 16px rgba(126, 226, 168, 0.25);
 }
 
+/* ── Studio surface ─────────────────────────────────────────────────────
+   The studio shares the console's palette and materials — surface-0 rails,
+   surface-1 cards, the glass border, the violet accent — instead of a second
+   set of neutrals, so the two read as one product.
+
+   The shared surfaces are cool-biased (#0a0c13 has blue > red), which on the
+   neutral #090909 page reads as a blue line wherever a rail meets the page.
+   Inside the studio they are neutralised; the console keeps its own. */
+.studio-oc {
+  --color-surface-0: #0e0e12;
+  --color-surface-1: #14141a;
+  --color-surface-2: #1b1b22;
+  background: var(--color-void);
+}
+
+/* The editor surface stays the console panel colour, never the OS dark-red.
+   The Monaco theme sets this too, but the surfacing rules here win. */
+.studio-oc .monaco-editor,
+.studio-oc .monaco-editor .overflow-guard,
+.studio-oc .monaco-editor .monaco-scrollable-element {
+  background-color: #0e0e12 !important;
+}
+
+/* The Explorer's preview is a code BLOCK, not the editor: the lighter #1E1E1E
+   surface and a 13.5px face are what make a snippet read as quoted code rather
+   than as a document you are editing. */
+.studio-oc .monaco-dense .monaco-editor,
+.studio-oc .monaco-dense .monaco-editor .overflow-guard,
+.studio-oc .monaco-dense .monaco-editor .monaco-scrollable-element {
+  background-color: #1E1E1E !important;
+}
+
+/* Thin, neutral scrollbars inside the editor. */
+.studio-oc .monaco-scrollable-element > .scrollbar.vertical { width: 4px !important; }
+.studio-oc .monaco-scrollable-element > .scrollbar.horizontal { height: 4px !important; }
+.studio-oc .monaco-scrollable-element > .scrollbar > .slider { border-radius: 2px; }
+.studio-oc ::selection { background: rgba(139, 124, 246, 0.35); }
+
+/* Queued queries slide in as they are stacked, so the eye catches the new row
+   without the whole composer jumping. Respects reduced-motion. */
+@keyframes queue-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-queue-in { animation: queue-in 160ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .animate-queue-in { animation: none; }
+}
+
+/* ── Code in the agent transcript ───────────────────────────────────────
+   The transcript's fences are one flat grey without these. The palette stays
+   in the studio's own key: violet for keywords, the accent's cool neighbours
+   for values, and grey italic for comments so prose never competes with code. */
+.studio-oc .tok-com { color: #6f7480; font-style: italic; }
+.studio-oc .tok-str { color: #9ad99a; }
+.studio-oc .tok-key { color: #8fc7f0; }
+.studio-oc .tok-kw  { color: #c0a6ff; }
+.studio-oc .tok-num { color: #e0b072; }
+.studio-oc .tok-fn  { color: #8fd3c7; }
+.studio-oc .tok-dec { color: #e0b072; }
+
+/* The composer: no scrollbar while it fits, a thin one when the text overflows. */
+.studio-oc textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+.studio-oc textarea::-webkit-scrollbar { width: 4px; }
+.studio-oc textarea::-webkit-scrollbar-track { background: transparent; }
+.studio-oc textarea::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+/* ── Studio interactive polish ──────────────────────────────────────────
+   One consistent language for every control in the studio: a 120ms
+   transition, a violet focus-visible ring, and a clear disabled state.
+   Scoped to `.studio-oc` so the rest of the console is untouched. */
+.studio-oc button,
+.studio-oc [role="button"],
+.studio-oc a {
+  transition: background-color 120ms ease, border-color 120ms ease,
+              color 120ms ease, opacity 120ms ease;
+}
+.studio-oc button:focus-visible,
+.studio-oc [role="button"]:focus-visible,
+.studio-oc a:focus-visible,
+.studio-oc [role="tab"]:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.studio-oc input:focus-visible,
+.studio-oc textarea:focus-visible,
+.studio-oc select:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--color-accent) 60%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
+.studio-oc button:disabled,
+.studio-oc [role="button"][aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* === BASE === */
 html, body, #root {
   height: 100%;
@@ -212,6 +315,11 @@ html, body, #root {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
+@keyframes panel-in-right {
+  from { transform: translateX(48px); }
+  to { transform: translateX(0); }
+}
+
 @keyframes surface-in {
   from { opacity: 0; transform: translateY(4px) scale(0.997); }
   to { opacity: 1; transform: translateY(0) scale(1); }
@@ -222,6 +330,10 @@ html, body, #root {
 }
 
 .msg-in { animation: msg-in 180ms var(--ease-out) backwards; }
+/* A section panel sliding in from the right edge of the workbench. Pure
+   transform — no fade, no sweep — so the content is never invisible while
+   it arrives. */
+.panel-in-right { animation: panel-in-right 150ms var(--ease-out) backwards; }
 /* `backwards`, not `both`: a forwards-filled keyframe keeps a transform on
    the element, and any transformed ancestor becomes the containing block for
    a `position: fixed` dialog inside it. Fill only the pre-animation state so
@@ -281,25 +393,46 @@ button, a, input, textarea, select, summary, [role="button"] {
    these rules replace the long per-view `[&_pre]:…` utility chains that
    were duplicated (and, in the pre-fence version, styled elements the
    renderer never produced). */
-.prose-chat { overflow-wrap: break-word; word-break: break-word; }
+.prose-chat { overflow-wrap: break-word; word-break: break-word;
+  font-size: 0.9375rem; line-height: 1.6; color: #ECECEC; }
 .prose-chat > :first-child { margin-top: 0; }
 .prose-chat h2, .prose-chat h3, .prose-chat h4,
 .prose-chat h5, .prose-chat h6 {
-  font-weight: 700; color: var(--color-zinc-100); line-height: 1.3;
+  font-weight: 600; color: #ECECEC; line-height: 1.35;
 }
-.prose-chat h2 { font-size: 0.95rem; margin: 0.9rem 0 0.35rem; color: #c4b5fd; }
-.prose-chat h3 { font-size: 0.85rem; margin: 0.75rem 0 0.3rem; }
+/* Headings are structure, not decoration: a violet h2 pulled the eye to the
+   label and away from the answer under it. */
+.prose-chat h2 { font-size: 1.02rem; margin: 1.1rem 0 0.4rem; }
+.prose-chat h3 { font-size: 0.96rem; margin: 0.95rem 0 0.35rem; }
 .prose-chat h4, .prose-chat h5, .prose-chat h6 {
-  font-size: 0.8rem; margin: 0.6rem 0 0.25rem; color: var(--color-zinc-300);
+  font-size: 0.9rem; margin: 0.75rem 0 0.3rem; color: #E4E4E7;
 }
-.prose-chat p { margin: 0.5rem 0; }
-.prose-chat ul, .prose-chat ol { margin: 0.4rem 0; padding-left: 1.25rem; }
+.prose-chat p { margin: 0.6rem 0; }
+.prose-chat ul, .prose-chat ol { margin: 0.5rem 0; padding-left: 1.3rem; }
 .prose-chat ul { list-style: disc; }
 .prose-chat ol { list-style: decimal; }
-.prose-chat li { margin: 0.15rem 0; }
-.prose-chat li > ul, .prose-chat li > ol { margin: 0.15rem 0; }
-.prose-chat a { color: #a78bfa; text-decoration: underline; }
-.prose-chat a:hover { color: #c4b5fd; }
+.prose-chat li { margin: 0.25rem 0; }
+.prose-chat li > ul, .prose-chat li > ol { margin: 0.2rem 0; }
+.prose-chat a { color: #7AA2F7; text-decoration: none; }
+.prose-chat a:hover { text-decoration: underline; }
+/* A file path is a handle you can click, not a badge: no pill, no dotted
+   border, just the muted periwinkle that reads as a reference. */
+.file-ref {
+  border: 0;
+  background: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  color: #7AA2F7;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.file-ref:hover { text-decoration: underline; color: #A9C6FF; }
+.file-ref:focus-visible {
+  outline: 2px solid #7AA2F7;
+  outline-offset: 1px;
+  border-radius: 2px;
+}
 .prose-chat b { font-weight: 700; color: var(--color-zinc-100); }
 .prose-chat del { opacity: 0.65; }
 /* LaTeX the model emitted anyway, degraded to readable characters. It is set
@@ -324,21 +457,48 @@ button, a, input, textarea, select, summary, [role="button"] {
   white-space: normal;
 }
 .prose-chat hr { border: 0; border-top: 1px solid var(--color-edge); margin: 0.9rem 0; }
+/* Thinking is rendered with the same markdown engine as the answer, but at
+   thinking scale and colour: smaller, muted, and never competing with the
+   reply underneath it. `.prose-chat` supplies the element rules; this only
+   overrides size/colour and tightens the rhythm. */
+.thinking-md { font-size: 12.5px; line-height: 1.6; color: #a1a1aa; }
+.thinking-md p { margin: 0.2rem 0; }
+.thinking-md h2, .thinking-md h3, .thinking-md h4,
+.thinking-md h5, .thinking-md h6 {
+  font-size: 0.95em; margin: 0.45rem 0 0.2rem; color: #d4d4d8;
+}
+.thinking-md strong { color: #e4e4e7; }
+.thinking-md ul, .thinking-md ol { margin: 0.2rem 0; padding-left: 1.1rem; }
+.thinking-md li { margin: 0.1rem 0; }
+.thinking-md :not(pre) > code { font-size: 0.9em; }
+.thinking-md pre { margin: 0.3rem 0; padding: 0.5rem 0.6rem; }
+.thinking-md blockquote { margin: 0.3rem 0; }
 .prose-chat blockquote {
   margin: 0.5rem 0; padding: 0.15rem 0 0.15rem 0.75rem;
   border-left: 2px solid rgba(139, 124, 246, 0.5); color: var(--color-zinc-400);
 }
+/* Inline code is a pill: dark chip, tiny radius, monospace a notch smaller than
+   the prose. This is the Claude/One-Dark look the rest of the answer uses. */
 .prose-chat :not(pre) > code {
-  background: rgba(255, 255, 255, 0.10); padding: 0.1rem 0.3rem;
-  border-radius: 4px; font-family: var(--font-mono); font-size: 0.8em;
+  background: #2E2E2E;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0.08rem 0.32rem;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 0.875em;
+  color: #E4E4E7;
+  white-space: nowrap;
 }
 .prose-chat pre {
-  margin: 0.55rem 0; padding: 0.75rem; overflow-x: auto;
-  background: rgba(0, 0, 0, 0.55); border: 1px solid var(--color-edge);
+  margin: 0.65rem 0; padding: 0.8rem 0.9rem; overflow-x: auto;
+  background: #1E1E1E; border: 1px solid rgba(255, 255, 255, 0.07);
   border-radius: 8px;
 }
 .prose-chat pre code {
-  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 13.5px; line-height: 1.6;
   color: #d4d4d8; white-space: pre;
 }
 /* A fenced block is one surface: language on the left, copy on the right,
@@ -544,6 +704,25 @@ button, a, input, textarea, select, summary, [role="button"] {
 .agent-panel :focus-visible {
   outline: none;
 }
+/* The studio composer's text box. The card edge lights up on focus-within,
+   which is the affordance; the global ring on top read as a browser default
+   leaking through the transparent textarea. Scoped to the textarea inside
+   the composer so the rest of the console keeps its keyboard ring. */
+[data-composer-menu] textarea:focus,
+[data-composer-menu] textarea:focus-visible {
+  outline: none;
+}
+/* The studio's session rail rows are buttons; the global accent ring sat
+   on the active row as a permanent blue box. The violet border on the
+   active row is the affordance for "where you are" — keyboard focus gets
+   a soft inset ring, not the accent outline. */
+[aria-label="Studio sessions"] button:focus,
+[aria-label="Studio sessions"] button:focus-visible {
+  outline: none;
+}
+[aria-label="Studio sessions"] button:focus-visible {
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.55);
+}
 
 /* === REDUCED MOTION === */
 @media (prefers-reduced-motion: reduce) {
@@ -557,6 +736,7 @@ button, a, input, textarea, select, summary, [role="button"] {
   .msg-in,
   .surface-in,
   .row-in,
+  .panel-in-right,
   .stagger > * {
     animation: none !important;
   }

@@ -1,6 +1,7 @@
 import {
   createContext, useContext, useEffect, useMemo, useState,
 } from 'react';
+import { Loader2 } from 'lucide-react';
 import type { A2uiComponent, A2uiProps, A2uiSurface, A2uiActionHandler } from '../api';
 import { Stat, Pill } from './ui';
 
@@ -238,6 +239,11 @@ const InputsContext = createContext<{
   set: (name: string, value: string) => void;
 }>({ values: {}, set: () => { /* no surface */ } });
 
+/* A run is in flight (action/refresh). Buttons disable and show a spinner so a
+   second click cannot fire a duplicate paid builder run, and the user gets
+   feedback instead of a silently-dropped click. */
+const BusyContext = createContext(false);
+
 const FIELD = 'w-full rounded-md border border-glass-border bg-black/30 px-2 py-1.5 text-[12px] text-zinc-200 outline-none focus:border-accent';
 
 function InputField({ c }: { c: A2uiComponent }) {
@@ -366,6 +372,7 @@ function RadioGroupField({ c }: { c: A2uiComponent }) {
 
 function FilterChipsField({ c, onAction }: { c: A2uiComponent; onAction?: A2uiActionHandler }) {
   const { values } = useContext(InputsContext);
+  const busy = useContext(BusyContext);
   const action = str(c.props.action);
   const options = ((c.props.options as unknown[]) || []).map((raw) => {
     const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
@@ -376,7 +383,7 @@ function FilterChipsField({ c, onAction }: { c: A2uiComponent; onAction?: A2uiAc
     };
   }).filter((o) => o.id);
   if (!options.length) return <p className="m-0 text-[11.5px] text-zinc-500">No filters.</p>;
-  const enabled = !!onAction && !!action;
+  const enabled = !!onAction && !!action && !busy;
   return (
     <div role="group" className="flex flex-wrap gap-1">
       {options.map((o) => (
@@ -394,20 +401,25 @@ function FilterChipsField({ c, onAction }: { c: A2uiComponent; onAction?: A2uiAc
 
 function ActionButton({ c, onAction }: { c: A2uiComponent; onAction?: A2uiActionHandler }) {
   const { values } = useContext(InputsContext);
+  const busy = useContext(BusyContext);
   const press = (c.props.onPress as Record<string, unknown> | undefined) || {};
   const action = str(c.props.action || press.action || '');
   const args = (c.props.args ?? press.args ?? press.params ?? {}) as Record<string, unknown>;
   const primary = str(c.props.variant) === 'primary';
-  const primaryCls = 'rounded-md bg-accent px-3 py-1.5 text-[11.5px] font-semibold text-[#0b0b0e] transition hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60';
-  const secondaryCls = 'rounded-md border border-glass-border bg-white/[0.03] px-3 py-1.5 text-[11.5px] text-zinc-200 transition hover:border-white/20 hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40';
+  // self-start: a Column is a stretch flex container, so a submit button used
+  // to fill the whole pane and read as a banner. Size it to its label instead.
+  const primaryCls = 'self-start rounded-md bg-accent px-3 py-1.5 text-[11.5px] font-semibold text-[#0b0b0e] transition hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60';
+  const secondaryCls = 'self-start rounded-md border border-glass-border bg-white/[0.03] px-3 py-1.5 text-[11.5px] text-zinc-200 transition hover:border-white/20 hover:bg-white/[0.07] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40';
   if (onAction && action) {
     return (
       <button
         type="button"
+        disabled={busy}
         onClick={() => onAction(action, { ...args, input: { ...values } })}
         title={str(c.props.tooltip || '')}
-        className={primary ? primaryCls : secondaryCls}
+        className={`${primary ? primaryCls : secondaryCls} inline-flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed`}
       >
+        {busy ? <Loader2 size={12} className="animate-spin" /> : null}
         {str(c.props.label)}
       </button>
     );
@@ -568,7 +580,7 @@ function Leaf({ c, onAction }: { c: A2uiComponent; onAction?: A2uiActionHandler 
       const variant = str(p.variant) || 'body';
       const text = str(p.text);
       if (variant === 'heading') {
-        return <h4 className="m-0 whitespace-pre-wrap text-[13.5px] font-semibold tracking-tight text-zinc-50">{text}</h4>;
+        return <h4 className="m-0 whitespace-pre-wrap text-[16px] font-semibold tracking-tight text-zinc-50">{text}</h4>;
       }
       if (variant === 'caption') {
         return <p className="m-0 whitespace-pre-wrap text-[10.5px] leading-snug text-zinc-muted">{text}</p>;
@@ -580,6 +592,24 @@ function Leaf({ c, onAction }: { c: A2uiComponent; onAction?: A2uiActionHandler 
     }
     case 'CodeBlock':
       return <pre className="m-0 overflow-x-auto rounded bg-surface-0 p-2 text-[11.5px] text-zinc-200"><code>{str(p.text)}</code></pre>;
+    case 'Image': {
+      /* The only URL the catalog admits is an https image src, and it is
+         rendered exactly like the chat markdown sandbox: no referrer, no
+         script, plain <img>. Anything non-https is refused, not loaded. */
+      const src = str(p.src);
+      const ok = /^https:\/\/[^\s"'<>]+$/i.test(src);
+      if (!ok) return <p className="m-0 text-[11px] text-zinc-muted">[image: https source required]</p>;
+      return (
+        <figure className="m-0">
+          <img src={src} alt={str(p.alt) || str(p.caption) || 'image'}
+            referrerPolicy="no-referrer" loading="lazy"
+            className="max-h-[320px] w-auto max-w-full rounded-md border border-glass-border object-contain" />
+          {str(p.caption) ? (
+            <figcaption className="mt-1 text-[10.5px] text-zinc-muted">{str(p.caption)}</figcaption>
+          ) : null}
+        </figure>
+      );
+    }
     case 'Badge':
       return <Pill tone={PILL_TONE[str(p.tone)] || 'muted'}>{str(p.text)}</Pill>;
     case 'KeyValue':
@@ -910,7 +940,7 @@ function defaultInputs(surface: A2uiSurface): Record<string, string> {
   return out;
 }
 
-export function A2ui({ surface, notes, onAction }: { surface: A2uiSurface; notes?: string[]; onAction?: A2uiActionHandler }) {
+export function A2ui({ surface, notes, onAction, busy }: { surface: A2uiSurface; notes?: string[]; onAction?: A2uiActionHandler; busy?: boolean }) {
   const byId = useMemo(() => new Map(surface.components.map((c) => [c.id, c])), [surface]);
   const defaults = useMemo(() => defaultInputs(surface), [surface]);
   const [inputs, setInputs] = useState<Record<string, string>>(defaults);
@@ -938,7 +968,9 @@ export function A2ui({ surface, notes, onAction }: { surface: A2uiSurface; notes
         values: inputs,
         set: (name, value) => setInputs((prev) => ({ ...prev, [name]: value })),
       }}>
-        <Node c={root} byId={byId} depth={0} onAction={onAction} />
+        <BusyContext.Provider value={!!busy}>
+          <Node c={root} byId={byId} depth={0} onAction={onAction} />
+        </BusyContext.Provider>
       </InputsContext.Provider>
     </div>
   );

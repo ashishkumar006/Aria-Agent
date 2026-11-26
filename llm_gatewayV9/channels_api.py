@@ -59,6 +59,13 @@ ALLOWED_KEYS = frozenset({
     "KOKORO_MODEL", "KOKORO_VOICES", "STT_MODEL",
     # gateway-owned integrations
     "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
+    "ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN",
+    "ZOHO_DC", "ZOHO_USER", "ZOHO_ACCOUNT_ID",
+    "NTFY_URL", "NTFY_TOKEN",
+    "ZOHO_CLIQ_TOKEN", "ZOHO_CLIQ_DC",
+    "BSKY_HANDLE", "BSKY_APP_PASSWORD",
+    "MASTODON_TOKEN", "MASTODON_INSTANCE",
+    "GOOGLE_CHAT_WEBHOOK",
     "GOOGLE_CALENDAR_REFRESH_TOKEN", "GOOGLE_CALENDAR_CLIENT_ID",
     "GOOGLE_CALENDAR_CLIENT_SECRET",
     "GOOGLE_CALENDAR_TOKEN",
@@ -68,6 +75,82 @@ ALLOWED_KEYS = frozenset({
 })
 # GMAIL_TOKEN / GMAIL_REFRESH_TOKEN are deliberately excluded: they are minted
 # by gmail_oauth_setup.py, not pasted by hand.
+
+# Direct "go get it" link per key, shown next to the field in the console.
+# Values are public URLs only — never a credential.
+KEY_LINKS: dict[str, str] = {
+    "TELEGRAM_BOT_TOKEN": "https://t.me/BotFather",
+    "DISCORD_BOT_TOKEN": "https://discord.com/developers/applications",
+    "SLACK_BOT_TOKEN": "https://api.slack.com/apps",
+    "SLACK_REFRESH_TOKEN": "https://api.slack.com/apps",
+    "SLACK_CLIENT_ID": "https://api.slack.com/apps",
+    "SLACK_CLIENT_SECRET": "https://api.slack.com/apps",
+    "SLACK_SIGNING_SECRET": "https://api.slack.com/apps",
+    "MATRIX_HOMESERVER": "https://matrix.org/",
+    "MATRIX_USER": "https://matrix.org/",
+    "MATRIX_PASSWORD": "https://matrix.org/",
+    "SIGNAL_NUMBER": "https://signal.org/",
+    "SIGNAL_DATA_DIR": "https://signal.org/",
+    "LINE_CHANNEL_SECRET": "https://developers.line.biz/console/",
+    "LINE_ACCESS_TOKEN": "https://developers.line.biz/console/",
+    "IMAP_HOST": "https://support.google.com/mail/answer/7126229",
+    "IMAP_USER": "https://support.google.com/mail/answer/7126229",
+    "IMAP_PASS": "https://support.google.com/mail/answer/7126229",
+    "SMTP_HOST": "https://support.google.com/mail/answer/7126229",
+    "SMTP_USER": "https://support.google.com/mail/answer/7126229",
+    "SMTP_PASS": "https://support.google.com/mail/answer/7126229",
+    "TWILIO_SID": "https://console.twilio.com/",
+    "TWILIO_AUTH": "https://console.twilio.com/",
+    "TWILIO_FROM": "https://console.twilio.com/us1/develop/sms/phonenumbers",
+    "TWILIO_WEBHOOK_URL": "https://console.twilio.com/",
+    "TWILIO_VOICE_FROM": "https://console.twilio.com/us1/develop/voice/phonenumbers",
+    "VOICE_WS_URL": "https://console.twilio.com/",
+    "WHATSAPP_FROM": "https://business.facebook.com/wa/manage/",
+    "WA_TOKEN": "https://developers.facebook.com/apps/",
+    "WA_PHONE_ID": "https://developers.facebook.com/apps/",
+    "WA_VERIFY_TOKEN": "https://developers.facebook.com/apps/",
+    "TEAMS_APP_ID": "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+    "TEAMS_APP_PASSWORD": "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+    "TEAMS_TENANT": "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+    "WEBHOOK_SECRET": "",
+    "WEBHOOK_OUT_URL": "",
+    "GEMINI_API_KEYS": "https://aistudio.google.com/apikey",
+    "NVIDIA_API_KEYS": "https://ngc.nvidia.com/",
+    "GROQ_API_KEYS": "https://console.groq.com/keys",
+    "CEREBRAS_API_KEYS": "https://cloud.cerebras.ai/",
+    "OPEN_ROUTER_API_KEYS": "https://openrouter.ai/keys",
+    "GITHUB_ACCESS_TOKENS": "https://github.com/settings/tokens",
+    "GITHUB_TOKEN": "https://github.com/settings/tokens",
+    "KILO_API_KEY": "https://app.kilo.ai/",
+    "KILO_API_KEYS": "https://app.kilo.ai/",
+    "GMAIL_CLIENT_ID": "https://console.cloud.google.com/apis/credentials",
+    "GMAIL_CLIENT_SECRET": "https://console.cloud.google.com/apis/credentials",
+    "ZOHO_CLIENT_ID": "https://api-console.zoho.com/",
+    "ZOHO_CLIENT_SECRET": "https://api-console.zoho.com/",
+    "ZOHO_REFRESH_TOKEN": "https://api-console.zoho.com/",
+    "ZOHO_DC": "https://www.zoho.com/mail/help/adminconsole/mail-settings.html",
+    "ZOHO_USER": "https://www.zoho.com/mail/",
+    "ZOHO_ACCOUNT_ID": "https://www.zoho.com/mail/",
+    "NTFY_URL": "https://ntfy.sh/",
+    "NTFY_TOKEN": "https://ntfy.sh/",
+    "ZOHO_CLIQ_TOKEN": "https://www.zoho.com/cliq/",
+    "ZOHO_CLIQ_DC": "https://www.zoho.com/cliq/",
+    "BSKY_HANDLE": "https://bsky.app/",
+    "BSKY_APP_PASSWORD": "https://bsky.app/settings/app-passwords",
+    "MASTODON_TOKEN": "https://mastodon.social/settings/applications",
+    "MASTODON_INSTANCE": "https://mastodon.social/",
+    "GOOGLE_CHAT_WEBHOOK": "https://chat.google.com/",
+    "GOOGLE_CALENDAR_TOKEN": "https://console.cloud.google.com/apis/credentials",
+    "GOOGLE_CALENDAR_REFRESH_TOKEN": "https://console.cloud.google.com/apis/credentials",
+    "GOOGLE_CALENDAR_CLIENT_ID": "https://console.cloud.google.com/apis/credentials",
+    "GOOGLE_CALENDAR_CLIENT_SECRET": "https://console.cloud.google.com/apis/credentials",
+    "NOTION_TOKEN": "https://www.notion.so/my-integrations",
+    "TAVILY_API_KEY": "https://app.tavily.com/",
+    "KOKORO_MODEL": "",
+    "KOKORO_VOICES": "",
+    "STT_MODEL": "",
+    "GATEWAY_GEMINI_ONLY": "",
+}
 
 _ENV_PATH = Path(__file__).parent / ".env"
 _MAX_KEY_LEN = 2000
@@ -693,9 +776,57 @@ async def config_keys():
             key_count = 0
         pools[provider] = {"count": key_count, "members": members}
     return {"keys": [
-        {"name": k, "set": _key_present(k)}
+        {"name": k, "set": _key_present(k), "link": KEY_LINKS.get(k, "")}
         for k in sorted(ALLOWED_KEYS)
     ], "pools": pools}
+
+
+@router.post("/v1/oauth/{provider}/start")
+async def oauth_start(provider: str):
+    """Begin a browser OAuth flow (gmail|calendar); returns a consent URL."""
+    import oauth_flows
+    return oauth_flows.start(provider)
+
+
+@router.get("/v1/oauth/{provider}/status")
+async def oauth_status(provider: str, flow_id: str):
+    """Poll an OAuth flow. Never returns the token, only done/ok/error."""
+    import oauth_flows
+    return oauth_flows.status(flow_id)
+
+
+@router.post("/v1/oauth/refresh")
+async def oauth_refresh():
+    """Renew Gmail + Calendar access tokens without a browser."""
+    import oauth_flows
+    return oauth_flows.refresh()
+
+
+@router.get("/v1/oauth/accounts")
+async def oauth_accounts():
+    """Which account is connected for Gmail/Calendar (emails only, no tokens)."""
+    out: dict = {}
+    try:
+        from integrations import gmail as g
+        p = g.profile()
+        out["gmail"] = {"ok": bool(p.get("ok")), "email": p.get("email"),
+                        "messages": p.get("messages_total"), "error": p.get("error")}
+    except Exception as e:  # noqa: BLE001
+        out["gmail"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        from integrations import calendar as c
+        r = c.list_events()
+        out["calendar"] = {"ok": bool(r.get("ok")), "error": r.get("error")}
+    except Exception as e:  # noqa: BLE001
+        out["calendar"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    try:
+        from integrations import zoho_mail as z
+        p = z.profile()
+        out["zoho_mail"] = {"ok": bool(p.get("ok")), "email": p.get("email"),
+                            "error": p.get("error")}
+    except Exception as e:  # noqa: BLE001
+        out["zoho_mail"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return out
 
 
 def _key_present(name: str) -> bool:

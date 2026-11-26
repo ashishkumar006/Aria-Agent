@@ -10,53 +10,45 @@ import re
 
 
 def filter_ax_markdown(tree_markdown: str, query: str | None = None,
-                       max_chars: int = 12000) -> str:
-    """Pre-filter the AX tree markdown.
+                       max_chars: int = 60000) -> str:
+    """Reduce the AX tree WITHOUT hiding anything important.
 
-    - If `query` given, keyword filter (stopword-stripped, any keyword hits)
-      instead of full-phrase substring which almost never matched.
-    - Truncate to `max_chars` (default 12k ≈ 3k tokens, up from 6k which
-      dropped controls) to bound the LLM context window.
-    - Drop pure-whitespace / decorative lines.
+    - Collapses the deep leading indentation (tens of thousands of spaces that
+      the model does not need — the [N] order carries the structure).
+    - Drops the repetitive `actions=[...]` attribute (the role implies it).
+    - Trims long value/help attributes to ~120 chars.
+    - TRUNCATES any line over 300 chars (keeps the beginning, so a long error /
+      result / confirmation is still readable) instead of dropping it.
+    - De-dupes consecutive identical lines.
+
+    Nothing is removed outright — long content is shortened, not discarded — so
+    important static information (errors, results, status) survives.
     """
     import re as _re
-    _STOP = {"the", "a", "an", "to", "of", "in", "on", "and", "or", "is",
-             "what", "does", "do", "show", "me", "my", "please", "click",
-             "open", "app", "window"}
-    # Media control synonyms: when query mentions one, also search for related
-    # control labels so the filter keeps the full playback UI (Play/Pause toggle,
-    # Next/Previous, etc.).
-    _MEDIA_SYNONYMS = {
-        "play": ["play", "pause"],
-        "pause": ["pause", "play"],
-        "next": ["next", "skip", "forward"],
-        "previous": ["previous", "prev", "back"],
-        "stop": ["stop", "pause"],
-    }
-    lines = [ln for ln in tree_markdown.splitlines() if ln.strip()]
-    if query:
-        kws = [w.lower() for w in _re.findall(r"[a-z0-9]+", query.lower())
-               if w not in _STOP and len(w) > 2]
-        # Expand media control keywords
-        expanded_kws = set(kws)
-        for k in kws:
-            if k in _MEDIA_SYNONYMS:
-                expanded_kws.update(_MEDIA_SYNONYMS[k])
-        kws = list(expanded_kws)
-        if kws:
-            scored = []
-            for ln in lines:
-                ll = ln.lower()
-                hits = sum(1 for k in kws if k in ll)
-                if hits:
-                    scored.append((hits, ln))
-            if scored:
-                # Keep all hits sorted by relevance, then truncate.
-                scored.sort(key=lambda x: -x[0])
-                lines = [ln for _, ln in scored] + [
-                    ln for ln in lines if ln not in {s[1] for s in scored}][:200]
-            # else: fall back to full list (no keyword matched)
-    text = "\n".join(lines)
+    if not tree_markdown:
+        return ""
+
+    def _trim_attr(m):
+        val = m.group(2)
+        if len(val) > 120:
+            val = val[:117] + "..."
+        return m.group(1) + '="' + val + '"'
+
+    out: list[str] = []
+    prev = None
+    for ln in tree_markdown.splitlines():
+        if not ln.strip():
+            continue
+        ln = ln.strip()                                   # collapse indentation
+        ln = _re.sub(r'(value|help)="([^"]*)"', _trim_attr, ln)
+        ln = _re.sub(r"\s*\[actions=\[[^\]]*\]\]", "", ln)  # drop actions attr
+        if len(ln) > 300:
+            ln = ln[:297] + "..."                         # truncate long content
+        if ln == prev:
+            continue
+        out.append(ln)
+        prev = ln
+    text = "\n".join(out)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n…(truncated)"
     return text

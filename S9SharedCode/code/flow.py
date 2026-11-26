@@ -269,43 +269,52 @@ class Graph:
         # sibling's question) back into the worker's INPUTS block and undo
         # the scoping. The structural parent edge is preserved separately
         # below so the graph topology is still correct.
-        for new_id, raw_inputs in pending:
-            resolved: list[str] = []
+        #
+        # POSITION CONVENTION: the Planner emits sibling positions inconsistently
+        # — sometimes 0-based ("0" = the first node it listed), sometimes 1-based
+        # ("1" = the first node). Resolving them all 0-based makes a 1-based plan
+        # self-referential: a node's "1" resolves to the node AFTER it, and the
+        # last node's own position resolves to itself. A node that waits on
+        # itself can never become ready, so the author/action/formatter were
+        # silently skipped and the run "finished" having only done research.
+        # Resolve 0-based first; if that yields a self-loop, the plan was
+        # 1-based — re-resolve with a -1 shift. Whichever is self-loop-free wins.
+        def _resolve_inputs(raw_inputs: list[str], pos_offset: int,
+                            _nid: str) -> list[str]:
+            out: list[str] = []
             for inp in raw_inputs:
-                # `n:<label>` or `n:<int>` form (preferred).
                 if inp.startswith("n:"):
                     suffix = inp[2:]
                     if suffix in label_to_id:
-                        resolved.append(label_to_id[suffix])
-                        continue
+                        out.append(label_to_id[suffix]); continue
                     if suffix.isdigit() and inp in self.g.nodes:
-                        resolved.append(inp)
-                        continue
-                # Bare label form — the Planner sometimes drops the n: prefix.
+                        out.append(inp); continue
                 if inp in label_to_id:
-                    resolved.append(label_to_id[inp])
-                    continue
-                # Special literal — the user query is always available.
+                    out.append(label_to_id[inp]); continue
                 if inp == "USER_QUERY":
-                    resolved.append(inp)
-                    continue
-                # Artifact handle — pass through, the input renderer handles it.
+                    out.append(inp); continue
                 if inp.startswith("art:"):
-                    resolved.append(inp)
-                    continue
-                # Bare position of a sibling in THIS plan ("0", "1", ...).
-                # Checked after the id forms so a real id always wins.
-                if inp.isdigit() and inp in idx_to_id:
-                    resolved.append(idx_to_id[inp])
-                    continue
-                # Unresolvable input — fall back to the parent so the child
-                # has at least one upstream dependency to wait on. This still
-                # leaks the parent's output into INPUTS, but only when the
-                # Planner emitted a bad input name; it is not the fan-out
-                # path. A future round may want to fail loudly here instead.
-                print(f"[flow] {new_id}: unresolvable input {inp!r}; "
+                    out.append(inp); continue
+                if inp.isdigit():
+                    key = str(int(inp) - pos_offset)
+                    if key in idx_to_id:
+                        out.append(idx_to_id[key]); continue
+                print(f"[flow] {_nid}: unresolvable input {inp!r}; "
                       f"falling back to {src_nid}")
-                resolved.append(src_nid)
+                out.append(src_nid)
+            return out
+
+        resolved_by_node: dict[str, list[str]] = {}
+        for new_id, raw_inputs in pending:
+            resolved_by_node[new_id] = _resolve_inputs(raw_inputs, 0, new_id)
+        # A self-loop anywhere means the positions were 1-based — redo with -1.
+        if any(nid in ins for nid, ins in resolved_by_node.items()):
+            for new_id, raw_inputs in pending:
+                if raw_inputs:
+                    resolved_by_node[new_id] = _resolve_inputs(raw_inputs, 1,
+                                                              new_id)
+        for new_id, raw_inputs in pending:
+            resolved = resolved_by_node[new_id]
             self.g.nodes[new_id]["inputs"] = resolved
             for inp in resolved:
                 if inp.startswith("n:") and inp in self.g.nodes:
@@ -1192,8 +1201,24 @@ def read_run_status(session_id: str) -> dict:
 # F10 FIX (cross-session memory contamination): best-effort append of the
 # completed turn (query + final answer) to this session's turn log. Runs on
 # a daemon thread so persistence cost never lands on the critical path.
-def _safe_log_turn(query: str, sid: str, answer: str) -> None:
+def _safe_log_turn(query: str, sid: str, answer: str,
+                   produced: list | None = None) -> None:
     try:
+        # Carry the produced files (with their doc/artifact ids) into the turn
+        # log, so a FOLLOW-UP turn's planner can see what was made and reuse the
+        # id — "send me that report" needs to know which file "that" is.
+        if produced:
+            bits = []
+            for p in produced[:6]:
+                if not isinstance(p, dict):
+                    continue
+                name = str(p.get("filename") or p.get("artifact") or "file")
+                ref = str(p.get("document_id") or p.get("artifact") or "")
+                bits.append(f"{name} [{ref}]" if ref else name)
+            if bits:
+                answer = (answer + "\n\n[Files produced this turn — reuse these "
+                          "ids if the user refers to them: " + "; ".join(bits)
+                          + "]")
         turnlog.append(sid, query, answer)
     except Exception as e:  # pragma: no cover - must never crash the run
         print(f"[turnlog] skipped: {e!r}")
@@ -1667,8 +1692,7 @@ class Executor:
                         fa = result.output.get("final_answer")
                         if isinstance(fa, str) and fa.strip():
                             formatter_answer = fa
-                        elif (self._run_kind == "chat"
-                              and isinstance(result.output.get("a2ui"), dict)):
+                        elif isinstance(result.output.get("a2ui"), dict):
                             # The formatter's A2UI branch answers with
                             # `final_answer: null` plus a surface. Leaving it
                             # here made `formatter_answer` stay None, so the
@@ -1677,6 +1701,16 @@ class Executor:
                             # fenced block on the one answer channel; the chat
                             # endpoints extract and validate it, and turn an
                             # unrenderable one into readable text.
+                            #
+                            # NOT gated on run_kind: a surface is opt-in — the
+                            # formatter only emits it instead of prose, and a
+                            # research report returns `final_answer` text and
+                            # never reaches here. Gating it on "chat" meant a
+                            # DAG turn whose run_kind was unset (or "research")
+                            # silently dropped a surface the formatter built,
+                            # which is exactly the "A2UI works in lightweight
+                            # but not in the DAG" report. Validation of the
+                            # block against the catalog is the real guard.
                             formatter_answer = (
                                 "```json\n"
                                 + json.dumps(result.output["a2ui"],
@@ -1857,6 +1891,31 @@ class Executor:
                         _dec.failure_report or f"node={_nid}")
                     for _nid, _dec in replans
                 ]
+                # A node that SUCCEEDED but reported a shortfall is not a
+                # failure - it is the planner's chance to fix a gap the user
+                # will otherwise see. Only nodes that asked for it
+                # (`report_to_planner`) are forwarded, and they are named as
+                # a repair, not a failure, so the planner does not re-run
+                # work that already landed.
+                _shortfalls = [
+                    (n, d["result"].output.get("shortfall"))
+                    for n, d in graph.g.nodes(data=True)
+                    if d.get("status") == "complete"
+                    and isinstance(d.get("result"), AgentResult)
+                    and isinstance(d["result"].output, dict)
+                    and (d["result"].output.get("shortfall") or {}
+                         ).get("report_to_planner")
+                ]
+                if _shortfalls:
+                    reports.append(
+                        "SHORTFALLS reported by nodes that still produced "
+                        "output. These are GAPS TO REPAIR, not failed nodes - "
+                        "do not redo what already exists:\n"
+                        + "\n".join(
+                            f"  - {_n} ({graph.g.nodes[_n]['skill']}): "
+                            f"{(_sf or {}).get('what_failed', '')}"
+                            f" (tried: {', '.join((_sf or {}).get('attempted') or []) or 'nothing recorded'})"
+                            for _n, _sf in _shortfalls))
                 rec_nid = graph.add_node(
                     "planner",
                     inputs=["USER_QUERY"] + prior_complete,
@@ -2275,7 +2334,8 @@ class Executor:
         # conversation has an authoritative record of what was asked and
         # answered. Daemon thread — never blocks the response.
         threading.Thread(
-            target=_safe_log_turn, args=(query, sid, formatter_answer or ""),
+            target=_safe_log_turn,
+            args=(query, sid, formatter_answer or "", take_produced_files(sid)),
             daemon=True,
         ).start()
         # Phase 2: this run's working notes die with the run (older_than
@@ -2324,7 +2384,8 @@ class Executor:
                     policy_notes=policy_notes,
                     doc_setup=doc_setup,
                     budget_note=budget_note,
-                    doc_ids=self._doc_ids)
+                    doc_ids=self._doc_ids,
+                    run_kind=getattr(self, "_run_kind", ""))
         except Exception as e:  # pragma: no cover - dispatcher fault path
             result = AgentResult(success=False, agent_name=skill_name,
                                  error=f"exception: {_readable_exc(e)}")

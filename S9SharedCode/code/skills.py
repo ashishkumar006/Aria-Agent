@@ -226,6 +226,11 @@ class Skill:
         self.prompt_path = ROOT / cfg["prompt"]
         self.description = cfg.get("description", "")
         self.tools_allowed: list[str] = cfg.get("tools_allowed", []) or []
+        # V10: narrow the tool payload per request to the channels the goal
+        # names. `tools_allowed` stays the full grant (the catalogue); the
+        # per-run payload is a subset, so the model sees ~8 schemas instead of
+        # 27 and the prompt's grant header names exactly what is callable.
+        self.dynamic_channels: bool = bool(cfg.get("dynamic_channels", False))
         self.internal_successors: list[str] = cfg.get("internal_successors", []) or []
         self.critic: bool = bool(cfg.get("critic", False))
         self.provider_pin: str | None = cfg.get("provider_pin")
@@ -514,14 +519,132 @@ def _format_policy_notes(notes: list) -> str:
     return "\n".join(lines)
 
 
+# ── Channel → tool catalogue (dynamic action payload) ───────────────────────
+# A request that names a channel only needs that channel's tools. The full
+# grant stays in `tools_allowed` (the catalogue the prompt documents); this map
+# decides what is actually OFFERED for a given goal. No channel signal → the
+# full grant, so a vague "send it where I read" still works.
+
+CHANNEL_TOOLS: dict[str, list[str]] = {
+    "gmail": ["send_email", "gmail_query", "gmail_profile", "gmail_refresh_token"],
+    "zoho_mail": ["zoho_mail_send", "zoho_mail_query", "zoho_mail_profile",
+                  "zoho_mail_folders", "zoho_mail_refresh_token", "zoho_mail_reply",
+                  "zoho_mail_mark", "zoho_mail_move", "zoho_mail_delete"],
+    "ntfy": ["ntfy_send", "ntfy_history"],
+    "zoho_cliq": ["zoho_cliq_message"],
+    "bluesky": ["bluesky_post"],
+    "mastodon": ["mastodon_post"],
+    "google_chat": ["google_chat_message"],
+    "zoho_calendar": ["zoho_calendar_list_calendars", "zoho_calendar_list_events"],
+    "calendar": ["create_calendar_event", "calendar_query", "calendar_refresh_token"],
+    "github": ["github_query", "github_get_user", "github_list_repos", "github_get_repo",
+               "github_read_file", "github_list_issues", "github_create_issue",
+               "github_update_issue", "github_comment_issue", "github_list_prs",
+               "github_create_pr", "github_search_repos"],
+    "slack": ["slack_message", "slack_history", "slack_refresh_token"],
+    "discord": ["discord_message", "discord_get_me", "discord_list_guilds",
+                "discord_list_channels", "discord_invite_url"],
+    "notion": ["notion_query", "notion_search", "notion_get_page",
+               "notion_get_page_markdown", "notion_get_blocks", "notion_append_blocks",
+               "notion_query_database"],
+    "telegram": ["send_telegram", "telegram_get_me", "telegram_get_updates",
+                 "telegram_get_chat", "telegram_send_message", "telegram_edit_message",
+                 "telegram_delete_message"],
+}
+ALL_CHANNEL_TOOLS = {t for tools in CHANNEL_TOOLS.values() for t in tools}
+
+# Words in a goal that imply a channel. Most specific first.
+CHANNEL_HINTS: list[tuple[str, str]] = [
+    ("gmail", "gmail"), ("e-mail", "gmail"), ("email", "gmail"),
+    ("calendar", "calendar"), ("meeting", "calendar"),
+    ("github", "github"), ("pull request", "github"), ("issue", "github"), ("repo", "github"),
+    ("slack", "slack"),
+    ("discord", "discord"),
+    ("notion", "notion"),
+    ("telegram", "telegram"),
+]
+
+
+def channels_for_goal(goal: str, metadata: dict | None = None) -> list[str]:
+    """Which channels a goal needs. Explicit metadata wins; else keywords."""
+    if isinstance(metadata, dict):
+        explicit = metadata.get("channels") or metadata.get("channel")
+        if isinstance(explicit, str):
+            explicit = [explicit]
+        if explicit:
+            return [str(c).lower() for c in explicit if str(c).lower() in CHANNEL_TOOLS]
+    low = (goal or "").lower()
+    found: list[str] = []
+    for needle, channel in CHANNEL_HINTS:
+        # Word-boundary match: "repo" must not fire on "report", "issue" must
+        # not fire on "tissue".
+        if re.search(rf"\b{re.escape(needle)}\b", low) and channel not in found:
+            found.append(channel)
+    return found
+
+
+def effective_tools(skill: Skill, goal: str, metadata: dict | None = None) -> list[str]:
+    """The tools OFFERED for this run.
+
+    Progressive disclosure: the node gets the **core** tools plus
+    `load_tool_bundle`, and pulls a channel's schemas mid-run by calling
+    `load_tool_bundle("github")`. The harness does not guess the channel from
+    the goal — the node reads the request and asks for the bundle it needs.
+    """
+    full = list(skill.tools_allowed or [])
+    if not skill.dynamic_channels or not full:
+        return full
+    core = [t for t in full if t not in ALL_CHANNEL_TOOLS]
+    if "load_tool_bundle" in full and "load_tool_bundle" not in core:
+        core.append("load_tool_bundle")
+    return core
+
+
+def build_tool_bundles() -> dict[str, list[dict]]:
+    """Bundle name → schemas, for `load_tool_bundle` progressive disclosure."""
+    out: dict[str, list[dict]] = {}
+    for bundle, names in CHANNEL_TOOLS.items():
+        schemas: list[dict] = []
+        for n in names:
+            p = tool_payload([n])
+            if p:
+                schemas.extend(p)
+        if schemas:
+            out[bundle] = schemas
+    return out
+
+
+def render_grant_header(tools: list[str], full: list[str]) -> str:
+    """The one line that tells the model which tools are callable THIS run."""
+    if not tools:
+        return "GRANTED THIS RUN: no tools are available."
+    if set(tools) == set(full):
+        return "GRANTED THIS RUN: the full catalogue below."
+    names = ", ".join(f"`{t}`" for t in tools)
+    return (
+        f"GRANTED THIS RUN — you may call ONLY: {names}. "
+        "Every other tool in the catalogue below is NOT available in this run "
+        "and will return an error; do not call it."
+    )
+
+
 def render_prompt(skill: Skill, query: str, resolved: list[dict],
                   failure_report: str | None = None,
                   memory_hits: list | None = None,
                   question: str | None = None,
                   prior_turns: list | None = None,
                   policy_notes: list | None = None,
-                  budget_note: str = "") -> str:
+                  budget_note: str = "",
+                  tools: list[str] | None = None) -> str:
     parts = [skill.prompt_template().rstrip()]
+    # A skill that narrows its tools per request (action) carries a
+    # `{{ACTION_TOOLS}}` marker. Fill it from the SAME list the payload uses,
+    # so the prompt can never promise a tool the run cannot call.
+    if "{{ACTION_TOOLS}}" in parts[0]:
+        grant = tools if tools is not None else (skill.tools_allowed or [])
+        parts[0] = parts[0].replace(
+            "{{ACTION_TOOLS}}",
+            render_grant_header(grant, skill.tools_allowed or []))
     # The current date, for every skill. A prompt template is a constant read
     # off disk, so it cannot state what day it is, and a model has no clock -
     # "this week", "recent", "as_of" and "currently" are all resolved against
@@ -560,19 +683,63 @@ def render_prompt(skill: Skill, query: str, resolved: list[dict],
             "finding worth reporting, and keep looking for the real answer "
             "elsewhere.",
         ]
-    # USER_QUERY top-line: only when the Planner wired USER_QUERY into this
-    # node's inputs. Earlier versions added it unconditionally, which
-    # leaked the full original query into every fan-out worker — three
-    # researcher siblings spawned to "find population of A / B / C" all
-    # saw the same "compare A, B, C" query and each one ended up
-    # searching for all three. Per-node scoping now travels through
-    # `metadata.question` (rendered as QUESTION below) and the INPUTS
-    # block; USER_QUERY is present only when the Planner asked for it.
-    user_query_in_inputs = any(
-        isinstance(r, dict) and r.get("id") == "USER_QUERY" for r in resolved
-    )
-    if user_query_in_inputs:
-        parts += ["", f"USER_QUERY: {query}"]
+    # USER_QUERY — the overall request, handed to EVERY node as CONTEXT.
+    #
+    # The task a node must actually do is its SLICE (the planner's `goal`, which
+    # arrives below as QUESTION and is authoritative). USER_QUERY is included
+    # everywhere so a worker understands the larger job its slice belongs to and
+    # can judge the trade-offs; it is explicitly labelled CONTEXT, not the task.
+    #
+    # This reverses an earlier rule that withheld USER_QUERY from workers: some
+    # read it as the whole job and all searched for everything. Labelling it as
+    # context, keeping QUESTION as the authoritative slice, and telling the node
+    # its slice limits what the planner can do next, preserves that fix while
+    # giving every node the intent it needs. It is no longer conditional on the
+    # planner remembering to wire "USER_QUERY" into a node's inputs.
+    parts += ["", f"USER_QUERY (the overall request — CONTEXT, not your task): {query}"]
+    # ROLE — every worker is one slice of a larger job it cannot see. Without
+    # this line a node treated its one-paragraph brief as the whole task and
+    # reported "done" on work that the planner could not use (a researcher
+    # that answered a sub-question in the wrong unit, an action that sent to
+    # the wrong chat), because nothing told it that anything downstream
+    # existed. The planner (prompts/planner.md) is told the same thing from
+    # the other end: its nodes receive only what it writes for them.
+    parts += [
+        "",
+        "YOUR ROLE IN THIS RUN: the task below is a SLICE, curated by a planner "
+        "that holds the whole task. You are the specialist for this slice. What "
+        "you return is consumed by the planner and by the nodes that come after "
+        "you — the planner cannot add detail you leave out, and a thin or "
+        "half-finished slice limits and can distort every choice the planner "
+        "makes next. Treat the slice as important and do it as completely as it "
+        "allows, not as a sketch of it.",
+    ]
+    # COMPLETION CONTRACT — machine-readable, so the orchestrator can route a
+    # poor result instead of reading prose. The tag is a fenced block with a
+    # JSON object; `skills.parse_shortfall` lifts it out and it never reaches
+    # the user, because every renderer strips fenced json.
+    parts += [
+        "",
+        "COMPLETION CONTRACT:",
+        "  - Attempt the whole task. Use every tool you have that moves it "
+        "forward, and do not stop at the first obstacle — try another route "
+        "before giving up.",
+        "  - When the result is genuinely satisfactory, return it and write "
+        "NO shortfall block. Do not invent doubt.",
+        "  - When part of the task could not be done, or the result is thin, "
+        "WRONG-shaped, or you had to substitute something, append this block "
+        "AFTER your normal output, changed to describe what actually "
+        "happened:",
+        '```json',
+        '{"shortfall": {"what_failed": "<one sentence>",'
+        ' "attempted": ["<route you tried>"],'
+        ' "report_to_planner": true}}',
+        '```',
+        "  Set `report_to_planner` true when the planner must know in order "
+        "to finish the user's task (a missing input, a wrong recipient, a "
+        "source that does not exist); false when the shortfall is incidental "
+        "and the result still answers the slice.",
+    ]
     # QUESTION: the per-node sub-question the Planner attached via
     # `metadata.question`. This is how a fan-out worker learns *its*
     # slice of the user's request without seeing the whole query.
@@ -927,6 +1094,9 @@ def _section_blocks(title: str, blocks: list) -> list[dict]:
 
 
 _FIGURES_CACHE: dict[str, dict] = {}
+# topic key -> the image URL fetched for it, so the section writer can be shown
+# the actual picture (the gateway routes image content to a vision model).
+_FIGURE_TOPIC_IMAGES: dict[str, str] = {}
 # Prompt context, not a content limit: a run scoped to a hundred image-heavy
 # PDFs would otherwise paste thousands of handles into every section call.
 # When the listing is shortened the author is told, and which documents still
@@ -1048,6 +1218,71 @@ _WANTS_FIGURES_R = re.compile(
 # search plus a download plus an index write.
 _FIGURE_ACQUIRE_MAX = 8
 
+# Openverse is a KEYWORD engine. The full section heading ("Cost trends and
+# economic viability of grid-scale battery storage") returns ZERO results,
+# while "grid-scale battery storage" returns plenty — so the pre-pass searched
+# with a phrase no stock library could match and silently produced a text-only
+# document. These helpers turn a heading into a short keyword query.
+_FIGURE_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "with",
+    "by", "at", "from", "as", "is", "are", "be", "this", "that", "these",
+    "those", "its", "their", "our", "your", "into", "over", "under", "about",
+    "vs", "versus", "using", "use", "based", "including", "include",
+})
+
+
+def _figure_search_query(text: str, max_words: int = 5,
+                         from_end: bool = False) -> str:
+    """A short keyword query for image search.
+
+    Drops stopwords, keeps the first (or last) few content words, and preserves
+    hyphenated terms like `grid-scale`. The subject of a section heading is
+    usually at the END ("... of grid-scale battery storage"), so callers try
+    the head first and the tail second.
+    """
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']+", str(text or ""))
+    keep = [w for w in words if w.lower() not in _FIGURE_STOPWORDS]
+    if not keep:
+        keep = words
+    keep = keep[-max_words:] if from_end else keep[:max_words]
+    return " ".join(keep)
+
+
+def _image_matches_topic(url: str, topic: str) -> bool | None:
+    """Does this image plausibly illustrate `topic`? Ask a vision model.
+
+    The old auto-fetch picked the LARGEST candidate by area and embedded it
+    without anything ever looking at it — which is how a report on attention
+    mechanisms got a random large photograph. This one call rejects an
+    irrelevant image BEFORE it reaches the document.
+
+    Returns True (it matches), False (the model looked and said no), or None
+    (the check itself could not run — no vision model, a timeout, a bad URL).
+    None is NOT False: a vision outage must not silently drop every figure in a
+    long document. The caller accepts an unverified top candidate in that case
+    and logs it, because the image search is relevance-ranked and the
+    alternative is a document with no pictures at all.
+    """
+    if not url:
+        return False
+    try:
+        from gateway import LLM
+        res = LLM().vision(
+            url,
+            "Answer with ONE word. Does this image plausibly illustrate or "
+            f"relate to the topic '{str(topic)[:120]}'? Reply YES or NO.",
+            max_tokens=8, temperature=0.0, agent="vision_verify")
+        txt = str((res or {}).get("text") or "").strip().upper()
+        if txt.startswith("YES"):
+            return True
+        if txt.startswith("NO"):
+            return False
+        # A refusal, a hedge, or an empty answer: treat as unverifiable, not as
+        # a confident "no".
+        return None
+    except Exception:
+        return None
+
 
 def _acquire_figures(query: str, outline: list[str]) -> str:
     """Fetch figures BEFORE the sections are written, and describe them as handles.
@@ -1068,6 +1303,11 @@ def _acquire_figures(query: str, outline: list[str]) -> str:
     or when nothing could be fetched — the sections then behave exactly as
     before.
     """
+    # A module-level cache keyed by the first four words of a section title.
+    # Without this clear, a later run with a similarly-named section was shown
+    # the PREVIOUS document's image — the section writer would describe a
+    # picture that has nothing to do with its chapter.
+    _FIGURE_TOPIC_IMAGES.clear()
     q = str(query or "")
     if not _WANTS_FIGURES_R.search(q):
         return ""
@@ -1086,6 +1326,7 @@ def _acquire_figures(query: str, outline: list[str]) -> str:
         return ""
     rows: list[str] = []
     seen: set[str] = set()
+    used_urls: set[str] = set()
     # One topic may name several chapters; take the distinct leading words so a
     # document with five "Roman army" chapters does not buy the same photo five
     # times.
@@ -1106,15 +1347,55 @@ def _acquire_figures(query: str, outline: list[str]) -> str:
             # the unattended fetch takes the narrower set. Explicit
             # `search_images` calls still see everything, because there the
             # author is choosing.
-            found = mcp_server.search_images(topic, 3,
-                                             commercial_only=True)
+            #
+            # Search with SHORT keyword queries, not the full heading: Openverse
+            # returns zero for "Cost trends and economic viability of grid-scale
+            # battery storage" but plenty for "grid-scale battery storage". Try
+            # the head, then the tail (the subject is usually at the end).
+            queries: list[str] = []
+            for q in (_figure_search_query(topic, 5),
+                      _figure_search_query(topic, 3, from_end=True)):
+                if q and q.lower() not in {x.lower() for x in queries}:
+                    queries.append(q)
+            found: dict = {"results": []}
+            for q in queries:
+                found = mcp_server.search_images(q, 3, commercial_only=True)
+                if found.get("results"):
+                    break
             picks = [p for p in (found.get("results") or [])
-                     if (p.get("width") or 0) >= 400 and (p.get("height") or 0) >= 240]
+                     if (p.get("width") or 0) >= 400
+                     and (p.get("height") or 0) >= 240
+                     and str(p.get("image_url") or "") not in used_urls]
             if not picks:
+                print(f"[skills] no figure candidates for {topic[:44]!r} "
+                      f"(queries={queries})")
                 continue
-            # Widest first: a 400x300 landscape photographs better across a text
-            # column than a portrait crop, and the caption sits under it.
-            pick = max(picks, key=lambda p: (p.get("width") or 0) * (p.get("height") or 0))
+            # Relevance FIRST: the engine ranks by relevance, so try the top
+            # candidates in order and let a vision check confirm the image
+            # actually shows the topic. The old code took the LARGEST by area
+            # with nothing looking at it — how a report on attention got a
+            # random large photo.
+            pick = None
+            for cand in picks[:3]:
+                if str(cand.get("image_url") or "") in used_urls:
+                    continue
+                verdict = _image_matches_topic(str(cand.get("image_url") or ""),
+                                               topic)
+                if verdict is True:
+                    pick = cand
+                    break
+                if verdict is None:
+                    # Vision unavailable (no model, timeout, bad URL). Do NOT
+                    # drop every figure in the document over it: the search is
+                    # relevance-ranked, so take the top candidate unverified and
+                    # say so in the log.
+                    pick = cand
+                    print(f"[skills] figure verify unavailable for "
+                          f"{topic[:40]!r}; using the top relevance candidate "
+                          f"unverified")
+                    break
+            if pick is None:
+                continue
             credit = " — ".join(x for x in (str(pick.get("creator") or "").strip(),
                                             str(pick.get("license") or "").strip()) if x)
             got = mcp_server.fetch_image(pick.get("image_url") or "",
@@ -1122,6 +1403,12 @@ def _acquire_figures(query: str, outline: list[str]) -> str:
                                          filename=key[:48] or "figure")
             if not got.get("ok"):
                 continue
+            # Remember the URL so the section writer can be SHOWN the picture,
+            # not just told its credit — the gateway routes image content to a
+            # vision-capable model (Gemini), so the author actually sees it.
+            if pick.get("image_url"):
+                _FIGURE_TOPIC_IMAGES[key] = str(pick["image_url"])
+                used_urls.add(str(pick["image_url"]))
             rows.append(
                 f'  document="{got["document"]}" page=1 index=0 in "{topic[:52]}"'
                 f'  caption="{credit[:90]}"')
@@ -1136,7 +1423,12 @@ def _acquire_figures(query: str, outline: list[str]) -> str:
             '        "caption": "the credit line shown below"}\n'
             + "\n".join(rows)
             + "\nEach figure belongs in the section named after `in`. Copy its "
-              "caption with the creator and licence intact.")
+              "caption with the creator and licence intact."
+            "\n\nIMPORTANT: the figure for THIS section is ATTACHED to this "
+            "message. LOOK at it, then (a) write prose that describes what it "
+            "actually shows and why it matters, and (b) place its `image` block "
+            "at the point in the section where it belongs. Do not describe an "
+            "image you were not shown.")
 
 
 async def _sectioned_document_blocks(skill: "Skill", rendered: str,
@@ -1217,9 +1509,15 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
     # below has a tool loop to fetch them with. Whatever the single-call author
     # already listed stays; this adds handles on top.
     #
+    # Skipped when `run_skill` already ran the web pre-pass (it marks its output
+    # "fetched for this document"): the outline it used was the planner's facet
+    # list, which is the same spine these sections follow, so fetching again
+    # would buy the same pictures twice.
+    #
     # Skipped on a stopped run: it is up to eight outbound searches plus a fetch
     # per hit, and nothing below it will read the result.
-    if headings and not cancel_requested():
+    if ("fetched for this document" not in (figures or "")
+            and headings and not cancel_requested()):
         try:
             import asyncio as _aio2
             got = await _aio2.to_thread(_acquire_figures, query, headings)
@@ -1231,7 +1529,7 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
             print(f"[skills] {skill.name}: figure pre-pass skipped ({e!r})")
 
     async def _call(chunk: str, title: str, heading: str,
-                    retry_note: str = "") -> list[dict]:
+                    retry_note: str = "", image_url: str = "") -> list[dict]:
         prompt = (
             f"{base}\n\n"
             f"{doc_line}{style_line}"
@@ -1245,10 +1543,25 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
             + (figures + "\n\n" if figures else "")
             + chunk + "\n\n"
         )
-        res = await _aio.to_thread(
-            LLM().chat, prompt=prompt, agent=skill.name,
-            session=session_id, provider=skill.provider_pin,
-            max_tokens=skill.max_tokens, temperature=skill.temperature)
+        if image_url:
+            # Show the section writer the actual picture. The gateway detects
+            # image content and routes to a vision-capable provider (Gemini), so
+            # the author writes about what is really in the figure instead of
+            # guessing from the credit line.
+            res = await _aio.to_thread(
+                LLM().chat,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]}],
+                agent=skill.name, session=session_id,
+                provider=skill.provider_pin,
+                max_tokens=skill.max_tokens, temperature=skill.temperature)
+        else:
+            res = await _aio.to_thread(
+                LLM().chat, prompt=prompt, agent=skill.name,
+                session=session_id, provider=skill.provider_pin,
+                max_tokens=skill.max_tokens, temperature=skill.temperature)
         spec = parse_skill_json(str((res or {}).get("text") or ""))
         blocks = spec.get("blocks")
         if isinstance(blocks, list):
@@ -1269,6 +1582,10 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
 
     async def _one(title: str, heading: str, idx: int,
                    previous_words: int = -1) -> list[dict]:
+        # The figure fetched for this section's topic (if any), so the writer
+        # is shown the actual picture.
+        _img_key = " ".join(str(title).lower().split()[:4])
+        _img = _FIGURE_TOPIC_IMAGES.get(_img_key, "")
         retry_note = ""
         if previous_words == 0:
             retry_note = ("Your previous attempt returned no usable blocks. "
@@ -1279,7 +1596,7 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
                           f"words for this section. Rewrite it in full, "
                           f"reaching at least {section_floor:,} words.\n\n")
         got = await _call(_section_evidence(entries, idx, titles), title,
-                          heading, retry_note)
+                          heading, retry_note, image_url=_img)
         if got:
             return got
         # The whole fleet did not fit into one answer. Give the section MORE
@@ -1294,7 +1611,7 @@ async def _sectioned_document_blocks(skill: "Skill", rendered: str,
               f"(one per researcher) instead of trimming", flush=True)
         merged: list[dict] = []
         for w in windows:
-            part = await _call(w, title, heading, retry_note)
+            part = await _call(w, title, heading, retry_note, image_url=_img)
             if not part:
                 continue
             if merged:
@@ -1555,7 +1872,8 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
     fmt = str(parsed.get("format") or "").strip().lower() or fmt
     if forced.get("format") and forced["format"] != "auto":
         fmt = str(forced["format"]).strip().lower()
-    if fmt not in ("pdf", "pptx", "docx", "xlsx"):
+    if fmt not in ("pdf", "pptx", "docx", "xlsx", "md", "markdown", "html",
+                   "csv", "json", "epub", "odt", "ods", "typst"):
         fmt = "pptx" if skill.name == "deck" else "pdf"
 
     expand, why = should_expand_document(
@@ -1670,7 +1988,13 @@ async def _expand_document_sections(skill, rendered, blocks, resolved,
                         if isinstance(parsed.get("references"), list)
                         and parsed.get("references")
                         else _references_from_resolved(resolved)),
-            slide_size=_f("slide_size"), blocks=merged)
+            slide_size=_f("slide_size"),
+            # The sectioned render must honour the SAME typesetting choice as
+            # the single-call render. Without this, a doc_setup `typeset=latex`
+            # was applied to the draft render but DROPPED here, so the final
+            # long document silently fell back to ReportLab.
+            typeset=str(forced.get("typeset") or parsed.get("typeset") or ""),
+            blocks=merged)
     except Exception as e:
         print(f"[skills] {skill.name}: sectioned render raised "
               f"{type(e).__name__}: {e}"[:200])
@@ -2072,7 +2396,7 @@ def _tool_sources(transcript) -> list[dict]:
 # render, not the missing braces.
 _JSON_CONTRACT_SKILLS = frozenset({"planner", "researcher", "distiller",
                                    "retriever", "critic", "summariser",
-                                   "formatter"})
+                                   "formatter", "coder", "action"})
 
 
 async def _repair_json_reply(skill: "Skill", rendered: str, previous: str,
@@ -2125,6 +2449,73 @@ async def _repair_json_reply(skill: "Skill", rendered: str, previous: str,
     got = parse_skill_json(str((res or {}).get("text") or "")) or {}
     return (got, int((res or {}).get("input_tokens") or 0),
             int((res or {}).get("output_tokens") or 0))
+
+
+async def _repair_json_with_model(skill: "Skill", broken: str, problem: str,
+                                  session_id: str):
+    """Fix malformed JSON with a LIGHTWEIGHT model instead of discarding the node.
+
+    `parse_skill_json` already repairs the common deterministic defects (raw
+    newlines in strings, LaTeX-as-control-character, trailing commas) with no
+    model call. What survives that — unquoted keys, single quotes, a truncated
+    object, a JSON blob buried in prose — used to fail the whole node, and in a
+    research run one bad researcher is a missing facet. So hand the broken text
+    to a cheap, fast model (agent `utility`, routed to groq) and ask it to fix
+    ONLY the syntax, preserving content.
+
+    One attempt. Returns (parsed_dict, input_tokens, output_tokens); {} means
+    still unusable, and the caller falls back to the same-model regenerate.
+    """
+    text = str(broken or "").strip()
+    if not text:
+        return {}, 0, 0
+    prompt = (
+        "The text below was meant to be ONE JSON object but does not parse as "
+        f"JSON ({problem}). Fix ONLY the syntax — quotes, commas, escaping of "
+        "control characters and backslashes, unquoted keys, single quotes, "
+        "truncation — and return the CORRECTED JSON object. Preserve the content "
+        "and meaning exactly; do NOT add, remove or summarise fields. Return "
+        "ONLY the JSON object: no prose, no markdown fences, no commentary.\n\n"
+        "---\n" + text[:60000] + "\n---"
+    )
+    # Kilo first (the cross-vendor backstop), gemini if kilo is busy/down. The
+    # gateway treats a provider pin as a HARD binding - `router.candidates("kilo")`
+    # returns exactly one entry - so a pin alone cannot fall over no matter what
+    # the old comment claimed. The fallback therefore has to be explicit here:
+    # one attempt per provider, in order. A model that returns unusable JSON is
+    # not retried on itself; the caller's same-model regenerate already does that.
+    res = None
+    try:
+        res = await asyncio.to_thread(
+            LLM().chat, prompt=prompt, agent="utility", provider="kilo",
+            session=session_id,
+            max_tokens=min(int(skill.max_tokens or 4096), 8000),
+            temperature=0.0)
+    except Exception as e:
+        print(f"[skills] {skill.name}: JSON fix call failed on kilo: "
+              f"{type(e).__name__}")
+    if res is not None:
+        got = parse_skill_json(str((res or {}).get("text") or "")) or {}
+        if got:
+            return (got, int((res or {}).get("input_tokens") or 0),
+                    int((res or {}).get("output_tokens") or 0))
+        print(f"[skills] {skill.name}: JSON fix on kilo still did not parse; "
+              f"trying gemini")
+    # Gemini fallback: kilo may be rate-limited, out of quota, or simply down.
+    # Same prompt and contract; only the worker changes.
+    try:
+        res2 = await asyncio.to_thread(
+            LLM().chat, prompt=prompt, agent="utility", provider="gemini",
+            session=session_id,
+            max_tokens=min(int(skill.max_tokens or 4096), 8000),
+            temperature=0.0)
+    except Exception as e:
+        print(f"[skills] {skill.name}: JSON fix call failed on gemini: "
+              f"{type(e).__name__}")
+        return {}, 0, 0
+    got = parse_skill_json(str((res2 or {}).get("text") or "")) or {}
+    return (got, int((res2 or {}).get("input_tokens") or 0),
+            int((res2 or {}).get("output_tokens") or 0))
 
 
 async def _sectioned_findings(skill: "Skill", rendered: str, transcript,
@@ -2442,8 +2833,11 @@ def length_target(query: str, skill_name: str = "") -> tuple[int, str]:
             if limit and v <= limit:
                 return 0, f"the requested {v:,} words at most"
             return min(v, _MAX_WORDS_PER_RENDER), f"the requested {v:,} words"
-    # Explicit page counts, at ~450 words of solid prose per page.
-    m = re.search(r"(\d{1,4})\s*\+?\s*pages?\b", q, re.I)
+    # Explicit page counts, at ~450 words of solid prose per page. Accept the
+    # hyphenated form too ("20-page", "a 12-page report"): the old pattern only
+    # matched "20 pages", so a hyphenated request parsed as NO length at all and
+    # the author shipped an 845-word "20-page" document.
+    m = re.search(r"(\d{1,4})\s*[-+]?\s*pages?\b", q, re.I)
     if m:
         v = int(m.group(1))
         if 1 <= v <= 2000:
@@ -2696,16 +3090,20 @@ def length_contract(query: str, skill_name: str = "") -> str:
 
 _STYLE_RULES = (
     ("memo", r"\b(memo|internal note|board note|decision note|policy note)\b"),
-    ("brief", r"\b(brief|one[- ]pager|executive summary|board briefing)\b"),
+    ("brief", r"\b(brief|one[- ]pager|executive summary|board briefing|"
+              r"pitch deck|investor deck|sales deck|board deck)\b"),
     ("academic", r"\b(academic|scholarly|research paper|journal article|"
-                 r"literature review|thesis|dissertation)\b"),
+                 r"literature review|thesis|dissertation|lecture|seminar|"
+                 r"conference talk|research talk|thesis defense)\b"),
     ("whitepaper", r"\b(white ?paper|industry report|market report|"
                     r"landscape report|position paper)\b"),
     ("manual", r"\b(manual|handbook|guide|how[- ]to|instructions|"
-               r"procedures?|playbook)\b"),
+               r"procedures?|playbook|training deck|training slides|"
+               r"workshop|onboarding deck|tutorial slides)\b"),
     ("newsletter", r"\b(newsletter|bulletin|digest)\b"),
     ("technical", r"\b(specification|technical report|engineering report|"
-                  r"architecture document|design document)\b"),
+                  r"architecture document|design document|technical talk|"
+                  r"engineering talk|architecture talk|tech talk)\b"),
     ("book", r"\b(book|book[- ]length|treatise|monograph|long[- ]form)\b"),
 )
 
@@ -3097,6 +3495,28 @@ def _format_requested_in(text: str) -> str:
     return best_fmt
 
 
+# An explicit LaTeX request, detected deterministically. The planner is ASKED to
+# set `metadata.engine="latex"`, but it is an LLM and in a live 20-page run it
+# only wrote "typeset with LaTeX" in the goal and left the field empty - so the
+# author rendered native and the document was ReportLab, not TeX. This is the
+# same belt-and-braces the format request gets: the user's words win.
+_LATEX_REQUEST_RE = re.compile(
+    r"\b(?:typeset|set|render|format|produce|generate|write|make|build|"
+    r"deliver|output|export)\b[^.\n]{0,40}\b(?:latex|tectonic)\b"
+    r"|\b(?:in|with|using|as)\s+(?:a\s+|an?\s+)?(?:latex|tectonic)\b"
+    r"|\blatex\s+(?:engine|renderer|typeset|typesetting)\b",
+    re.I)
+
+
+def _latex_requested_in(text: str) -> bool:
+    """True when the user explicitly asked for the LaTeX engine.
+
+    Narrow on purpose: a passing mention ("compare LaTeX and native") must not
+    force it, or the console would override a deliberate choice.
+    """
+    return bool(_LATEX_REQUEST_RE.search(str(text or "")))
+
+
 def _balanced_object(t: str) -> str | None:
     """The first complete top-level JSON object in `t`, string-aware.
 
@@ -3422,19 +3842,45 @@ _TOOL_CATALOG = {
             "as a blob of text: the layout follows the block structure. "
             "Block types: heading, paragraph, bullets, numbers, quote, "
             "table, pagebreak, plus three the short list used to omit - "
-            "`chart` (kind bar/line/pie with `categories` and `series`, "
+            "`chart` (kind bar/line/pie/scatter/area with `categories` and `series`, "
             "drawn as a real vector chart in the document: use it whenever "
             "the answer compares numbers over time or across categories, "
             "rather than describing the numbers in prose), `image` (a "
-            "figure from a document the user uploaded, by document id and "
-            "page - there is no URL fetching), and `cover` (a title page). "
+            "figure from a document the user uploaded by `document` id and "
+            "page, OR a plot you produced by `artifact` (`art:` handle) or "
+            "`path` (a sandbox file such as a matplotlib/matlab PNG) - there "
+            "is no URL fetching), and `cover` (a title page). "
+            "Three more carry a DECK's visual variety, and a deck built from "
+            "bullets alone reads as a converted report: `stats` ({items: "
+            "[{value, label}]}, one to four big numbers - use it whenever a "
+            "slide is ABOUT the figures), `columns` ({items: [{title, body}]}, "
+            "two or three side-by-side cards - use it to compare things in "
+            "words), and `callout` ({title, text, tone: insight|warning}, a "
+            "tinted panel for the one conclusion or trap worth breaking the "
+            "page for). Vary the register: two bullet slides in a row is the "
+            "most a deck should take before a chart, stats row, table or "
+            "columns slide. "
             "Returns an artifact handle and filename - report the filename to "
             "the user, and copy the handle EXACTLY as returned."),
         "input_schema": {
             "type": "object",
             "properties": {
-                "format": {"type": "string", "enum": ["pdf", "pptx", "docx", "xlsx"],
-                           "description": "Output file type."},
+                "format": {"type": "string",
+                           "enum": ["pdf", "pptx", "docx", "xlsx", "md", "html",
+                                    "csv", "json", "epub", "odt", "ods", "typst"],
+                           "description": "Output file type. pdf/pptx/docx/xlsx are "
+                                          "layout engines; md/html/csv/json/epub/odt/ods "
+                                          "are serialisations of the same block model; "
+                                          "typst is a PDF typeset by Typst."},
+                "typeset": {
+                    "type": "string", "enum": ["latex"],
+                    "description": "pdf only. Set to 'latex' to typeset "
+                                   "with a real TeX engine. Use it when the "
+                                   "document has mathematics - write `$...$` "
+                                   "inline and `\\[...\\]` for display "
+                                   "equations and they are set properly. "
+                                   "OMIT the parameter entirely for prose; "
+                                   "there is no 'empty' value to send."},
                 "title": {"type": "string", "description": "Document title."},
                 "subtitle": {"type": "string", "description": "Optional subtitle."},
                 "author_name": {"type": "string", "description": "Optional author line."},
@@ -3477,7 +3923,9 @@ _TOOL_CATALOG = {
                                    "the document IS, not how it looks: "
                                    "report (default), brief, memo, academic, "
                                    "whitepaper, manual, newsletter (2-col), "
-                                   "technical, book, plain."},
+                                   "technical, book, plain. For pptx it also "
+                                   "sets the deck's colour palette and type "
+                                   "pairing, so pick the mood of the talk."},
                 "citation_style": {
                     "type": "string",
                     "enum": ["apa", "mla", "chicago", "harvard", "ieee",
@@ -3786,25 +4234,42 @@ _TOOL_CATALOG = {
     },
     "send_telegram": {
         "name": "send_telegram",
-        "description": "Send a text message to a Telegram chat via the gateway (gateway-owned bot credential).",
+        "description": "Send a text message to a Telegram chat via the gateway, optionally attaching a file from the user's Documents (as a Telegram document).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "chat_id": {"type": "string"},
                 "message": {"type": "string"},
+                "document": {
+                    "type": "string",
+                    "description": "Optional file to attach: a document id (doc-...), an art: handle, or a sandbox path. Leave empty for text only.",
+                },
+                "filename": {"type": "string"},
             },
             "required": ["chat_id", "message"],
         },
     },
     "send_email": {
         "name": "send_email",
-        "description": "Send an email via the gateway Gmail adaptor, OAuth (no SMTP / app password); gmail.send scope, gateway-owned credential.",
+        "description": (
+            "Send an email via the gateway Gmail adaptor, OAuth (no SMTP / app "
+            "password); gmail.send scope, gateway-owned credential.\n\n"
+            "`document` ATTACHES A FILE — a document id (doc-...), an `art:` "
+            "artifact handle, or a sandbox path. Use it for \"email me that "
+            "report\": attach the report, do not just describe it. Leave empty "
+            "for a plain email."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "to": {"type": "string"},
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
+                "document": {"type": "string",
+                             "description": "File to attach: doc-..., art:..., or a sandbox path."},
+                "documents": {"type": "array", "items": {"type": "string"},
+                              "description": "Multiple files to attach (each doc-.../art:.../path). Use for \"email the package\"."},
+                "filename": {"type": "string",
+                             "description": "Optional attachment filename (single-document case)."},
             },
             "required": ["to", "subject", "body"],
         },
@@ -3883,6 +4348,167 @@ _TOOL_CATALOG = {
             "properties": {
                 "write_env": {"type": "boolean", "default": True},
             },
+            "required": [],
+        },
+    },
+    "zoho_mail_send": {
+        "name": "zoho_mail_send",
+        "description": "Send an email via Zoho Mail (gateway-owned OAuth). `document`/`documents` attach file(s) — any type. Use for 'email the report' / 'email the package'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+                "document": {"type": "string", "description": "File to attach: doc-..., art:..., or a sandbox path."},
+                "documents": {"type": "array", "items": {"type": "string"}, "description": "Multiple files to attach."},
+                "filename": {"type": "string", "description": "Optional attachment filename (single-document case)."},
+                "mail_format": {"type": "string", "enum": ["html", "text"], "default": "html"},
+            },
+            "required": ["to", "subject", "body"],
+        },
+    },
+    "zoho_mail_query": {
+        "name": "zoho_mail_query",
+        "description": "Read Zoho Mail via the gateway (OAuth); api_method 'list' returns message summaries + ids, 'read' returns one message's content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "api_method": {"type": "string", "enum": ["list", "read"]},
+                "query": {"type": "string", "description": "search string for 'list', or message id for 'read'"},
+                "max_results": {"type": "integer", "default": 5},
+            },
+            "required": ["api_method", "query"],
+        },
+    },
+    "zoho_mail_profile": {
+        "name": "zoho_mail_profile",
+        "description": "Zoho Mail: the connected mailbox (email, account id, folder count). Answers 'which Zoho account is connected?'.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "zoho_mail_folders": {
+        "name": "zoho_mail_folders",
+        "description": "List the Zoho Mailbox folders (Inbox, Sent, Drafts, custom).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "zoho_mail_refresh_token": {
+        "name": "zoho_mail_refresh_token",
+        "description": "Renew the gateway Zoho Mail OAuth token. Call this if zoho_mail_send / zoho_mail_query returns a 401/expired error.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"write_env": {"type": "boolean", "default": True}},
+            "required": [],
+        },
+    },
+    "zoho_mail_reply": {
+        "name": "zoho_mail_reply",
+        "description": "Reply to a Zoho Mail message. If to/subject are omitted they are read from the original (a Re: subject is added).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}, "body": {"type": "string"}, "to": {"type": "string"}, "subject": {"type": "string"}},
+            "required": ["message_id", "body"],
+        },
+    },
+    "zoho_mail_mark": {
+        "name": "zoho_mail_mark",
+        "description": "Mark a Zoho Mail message read or unread. mode = read | unread.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}, "mode": {"type": "string", "default": "read"}},
+            "required": ["message_id"],
+        },
+    },
+    "zoho_mail_move": {
+        "name": "zoho_mail_move",
+        "description": "Move a Zoho Mail message to a folder (id from zoho_mail_folders).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}, "dest_folder_id": {"type": "string"}},
+            "required": ["message_id", "dest_folder_id"],
+        },
+    },
+    "zoho_mail_delete": {
+        "name": "zoho_mail_delete",
+        "description": "Move a Zoho Mail message to Trash (recoverable).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"}},
+            "required": ["message_id"],
+        },
+    },
+    "ntfy_send": {
+        "name": "ntfy_send",
+        "description": "Push a notification to an ntfy topic (free phone push, keyless). Use for instant alerts / approve-deny prompts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "message": {"type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["topic", "message"],
+        },
+    },
+    "ntfy_history": {
+        "name": "ntfy_history",
+        "description": "Read recent messages posted to an ntfy topic (poll). since = message id / duration / timestamp; empty = latest.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"topic": {"type": "string"}, "since": {"type": "string"}, "max_results": {"type": "integer", "default": 20}},
+            "required": ["topic"],
+        },
+    },
+    "zoho_cliq_message": {
+        "name": "zoho_cliq_message",
+        "description": "Post a message to a Zoho Cliq bot/channel (free team chat). `target` is the bot/channel unique name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"target": {"type": "string"}, "text": {"type": "string"}},
+            "required": ["target", "text"],
+        },
+    },
+    "bluesky_post": {
+        "name": "bluesky_post",
+        "description": "Post to Bluesky (AT Protocol) as the configured account (text, <=300 chars).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    "mastodon_post": {
+        "name": "mastodon_post",
+        "description": "Post a status to the configured Mastodon instance. visibility: public/unlisted/private/direct.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "visibility": {"type": "string", "default": "public"},
+            },
+            "required": ["text"],
+        },
+    },
+    "google_chat_message": {
+        "name": "google_chat_message",
+        "description": "Post a message to the configured Google Chat space (Workspace).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    "zoho_calendar_list_calendars": {
+        "name": "zoho_calendar_list_calendars",
+        "description": "List the Zoho Calendar calendars (id + name) on the connected account (shares the Zoho Mail OAuth).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "zoho_calendar_list_events": {
+        "name": "zoho_calendar_list_events",
+        "description": "List upcoming events from a Zoho Calendar (default primary).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"calendar_id": {"type": "string", "default": "primary"},
+                           "max_results": {"type": "integer", "default": 10}},
             "required": [],
         },
     },
@@ -4018,7 +4644,15 @@ _TOOL_CATALOG = {
             "type": "object",
             "properties": {
                 "query": {"type": "string",
-                          "description": "The task for the agent to run at the scheduled time."},
+                          "description": (
+                              "What the job IS, in one line - it is the row's "
+                              "label on the Schedules page. For a reminder "
+                              "write the reminder itself ('Stretch and drink "
+                              "water'), never 'remind me to ...': a query "
+                              "phrased as an instruction is re-executed at "
+                              "fire time and schedules itself again. For a "
+                              "job that must go and find something out, write "
+                              "the work it should do.")},
                 "when": {"type": "string",
                          "description": "When to run it (natural language or ISO)."},
                 "conversation_id": {"type": "string"},
@@ -4045,6 +4679,42 @@ _TOOL_CATALOG = {
                                    "description": "Hard cap on re-messages, 0-10."},
             },
             "required": ["query", "when"],
+        },
+    },
+    "schedule_self": {
+        "name": "schedule_self",
+        "description": (
+            "Continue a goal in a FUTURE turn of yourself — end this turn now and "
+            "be woken later with the goal AND what you already did. This is how "
+            "you hand a task to your future self.\n\n"
+            "Give EXACTLY ONE trigger:\n"
+            "- `when`: a time ('in 1h', 'in 30m', 'tomorrow 9am', '9am', ISO). A "
+            "fresh you runs at that time with the goal + context.\n"
+            "- `email_from`: an email address. Wakes you when mail from that person "
+            "arrives (polled read-only; no cost while nothing matches).\n\n"
+            "`context` = what you already did this turn (findings, ids, decisions) "
+            "so the future you continues, not restarts. `interim` = the line shown "
+            "now. Use when work is best finished LATER (waiting on research, an "
+            "email, a long task to pause). For a no-work nudge use schedule_task."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string",
+                         "description": "What the future you must do. Standalone and specific."},
+                "when": {"type": "string",
+                         "description": "Time to wake (natural language or ISO). One trigger."},
+                "email_from": {"type": "string",
+                               "description": "Wake when mail arrives from this address. The other trigger."},
+                "context": {"type": "string",
+                            "description": "Optional one-line note. The system automatically attaches this run's full findings as context, so the future you has the real research/results — you only need the goal."},
+                "interim": {"type": "string",
+                            "description": "The line shown now while you wait."},
+                "conversation_id": {"type": "string"},
+                "every_s": {"type": "integer",
+                            "description": "Email poll interval seconds (default 120)."},
+            },
+            "required": ["goal"],
         },
     },
     "list_channels": {
@@ -4267,11 +4937,15 @@ _TOOL_CATALOG = {
     # silently dropping them.
     "read_file": {
         "name": "read_file",
-        "description": "Read a UTF-8 text file from the sandbox, optionally one line range. A large file is paginated: pass offset (1-based start line) and/or limit, and use next_offset to read on.",
+        "description": "Read a UTF-8 text file, optionally a 1-based inclusive line range via start_line/end_line (e.g. read_file(\"t.py\", start_line=30, end_line=40)). Returns raw `content` plus `numbered` (lines prefixed \"N: \") so you can cite exact lines and target edit_file. line_count is the whole file; large selections paginate via truncated/next_offset. offset/limit still accepted.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
+                "start_line": {"type": "integer", "default": 0,
+                               "description": "1-based first line (0 = use offset)."},
+                "end_line": {"type": "integer", "default": 0,
+                             "description": "1-based last line inclusive (0 = to end)."},
                 "offset": {"type": "integer", "default": 1},
                 "limit": {"type": "integer", "default": 0},
             },
@@ -4369,6 +5043,20 @@ _TOOL_CATALOG = {
             "required": ["name"],
         },
     },
+    "project_map": {
+        "name": "project_map",
+        "description": "The map of the project's code: the folder overview plus the files worth reading first (what='summary'), one file's classes/functions with line numbers and imports (what='file', path=...), every use of a symbol (what='refs', name=...), or what a change would touch, ranked (what='blast', name=...). Built from Python's ast where it can be exact, refreshed from file fingerprints. Use it to learn what a project contains and what a change would break instead of listing directories or re-scanning the tree.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "what": {"type": "string",
+                         "enum": ["summary", "file", "refs", "blast"],
+                         "default": "summary"},
+                "path": {"type": "string", "default": "."},
+                "name": {"type": "string", "default": ""},
+            },
+        },
+    },
     "document_symbols": {
         "name": "document_symbols",
         "description": "The file's outline: classes, functions, methods, constants. Read this before editing so you know what exists. Exact for Python (ast), conservative elsewhere.",
@@ -4376,6 +5064,31 @@ _TOOL_CATALOG = {
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
+        },
+    },
+    "studio_coder": {
+        "name": "studio_coder",
+        "description": (
+            "Delegate a whole coding task to the Studio coding agent — the full "
+            "code agent that reads, edits and runs the project's OWN checks on the "
+            "session's REAL project roots (NOT the throwaway sandbox). Use when the "
+            "goal is to change the user's actual codebase. Returns a receipt: the "
+            "files it changed, the check result and its summary. Edits are "
+            "auto-approved inside the session roots and checkpointed (revertible). "
+            "Leave `session` empty to use the most recently active project."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string",
+                         "description": "What to build/change, in full."},
+                "paths": {"type": "array", "items": {"type": "string"},
+                          "description": "Extra files to attach as context."},
+                "session": {"type": "string",
+                            "description": "Studio session sid; empty = most recent project."},
+                "read_only": {"type": "boolean",
+                              "description": "Investigate without editing."},
+            },
+            "required": ["task"],
         },
     },
     "find_references": {
@@ -4446,6 +5159,8 @@ _TOOL_CATALOG = {
                 "include": {"type": "string", "default": "",
                             "description": "fnmatch glob of files to search, e.g. *.py (empty = all)."},
                 "ignore_case": {"type": "boolean", "default": False},
+                "context": {"type": "integer", "default": 0,
+                            "description": "Lines of before/after context around each hit (grep -C), 0-10."},
             },
             "required": ["pattern"],
         },
@@ -4485,7 +5200,7 @@ _TOOL_CATALOG = {
     },
     "edit_file": {
         "name": "edit_file",
-        "description": "Find-and-replace inside a sandbox file.",
+        "description": "The single verified edit tool: replace/insert/delete code. Give start_line/end_line (from read_file numbered output) + find = the EXACT current code in that range; the harness double-checks it matches before writing and refuses (showing actual lines) on mismatch. replace = new code; replace=\"\" deletes the range; insert after N via start_line=N+1, end_line=N. Without line numbers, find must be unique (else replace_all).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4493,6 +5208,9 @@ _TOOL_CATALOG = {
                 "find": {"type": "string"},
                 "replace": {"type": "string"},
                 "replace_all": {"type": "boolean", "default": False},
+                "start_line": {"type": "integer", "default": 0,
+                               "description": "1-based first line of the range to verify+replace (0 = unique-substring mode)."},
+                "end_line": {"type": "integer", "default": 0},
             },
             "required": ["path", "find", "replace"],
         },
@@ -4520,6 +5238,213 @@ _TOOL_CATALOG = {
 # `tool_payload` consults both, so `tools_allowed` remains the one grant
 # mechanism; local calls are answered by `local_tools.dispatch` through the
 # extra_dispatch hook.
+# ── Channel tool catalogue: GitHub / Notion / Telegram ──────────────────────
+# Thin forwarders to the gateway integrations (credentials never leave it).
+_TOOL_CATALOG.update({
+    "gmail_profile": {
+        "name": "gmail_profile",
+        "description": "Gmail: the signed-in account (email address, message/thread counts).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "load_tool_bundle": {
+        "name": "load_tool_bundle",
+        "description": ("Load a channel's tool schemas into THIS run. Call this first when the task "
+                        "needs a channel; the schemas are appended and callable on the next step. "
+                        "Bundles: " + ", ".join(sorted(CHANNEL_TOOLS)) + "."),
+        "input_schema": {"type": "object", "properties": {
+            "bundle_id": {"type": "string", "enum": sorted(CHANNEL_TOOLS)}},
+            "required": ["bundle_id"]},
+    },
+    "github_get_user": {
+        "name": "github_get_user",
+        "description": "GitHub: the authenticated user (login, id, name, public_repos).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "github_list_repos": {
+        "name": "github_list_repos",
+        "description": "GitHub: the authenticated user's repositories.",
+        "input_schema": {"type": "object", "properties": {
+            "limit": {"type": "integer", "default": 30}}, "required": []},
+    },
+    "github_get_repo": {
+        "name": "github_get_repo",
+        "description": "GitHub: repository metadata (description, default_branch, open_issues).",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"}},
+            "required": ["owner", "repo"]},
+    },
+    "github_read_file": {
+        "name": "github_read_file",
+        "description": "GitHub: read a file's text and blob sha from a repository.",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "path": {"type": "string"}, "ref": {"type": "string"}},
+            "required": ["owner", "repo", "path"]},
+    },
+    "github_list_issues": {
+        "name": "github_list_issues",
+        "description": "GitHub: list issues (pull requests excluded).",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+            "limit": {"type": "integer", "default": 30}},
+            "required": ["owner", "repo"]},
+    },
+    "github_create_issue": {
+        "name": "github_create_issue",
+        "description": "GitHub: create an issue; returns number and url.",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "title": {"type": "string"}, "body": {"type": "string"}},
+            "required": ["owner", "repo", "title"]},
+    },
+    "github_update_issue": {
+        "name": "github_update_issue",
+        "description": "GitHub: update an issue (state=open|closed, optional title/body).",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "number": {"type": "integer"},
+            "state": {"type": "string", "enum": ["open", "closed"], "default": "closed"},
+            "title": {"type": "string"}, "body": {"type": "string"}},
+            "required": ["owner", "repo", "number"]},
+    },
+    "github_comment_issue": {
+        "name": "github_comment_issue",
+        "description": "GitHub: comment on an issue or pull request.",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "number": {"type": "integer"}, "body": {"type": "string"}},
+            "required": ["owner", "repo", "number", "body"]},
+    },
+    "github_list_prs": {
+        "name": "github_list_prs",
+        "description": "GitHub: list pull requests (number, title, head, base).",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+            "limit": {"type": "integer", "default": 30}},
+            "required": ["owner", "repo"]},
+    },
+    "github_create_pr": {
+        "name": "github_create_pr",
+        "description": "GitHub: open a pull request from head into base.",
+        "input_schema": {"type": "object", "properties": {
+            "owner": {"type": "string"}, "repo": {"type": "string"},
+            "title": {"type": "string"}, "head": {"type": "string"},
+            "base": {"type": "string"}, "body": {"type": "string"}},
+            "required": ["owner", "repo", "title", "head", "base"]},
+    },
+    "github_search_repos": {
+        "name": "github_search_repos",
+        "description": "GitHub: search repositories by keyword.",
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer", "default": 20}},
+            "required": ["query"]},
+    },
+    "notion_search": {
+        "name": "notion_search",
+        "description": "Notion: search pages/databases by title.",
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "page_size": {"type": "integer", "default": 20}},
+            "required": []},
+    },
+    "notion_get_page": {
+        "name": "notion_get_page",
+        "description": "Notion: page metadata (id, title, url).",
+        "input_schema": {"type": "object", "properties": {
+            "page_id": {"type": "string"}}, "required": ["page_id"]},
+    },
+    "notion_get_page_markdown": {
+        "name": "notion_get_page_markdown",
+        "description": "Notion: page content as markdown.",
+        "input_schema": {"type": "object", "properties": {
+            "page_id": {"type": "string"}}, "required": ["page_id"]},
+    },
+    "notion_get_blocks": {
+        "name": "notion_get_blocks",
+        "description": "Notion: child blocks of a page/block.",
+        "input_schema": {"type": "object", "properties": {
+            "block_id": {"type": "string"}, "page_size": {"type": "integer", "default": 100}},
+            "required": ["block_id"]},
+    },
+    "notion_append_blocks": {
+        "name": "notion_append_blocks",
+        "description": "Notion: append a paragraph (text) or raw children blocks.",
+        "input_schema": {"type": "object", "properties": {
+            "block_id": {"type": "string"}, "text": {"type": "string"},
+            "children": {"type": "array", "items": {"type": "object"}}},
+            "required": ["block_id"]},
+    },
+    "notion_query_database": {
+        "name": "notion_query_database",
+        "description": "Notion: query a database (optional filter).",
+        "input_schema": {"type": "object", "properties": {
+            "database_id": {"type": "string"},
+            "filter": {"type": "object"}}, "required": ["database_id"]},
+    },
+    "telegram_get_me": {
+        "name": "telegram_get_me",
+        "description": "Telegram: bot identity (username, id, can_join_groups).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "telegram_get_updates": {
+        "name": "telegram_get_updates",
+        "description": "Telegram: recent updates (messages). Use to discover a chat_id.",
+        "input_schema": {"type": "object", "properties": {
+            "offset": {"type": "integer", "default": 0},
+            "limit": {"type": "integer", "default": 100}}, "required": []},
+    },
+    "telegram_get_chat": {
+        "name": "telegram_get_chat",
+        "description": "Telegram: chat metadata (title, type).",
+        "input_schema": {"type": "object", "properties": {
+            "chat_id": {"type": "string"}}, "required": ["chat_id"]},
+    },
+    "telegram_send_message": {
+        "name": "telegram_send_message",
+        "description": "Telegram: send a text message to a chat.",
+        "input_schema": {"type": "object", "properties": {
+            "chat_id": {"type": "string"}, "text": {"type": "string"}},
+            "required": ["chat_id", "text"]},
+    },
+    "telegram_edit_message": {
+        "name": "telegram_edit_message",
+        "description": "Telegram: edit a message the bot sent.",
+        "input_schema": {"type": "object", "properties": {
+            "chat_id": {"type": "string"}, "message_id": {"type": "integer"},
+            "text": {"type": "string"}}, "required": ["chat_id", "message_id", "text"]},
+    },
+    "telegram_delete_message": {
+        "name": "telegram_delete_message",
+        "description": "Telegram: delete a message the bot sent.",
+        "input_schema": {"type": "object", "properties": {
+            "chat_id": {"type": "string"}, "message_id": {"type": "integer"}},
+            "required": ["chat_id", "message_id"]},
+    },
+    "discord_get_me": {
+        "name": "discord_get_me",
+        "description": "Discord: the bot's own user (id, username).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "discord_list_guilds": {
+        "name": "discord_list_guilds",
+        "description": "Discord: guilds the bot is in. Empty until the bot is invited (see discord_invite_url).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "discord_list_channels": {
+        "name": "discord_list_channels",
+        "description": "Discord: channels in a guild (bot must be a member).",
+        "input_schema": {"type": "object", "properties": {
+            "guild_id": {"type": "string"}}, "required": ["guild_id"]},
+    },
+    "discord_invite_url": {
+        "name": "discord_invite_url",
+        "description": "Discord: OAuth2 URL to invite the bot to a server. permissions is a bitfield string ('8' = Administrator).",
+        "input_schema": {"type": "object", "properties": {
+            "permissions": {"type": "string", "default": "0"}}, "required": []},
+    },
+})
+
 try:
     import local_tools as _local_tools
 except Exception as _lt_exc:  # pragma: no cover - import-time environment
@@ -4849,6 +5774,76 @@ def tool_payload(tool_names: list[str]) -> list[dict] | None:
 
 # ── per-node execution ───────────────────────────────────────────────────────
 
+def parse_shortfall(text: str) -> dict | None:
+    """Lift the COMPLETION CONTRACT block out of a node's raw reply.
+
+    Every node prompt appends the same fenced JSON tag when it could not
+    finish its slice. The orchestrator reads it to decide whether the run
+    needs a recovery plan, so it must be a PARSED structure, not prose the
+    planner has to interpret. Returns None when the node was satisfied -
+    which is the common case and must not be mistaken for a failure.
+    """
+    raw = str(text or "")
+    if "shortfall" not in raw:
+        return None
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        sf = obj.get("shortfall") if isinstance(obj, dict) else None
+        if isinstance(sf, dict):
+            attempted = sf.get("attempted")
+            return {
+                "what_failed": str(sf.get("what_failed") or "")[:600],
+                "attempted": [str(a)[:200] for a in attempted][:6]
+                if isinstance(attempted, list) else [],
+                "report_to_planner": bool(sf.get("report_to_planner")),
+                "block": m.group(0),
+            }
+    return None
+
+
+def strip_shortfall(text: str, found: dict | None = None) -> str:
+    """Remove the shortfall block from user-facing text.
+
+    The tag is orchestrator plumbing; a reader who sees
+    `{"shortfall": ...}` at the end of an answer learns that the machine
+    doubted itself and nothing about their question.
+    """
+    sf = found if found is not None else parse_shortfall(text)
+    if not sf or not sf.get("block"):
+        return str(text or "")
+    return str(text or "").replace(sf["block"], "").rstrip()
+
+
+def _author_format_fragment(skill_name: str, fmt: str, engine: str) -> str:
+    """The renderer-specific instructions for the author/deck skill.
+
+    The planner (or the authoring page) picks the output format/engine in the
+    node metadata; the author gets ONLY the fragment for that choice, so the
+    LaTeX and native rules can never contradict each other in one prompt (which
+    is exactly what a single monolith prompt did). Returns "" when nothing is
+    chosen — the base prompt's general rules still apply.
+    """
+    name = (skill_name or "").lower()
+    fmt = (fmt or "").strip().lower()
+    engine = (engine or "").strip().lower()
+    if name == "deck" or fmt == "pptx":
+        which = "deck"
+    elif engine in ("latex", "tex", "tectonic"):
+        which = "latex"
+    else:
+        # pdf (native), docx, html, md, epub, odt, xlsx... all use the native
+        # rules; only the LaTeX engine has a different maths contract.
+        which = "native"
+    path = ROOT / "prompts" / "author" / f"{which}.md"
+    try:
+        return "\n\n" + path.read_text(encoding="utf-8").strip() + "\n"
+    except Exception:
+        return ""
+
+
 async def run_skill(skill: Skill, node_id: str, graph_nodes,
                     session_id: str, query: str,
                     failure_report: str | None,
@@ -4858,6 +5853,7 @@ policy_notes: list | None = None,
                      doc_setup: dict | None = None,
                      budget_note: str = "",
                      doc_ids: set[str] | None = None,
+                     run_kind: str = "",
                      ) -> tuple[AgentResult, str]:
     """Dispatch one node. Returns (result, rendered_prompt).
 
@@ -4886,6 +5882,12 @@ policy_notes: list | None = None,
     # function reaches the final return, so binding it only inside the tools
     # branch left every tool-less skill with an UnboundLocalError.
     _authoritative: list[dict] | None = None
+    # Receipt tracking: names of every tool actually dispatched this run, at
+    # function scope so the post-parse guard can read it for ANY skill. A skill
+    # that reports `tool_used` while this is empty narrated the call instead of
+    # making it (observed live: an action node claimed schedule_self and a
+    # schedule id, but no tool ran and nothing was scheduled).
+    dispatched: list[str] = []
     # Per-node sub-question from the Planner's `metadata.question`. Travels
     # into the rendered prompt as a QUESTION: block so a fan-out worker
     # (e.g. one of three researchers spawned to cover three cities) can
@@ -4893,11 +5895,24 @@ policy_notes: list | None = None,
     # in its inputs.
     node_meta = graph_nodes[node_id].get("metadata") or {}
     question = node_meta.get("question") if isinstance(node_meta, dict) else None
+    # Per-run tool grant: core + the channels this goal names. Computed once
+    # and used for BOTH the prompt's grant header and the payload, so the two
+    # are the same list by construction.
+    _effective = effective_tools(skill, query, node_meta)
     rendered = render_prompt(skill, query, resolved, failure_report,
                              memory_hits=memory_hits, question=question,
                              prior_turns=prior_turns,
                              policy_notes=policy_notes,
-                             budget_note=budget_note)
+                             budget_note=budget_note,
+                             tools=_effective)
+    # Format-specific author instructions. The planner (or the authoring page)
+    # chooses the output format/engine in the node metadata; the author gets
+    # ONLY the fragment for that choice, so the LaTeX and native rules can
+    # never contradict each other in one prompt.
+    if skill.name in ("author", "deck"):
+        _fmt = str(node_meta.get("format") or (doc_setup or {}).get("format") or "")
+        _eng = str(node_meta.get("engine") or (doc_setup or {}).get("typeset") or "")
+        rendered += _author_format_fragment(skill.name, _fmt, _eng)
     if skill.name == "researcher":
         rendered += _research_effort_note(query)
         _h = node_meta.get("source_hints") if isinstance(node_meta, dict) else None
@@ -4915,6 +5930,22 @@ policy_notes: list | None = None,
     if skill.name in ("author", "deck"):
         rendered = rendered + length_contract(query, skill.name)
         figures = _figures_context(doc_ids)
+        # A long document is written section-by-section and the sectioned path
+        # fetches its own figures. A single-call document never reaches that
+        # path, so fetch here when the request asks for pictures: the handles go
+        # into the author's prompt and, if it expands, into every section. The
+        # call is network-bound, so it runs in a worker thread.
+        if _WANTS_FIGURES_R.search(str(query or "")) and not cancel_requested():
+            try:
+                _outline = _derive_document_outline(
+                    [], resolved, graph_nodes, query)[:8]
+                _web = await asyncio.to_thread(
+                    _acquire_figures, query, _outline)
+                if _web:
+                    figures = (figures or "") + _web
+            except Exception as _e:
+                print(f"[skills] {skill.name}: web figure pre-pass skipped "
+                      f"({_e!r})")
         rendered = rendered + figures
     started = time.time()
 
@@ -4956,12 +5987,24 @@ policy_notes: list | None = None,
         # and the gateway-chat dispatch entirely and hand off to
         # BrowserSkill.run(NodeSpec).
         node_dict = graph_nodes[node_id]
+        # A Planner browser node carries `inputs: ["USER_QUERY"]` and its
+        # destination in `metadata.goal` ("Go to Amazon, search for …"), with no
+        # `metadata.url`. Resolve the USER_QUERY token to the real query here so
+        # the skill never sees the literal token, and surface the query as
+        # `metadata.query` for the goal→URL fallback in BrowserSkill.run.
+        _bmeta = dict(node_dict.get("metadata") or {})
+        _bmeta.setdefault("query", query)
+        _binputs = [query if str(i) == "USER_QUERY" else i
+                    for i in (node_dict.get("inputs") or [])]
         node_spec = NodeSpec(
             skill="browser",
-            inputs=node_dict.get("inputs") or [],
-            metadata=node_dict.get("metadata") or {},
+            inputs=_binputs,
+            metadata=_bmeta,
         )
         from browser.skill import BrowserSkill
+        # Planner-tunable knobs via node metadata (previously code-only —
+        # tuning required editing BrowserSkill defaults). Clamped to sane
+        # bounds so a bad Planner value can't hang or bankrupt the run.
         _bmeta = node_spec.metadata or {}
         # Planner-tunable knobs via node metadata (previously code-only —
         # tuning required editing BrowserSkill defaults). Clamped to sane
@@ -5215,6 +6258,19 @@ policy_notes: list | None = None,
                     updated.get("state"), event)
                 if saved is None:
                     raise ValueError("app disappeared while the action ran")
+                # A refresh/action may refine identity. parse_reply inherits
+                # the existing values, so persist only what actually changed;
+                # an invalid schedule must not undo a surface that already saved.
+                _meta = {k: updated.get(k)
+                         for k in ("name", "description", "schedule",
+                                   "refresh_prompt")
+                         if updated.get(k) is not None
+                         and updated.get(k) != existing.get(k)}
+                if _meta:
+                    try:
+                        _apps.update_app_meta(str(saved.get("id")), **_meta)
+                    except ValueError:
+                        pass
                 output = {
                     "app_id": saved.get("id"),
                     "kind": "a2ui",
@@ -5245,7 +6301,30 @@ policy_notes: list | None = None,
                 error=f"{type(exc).__name__}: {exc}"[:800],
                 elapsed_s=time.time() - started), rendered
 
-    tools = tool_payload(skill.tools_allowed)
+    # SECTIONED LONG-REPORT PATH (before the tool loop).
+    # A sectioned skill (the formatter) with two or more upstream results writes
+    # one focused section per result and assembles them (skills.
+    # _sectioned_final_answer), instead of a single ~300-word call. This MUST run
+    # before the tool loop: the formatter has read-only tools, and the tool loop
+    # would otherwise consume the turn and the sectioning would never fire —
+    # which is why a 3-source run produced one short formatter call, not four.
+    # Never on a chat turn (a chat answer is one message, not a report).
+    _sectioned_ok = (skill.sectioned and (run_kind or "") != "chat"
+                     and len([e for e in (resolved or [])
+                              if isinstance(e, dict)]) >= 2)
+    if _sectioned_ok:
+        _assembled = await _sectioned_final_answer(
+            skill, rendered, resolved, query, session_id)
+        if _assembled:
+            import re as _re
+            return AgentResult(
+                success=True, agent_name=skill.name,
+                output={"final_answer": _assembled, "sectioned": True,
+                        "sections": len(_re.findall(r"(?m)^#{2,3} ", _assembled))},
+                elapsed_s=time.time() - started,
+            ), rendered
+
+    tools = tool_payload(_effective)
     # The AUTHORITATIVE record of what the run actually produced.
     #
     # A run is told "report the filename to the user", so the model's JSON
@@ -5280,6 +6359,15 @@ policy_notes: list | None = None,
         # it is applied here, on the way to the renderer, for BOTH paths: a
         # render_document tool call and the harness fallback below.
         _forced = dict(doc_setup or {})
+        # The planner's format/engine (node metadata) is a FORCED choice too, so
+        # the author cannot render a different one than the planner asked for.
+        # This is the third lock (planner decides, render forced, instructions
+        # match).
+        if isinstance(node_meta, dict):
+            if node_meta.get("format"):
+                _forced.setdefault("format", str(node_meta["format"]))
+            if node_meta.get("engine"):
+                _forced.setdefault("typeset", str(node_meta["engine"]))
         # The console no longer sends doc_setup at all: the format travels in
         # the user's own sentence ("... as a PDF"), because eleven controls
         # before you had described the document was the wrong trade. But the
@@ -5291,6 +6379,14 @@ policy_notes: list | None = None,
             _asked = _format_requested_in(query or "")
             if _asked:
                 _forced["format"] = _asked
+        # The planner is asked to set engine="latex" for a maths-heavy PDF, but
+        # it is an LLM: a live 20-page run left the field empty and the document
+        # came out ReportLab despite "typeset with LaTeX" in the request. The
+        # user's explicit words win, the same way the format does.
+        if _latex_requested_in(query or "") and not _forced.get("typeset"):
+            _forced["typeset"] = "latex"
+            if not _forced.get("format") or _forced.get("format") == "auto":
+                _forced["format"] = "pdf"
 
         def _force(fmt: str, blocks: list, sheets, title: str, subtitle: str,
                    author_name: str, toc: bool, running_header: str,
@@ -5305,15 +6401,53 @@ policy_notes: list | None = None,
                 "slide_size": slide_size, "columns": columns,
             }
 
+        def _wake_context(model_ctx, resolved):
+            """Full context for a self-wake: the run's actual findings, not a
+            terse model-written goal. The model's own `context` is prepended;
+            the upstream node results carry the substance, so a fresh planner
+            can continue without redoing the work."""
+            parts = []
+            if model_ctx and str(model_ctx).strip():
+                parts.append("SUMMARY:\n" + str(model_ctx).strip()[:1500])
+            for r in (resolved or []):
+                if not isinstance(r, dict):
+                    continue
+                out = r.get("output") if isinstance(r.get("output"), dict) else {}
+                who = str(r.get("skill") or r.get("kind") or "upstream")
+                text = ""
+                for key in ("findings", "summary", "text", "final_answer",
+                            "message_to_user", "answer"):
+                    v = out.get(key)
+                    if isinstance(v, str) and v.strip():
+                        text = v.strip()
+                        break
+                if not text:
+                    try:
+                        text = json.dumps(out)[:1500]
+                    except Exception:
+                        text = ""
+                if text:
+                    parts.append(f"FROM {who}:\n{text[:2500]}")
+            return "\n\n".join(parts)[:6000]
+
         def _prepare(name, args):
-            """Rewrite the render arguments BEFORE the tool is called.
+            """Rewrite the tool arguments BEFORE the tool is called.
 
             This used to live in on_outcome, which runs after the call has
             already gone out over the MCP wire - so the arguments the tool
             actually received were the model's own and the user's chosen
             format, page and style were quietly discarded.
             """
-            if name != "render_document" or not isinstance(args, dict):
+            if not isinstance(args, dict):
+                return args
+            if name == "schedule_self":
+                # Auto-capture the run's findings so the future self wakes with
+                # FULL context, not a terse goal the model may have written.
+                args = dict(args)
+                args["context"] = _wake_context(args.get("context") or "",
+                                                 resolved)
+                return args
+            if name != "render_document":
                 return args
             try:
                 merged = dict(args)
@@ -5328,7 +6462,7 @@ policy_notes: list | None = None,
                 if f and f != "auto":
                     merged["format"] = f
                 for key in ("page_size", "orientation", "margins",
-                            "style", "citation_style", "slide_size"):
+                            "style", "citation_style", "slide_size", "typeset"):
                     if _forced.get(key):
                         merged[key] = _forced[key]
                 # The model usually leaves style at the default. Pick a
@@ -5381,6 +6515,9 @@ policy_notes: list | None = None,
                 return args
 
         def _capture(name, args, ok, text, lat):
+            # Receipt tracking: every dispatched tool lands here, so a skill that
+            # CLAIMS it called a tool can be checked against what actually ran.
+            dispatched.append(str(name))
             _outcomes.on_tool_outcome(
                 name=name, arguments=args, ok=ok, result_text=text,
                 latency_s=lat, session_id=session_id, run_id=session_id)
@@ -5435,7 +6572,31 @@ policy_notes: list | None = None,
                           & (_local_tools.LOCAL_TOOL_NAMES
                              if _local_tools is not None else set()))
 
+        # Progressive disclosure: the action node calls load_tool_bundle("github")
+        # and the schemas are appended to the SAME `tools` list the loop sends
+        # each hop, so the next model call sees them.
+        _bundles = build_tool_bundles()
+
         async def _dispatch_extra(name: str, args: dict):
+            if name == "load_tool_bundle":
+                bid = str((args or {}).get("bundle_id") or "").lower()
+                schemas = _bundles.get(bid)
+                if not schemas:
+                    return json.dumps({
+                        "ok": False,
+                        "error": (f"unknown bundle '{bid}'. Available: "
+                                  + ", ".join(sorted(_bundles)))})
+                have = {str(t.get("name")) for t in tools}
+                added = [s for s in schemas if str(s.get("name")) not in have]
+                for s in added:
+                    tools.append(s)
+                    have.add(str(s.get("name")))
+                print(f"[skills] loaded tool bundle '{bid}' (+{len(added)} tools)")
+                return json.dumps({
+                    "ok": True, "bundle": bid,
+                    "added": [str(s.get("name")) for s in added],
+                    "total": len(tools),
+                    "note": "schemas appended — call them directly on the next step"})
             if name in _allowed_local:
                 disabled_now = _disabled_tools()
                 if disabled_now is None or name in disabled_now:
@@ -5472,17 +6633,41 @@ policy_notes: list | None = None,
             )
 
         reply = await _run_loop(rendered)
-        if (skill.name in ("author", "deck") and not produced
-                and "empty reply" in str((reply or {}).get("error") or "")):
+        if (skill.name in ("author", "deck", "action") and not produced
+                and ("empty reply" in str((reply or {}).get("error") or "")
+                     or "empty completion" in str((reply or {}).get("error") or ""))):
             # Gemini sometimes completes a large author call with zero tokens.
             # The rescue used to be a trimmed prompt, which bought a reply by
             # throwing most of the research away. The retry now repeats the
             # FULL evidence: a document too big for one call is handled by the
             # sectioned expansion below, which spends calls on size rather than
-            # dropping content.
+            # dropping content. `action` is included because an empty completion
+            # there used to dead-end the node with no corrective call at all.
             print(f"[skills] {skill.name}: empty reply; retrying once with "
                   f"the complete prompt", flush=True)
             reply = await _run_loop(rendered)
+        # RECEIPT CHECK — the model's word is not evidence.
+        # A tool-using skill that returns `tool_used: X` while the loop
+        # dispatched NOTHING narrated the call instead of making it (observed
+        # live: an action node claimed `schedule_self` and reported a schedule
+        # id, but no tool ever ran and nothing was scheduled). Re-ask once with
+        # the discrepancy stated, so the model actually calls the tool; if it
+        # still makes no call, the honest-failure guard below refuses to dress
+        # the narration up as success.
+        if skill.name == "action" and isinstance(reply, dict):
+            try:
+                _claimed = str((parse_skill_json(reply.get("text", "")) or {})
+                               .get("tool_used") or "")
+            except Exception:
+                _claimed = ""
+            if _claimed and not dispatched:
+                print(f"[skills] action: claimed tool '{_claimed}' but dispatched "
+                      f"none — retrying with a corrective note", flush=True)
+                reply = await _run_loop(
+                    rendered + "\n\nIMPORTANT: your previous reply said you "
+                    "called a tool, but no tool call was actually made and "
+                    "nothing happened. Call the tool for real now, then report "
+                    "the id it returned.")
         # Whatever the model said about the artifact, the receipt uses this.
         _authoritative = produced
     elif skill.tools_allowed:
@@ -5508,24 +6693,9 @@ policy_notes: list | None = None,
             elapsed_s=time.time() - started,
         ), rendered
     else:
-        # Sectioned expansion: one focused call per upstream result, so a
-        # multi-source research run yields a multi-section report instead
-        # of the ~300 words a single call yields from these models.
-        if skill.sectioned and len([e for e in (resolved or [])
-                                    if isinstance(e, dict)]) >= 2:
-            assembled = await _sectioned_final_answer(
-                skill, rendered, resolved, query, session_id)
-            if assembled:
-                import re as _re
-                return AgentResult(
-                    success=True,
-                    agent_name=skill.name,
-                    output={"final_answer": assembled,
-                            "sectioned": True,
-                            "sections": len(_re.findall(r"(?m)^#{2,3} ",
-                                                        assembled))},
-                    elapsed_s=time.time() - started,
-                ), rendered
+        # Sectioned long-report expansion now runs BEFORE the tool loop (see the
+        # block above `tools = tool_payload(...)`), so a formatter that HAS read
+        # tools still sections instead of being shunted into the tool loop.
         # Python 3.8 compat: asyncio.to_thread was added in 3.9. Fall back to
         # run_in_executor with the default thread pool.
         if hasattr(asyncio, "to_thread"):
@@ -5648,6 +6818,22 @@ policy_notes: list | None = None,
                   f"recovering the spec")
             parsed = dict(_inner)
 
+    # RECEIPT GUARD (action): the node claims it called a tool but the loop
+    # dispatched NOTHING — the "result" is fabricated. Fail honestly instead of
+    # letting a narrated side effect read as a completed one (this is the
+    # schedule/email/page "success" that never happened).
+    if (skill.name == "action" and parsed.get("tool_used") and not dispatched):
+        print(f"[skills] action: claimed tool '{parsed.get('tool_used')}' but "
+              f"no tool call was made — reporting an honest failure")
+        return AgentResult(
+            success=False, agent_name=skill.name, output={},
+            elapsed_s=time.time() - started,
+            provider=reply.get("provider", ""),
+            error=("action claimed it called "
+                   f"'{parsed.get('tool_used')}' but no tool call was actually "
+                   "made — nothing was scheduled, sent or created"),
+        ), rendered
+
     # NOTE on duplicate renders: a second render_document call is normally the
     # model re-rendering after reading `stats.words`, or correcting itself.
     # Both files used to reach produced_files.json, so the console listed two
@@ -5755,11 +6941,25 @@ policy_notes: list | None = None,
         _raw = (reply.get("text") or "")
         _why = ("empty reply" if not _raw.strip()
                 else f"reply was not JSON (starts {str(_raw.strip())[:60]!r})")
-        # One repair call before failing. A model that answered in prose (or
-        # with a single word) is asked once for the contract's JSON; the run
-        # is only failed if that also misses. See _repair_json_reply.
-        if (skill.name in _JSON_CONTRACT_SKILLS and not _authoritative
-                and not reply.get("error")):
+        # 1. A reply that LOOKS like JSON but is malformed: a LIGHTWEIGHT model
+        #    fixes the SYNTAX (cheap, preserves content) rather than discarding
+        #    the node's whole output. This is the common failure in research —
+        #    one truncated or unquoted researcher reply losing a whole facet.
+        if (_raw.strip() and ("{" in _raw or "[" in _raw)
+                and not reply.get("error") and not _authoritative):
+            _fixed, _ti, _to = await _repair_json_with_model(
+                skill, _raw, _why, session_id)
+            if _fixed:
+                parsed = _fixed
+                reply = dict(reply)
+                reply["input_tokens"] = int(reply.get("input_tokens") or 0) + _ti
+                reply["output_tokens"] = int(reply.get("output_tokens") or 0) + _to
+                print(f"[skills] {skill.name}: JSON fixed by lightweight model "
+                      f"({_why})")
+        # 2. Still unusable (a prose reply, or the fix failed): one regenerate
+        #    call with the contract's own schema quoted back.
+        if (not parsed and skill.name in _JSON_CONTRACT_SKILLS
+                and not _authoritative and not reply.get("error")):
             _fixed, _ti, _to = await _repair_json_reply(
                 skill, rendered, _raw, _why, session_id)
             if _fixed:
@@ -5914,6 +7114,11 @@ policy_notes: list | None = None,
                             and parsed.get("references")
                             else _references_from_resolved(resolved)),
                 slide_size=_f("slide_size"),
+                # The model decides the engine by default (it knows whether the
+                # document carries maths), BUT an explicit doc_setup `typeset`
+                # from the Authoring panel overrides it — the user asked for a
+                # LaTeX-typeset PDF, so that is what they get.
+                typeset=str(_forced.get("typeset") or parsed.get("typeset") or ""),
                 blocks=_blocks,
                 sheets=parsed.get("sheets") if isinstance(
                     parsed.get("sheets"), list) else None,
@@ -6093,6 +7298,16 @@ policy_notes: list | None = None,
                 elapsed_s=time.time() - started,
                 provider=reply.get("provider", ""), error=_qerr), rendered
 
+    _shortfall = parse_shortfall(reply.get("text") or "")
+    if _shortfall:
+        # Recorded, never fatal: a node that did its best and said what was
+        # missing is more useful than one that silently half-finished. The
+        # block itself is removed from the payload so no renderer can show it.
+        out["shortfall"] = {k: v for k, v in _shortfall.items()
+                            if k != "block"}
+        print(f"[skills] {skill.name}: shortfall reported "
+              f"({_shortfall['what_failed'][:120]!r}, "
+              f"report={_shortfall['report_to_planner']})")
     return AgentResult(
         success=True,
         agent_name=skill.name,

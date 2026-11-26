@@ -161,12 +161,19 @@ def test_ee01_mcp_tool_catalogue():
     # advertised only when browser.tools is on — the same split as
     # schedule_wake, and the reason the count moves even though the default
     # payload does not.
-    assert len(tools) == 85, f"expected 85 tools, got {len(tools)}"
+    # 86 = re-measured 2026-11-07, one above the pin (same class of drift the
+    # earlier "65, re-measured" note records). Keeps this file in step with
+    # tests/comprehensive/test_mcp_tools.py.
+    # A lower bound, not an equality: tools are added over time (channel
+    # catalogue, browser verbs), and pinning an exact number turns every
+    # legitimate addition into a failure. 113 = 2026-11-24 channel tools.
+    assert len(tools) >= 113, f"expected at least 113 tools, got {len(tools)}"
     for expected in ("run_checks", "git_inspect", "find_symbol",
                      "list_scheduled", "web_search", "read_file", "list_dir",
                      "search_knowledge", "github_query", "read_artifact",
                      "schedule_task", "list_channels", "check_channel",
-                     "enable_scheduled", "save_as_document", "record_observation", "recall_observations"):
+                     "enable_scheduled", "save_as_document", "record_observation", "recall_observations",
+                     "github_get_user", "notion_search", "telegram_get_me", "discord_invite_url"):
         assert expected in names, f"missing MCP tool: {expected}"
 
 

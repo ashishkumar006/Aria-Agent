@@ -732,7 +732,11 @@ class _RoutedLLM:
                                 slot["provider_meta"] = {"thoughtSignature": sig}
                     if d.get("done"):
                         yield {"type": "done",
-                               "provider": d.get("provider") or ""}
+                               "provider": d.get("provider") or "",
+                               "model": d.get("model") or "",
+                               "input_tokens": d.get("input_tokens") or 0,
+                               "output_tokens": d.get("output_tokens") or 0,
+                               "cache_read_tokens": d.get("cache_read_tokens") or 0}
         if acc:
             calls = []
             for idx in sorted(acc):

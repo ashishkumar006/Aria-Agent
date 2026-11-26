@@ -395,22 +395,20 @@ def _missing(*names: str) -> list[str]:
 
 
 # Integrations reachable by the same Test button (safe read-only ops).
-# calendar has no read op — key presence only, create is never probed.
+# Calendar uses events.list (a read) so an expired token reports FAILED rather
+# than "key present" — create is never probed because it would book a real event.
 _INTEGRATION_PROBES: dict[str, tuple[str, str, dict]] = {
     "notion": ("notion", "query", {"api_method": "list_pages"}),
     "github": ("github", "query", {"api_method": "list_repos"}),
     "websearch": ("websearch", "search", {"query": "python programming", "max_results": 1}),
+    "calendar": ("calendar", "list", {}),
+    "zoho_mail": ("zoho_mail", "profile", {}),
+    "zoho_calendar": ("zoho_calendar", "list_calendars", {}),
 }
 
 
 async def _probe_integration(name: str) -> DeployResult:
     from integrations_api import _run as _irun
-    if name == "calendar":
-        if _missing("GOOGLE_CALENDAR_TOKEN"):
-            return DeployResult(area="integrations", name=name, status="UNKEYED",
-                                detail="needs GOOGLE_CALENDAR_TOKEN")
-        return DeployResult(area="integrations", name=name, status="WORKING",
-                            detail="key present (create never probed — would book a real event)")
     svc, op, args = _INTEGRATION_PROBES[name]
     try:
         res = await asyncio.wait_for(_irun(svc, op, dict(args)), timeout=90)
@@ -638,6 +636,48 @@ async def _probe_channel(name: str, base: str, timeout: float = 15.0,
                     return DeployResult(area="channels", name=name, status="WORKING",
                                         detail=f"{r.json().get('display_phone_number', '?')} verified")
                 return DeployResult(area="channels", name=name, status="FAILED", detail=f"HTTP {r.status_code}: {r.text[:100]}")
+            if name == "ntfy":
+                nb = (os.getenv("NTFY_URL") or "https://ntfy.sh").rstrip("/")
+                try:
+                    r = await c.get(nb + "/")
+                    ok = r.status_code < 500
+                except Exception:
+                    ok = False
+                return DeployResult(area="channels", name=name, status="WORKING" if ok else "FAILED",
+                                    detail="hosted reachable (keyless)" if ok else "host unreachable")
+            if name == "zoho_cliq":
+                if miss("ZOHO_CLIQ_TOKEN"):
+                    return DeployResult(area="channels", name=name, status="UNKEYED", detail="needs ZOHO_CLIQ_TOKEN")
+                return DeployResult(area="channels", name=name, status="WORKING", detail="token present (send not probed)")
+            if name == "bluesky":
+                if miss("BSKY_HANDLE", "BSKY_APP_PASSWORD"):
+                    return DeployResult(area="channels", name=name, status="UNKEYED", detail="needs BSKY_HANDLE + BSKY_APP_PASSWORD")
+                try:
+                    r = await c.post("https://bsky.social/xrpc/com.atproto.server.createSession",
+                                     json={"identifier": os.getenv("BSKY_HANDLE"), "password": os.getenv("BSKY_APP_PASSWORD")})
+                    if r.status_code == 200:
+                        return DeployResult(area="channels", name=name, status="WORKING", detail="auth ok (no post)")
+                    return DeployResult(area="channels", name=name, status="FAILED", detail=f"HTTP {r.status_code} — app password invalid?")
+                except Exception as e:
+                    return DeployResult(area="channels", name=name, status="FAILED", detail=f"{type(e).__name__}: {e}"[:120])
+            if name == "mastodon":
+                if miss("MASTODON_TOKEN", "MASTODON_INSTANCE"):
+                    return DeployResult(area="channels", name=name, status="UNKEYED", detail="needs MASTODON_TOKEN + MASTODON_INSTANCE")
+                inst = (os.getenv("MASTODON_INSTANCE") or "").strip()
+                if not inst.startswith("http"):
+                    inst = "https://" + inst
+                try:
+                    r = await c.get(inst.rstrip("/") + "/api/v1/accounts/verify_credentials",
+                                    headers={"Authorization": f"Bearer {os.getenv('MASTODON_TOKEN')}"})
+                    if r.status_code == 200:
+                        return DeployResult(area="channels", name=name, status="WORKING", detail="token ok (no post)")
+                    return DeployResult(area="channels", name=name, status="FAILED", detail=f"HTTP {r.status_code} — token invalid?")
+                except Exception as e:
+                    return DeployResult(area="channels", name=name, status="FAILED", detail=f"{type(e).__name__}: {e}"[:120])
+            if name == "google_chat":
+                if miss("GOOGLE_CHAT_WEBHOOK"):
+                    return DeployResult(area="channels", name=name, status="UNKEYED", detail="needs GOOGLE_CHAT_WEBHOOK")
+                return DeployResult(area="channels", name=name, status="WORKING", detail="webhook set (send not probed)")
             return DeployResult(area="channels", name=name, status="FAILED", detail=f"unknown channel '{name}'")
     except Exception as e:
         return DeployResult(area="channels", name=name, status="FAILED", detail=f"{type(e).__name__}: {e}"[:120])
@@ -653,7 +693,8 @@ async def channel_test(body: ChannelTestBody, request: Request):
     name = (body.channel or "").lower()
     channels = ["telegram", "gmail", "discord", "matrix", "line", "webhook", "webui",
                 "slack", "signal", "imap", "twilio_sms", "whatsapp_twilio",
-                "local_mic", "teams", "whatsapp_meta", "twilio_voice"]
+                "local_mic", "teams", "whatsapp_meta", "twilio_voice",
+                "ntfy", "zoho_cliq", "bluesky", "mastodon", "google_chat"]
     rot = bool(getattr(body, "rotate", False))
     if name == "all":
         out = [await _probe_channel(n, _base_url()) for n in channels]

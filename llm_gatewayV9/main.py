@@ -2,6 +2,8 @@ import os, time, json
 import sys
 import asyncio
 import re
+import hashlib
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 from contextlib import asynccontextmanager
@@ -260,6 +262,16 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
             router_latency_ms=0, fallback_used=True,
         )
 
+    # Memoized tier: the same prompt text maps to the same tier, so skip the
+    # router-LLM round-trip on repeat prompts.
+    cached = _tier_cached(role, prompt_text)
+    if cached:
+        return RouterDecision(
+            role=role, tier=cached, estimated_tokens=estimated,
+            router_provider="(cache)", router_model="(cache)",
+            router_latency_ms=0, fallback_used=True,
+        )
+
     sample = _build_sample(prompt_text)
     envelope = f"token_count: {estimated}\nsample:\n{sample}"
     call_role = f"router_{role}"
@@ -326,6 +338,7 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
                         prompt_chars=len(envelope), response_chars=len(result.get("text", "")),
                         call_role=call_role, router_decision=tier,
                         agent=req.agent, session=req.session, user_id=user_id)
+            _tier_store(role, prompt_text, tier)
             return RouterDecision(
                 role=role, tier=tier, estimated_tokens=estimated,
                 router_provider=name, router_model=result.get("model", provider.model),
@@ -349,6 +362,8 @@ async def _classify_tier(req: ChatRequest, role: str, router_pool: RouterPool, p
             continue
 
     # All routers in the pool failed — deterministic token-count fallback.
+    # Not cached: a fallback means the router is broken/benched, and caching it
+    # would hide the bench/retry behaviour for this prompt.
     return RouterDecision(
         role=role, tier=_tier_from_count(estimated), estimated_tokens=estimated,
         router_provider=last_provider or "(unavailable)",
@@ -397,12 +412,21 @@ async def lifespan(app: FastAPI):
         ORDER, ROUTER_ORDER, gemini_only=app.state.gemini_only)
     # Warm Kokoro/Whisper off the request path. The first TTS call otherwise
     # pays the model load (measured 16.9s for the first chunk).
-    try:
-        import voice_api as _voice
-        __import__("threading").Thread(
-            target=_voice.warm_up, daemon=True, name="voice-warmup").start()
-    except Exception:
-        pass
+    #
+    # NOT under pytest: warm_up loads native TTS models in a daemon thread that
+    # nothing joins on shutdown. If the test process exits while that thread is
+    # mid-native-load, the interpreter finalizes under it and Windows raises
+    # 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) AFTER pytest has reported all
+    # tests passed — a green run with a non-zero exit code. Tests never need the
+    # model warm, so skip it there; production is unaffected (PYTEST_CURRENT_TEST
+    # is only set by pytest).
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        try:
+            import voice_api as _voice
+            __import__("threading").Thread(
+                target=_voice.warm_up, daemon=True, name="voice-warmup").start()
+        except Exception:
+            pass
     # Kilo model discovery. Registers every upstream model id so a caller can
     # pass `model="vendor/name"` and land on kilo without naming the provider.
     # Needs no key, so it runs even when kilo is unwired. Guarded and bounded:
@@ -438,6 +462,14 @@ async def lifespan(app: FastAPI):
     except Exception as _e:  # noqa: BLE001 - discovery is strictly optional
         log.warning("kilo model discovery unavailable at startup: %s", _e)
     app.state.embedders, app.state.embed_order = E.build_embedders()
+    # Capture channel credentials BEFORE the provider-key scrub — GitHub's
+    # token is one of the scrubbed names — so the startup probe can still
+    # verify each configured channel.
+    try:
+        import channel_probe as _CP
+        _CP.capture_tokens()
+    except Exception as _e:  # noqa: BLE001 - diagnostics only
+        log.warning("channel credential capture failed: %s", _e)
     # Provider keys are no longer needed in the process environment once the
     # pools and embedders are built. Keeping them there lets any in-process
     # adapter read os.environ["GEMINI_API_KEY"] — the glc_v1 attack. Capture
@@ -450,6 +482,14 @@ async def lifespan(app: FastAPI):
                      _scrubbed)
     except Exception as _e:  # noqa: BLE001 - must not block startup
         log.warning("provider-key env scrub failed: %s", _e)
+    # One line at boot: which configured channels are actually alive. A
+    # revoked token leaves a channel looking "configured" while every send
+    # fails; this is the only place that difference is said out loud.
+    try:
+        import channel_probe as _CP
+        _CP.schedule_startup_report(app, log)
+    except Exception as _e:  # noqa: BLE001 - diagnostics only
+        log.warning("channel health probe unavailable: %s", _e)
     # Inbound Telegram. Long-polls in-process because a webhook needs a public
     # HTTPS URL (Telegram cannot reach 127.0.0.1) and no `setWebhook` call
     # exists anywhere in this repo — which left the inbound path, and therefore
@@ -459,10 +499,32 @@ async def lifespan(app: FastAPI):
         app.state.telegram_poller = _TGP.start(app)
     except Exception as _e:
         print(f"[telegram] poller not started: {type(_e).__name__}")
+    # Inbound Gmail + Slack, same reasoning: a webhook needs a public HTTPS URL,
+    # so these long-poll in-process. See gmail_poller.py / slack_poller.py.
+    try:
+        import gmail_poller as _GP
+        app.state.gmail_poller = _GP.start(app)
+    except Exception as _e:
+        print(f"[gmail] poller not started: {type(_e).__name__}")
+    try:
+        import slack_poller as _SP
+        app.state.slack_poller = _SP.start(app)
+    except Exception as _e:
+        print(f"[slack] poller not started: {type(_e).__name__}")
     yield
     try:
         import telegram_poller as _TGP
         _TGP.stop()
+    except Exception:
+        pass
+    try:
+        import gmail_poller as _GP
+        _GP.stop()
+    except Exception:
+        pass
+    try:
+        import slack_poller as _SP
+        _SP.stop()
     except Exception:
         pass
     # The roster poller sleeps for up to half an hour; cancel it explicitly or
@@ -740,10 +802,19 @@ def _est_input_tokens(messages, system_blocks, tools=None) -> int:
         for b in system_blocks:
             chars += len(b.get("text", "") if isinstance(b, dict) else "")
     if tools:
-        try:
-            chars += len(json.dumps(tools))
-        except (TypeError, ValueError):
-            chars += len(str(tools))
+        fp = (len(tools), tuple(
+            str((t.get("function") or {}).get("name") or t.get("name") or "")
+            for t in tools if isinstance(t, dict)))
+        cc = _TOOLS_CHARS.get(fp)
+        if cc is None:
+            try:
+                cc = len(json.dumps(tools))
+            except (TypeError, ValueError):
+                cc = len(str(tools))
+            if len(_TOOLS_CHARS) > 256:
+                _TOOLS_CHARS.clear()
+            _TOOLS_CHARS[fp] = cc
+        chars += cc
     return chars // 4
 
 
@@ -943,6 +1014,85 @@ def _validate_structured(text: str, schema: dict):
     return obj
 
 
+# ── latency caches ──────────────────────────────────────────────────────────
+# Local response cache: identical deterministic (temperature=0, non-stream)
+# requests return instantly instead of paying a provider round-trip. Bounded LRU
+# with a short TTL so stale answers cannot linger.
+_RESP_CACHE: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_RESP_TTL_S = 60.0
+_RESP_MAX = 256
+
+
+def _resp_key(req, messages, system_blocks) -> str:
+    return hashlib.sha256(json.dumps(
+        [req.model, req.provider, messages, system_blocks, req.tools, req.max_tokens],
+        sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _resp_get(key):
+    e = _RESP_CACHE.get(key)
+    if not e:
+        return None
+    exp, val = e
+    if time.time() > exp:
+        _RESP_CACHE.pop(key, None)
+        return None
+    _RESP_CACHE.move_to_end(key)
+    return val
+
+
+def _resp_put(key, val):
+    _RESP_CACHE[key] = (time.time() + _RESP_TTL_S, val)
+    _RESP_CACHE.move_to_end(key)
+    while len(_RESP_CACHE) > _RESP_MAX:
+        _RESP_CACHE.popitem(last=False)
+
+
+# Tier-classification cache: the router-LLM hop is a full extra round-trip; the
+# same prompt text maps to the same tier, so memoize it briefly.
+_TIER_CACHE: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
+_TIER_TTL_S = 300.0
+_TIER_MAX = 512
+
+
+def _tier_cached(role, prompt_text):
+    key = hashlib.sha256(f"{role}\x00{prompt_text}".encode()).hexdigest()
+    e = _TIER_CACHE.get(key)
+    if e and time.time() <= e[0]:
+        _TIER_CACHE.move_to_end(key)
+        return e[1]
+    return None
+
+
+def _tier_store(role, prompt_text, tier):
+    key = hashlib.sha256(f"{role}\x00{prompt_text}".encode()).hexdigest()
+    _TIER_CACHE[key] = (time.time() + _TIER_TTL_S, tier)
+    _TIER_CACHE.move_to_end(key)
+    while len(_TIER_CACHE) > _TIER_MAX:
+        _TIER_CACHE.popitem(last=False)
+
+
+# Control-plane snapshot cache: /v1/status & /v1/routers recompute all_status()
+# (db + provider state) per request (~200ms). Cache ~1s for polling UIs.
+_STATUS_CACHE: dict = {}
+_STATUS_TTL_S = 1.0
+
+
+def _snap(key, build):
+    now = time.time()
+    e = _STATUS_CACHE.get(key)
+    if e and now - e[0] < _STATUS_TTL_S:
+        return e[1]
+    val = build()
+    _STATUS_CACHE[key] = (now, val)
+    return val
+
+
+# Tool-schema serialized size rarely changes; cache it by (count, names) so we
+# don't json.dumps the whole schema on every request (estimate only).
+_TOOLS_CHARS: dict = {}
+
+
 @app.post("/v1/chat")
 async def chat(req: ChatRequest, request: Request):
     auth = getattr(request.state, "auth", None)
@@ -984,6 +1134,14 @@ async def chat(req: ChatRequest, request: Request):
     )
     est = _est_tokens(messages, system_blocks, req.max_tokens)
     est_in = _est_input_tokens(messages, system_blocks, req.tools)
+    # Local response cache: deterministic non-stream requests return instantly on
+    # a repeat instead of paying a provider round-trip.
+    _rc_key = None
+    if not req.stream and (req.temperature or 0) == 0:
+        _rc_key = _resp_key(req, messages, system_blocks)
+        _hit = _resp_get(_rc_key)
+        if _hit is not None:
+            return _hit
     explicit_override = bool(req.provider)
     required_caps = _required_caps(req)
 
@@ -1007,11 +1165,14 @@ async def chat(req: ChatRequest, request: Request):
     # pin a provider explicitly, apply agent_routing.yaml's preferred provider.
     # This mutates req.provider so the rest of the function (router-pick,
     # candidate-narrowing, single-candidate-wait) sees the pin.
+    # Agent-routing is a SOFT preference, not a hard pin: a transient 5xx on
+    # the preferred provider must fail over to the ladder, not 502 the whole
+    # node. A caller's explicit provider= stays a hard binding below.
+    _agent_pref = None
     if req.agent and not req.provider:
         pinned = AGENT_ROUTING.get(req.agent)
         if pinned and pinned in router.providers:
-            req.provider = pinned
-            explicit_override = True
+            _agent_pref = pinned
 
     # V9: Kilo's free models reason by default, which adds a long thinking
     # delay. Unless the caller explicitly asks for reasoning, force it OFF for
@@ -1071,7 +1232,7 @@ async def chat(req: ChatRequest, request: Request):
     # that pinned `req.provider` already knows what it wants, and `candidates`
     # is a single entry there, so affinity is only consulted for routed calls.
     _preferred = (None if explicit_override
-                  else router.provider_for(req.route_affinity))
+                  else (_agent_pref or router.provider_for(req.route_affinity)))
 
     # When explicit provider is requested and the only blocker is cooldown,
     # wait briefly rather than 503-ing — this is what users intuitively expect.
@@ -1079,18 +1240,19 @@ async def chat(req: ChatRequest, request: Request):
         import asyncio as _asyncio
         deadline = time.time() + 30
         while time.time() < deadline:
-            name, _ = router.pick(est, candidates, required_caps=required_caps)
+            name, _ = router.pick(est, candidates, required_caps=required_caps,
+                                  model=req.model)
             if name is not None:
                 break
             cd = router.state[candidates[0]].snapshot(limits_for(candidates[0]))["cooldown_remaining"]
             if cd <= 0 or cd > 30:
                 break
-            await _asyncio.sleep(min(cd + 0.05, 5))
+            await _asyncio.sleep(min(cd + 0.05, 2))
 
     _waits_left = SLOT_WAITS
     for _ in range(len(candidates) + 1 + SLOT_WAITS):
         name, atts = router.pick(est, candidates, required_caps=required_caps,
-                                 preferred=_preferred)
+                                 preferred=_preferred, model=req.model)
         # Once the affinity provider has been tried (successfully or not), stop
         # preferring it: the next pass must fall back to the load-based pick so
         # a wedged provider cannot pin a node into an outage.
@@ -1134,6 +1296,7 @@ async def chat(req: ChatRequest, request: Request):
                 async def gen():
                     try:
                         agg = []
+                        usage_blob = None
                         # Whether the stream produced anything that counts as
                         # an answer. A tool call is an answer; zero text and
                         # zero tool calls is not.
@@ -1154,10 +1317,27 @@ async def chat(req: ChatRequest, request: Request):
                                 yield f"data: {json.dumps({'provider': name, 'tool_call_delta': chunk[len('[[TOOL_CALL_DELTA]] '):]})}\n\n"
                             elif chunk.startswith("[[REASONING_DELTA]]"):
                                 yield f"data: {json.dumps({'provider': name, 'reasoning_delta': json.loads(chunk[len('[[REASONING_DELTA]] '):])})}\n\n"
+                            elif chunk.startswith("[[USAGE]]"):
+                                # Consumed here — the client gets no usage
+                                # frame; the ledger gets the real numbers.
+                                usage_blob = chunk[len("[[USAGE]] "):]
                             else:
                                 yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
                         text = "".join(agg)
                         latency = int((time.time() - t0) * 1000)
+                        usage_out = None
+                        if usage_blob is not None:
+                            try:
+                                _u = json.loads(usage_blob)
+                                _det = _u.get("prompt_tokens_details") or {}
+                                usage_out = {
+                                    "in_tok": int(_u.get("prompt_tokens") or 0),
+                                    "out_tok": int(_u.get("completion_tokens") or 0),
+                                    "cache_read": max(int(_det.get("cached_tokens") or 0),
+                                                      int(_u.get("cached_tokens") or 0)),
+                                }
+                            except Exception:
+                                usage_out = None
                         # An empty stream is NOT a successful call, and this
                         # branch had no guard for it while the batched branch
                         # below does. Measured: 57 worker calls in seven days
@@ -1224,15 +1404,20 @@ async def chat(req: ChatRequest, request: Request):
                         # 27 tool schemas are 4,232 tokens of prompt that no
                         # row ever mentioned. Use the same estimate the router
                         # used, so the ledger and the invoice agree.
+                        # Prefer the provider's own usage frame (the stream
+                        # asked for it); fall back to the pre-flight estimate.
+                        _log_in = usage_out["in_tok"] if usage_out else est_in
+                        _log_out = usage_out["out_tok"] if usage_out else len(text) // 4
+                        _log_cache = usage_out["cache_read"] if usage_out else 0
                         db.log_call(provider=name, model=req.model or provider.model,
-                                    input_tokens=est_in,
-                                    output_tokens=len(text) // 4,
+                                    input_tokens=_log_in,
+                                    output_tokens=_log_out,
                                     latency_ms=latency, status="ok",
                                     prompt_chars=len(prompt_text), response_chars=len(text),
                                     override=req.provider, attempted=_attempts_str(all_attempts),
                                     agent=req.agent, session=req.session, retries=retries,
-                                    user_id=user_id)
-                        yield f"data: {json.dumps({'done': True, 'provider': name, 'model': req.model or provider.model})}\n\n"
+                                    user_id=user_id, cache_read_tokens=_log_cache)
+                        yield f"data: {json.dumps({'done': True, 'provider': name, 'model': req.model or provider.model, 'input_tokens': _log_in, 'output_tokens': _log_out, 'cache_read_tokens': _log_cache})}\n\n"
                     except Exception as e:
                         db.log_call(provider=name, model=req.model or provider.model,
                                     status="error", error=str(e)[:500],
@@ -1363,7 +1548,7 @@ async def chat(req: ChatRequest, request: Request):
                                 provider=name, model=result["model"],
                                 agent=req.agent, session=req.session,
                                 call_role="worker")
-            return ChatResponse(
+            _resp = ChatResponse(
                 provider=name,
                 model=result["model"],
                 text=result["text"],
@@ -1382,6 +1567,9 @@ async def chat(req: ChatRequest, request: Request):
                 router_decision=router_decision,
                 retries=retries,
             ).model_dump()
+            if _rc_key:
+                _resp_put(_rc_key, _resp)
+            return _resp
 
         except P.ProviderError as e:
             last_err = str(e)
@@ -1769,12 +1957,51 @@ async def capabilities():
     return out
 
 
+@app.get("/v1/keys/info")
+async def keys_info():
+    """How to obtain and refresh every gateway credential, plus live presence.
+
+    Returns names, purpose, where to get each key and how to renew it — never
+    a value. `set` is the only thing read from the environment.
+    """
+    import key_info
+    rows = key_info.collect()
+    return {
+        "configured": sum(1 for r in rows if r["set"]),
+        "total": len(rows),
+        "keys": [
+            {k: r[k] for k in
+             ("name", "env", "enables", "group", "get", "refresh", "script", "set")}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/v1/channels/health")
+async def channels_health():
+    """Live, read-only probe of each configured channel's credential.
+
+    "Configured" (a token exists) is not "working" (the token is accepted).
+    This runs one cheap read per channel and reports ok/detail — never a send.
+    """
+    import channel_probe
+    rows = await asyncio.to_thread(channel_probe.probe_all)
+    configured = [r for r in rows if r["configured"]]
+    return {
+        "configured": len(configured),
+        "healthy": sum(1 for r in configured if r["ok"]),
+        "unhealthy": [r for r in configured if not r["ok"]],
+        "channels": rows,
+    }
+
+
 @app.get("/v1/status")
 async def status():
     r = app.state.router
-    return {"order": r.order, "live": r.all_status(),
-            "today": db.aggregate(call_role="worker"), "limits": LIMITS,
-            "gemini_only": bool(getattr(app.state, "gemini_only", False))}
+    return _snap("status", lambda: {
+        "order": r.order, "live": r.all_status(),
+        "today": db.aggregate(call_role="worker"), "limits": LIMITS,
+        "gemini_only": bool(getattr(app.state, "gemini_only", False))})
 
 
 @app.get("/v1/routers")
@@ -1782,7 +2009,7 @@ async def routers():
     """V3: router pool — separate from the worker pool. Shows which router LLMs
     are wired, the failover order, and live rate-state."""
     rp = app.state.router_pool
-    return {
+    return _snap("routers", lambda: {
         "order": rp.order,
         "providers": list(rp.providers.keys()),
         "models": {n: p.model for n, p in rp.providers.items()},
@@ -1790,7 +2017,7 @@ async def routers():
         "today": db.aggregate(call_role="router"),
         "limits": {k: limits_for(k) for k in rp.providers},
         "tier_to_order": TIER_TO_ORDER,
-    }
+    })
 
 
 @app.get("/v1/cache")

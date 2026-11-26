@@ -11,9 +11,10 @@ import { RAIL } from './ui';
 
 const ROUTES = [
   '/console', '/runs', '/memory', '/documents', '/research', '/scheduler',
-  '/skills', '/code', '/studio', '/authoring', '/apps', '/ledger', '/mission',
-  '/settings',
+  '/skills', '/code', '/studio', '/authoring', '/architecture', '/apps',
+  '/ledger', '/mission', '/settings',
   '/parts', '/computer',
+  '/model-lab',
 ];
 
 const railRoutes = RAIL.flatMap((g) => g.items.map((i) => i.to));

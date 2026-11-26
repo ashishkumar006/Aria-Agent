@@ -42,6 +42,7 @@ from documents.registry import (
     BLOCKED, CHUNKING, EMBEDDING, FAILED, PARSING, PENDING, READY,
     INDEX_FORMAT_VERSION,
     EmbedderUnavailable, Indexer, Registry, Document,
+    image_caption_blocks, image_caption_enabled,
 )
 from memory.models import (
     DocSpan,
@@ -181,6 +182,192 @@ def _doc_embedder(app_state_embedders) -> "Callable[[list[str]], dict]":
     return _embed
 
 
+# ── index-time image captioning ──────────────────────────────────────────────
+# A vision call is a network step, so it lives in the indexing worker (a plain
+# thread) and is bridged back to the event loop that owns the providers, exactly
+# like `_doc_embedder`. The description is persisted once per picture (keyed by
+# content hash) and read back deterministically by `_doc_chunks`, so a model's
+# varying answer never shifts chunk indices.
+_DOC_CAPTION_TIMEOUT_S = 90.0
+# Yield the shared vision model between pictures, the way embedding yields
+# between batches. Pacing, not a cap: every picture is described.
+_CAPTION_YIELD_S = float(os.getenv("DOCUMENT_IMAGE_CAPTION_YIELD_S", "1.0") or 1.0)
+_CAPTION_PROMPT = (
+    "Describe this image in 2-4 factual sentences for a search index. State "
+    "what it shows and transcribe any visible text, numbers, labels, chart "
+    "axes/legends or diagram relationships. Do not speculate or add opinions.")
+# Scanned-page OCR is a transcription, not a description: the page has no text
+# layer, so the vision model's output IS the document text and must be faithful.
+_OCR_PROMPT = (
+    "Transcribe ALL text in this image exactly, in reading order. Include every "
+    "word, number, equation, unit, chart-axis label, legend and diagram label. "
+    "Write equations in plain text or LaTeX. Do not summarize, describe or add "
+    "commentary — output only the transcribed text.")
+
+
+class _CaptionRequest:
+    """Minimal stand-in for the Starlette Request `main.chat` reads.
+
+    `auth=None` routes the call through the gateway's own operator router (no
+    user keys), which is what a system indexing task wants. Only `.state.auth`
+    and `.app` are consulted on that path."""
+
+    def __init__(self, application):
+        self.app = application
+        self.state = type("_S", (), {"auth": None, "user_id": None})()
+
+
+def _make_vision_caller(app, prompt: str, max_tokens: int = 300):
+    """Bridge a single-image vision call for the indexing worker.
+
+    Returns `call(blob, ext, context) -> str`. Raises on failure; the generator
+    treats that as 'no caption for this picture' and moves on, so a vision
+    outage never fails the document. Used for both figure captions and
+    scanned-page OCR — only the prompt and token budget differ.
+
+    The chat coroutine is resolved from the RUNNING app's routes, not via
+    `import main`: the gateway is launched as `python main.py`, so its live app
+    and globals live in `__main__`. `import main` would load a SECOND, never-
+    started copy of the module whose `app.state.router` does not exist — the
+    call then died with `'State' object has no attribute 'router'`. The endpoint
+    object on the running app carries the correct globals."""
+    chat_endpoint = None
+    for r in getattr(app, "routes", []):
+        if getattr(r, "path", None) == "/v1/chat":
+            chat_endpoint = getattr(r, "endpoint", None)
+            break
+
+    def _call(blob: bytes, ext: str, context: str = "") -> str:
+        if chat_endpoint is None:
+            raise RuntimeError("the running app exposes no /v1/chat endpoint")
+
+        async def _go():
+            import base64
+            from schemas import ChatRequest
+            data_url = f"data:image/{ext};base64,{base64.b64encode(blob).decode()}"
+            req = ChatRequest(
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt + (context or "")},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]}],
+                max_tokens=max_tokens, temperature=0.0, agent="document-index")
+            return await chat_endpoint(req, _CaptionRequest(app))
+        loop = _LOOP
+        if loop is not None and loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(_go(), loop)
+            resp = fut.result(timeout=_DOC_CAPTION_TIMEOUT_S)
+        else:
+            resp = asyncio.run(_go())
+        # The resolved endpoint hands back a serialized dict (provider/model/
+        # text/...), not the pydantic model — read the key, fall back to attr.
+        text = resp.get("text", "") if isinstance(resp, dict) else getattr(resp, "text", "")
+        return str(text or "").strip()
+    return _call
+
+
+def _doc_captioner(app):
+    """Figure/image describer for the indexing worker."""
+    return _make_vision_caller(app, _CAPTION_PROMPT, 300)
+
+
+def _doc_ocr(app):
+    """Scanned-page transcriber for the indexing worker."""
+    return _make_vision_caller(app, _OCR_PROMPT, 1200)
+
+
+def _make_caption_generator(reg: Registry, captioner, ocr=None):
+    """The Indexer's `caption(doc, parsed)` hook: describe visual content, persist.
+
+    Alt-text is preferred when an author wrote it (free, and often the only
+    description); a vision call fills the rest. PDFs add two sources: embedded
+    figures (captioned like a picture) and text-less pages (transcribed when an
+    `ocr` caller is given — the output IS the page's text). Gated by the master
+    flag — off returns immediately and writes nothing, so a fresh document chunks
+    exactly as it did before the feature. Idempotent: a picture already
+    captioned (by hash) is never re-described."""
+    def _generate(doc: Document, parsed) -> None:
+        if not image_caption_enabled():
+            return
+        data = reg.read_source(doc.id)
+        if data is None:
+            return
+        if doc.doc_type == "pptx":
+            figs = parsers.iter_pptx_pictures(data)
+            scans = []
+        elif doc.doc_type == "docx":
+            figs = parsers.iter_docx_figures(data)
+            scans = []
+        elif doc.doc_type == "image":
+            one = parsers.image_figure(data)
+            figs = [one] if one else []
+            scans = []
+        elif doc.doc_type == "pdf":
+            figs = parsers.iter_pdf_figures(data)
+            scans = parsers.iter_pdf_scanned_pages(data) if ocr is not None else []
+        else:
+            return
+        if not figs and not scans:
+            return
+        headings: dict[int, str] = {}
+        for b in parsed.blocks:
+            if b.kind == "heading" and b.page and b.page not in headings:
+                headings[b.page] = b.text
+        by_sha = {str(r.get("sha")): r for r in reg.read_captions(doc.id)}
+        changed = False
+        # Embedded figures: alt-text first, else a vision description.
+        for f in figs:
+            sha = f["sha"]
+            prev = by_sha.get(sha)
+            if prev and str(prev.get("caption") or "").strip():
+                continue
+            caption = str(f.get("alt") or "").strip()
+            source = "alt"
+            if not caption and captioner is not None:
+                h = headings.get(f["page"])
+                ctx = (f" The image appears on page {f['page']} titled \"{h}\"."
+                       if h else "")
+                try:
+                    caption = str(captioner(f["blob"], f["ext"], ctx) or "").strip()
+                    source = "vision"
+                except Exception as e:              # noqa: BLE001
+                    print(f"[index] {doc.id} vision caption failed "
+                          f"(page {f['page']}): {type(e).__name__}: {e}",
+                          flush=True)
+                    caption = ""
+            if not caption:
+                continue
+            by_sha[sha] = {"sha": sha, "page": f["page"], "index": f["index"],
+                           "caption": caption, "source": source}
+            changed = True
+            if source == "vision":
+                time.sleep(_CAPTION_YIELD_S)
+        # Text-less (scanned) pages: OCR the whole page — the output IS the text.
+        for s in scans:
+            sha = s["sha"]
+            prev = by_sha.get(sha)
+            if prev and str(prev.get("caption") or "").strip():
+                continue
+            text = ""
+            if ocr is not None:
+                try:
+                    text = str(ocr(s["blob"], s["ext"],
+                                   f" This is page {s['page']} of a scanned PDF."
+                                   ) or "").strip()
+                except Exception as e:              # noqa: BLE001
+                    print(f"[index] {doc.id} page {s['page']} OCR failed: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                    text = ""
+            if not text:
+                continue
+            by_sha[sha] = {"sha": sha, "page": s["page"], "index": 0,
+                           "caption": text, "source": "ocr"}
+            changed = True
+            time.sleep(_CAPTION_YIELD_S)
+        if changed:
+            reg.write_captions(doc.id, list(by_sha.values()))
+    return _generate
+
+
 def _doc_chunks(reg: Registry, doc: Document) -> list:
     """Re-parse the stored source to get chunk texts, matching the order the
     indexer embedded them. Chunking is deterministic, so index N here is the
@@ -199,7 +386,15 @@ def _doc_chunks(reg: Registry, doc: Document) -> list:
     Memoised per (doc_id, source size) because the detail route and the indexer
     ask for the same chunk list repeatedly while a document is indexing.
     """
-    key = (doc.id, _SOURCE_TOKEN(doc))
+    # The caption sidecar is part of the chunk identity. It is written once,
+    # atomically, by the caption hook during the PARSE phase — but the detail
+    # route and `/text` also call this, and a poll that lands before the sidecar
+    # exists would otherwise cache a no-caption chunk list under a key that the
+    # embedding path (which runs AFTER the sidecar is written) then reuses,
+    # storing a chunk with no caption and making the image unsearchable. Keying
+    # on the caption count makes the pre-caption entry and the post-caption entry
+    # distinct, so the embedding always re-chunks from the final sidecar.
+    key = (doc.id, _SOURCE_TOKEN(doc), len(reg.read_captions(doc.id)))
     hit = _CHUNK_CACHE.get(key)
     if hit is not None:
         return hit
@@ -209,7 +404,12 @@ def _doc_chunks(reg: Registry, doc: Document) -> list:
         return []
     from documents.chunker import chunk_blocks
     parsed = parsers.parse(doc.filename, data)
-    chunks = chunk_blocks(parsed.blocks)
+    # Image captions are persisted at index time and read back here, so this
+    # re-parse produces the SAME chunk list the indexer embedded — index N is
+    # the same chunk in both. No generation happens on this path (it runs on the
+    # event loop from the detail route); it only reads the sidecar.
+    blocks = list(parsed.blocks) + image_caption_blocks(reg, doc)
+    chunks = chunk_blocks(blocks)
     if len(_CHUNK_CACHE) >= _CHUNK_CACHE_MAX:
         _CHUNK_CACHE.clear()
     _CHUNK_CACHE[key] = chunks
@@ -233,8 +433,9 @@ class _PlaneIndexer(Indexer):
     provenance recorded so their vectors are never compared against a
     different model's."""
 
-    def __init__(self, registry, plane, embed, generation=0, generations=None):
-        super().__init__(registry, embed=embed)
+    def __init__(self, registry, plane, embed, generation=0, generations=None,
+                 caption=None):
+        super().__init__(registry, embed=embed, caption=caption)
         self.plane = plane
         self._cache: dict[str, list] = {}
         self.generation = generation
@@ -398,6 +599,9 @@ def _start_index(request: Request, doc_id: str) -> None:
             _PlaneIndexer(reg, plane,
                           _doc_embedder(request.app.state.embedders),
                           generation=gen, generations=_doc_generation,
+                          caption=_make_caption_generator(
+                              reg, _doc_captioner(request.app),
+                              ocr=_doc_ocr(request.app)),
                           ).run(doc_id)
         except _IndexSuperseded:
             # A reindex superseded this run. The replacement owns the status

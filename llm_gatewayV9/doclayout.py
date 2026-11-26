@@ -209,6 +209,41 @@ DOC_STYLES: dict[str, dict] = {
         align="left", indent_first=False, numbered=False,
         accent="#5c5c66", measure=76, columns=1,
     ),
+    # ── exam-reference styles ────────────────────────────────────────────────
+    # The looks above vary TYPE only; every one still opens with a left-aligned
+    # black title and black headings on plain white. The styles below add the
+    # visual chrome a study document actually carries - a centred masthead,
+    # coloured section heads, a shaded abstract, and (for the coursework look)
+    # a full-bleed navy cover band. Each is a *named design*, not a size tweak.
+    #
+    # A lecture/exam companion: centred serif masthead with a subtitle and a
+    # rule, and section headings in the accent colour.
+    "lecture": dict(
+        family="serif", body=10.9, leading=16.2, scale=1.32,
+        align="justify", indent_first=False, numbered=True,
+        accent="#1f3557", measure=84, columns=1,
+        chrome=dict(masthead="centred", heading_color="accent",
+                    running="split", h1_size=1.34, title_size=20),
+    ),
+    # Same family as `lecture` but the masthead sits under a full-width band -
+    # the "course notes" look.
+    "exambook": dict(
+        family="serif", body=10.6, leading=15.8, scale=1.30,
+        align="justify", indent_first=False, numbered=True,
+        accent="#8a1f2e", measure=86, columns=1,
+        chrome=dict(masthead="band", heading_color="accent",
+                    running="split", h1_size=1.28, title_size=18),
+    ),
+    # A bound-coursework cover: a full navy band across the top with an amber
+    # eyebrow line and white display type.
+    "coursework": dict(
+        family="serif", body=10.7, leading=16.0, scale=1.30,
+        align="justify", indent_first=False, numbered=True,
+        accent="#8a6a1f", measure=84, columns=1,
+        chrome=dict(masthead="cover_band", heading_color="accent",
+                    running="split", h1_size=1.30, title_size=24,
+                    cover_band="#16233c", cover_ink="#ffffff"),
+    ),
 }
 DEFAULT_STYLE = "report"
 

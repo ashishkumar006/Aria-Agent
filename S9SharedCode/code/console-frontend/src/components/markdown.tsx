@@ -24,13 +24,50 @@ export function esc(s: string): string {
 const SAFE_URL = /^https?:\/\/[^\s"'<>]+$/i;
 
 /** Inline spans: bold, inline code, links, images, strikethrough. Operates on
-    already-escaped text, so `<b>` etc. are the only tags it introduces. */
-function inline(s: string): string {
+ *  already-escaped text, so `<b>` etc. are the only tags it introduces.
+ *
+ *  File paths named in model output (`src/views/studio/Studio.tsx`,
+ *  `C:\dev\app.py`, `/srv/x/y.ts:123`) become clickable `file-ref` buttons
+ *  when the caller opts in via `fileRefs` (the studio's transcript). They
+ *  need a real extension and at least one folder; `1.5/2.5` is a fraction,
+ *  not a path, and `x://y` is a URL, not a path. */
+/* What makes a token a file reference rather than prose:
+ *  1. An absolute Windows or POSIX path with a real letter-bearing extension
+ *     (`C:\dev\app.py`, `/srv/x/y.ts`), a drive-relative `x/y.ts` with a
+ *     folder, or a bare filename carrying a known code/config extension
+ *     (`renamed.txt`, `app.ts`). Bare names are excluded from looking like
+ *     decimal fractions (`1.5/2.5`) or URLs (`x://y`), and the extension must
+ *     contain a letter — nothing matches `file.5`.
+ *  The match carries an optional `:line` suffix, which the click handler
+ *  strips before opening the file. */
+const FILE_REF = new RegExp(
+  '(?:' +
+    [
+      '[A-Za-z]:[\\\\/][\\w.-]+(?:[\\\\/][\\w.-]+)*\\.[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*',
+      '(?:[\\w.-]+/)+[\\w.-]+\\.[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*',
+      '/(?:[\\w.-]+/)*[\\w.-]+\\.[A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*',
+      '[A-Za-z0-9_-][\\w.-]*\\.(?:ts|tsx|js|jsx|mjs|cjs|py|pyi|go|rs|java|c|cc|cpp|cxx|h|hh|hpp|cs|rb|php|swift|kt|kts|lua|sql|css|scss|html|htm|sh|bash|zsh|ps1|psm1|bat|cmd|toml|ya?ml|ini|cfg|gradle|md|mdx|json|txt|log|csv|xml|svg|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|rtf|zip|tar|gz|tgz|rar|7z|iso|bin|lock|env|bak|orig|rej|eps|psd)',
+    ].join('|') +
+    ')(?::\\d+)?\\b',
+  'gi');
+
+function inline(s: string, fileRefs = false): string {
   return esc(s)
     // Math FIRST. The italic rule below matches a lone pair of underscores,
     // so `$d_k$` would otherwise reach the reader as `d<em>k</em>` around a
     // surviving dollar. renderMath consumes those underscores as subscripts.
     .replace(/[\s\S]+/, (body) => renderMath(body))
+    // File path buttons first: the transforms below can produce or consume
+    // backticks and brackets around the match, and the button must be intact
+    // by the time they run. The match text is entity-safe by construction.
+    .replace(FILE_REF, (m, offset, whole) => {
+      if (!fileRefs) return m;
+      const before = String(whole).slice(Math.max(0, Number(offset) - 14), Number(offset));
+      const justBefore = String(whole)[Number(offset) - 1];
+      if (justBefore === '/' || /^www\./i.test(String(m)) || /:\/\/|www\.|mailto:/i.test(before)) return m;
+      return '<button type="button" class="file-ref" data-file-ref="' +
+        esc(String(m).replace(/:\d+$/, '')) + '">' + esc(String(m)) + '</button>';
+    })
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[\s(])_([^_]+)_(?=$|[\s.,;:)!?])/g, '$1<i>$2</i>')
@@ -87,9 +124,9 @@ const MD_CACHE_MAX = 8;
 const mdCache = new Map<string, Map<string, string>>();
 
 export function renderMarkdown(src: string, headingOffset = 0,
-                               fitTopLevel = false): string {
+                               fitTopLevel = false, fileRefs = false): string {
   const source = String(src || '');
-  const opts = `${headingOffset}\u0000${fitTopLevel ? 1 : 0}`;
+  const opts = `${headingOffset}\u0000${fitTopLevel ? 1 : 0}\u0000${fileRefs ? 1 : 0}`;
   let byOpts = mdCache.get(source);
   if (byOpts) {
     const hit = byOpts.get(opts);
@@ -100,7 +137,7 @@ export function renderMarkdown(src: string, headingOffset = 0,
       return hit;
     }
   }
-  const html = renderMarkdownUncached(source, headingOffset, fitTopLevel);
+  const html = renderMarkdownUncached(source, headingOffset, fitTopLevel, fileRefs);
   if (!byOpts) {
     byOpts = new Map();
     mdCache.set(source, byOpts);
@@ -114,7 +151,7 @@ export function renderMarkdown(src: string, headingOffset = 0,
 }
 
 function renderMarkdownUncached(src: string, headingOffset = 0,
-                                fitTopLevel = false): string {
+                                fitTopLevel = false, fileRefs = false): string {
   // Page citations (`[[p:3|words]]`) are for the document viewer, not the
   // reader. Stripping them here rather than at each call site is what keeps a
   // discussion thread reopened tomorrow — where the raw text is the stored
@@ -189,9 +226,9 @@ function renderMarkdownUncached(src: string, headingOffset = 0,
         body.push(cells(lines[i]));
       }
       i--;
-      const th = head.map((c) => `<th>${inline(c)}</th>`).join('');
+      const th = head.map((c) => `<th>${inline(c, fileRefs)}</th>`).join('');
       const rows = body
-        .map((r) => `<tr>${head.map((_, n) => `<td>${inline(r[n] ?? '')}</td>`).join('')}</tr>`)
+        .map((r) => `<tr>${head.map((_, n) => `<td>${inline(r[n] ?? '', fileRefs)}</td>`).join('')}</tr>`)
         .join('');
       html += `<div class="table-scroll"><table><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`;
       continue;
@@ -211,7 +248,7 @@ function renderMarkdownUncached(src: string, headingOffset = 0,
     if (h) {
       closeLists();
       const lv = Math.max(2, Math.min(6, h[1].length + off));
-      html += `<h${lv}>${inline(h[2])}</h${lv}>`;
+      html += `<h${lv}>${inline(h[2], fileRefs)}</h${lv}>`;
       continue;
     }
 
@@ -219,7 +256,7 @@ function renderMarkdownUncached(src: string, headingOffset = 0,
     const bq = t.match(/^>\s?(.*)$/);
     if (bq) {
       closeLists();
-      html += `<blockquote>${inline(bq[1])}</blockquote>`;
+      html += `<blockquote>${inline(bq[1], fileRefs)}</blockquote>`;
       continue;
     }
 
@@ -247,13 +284,13 @@ function renderMarkdownUncached(src: string, headingOffset = 0,
       // The <li> stays OPEN on purpose: a deeper item that follows opens
       // its sublist inside this element (`<li>one<ul>…`), which is what
       // makes the nesting real instead of sibling lists.
-      html += `<li>${inline(li[3])}`;
+      html += `<li>${inline(li[3], fileRefs)}`;
       liDepth.push(depth);
       continue;
     }
 
     closeLists();
-    html += `<p>${inline(t.trim())}</p>`;
+    html += `<p>${inline(t.trim(), fileRefs)}</p>`;
   }
   closeLists();
   return html;

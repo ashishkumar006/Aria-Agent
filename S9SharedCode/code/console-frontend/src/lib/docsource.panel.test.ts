@@ -38,8 +38,17 @@ describe('pickPanel', () => {
     expect(pickPanel('txt', { failed: true })).toBe('frame');
   });
 
+  it('shows a deck as its slide outline, not the raster pager', () => {
+    // There is no LibreOffice/PowerPoint on this machine to rasterise a .pptx,
+    // so the old 'raster' panel drew a red "no server-side preview" strip under
+    // a file that opens fine in PowerPoint. The outline is read from the
+    // artifact's own XML instead.
+    expect(pickPanel('pptx')).toBe('slides');
+    expect(pickPanel('PPTX')).toBe('slides');
+  });
+
   it('falls back to the pager for a format neither can draw', () => {
-    for (const f of ['pptx', 'docx', 'xlsx', '']) {
+    for (const f of ['docx', 'xlsx', '']) {
       expect(pickPanel(f)).toBe('raster');
     }
   });

@@ -73,7 +73,7 @@ researcher:
   tools_allowed: [web_search, fetch_url, arxiv_search, wikipedia_search,
                   openalex_search, news_search, fetch_pdf, extract_tables,
                   wayback_fetch, remember_preference, recall_preferences,
-                  read_artifact, computer_action]
+                  read_artifact, computer_action, search_images, fetch_image]
   temperature: 0.7         # exploratory; let the model choose phrasings
   # `findings` is what every downstream node reads, and this was the single
   # tightest constraint in the whole DAG: 6000 tokens had to cover the
@@ -227,6 +227,12 @@ formatter:
   # "write the report" request with ~300 words no matter how high the
   # cap, so length has to come from splitting the work.
   sectioned: true
+  # Read-only tools, so a chat answer can settle a detail the upstream nodes
+  # left as a pointer instead of claiming it "cannot check". No write tools:
+  # the formatter relays and formats, it does not act. `send_telegram` is
+  # deliberately absent - a formatter that could send would duplicate the
+  # action node's job and the user would get the message twice.
+  tools_allowed: [web_search, fetch_url, search_knowledge, read_document]
   description: Renders the final answer for the user. Conventional terminal node — its output.final_answer is what the executor returns.
 
 sandbox_executor:
@@ -260,6 +266,19 @@ coder:
   max_tokens: 65536
   description: Implements changes against the real project - reads it first, edits it, then runs the project's own checks and fixes what fails.
 
+studio_coder:
+  prompt: prompts/studio_coder_delegate.md
+  # DELEGATION TO THE STUDIO CODER. The `coder` skill writes into the throwaway
+  # sandbox; this skill hands the whole task to the Studio coding agent — the
+  # full code agent that reads, edits and runs the project's OWN checks on the
+  # session's REAL project roots. The planner emits this node when the goal is
+  # to change the user's actual codebase. The node makes one `studio_coder`
+  # call and reports the receipt (files changed, checks, summary).
+  tools_allowed: [studio_coder]
+  temperature: 0.2
+  max_tokens: 8192
+  description: Delegates a coding task to the Studio coding agent, which edits the session's real project (reads, writes, runs the project's checks) and reports what changed. Use for changes to the actual codebase, not the throwaway sandbox.
+
 browser:
   prompt: prompts/browser.md
   # The browser's switches are NOT here. `browser.tools` and `browser.headed`
@@ -288,11 +307,27 @@ browser:
 # by itself — pair it with a formatter so the user gets a confirmation.
 action:
   prompt: prompts/action.md
+  # Narrow the per-run tool payload to the channels the goal names; the full
+  # list below stays the catalogue the prompt documents. See skills.py
+  # CHANNEL_TOOLS / effective_tools.
+  dynamic_channels: true
   tools_allowed: [send_telegram, send_email, gmail_refresh_token, create_calendar_event, calendar_refresh_token,
-                  calendar_query, gmail_query, github_query, slack_message, slack_refresh_token, slack_history,
+                  calendar_query, gmail_query, gmail_profile, github_query, slack_message, slack_refresh_token, slack_history,
+                  zoho_mail_send, zoho_mail_query, zoho_mail_profile, zoho_mail_folders, zoho_mail_refresh_token, zoho_mail_reply,
+                  zoho_mail_mark, zoho_mail_move, zoho_mail_delete,
+                  ntfy_send, ntfy_history, zoho_cliq_message, bluesky_post, mastodon_post, google_chat_message,
+                  zoho_calendar_list_calendars, zoho_calendar_list_events,
                   discord_message, notion_query,
                   web_search, fetch_url,
+                  # Document-aware delivery. "Send the report on X to Telegram"
+                  # needs the node to FIND the file (search_knowledge over the
+                  # user's indexed Documents), read it, or resolve an `art:`
+                  # handle the author produced — otherwise the send has nothing
+                  # to attach. send_telegram/send_email accept a doc id, an
+                  # `art:` handle or a sandbox path as `document`.
+                  search_knowledge, read_document, read_artifact,
                   schedule_task, list_scheduled, cancel_scheduled, enable_scheduled,
+                  schedule_self,
                   # The action prompt tells the model to call list_channels()
                   # and check_channel() before picking a delivery target. It
                   # could not: neither was in this list, so the instruction
@@ -307,7 +342,16 @@ action:
                   # different facts and only the second one is load-bearing.
                   # schedule_wake stays behind agent.self_wake at the tool.
                   list_channels, check_channel, save_as_document,
-                  whats_new, schedule_wake]
+                  whats_new, schedule_wake, load_tool_bundle,
+                  # Channel tool catalogue (GitHub / Notion / Telegram / Discord)
+                  github_get_user, github_list_repos, github_get_repo, github_read_file,
+                  github_list_issues, github_create_issue, github_update_issue, github_comment_issue,
+                  github_list_prs, github_create_pr, github_search_repos,
+                  notion_search, notion_get_page, notion_get_page_markdown,
+                  notion_get_blocks, notion_append_blocks, notion_query_database,
+                  telegram_get_me, telegram_get_updates, telegram_get_chat,
+                  telegram_send_message, telegram_edit_message, telegram_delete_message,
+                  discord_get_me, discord_list_guilds, discord_list_channels, discord_invite_url]
   temperature: 0.2
   max_tokens: 1500
   description: |

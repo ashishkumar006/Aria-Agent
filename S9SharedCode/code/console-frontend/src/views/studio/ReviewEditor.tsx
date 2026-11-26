@@ -81,6 +81,15 @@ export default function ReviewEditor({
   const modRef = useRef<monaco.editor.ITextModel | null>(null);
   const zones = useRef<{ id: string; node: HTMLElement; at: number;
                          hunkId: string }[]>([]);
+  /* Per-hunk review comments, kept for the life of the tab. A comment is a
+     reviewer's note on a specific change, so it hangs off the hunk id. */
+  const comments = useRef(new Map<string, string>());
+  /* Set when a comment changed, so the next sync rebuilds the zones even
+     though no anchor moved. */
+  const forceZones = useRef(false);
+  /* `buildZone` is defined before `syncZones` (they are mutually recursive),
+     so the comment handler calls the latest one through a ref. */
+  const syncRef = useRef<() => void>(() => {});
   const active = useRef(0);
   const [shown, setShown] = useState(0);
   /* True while this component mutates a model, so the model's own change event
@@ -108,7 +117,7 @@ export default function ReviewEditor({
     const count = hs.length;
     const row = document.createElement('div');
     row.className = 'flex items-center gap-2 border-y border-glass-border '
-      + 'bg-surface-2 px-3 py-1 text-[11px]';
+      + 'bg-surface-1 px-3 py-1 text-[11px]';
     row.dataset.hunk = h.id;
     /* Monaco puts `.view-zones` (index 2) BEFORE `.view-lines` (index 3), both
        absolutely positioned with `z-index: auto`, so the text layer paints over
@@ -123,6 +132,15 @@ export default function ReviewEditor({
     label.className = 'text-zinc-muted';
     label.textContent = `hunk ${i + 1}/${count} · +${h.added} −${h.removed}`;
     row.appendChild(label);
+
+    const note = comments.current.get(h.id);
+    if (note) {
+      const c = document.createElement('span');
+      c.className = 'min-w-0 max-w-[45%] truncate text-zinc-300';
+      c.textContent = `💬 ${note}`;
+      c.title = note;
+      row.appendChild(c);
+    }
 
     const spacer = document.createElement('span');
     spacer.className = 'min-w-0 flex-1';
@@ -154,10 +172,27 @@ export default function ReviewEditor({
       });
       row.appendChild(b);
     };
-    mk('Keep', 'rounded-lg border border-ok/40 bg-ok-dim '
+    mk('Keep', 'rounded-md border border-ok/40 bg-ok-dim '
       + 'px-1.5 py-0.5 text-ok hover:bg-ok/20', 'keep');
-    mk('Revert', 'rounded-lg border border-danger/40 bg-danger-dim '
+    mk('Revert', 'rounded-md border border-danger/40 bg-danger-dim '
       + 'px-1.5 py-0.5 text-danger hover:bg-danger/20', 'revert');
+    const cb = document.createElement('button');
+    cb.type = 'button';
+    cb.textContent = note ? 'Edit note' : 'Comment';
+    cb.className = 'rounded-md border border-glass-border px-1.5 py-0.5 text-zinc-300 hover:bg-white/5';
+    cb.setAttribute('aria-label', `Comment on hunk ${i + 1} of ${count} in ${path}`);
+    cb.addEventListener('mousedown', (e) => e.stopPropagation());
+    cb.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const text = window.prompt(`Comment on hunk ${i + 1} of ${path}:`, note || '');
+      if (text === null) return;
+      if (text.trim()) comments.current.set(h.id, text.trim());
+      else comments.current.delete(h.id);
+      forceZones.current = true;
+      syncRef.current();
+    });
+    row.appendChild(cb);
     return row;
   };
 
@@ -185,10 +220,12 @@ export default function ReviewEditor({
     /* Nothing moved, nothing to rebuild. A keystroke that does not change any
        anchor must not tear down and re-create every bar: that is a full DOM
        rebuild per character, on top of the diff Monaco is already doing. */
-    const same = want.length === zones.current.length
+    const same = !forceZones.current
+      && want.length === zones.current.length
       && want.every((w, i) => w.at === zones.current[i].at
         && w.h.id === zones.current[i].hunkId);
     if (same) return;
+    forceZones.current = false;
     ed.getModifiedEditor().changeViewZones((acc) => {
       for (const z of zones.current) {
         try { acc.removeZone(z.id); } catch { /* already gone */ }
@@ -203,6 +240,7 @@ export default function ReviewEditor({
       }
     });
   };
+  syncRef.current = syncZones;
 
   const goTo = (index: number): void => {
     const ed = edRef.current;
@@ -330,7 +368,7 @@ export default function ReviewEditor({
   return (
     <div className="relative min-h-0 flex-1">
       <div ref={host} data-editor-host="" className="absolute inset-0" />
-      <div className="absolute right-4 top-1 z-10 flex items-center gap-1.5 rounded-lg border border-glass-border bg-surface-2/90 px-1.5 py-0.5">
+      <div className="absolute right-4 top-1 z-10 flex items-center gap-1.5 rounded-md border border-glass-border bg-surface-1/90 px-1.5 py-0.5">
         <button type="button"
                 className="text-zinc-muted hover:text-zinc-100"
                 aria-label="Previous hunk (Shift+F8)"

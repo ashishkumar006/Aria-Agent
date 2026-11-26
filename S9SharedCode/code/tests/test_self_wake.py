@@ -48,6 +48,9 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(sched, "_LOG_PATH", tmp_path / "scheduler.log")
     sched._SCHEDULES.clear()
     sched._HEAP.clear()
+    # The worker reloads schedules.json when another process writes it; reset
+    # the mtime baseline so in-memory setup here is not clobbered by a reload.
+    monkeypatch.setattr(sched, "_WORKER_MTIME", None)
     import flags as f
     importlib_flags(monkeypatch, f)
     f.set_override("agent.self_wake", True)

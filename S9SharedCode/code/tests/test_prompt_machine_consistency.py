@@ -27,61 +27,18 @@ AU = (ROOT / "prompts" / "author.md").read_text(encoding="utf-8")
 
 # The block types docgen.py actually accepts (BLOCK_SCHEMA plus aliases).
 ALLOWED = {"cover", "heading", "paragraph", "bullets", "numbers", "quote",
-           "chart", "image", "table", "note", "pagebreak"}
+           "chart", "image", "table", "stats", "columns", "callout", "note",
+           "pagebreak"}
 PDF_ALLOWED = ALLOWED - {"note"}  # note is pptx speaker-notes only
 
 
-def test_depth_defines_three_distinct_commitments():
-    low = PL.lower()
-    for lvl in ("`quick`", "`normal`", "`deep`"):
-        assert lvl in low, f"{lvl} is no longer defined"
-    # the old bug: deep and normal were the same commitment described twice
-    assert "one researcher per facet" in low
-    deep_line = next(l for l in PL.splitlines() if l.strip().startswith("- `deep`"))
-    normal_line = next(l for l in PL.splitlines()
-                       if l.strip().startswith("- `normal`"))
-    assert deep_line.strip() != normal_line.strip(), (
-        "deep and normal are the same commitment; the dimension that changes "
-        "cost (how many researchers) must be distinct")
-    assert "researcher" in deep_line.lower()
-    assert "researcher" in normal_line.lower()
+# The lean planner no longer defines quick/normal/deep commitments or sizes the
+# research fleet — that strategy was removed on purpose (capability + output
+# contract only). The researcher/author invariants below still hold.
 
 
-def test_depth_says_it_is_read_at_runtime():
-    """The field was documented as load-bearing while nothing consumed it."""
-    low = PL.lower()
-    assert "read by the executor" in low or "executor" in low, (
-        "depth is described as decorative; if it is actually read, say so, "
-        "and if it is not, do not call it a commitment")
-
-
-def test_facet_count_is_derived_from_the_target_not_a_fixed_band():
-    """6 x 4,000 = 24,000 < the 27,000-word floor for 60 pages."""
-    assert re.search(r"\b(60|100)\b.*(facet|words)", PL, re.I), (
-        "no worked sizing: the facet count must be derived from the document "
-        "the user asked for")
-    assert "x 450" in PL or "x450" in PL or "450 words" in PL, (
-        "the words-per-page figure the author contract uses is not in the "
-        "planner, so its facet arithmetic cannot be checked")
-
-
-def test_the_worked_example_sizing_fits_its_own_document():
-    body = PL[PL.index("Worked example"):] if "Worked example" in PL else ""
-    m = re.search(r"(\d+)\s*pages?\s*[x×]\s*450\s*words?\s*=\s*\*{0,2}"
-                  r"([\d,]+)", body)
-    assert m, ("the worked example no longer derives its word target with the "
-               "pages x 450 arithmetic")
-    pages, target = int(m.group(1)), int(m.group(2).replace(",", ""))
-    assert pages * 450 == target, (pages, target)
-    assert target >= 27_000, target
-    n = re.search(r"\*\*(\d+)\s+distinct subject areas", body) \
-        or re.search(r"(\d+)\s+facets", body) \
-        or re.search(r"=\s*\*\*(\d+)\s+facets", body)
-    assert n, "the worked example states no facet count"
-    facets = int(n.group(1))
-    assert facets * 1500 >= target, (
-        f"{facets} facets at the 1,500-word floor = {facets*1500} words, "
-        f"under the {target} the document needs")
+# Facet sizing / the worked example were removed with the rest of the planner's
+# prescriptive strategy; the planner now decides the fleet from the request.
 
 
 def test_researcher_tells_the_model_to_batch_its_fetches():
@@ -135,25 +92,5 @@ def test_author_teaches_only_block_types_the_pdf_renderer_has():
     assert taught, "no block types taught at all"
 
 
-def test_no_two_prompts_contradict_each_other_on_facet_shape():
-    """researcher.md used to carry a workaround for behaviour the planner
-    prompt already forbade."""
-    assert "never the request itself" in PL.lower(), (
-        "the planner no longer forbids echoing the request as a facet")
-    # the researcher must not re-litigate the failure in its own opener
-    opener = RS[:RS.index("##")]
-    assert "may look like a whole brief" not in opener, (
-        "researcher.md still defends against a planner failure the planner's "
-        "contract already prohibits; the two prompts assume different things")
-
-def test_the_worked_example_lists_the_facets_it_claims():
-    """A worked example that says 18 and lists 10 teaches nothing."""
-    body = PL[PL.index("Worked example"):]
-    n = re.search(r"\*\*(\d+)\s+distinct subject areas", body) \
-        or re.search(r"(\d+)\s+facets", body)
-    assert n, "the worked example states no facet count"
-    claimed = int(n.group(1))
-    listed = body.count("\u2713")
-    assert listed >= claimed, (
-        f"the example claims {claimed} facets and lists {listed}; the model "
-        f"reads the list, not the number")
+# The facet-shape and worked-example checks went with the worked example itself;
+# researcher.md no longer needs a workaround for a planner rule that is gone.

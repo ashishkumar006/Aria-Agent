@@ -486,3 +486,151 @@ def test_all_three_routes_are_registered():
     paths = {r.path for r in agent_server.app.routes}
     assert {"/api/apps/build", "/api/apps/flags",
             "/api/a2ui/generate"} <= paths, sorted(paths)[:5]
+
+
+# ── PATCH /api/apps/{id} + action/refresh coalescing ───────────────────────
+# These exercise the REAL on-disk store (isolated in tmp), not a mock, so the
+# whole path route → update_app_meta → disk is covered.
+
+@pytest.fixture()
+def real_app(tmp_path, monkeypatch):
+    import importlib
+    monkeypatch.setenv("S9_STATE_DIR", str(tmp_path / "state"))
+    importlib.reload(apps)
+    spec = apps.create_app({"name": "Counter", "kind": "a2ui",
+                            "surface": GOOD_SURFACE,
+                            "description": "a counter", "schedule": "manual"})
+    return spec["id"]
+
+
+@pytest.fixture()
+def action_run(monkeypatch):
+    """The builder run behind an action/refresh, frozen and recorded."""
+    seen = {"calls": []}
+
+    async def _rs(skill, query, *, run_kind, metadata=None, session_id=None):
+        seen["calls"].append({"skill": skill,
+                              "mode": (metadata or {}).get("mode")})
+        return {"mode": (metadata or {}).get("mode")}, "run-x"
+
+    monkeypatch.setattr(section_runs, "require_success", _rs)
+    return seen
+
+
+def test_patch_edits_identity_without_rebuilding_the_surface(client, real_app):
+    before = apps.get_spec(real_app)["surface"]
+    r = client.patch(f"/api/apps/{real_app}",
+                     json={"name": "Renamed", "description": "new desc"})
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body["ok"] is True
+    assert body["spec"]["name"] == "Renamed"
+    assert body["spec"]["description"] == "new desc"
+    # The surface is untouched — an identity edit must not rebuild the app.
+    assert apps.get_spec(real_app)["surface"] == before
+    assert body["app"]["spec"]["name"] == "Renamed"
+
+
+def test_patch_null_field_is_left_unchanged(client, real_app):
+    r = client.patch(f"/api/apps/{real_app}",
+                     json={"name": None, "description": "only desc"})
+    assert r.status_code == 200, r.text[:300]
+    assert r.json()["spec"]["name"] == "Counter"
+    assert r.json()["spec"]["description"] == "only desc"
+
+
+@pytest.mark.parametrize("body,fragment", [
+    ({"name": "   "}, "name cannot be empty"),
+    ({"schedule": ""}, "schedule cannot be empty"),
+    ({"name": 123}, "name must be a string"),
+    ({"description": ["x"]}, "description must be a string"),
+    ({}, "nothing to update"),
+    ({"name": None}, "nothing to update"),
+    ({"schedule": "sometimes"}, "invalid schedule"),
+    ({"schedule": "every 1s"}, "60s"),
+])
+def test_patch_bad_input_is_a_400_that_names_the_problem(client, real_app,
+                                                         body, fragment):
+    r = client.patch(f"/api/apps/{real_app}", json=body)
+    assert r.status_code == 400, (body, r.status_code, r.text[:300])
+    assert fragment in r.json()["error"], r.json()
+
+
+def test_patch_unknown_app_is_a_404(client, real_app):
+    r = client.patch("/api/apps/no-such-app", json={"name": "x"})
+    assert r.status_code == 404, r.text[:300]
+
+
+def test_patch_non_object_body_is_a_400(client, real_app):
+    r = client.patch(f"/api/apps/{real_app}", content=b"[1,2,3]")
+    assert r.status_code == 400, r.text[:300]
+
+
+def test_patch_valid_schedule_recomputes_next_refresh(client, real_app):
+    r = client.patch(f"/api/apps/{real_app}", json={"schedule": "every 5m"})
+    assert r.status_code == 200, r.text[:300]
+    assert r.json()["spec"]["schedule"] == "every 5m"
+    assert r.json()["spec"].get("next_refresh")
+
+
+def test_sequential_identical_actions_both_run(client, real_app, action_run):
+    """The claim is released when the run ends, so a counter clicked twice in
+    sequence still counts twice — coalescing must not swallow intentional
+    repeats."""
+    for _ in range(2):
+        r = client.post(f"/api/apps/{real_app}/actions",
+                        json={"action": "increment", "input": {}})
+        assert r.status_code == 200, r.text[:300]
+        assert r.json()["ok"] is True
+    assert len(action_run["calls"]) == 2, "a sequential repeat was swallowed"
+
+
+def test_action_is_409_while_an_identical_one_is_in_flight(client, real_app,
+                                                           action_run):
+    """Hold the same idempotency key the route computes, then submit: the
+    second concurrent click must be refused, not billed."""
+    action, raw_input = "increment", {}
+    event_input = {str(k)[:80]: str(v)[:4000]
+                   for k, v in list(raw_input.items())[:40]}
+    key = "app-action:%s:%s" % (
+        real_app, agent_server._req_digest(
+            action + "|" + json.dumps(event_input, sort_keys=True)))
+    assert agent_server._inflight_run_claim(key, "other-run") == ""
+    try:
+        r = client.post(f"/api/apps/{real_app}/actions",
+                        json={"action": action, "input": raw_input})
+        assert r.status_code == 409, r.text[:300]
+        assert "already running" in r.json()["error"], r.json()
+        assert action_run["calls"] == [], "a refused action still billed a run"
+    finally:
+        agent_server._inflight_run_release(key, owner="other-run")
+
+
+def test_manual_refresh_runs_then_releases(client, real_app, action_run):
+    r = client.post(f"/api/apps/{real_app}/refresh")
+    assert r.status_code == 200, r.text[:300]
+    assert r.json()["error"] is None
+    r2 = client.post(f"/api/apps/{real_app}/refresh")
+    assert r2.status_code == 200, r2.text[:300]
+    assert len(action_run["calls"]) == 2
+
+
+def test_refresh_is_409_while_one_is_in_flight(client, real_app, action_run):
+    key = f"app-refresh:{real_app}"
+    assert agent_server._inflight_run_claim(key, "other-run") == ""
+    try:
+        r = client.post(f"/api/apps/{real_app}/refresh")
+        assert r.status_code == 409, r.text[:300]
+        assert "already running" in r.json()["error"], r.json()
+        assert action_run["calls"] == []
+    finally:
+        agent_server._inflight_run_release(key, owner="other-run")
+
+
+def test_the_identity_and_coalescing_routes_are_registered():
+    paths = {r.path for r in agent_server.app.routes}
+    assert "/api/apps/{app_id}" in paths
+    methods = {m for r in agent_server.app.routes
+               if getattr(r, "path", None) == "/api/apps/{app_id}"
+               for m in getattr(r, "methods", set())}
+    assert "PATCH" in methods, sorted(methods)

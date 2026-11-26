@@ -258,3 +258,69 @@ def test_a_chart_block_still_survives_normalisation_twice():
     once = docgen._norm_chart(b)
     assert once and once["chart"] == "pie"
     assert docgen._norm_chart(once) == once
+
+
+# ── office documents: embedded pictures are reusable figures ────────────────
+
+def _pptx_with_picture(tmp_path: Path) -> Path:
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "Chart"
+    img = tmp_path / "p.png"
+    img.write_bytes(_png(w=48, h=20))
+    s.shapes.add_picture(str(img), Inches(1), Inches(2), width=Inches(2))
+    p = tmp_path / "deck.pptx"
+    prs.save(str(p))
+    return p
+
+
+def _docx_with_picture(tmp_path: Path) -> Path:
+    pytest.importorskip("docx")
+    import docx
+    from docx.shared import Inches
+    d = docx.Document()
+    d.add_heading("Report", level=1)
+    img = tmp_path / "d.png"
+    img.write_bytes(_png(w=40, h=16))
+    d.add_picture(str(img), width=Inches(2))
+    p = tmp_path / "report.docx"
+    d.save(str(p))
+    return p
+
+
+def test_pptx_picture_lists_and_lifts_on_its_slide(tmp_path):
+    p = _pptx_with_picture(tmp_path)
+    listing = docgen.figures_in(p)
+    assert listing, "a deck with an embedded picture listed no figure"
+    assert listing[0]["page"] == 1 and listing[0]["width"] == 48
+    for f in listing:
+        got = docgen._extract_figure(p, f["page"], f["index"])
+        assert got and got[1] in ("png", "jpeg"), f
+    # No clamping: a slide or index that does not exist lifts nothing.
+    assert docgen._extract_figure(p, 99, 0) is None
+    assert docgen._extract_figure(p, 1, 40) is None
+
+
+def test_docx_picture_lists_and_lifts(tmp_path):
+    p = _docx_with_picture(tmp_path)
+    listing = docgen.figures_in(p)
+    assert listing, "a DOCX with an embedded picture listed no figure"
+    assert listing[0]["page"] == 1 and listing[0]["width"] == 40
+    for f in listing:
+        got = docgen._extract_figure(p, f["page"], f["index"])
+        assert got and got[1] in ("png", "jpeg"), f
+    assert docgen._extract_figure(p, 2, 0) is None
+    assert docgen._extract_figure(p, 1, 40) is None
+
+
+def test_a_textless_office_file_lists_no_figures(tmp_path):
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    prs = Presentation()
+    prs.slides.add_slide(prs.slide_layouts[5]).shapes.title.text = "No pictures"
+    p = tmp_path / "empty.pptx"
+    prs.save(str(p))
+    assert docgen.figures_in(p) == []

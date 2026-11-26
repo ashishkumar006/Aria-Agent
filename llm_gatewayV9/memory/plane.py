@@ -60,6 +60,31 @@ SESSION_DRAWERS: list[str] = [
 WORKING_TTL_MINUTES = 60
 
 
+# How deep each drawer is searched when the caller restricts results to a set
+# of `doc_ids`. The allowlist is applied AFTER the drawer's global top-K, so a
+# scoped search that fetched only `top_k*2` could miss a genuinely-matching
+# chunk ranked below that cut and return nothing (a single common term matched
+# 73 chunks across the library; the wanted one ranked ~22nd and was never
+# fetched). Bounded so the deep fetch stays cheap (FAISS/BM25 top-N only).
+_DOC_SCOPED_FETCH = 200
+
+
+# Minimum per-drawer candidate pool for every search. The per-document
+# diversity pass can only pick from what the drawer returned, so fetching
+# exactly top_k often yields top_k chunks of ONE document and leaves nothing
+# to diversify into ("radiation" gave 10 hits from 2 docs). Cheap locally:
+# both the vector and BM25 paths are top-N over an in-memory index.
+_DOC_FETCH_FLOOR = 40
+
+
+# Most chunks one document may contribute to a single result set before the
+# selection moves on to other documents. Purely a diversity cap: it is
+# backfilled from the same ranked list when fewer documents match, so it never
+# shrinks a result below top_k - it only stops one document's many near-
+# duplicate chunks from filling every slot.
+_DOC_CHUNK_CAP = 2
+
+
 # Maximum JSON-encoded structured payload per write. Descriptors are
 # already capped at 200 chars; this bounds `value`/`arguments` so one
 # runaway writer can't bloat the store files (413, not silent truncation).
@@ -485,36 +510,80 @@ class MemoryPlane:
             return []  # nothing was ever written to the selected drawers
         qvec = await self._query_vector(query)
         per = max(1, top_k)
+        # Fetch deeper than the final cut, always. The per-document diversity
+        # pass below can only choose among what the drawer returned, so a
+        # shallow fetch of exactly top_k items (often all from one document)
+        # leaves nothing to diversify into. A doc_ids scope needs a much
+        # deeper fetch again, because the allowlist is applied AFTER this
+        # fetch and a genuine match can rank far below the cut.
+        floor = _DOC_FETCH_FLOOR
+        if doc_ids is not None:
+            floor = max(floor, _DOC_SCOPED_FETCH)
+        fetch_per = max(per, floor)
         merged: list[MemoryRecord] = []
         for svc in svcs:
             merged.extend(await svc.read(
-                query, history, kinds=kinds, top_k=per,
+                query, history, kinds=kinds, top_k=fetch_per,
                 session_id=session_id, qvec=qvec))
         legacy_hits: list[MemoryRecord] = []
         if include_legacy:
             legacy_hits = await self.legacy.read(
-                query, history, kinds=kinds, top_k=per,
+                query, history, kinds=kinds, top_k=fetch_per,
                 session_id=session_id, qvec=qvec)
         seen: set[str] = set()
         picked: list[MemoryRecord] = []
+        # Per-document diversity: at most this many chunks from one document
+        # in a result set. Without it a single long document's many matching
+        # chunks fill every slot and genuinely-matching chunks from other
+        # documents never surface - "radiation" returned 10 hits from 2 docs.
+        # Backfilled below, so a corpus with fewer matching documents still
+        # returns a full top_k.
+        per_doc: dict[str, int] = {}
         versions = self._doc_versions()
-        for hit in merged + legacy_hits:
-            if hit.id in seen:
-                continue
-            seen.add(hit.id)
-            if (not include_stale and hit.drawer == "document" and hit.doc
-                    and hit.doc.doc_id
-                    and versions.get(hit.doc.doc_id) != hit.doc.version):
-                continue  # stale document version: review only
-            # Document allowlist. Applied here, AFTER the vector search, so a
-            # disabled document is excluded without harming recall for the
-            # others. `None` disables the filter entirely; an empty set means
-            # no documents at all.
-            if doc_ids is not None and hit.doc is not None \
-                    and hit.doc.doc_id:
-                if hit.doc.doc_id not in doc_ids:
+
+        def _doc_id(hit: MemoryRecord) -> str | None:
+            return hit.doc.doc_id if hit.doc else None
+
+        def _admit(hit: MemoryRecord, respect_cap: bool) -> bool:
+            d = _doc_id(hit)
+            if not respect_cap:
+                return True  # backfill pass: no cap, and it must not count
+            if d is not None and per_doc.get(d, 0) >= _DOC_CHUNK_CAP:
+                return False
+            if d is not None:
+                per_doc[d] = per_doc.get(d, 0) + 1
+            return True
+
+        # Diverse pass: take at most _DOC_CHUNK_CAP per document, and only as
+        # many as the cap can justify (cap x distinct docs). Without this
+        # inner limit, a top_k larger than the corpus lets the capped pass
+        # fill every slot from one document and the backfill adds nothing.
+        distinct = {d for d in (_doc_id(h) for h in merged + legacy_hits)
+                    if d is not None}
+        diverse_limit = min(top_k, _DOC_CHUNK_CAP * max(1, len(distinct)))
+        for pass_respect_cap in (True, False):
+            limit = diverse_limit if pass_respect_cap else top_k
+            for hit in merged + legacy_hits:
+                if len(picked) >= limit:
+                    break
+                if hit.id in seen:
                     continue
-            picked.append(hit)
+                if (not include_stale and hit.drawer == "document" and hit.doc
+                        and hit.doc.doc_id
+                        and versions.get(hit.doc.doc_id) != hit.doc.version):
+                    continue  # stale document version: review only
+                # Document allowlist. Applied here, AFTER the vector search, so
+                # a disabled document is excluded without harming recall for
+                # the others. `None` disables the filter entirely; an empty set
+                # means no documents at all.
+                if doc_ids is not None and hit.doc is not None \
+                        and hit.doc.doc_id:
+                    if hit.doc.doc_id not in doc_ids:
+                        continue
+                if not _admit(hit, pass_respect_cap):
+                    continue
+                seen.add(hit.id)
+                picked.append(hit)
             if len(picked) >= top_k:
                 break
         if not any(h.drawer == "document" for h in picked):

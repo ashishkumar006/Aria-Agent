@@ -292,6 +292,17 @@ export interface ScheduleJob {
   parent?: string;
   watch_until?: number;
   watch?: { surface?: string; match?: Record<string, string> };
+  /* The words the user actually receives. Without it the Schedules page could
+   * only show `query`, so a row whose query was the imperative "remind me to
+   * stretch" looked identical to a healthy reminder while it re-scheduled
+   * itself every two hours. */
+  notify_policy?: {
+    channel?: string;
+    message?: string;
+    lead_message?: string;
+    lead_fire?: number;
+    wait_for_ack?: boolean;
+  };
 }
 
 export interface ToolSpec {
@@ -494,6 +505,9 @@ export interface StudioRunCost {
   in_tok?: number;
   out_tok?: number;
   calls?: number;
+  /** Tokens the provider answered from its cache (or minted for it), per run. */
+  cache_reads?: number;
+  cache_creates?: number;
   note?: string;
   error?: string;
 }
@@ -623,6 +637,8 @@ export interface StudioJournalEntry {
  *  filmstrip of screenshots, and the pane says which it is showing rather
  *  than letting an empty box be read as a blank page. */
 export interface StudioBrowserStatus {
+  /** The page viewport, so the viewer can map screencast pixels to page pixels. */
+  viewport?: { width?: number; height?: number };
   running?: boolean;
   disabled?: boolean;
   sid?: string;
@@ -716,6 +732,14 @@ export interface StudioSession {  sid: string;
   created: number;
   updated: number;
   current: boolean;
+  /** Live runs right now (in-memory count, cheap). Drives the spinner. */
+  live?: number;
+  /** Status of the newest run in the index (`running`, `finished`, `stopped`,
+   *  `error`, …), when one exists. Drives the "finished" dot. */
+  last_status?: string;
+  /** Unreviewed changes this session is holding — the same definition the
+   *  Changes drawer renders. Drives the finished-but-needs-you dot. */
+  pending_review?: number;
 }
 
 export interface StudioSessionsResult {
@@ -736,6 +760,32 @@ export interface StudioWorkspace {
   workspace?: string;
   warning?: string;
   created?: string;
+  error?: string;
+}
+
+/** The folder picker's read: folder names only, drives at the top level.
+ *  `selectable` is `validate_root` surfaced as data — clicking a blocked row
+ *  navigates into it (you must be able to reach your project), the Select
+ *  button greys it with the refusal text. */
+export interface StudioFsDir {
+  name: string;
+  path: string;
+  selectable: boolean;
+  reason: string;
+}
+export interface StudioFsListResult {
+  path: string;
+  parent: string;
+  dirs?: StudioFsDir[];
+  truncated?: boolean;
+  /** Whether the CURRENT folder may be picked — the same refusal text the add
+   *  route would give, greyed into the button instead. */
+  selectable?: boolean;
+  reason?: string;
+  /** The user's home directory, for the quick-access column. */
+  home?: string;
+  /** Desktop / Documents / Downloads / … that exist on this machine. */
+  quick?: StudioFsDir[];
   error?: string;
 }
 
@@ -959,6 +1009,10 @@ export interface CodeAgentChange {
   summary?: string;
   diff?: string;
   when?: number;
+  /** The task this file was last written under — the change-set key. Files
+   *  with no turn predate task tracking and group as "older work". */
+  turn?: string;
+  checkpoint?: string;
   /** true when the agent created the file (before-content: nothing). */
   created?: boolean;
   /** Present from slice 4 on both surfaces: the same hunks the studio renders,
@@ -1020,17 +1074,35 @@ export interface StudioCheckpoint {
   name: string;
   turn: string;
   when: number;
+  /** "" for a task's own "before" state, "redo" for a state a redo can replay,
+   *  "undo" for the state a redo came from (which is what undo takes next). */
+  capture?: string;
   files: number;
   bytes: number;
+}
+
+/** `/api/studio/checkpoints` also carries the walk cursor: ids of checkpoints
+ *  the undo/redo history has already passed. Without it every `/undo` would
+ *  pick the same entry, because checkpoints are kept, not popped. */
+export interface StudioCheckpointList {
+  checkpoints?: StudioCheckpoint[];
+  acted?: string[];
+  error?: string;
 }
 
 export interface StudioCheckpointRestoreResult {
   ok?: boolean;
   checkpoint?: string;
   name?: string;
+  /** Paths put back to their checkpointed bytes. */
   restored?: string[];
+  /** Paths a rename had moved, taken away again so undo is not a duplicate. */
+  removed?: string[];
   failed?: { path: string; reason: string }[];
   skipped?: { path: string; reason: string }[];
+  /** The walk cursor after this restore, so the caller can offer the next step
+   *  without waiting for a reload. */
+  acted?: string[];
   undo?: { id: string; turn: string; name: string };
   error?: string;
 }
@@ -1653,6 +1725,10 @@ const sidQs = (sid?: string, hasQuery = false): string =>
 export const api = {
   health: (fresh = false) => j<{ agent: string; gateway_up: boolean }>(
     `/api/health${fresh ? '?fresh=1' : ''}`, { cache: 'no-store' }),
+  /** Is the local Model Lab playground (port 7861) running? The page embeds it
+      in an iframe and shows a helpful placeholder when it is down. */
+  modelLabStatus: () => j<{ up: boolean; url: string }>(
+    '/api/model-lab/status', { cache: 'no-store' }),
   /* ── computer-use (gated desktop control) ──────────────────────────────
      The gates live server-side: a sensitive action returns a PENDING
      approval and waits for a human. This view is where that human is -
@@ -1820,6 +1896,9 @@ export const api = {
   appAction: (id: string, action: string, input: Record<string, string>) =>
     pj<{ ok?: boolean; app?: TrackerAppDetail; surface?: A2uiSurface; error?: string }>(
       `/api/apps/${encodeURIComponent(id)}/actions`, { action, input }),
+  appPatch: (id: string, fields: { name?: string; schedule?: string; description?: string; refresh_prompt?: string }) =>
+    pj<{ ok?: boolean; spec?: Record<string, unknown>; app?: TrackerAppDetail; apps?: TrackerApp[]; error?: string }>(
+      `/api/apps/${encodeURIComponent(id)}`, fields, { method: 'PATCH' }),
   trackerRefresh: (id: string) =>
     j<{ count?: number; added?: number; removed?: number; error?: string | null; refreshed_at?: number }>(
       `/api/apps/${encodeURIComponent(id)}/refresh`,
@@ -2189,6 +2268,18 @@ export const api = {
     pj<StudioWorkspace>(`/api/studio/roots${sidQs(sid)}`, { path }),
   studioRootRemove: (sid: string, path: string) =>
     pj<StudioWorkspace>(`/api/studio/roots/remove${sidQs(sid)}`, { path }),
+  /** The picker's directory read: folders only, drives at the top. */
+  studioFsList: (path: string, signal?: AbortSignal) =>
+    j<StudioFsListResult>(`/api/studio/fs/list?path=${encodeURIComponent(path)}`,
+      signal ? { signal } : undefined),
+  /** Open the OS folder dialog on the machine running the agent. Returns
+   *  {path} when the user picked one, {cancelled: true} when they dismissed
+   *  it, or an error when the platform has no dialog — the console falls
+   *  back to the in-app picker then. The call blocks until the dialog is
+   *  closed, up to five minutes. */
+  studioPickFolder: () =>
+    pj<{ path?: string; cancelled?: boolean; error?: string }>(
+      '/api/studio/pick-folder', {}),
   studioPlayground: (sid: string) =>
     pj<StudioWorkspace>(`/api/studio/playground${sidQs(sid)}`, {}),
   studioReset: (sid: string) =>
@@ -2215,12 +2306,15 @@ export const api = {
     j<StudioChangesResult>(
       `/api/studio/changes?sid=${encodeURIComponent(sid)}`
       + (path ? `&path=${encodeURIComponent(path)}` : ''),
-      signal ? { signal } : undefined),
+      // Liveness: this is the unreviewed-changes truth per turn; a 30s cache
+      // keyed on the identical URL serves pre-turn values at turn end.
+      { cache: 'no-store', ...(signal ? { signal } : {}) }),
   /** Slice 5 — the runs this session has. A run is an object now: an id you
    *  can stop from another tab, a transcript a reload can replay, a cost. */
   studioRuns: (sid: string, signal?: AbortSignal) =>
     j<StudioRunsResult>(`/api/studio/runs?sid=${encodeURIComponent(sid)}`,
-      signal ? { signal } : undefined),
+      // Same reason as changes/checkpoints: liveness cannot be cached.
+      { cache: 'no-store', ...(signal ? { signal } : {}) }),
   /** The watcher stream: this session's run statuses, pushed as they change.
    *
    *  The server closes it when nothing is live, so a tab with no agents
@@ -2244,7 +2338,7 @@ export const api = {
     j<StudioRunFrames>(
       `/api/studio/runs/${encodeURIComponent(runId)}`
       + `?sid=${encodeURIComponent(sid)}&after=${after}`,
-      signal ? { signal } : undefined),
+      { cache: 'no-store', ...(signal ? { signal } : {}) }),
   /** Stop a run AT ITS NEXT HOP. A different verb from aborting the fetch,
    *  which only closes this view and leaves the loop buying model calls. */
   studioRunStop: (sid: string, id: string) =>
@@ -2334,13 +2428,16 @@ export const api = {
   studioBrowserTab: (sid: string, action: string, index?: number, url?: string) =>
     pjBody<Record<string, unknown>>(`/api/studio/browser/tab${sidQs(sid)}`,
       { sid, action, index, url }, [400, 403, 500]),
+  studioBrowserInput: (sid: string, ev: { kind: string; x?: number; y?: number; dx?: number; dy?: number; text?: string; key?: string }) =>
+    pjBody<Record<string, unknown>>(`/api/studio/browser/input${sidQs(sid)}`,
+      { sid, ...ev }, [400, 403, 500]),
   studioBrowserClose: (sid: string) =>
     pj<{ ok?: boolean; closed?: boolean; disabled?: boolean }>(
       `/api/studio/browser/close${sidQs(sid)}`, { sid }),
   /** The live view. Yields each frame as it arrives and returns when the
    *  server ends the window, so the caller reopens it — the same shape as
    *  `studioLive`, and for the same reason: no long-lived idle socket. */
-  async *studioBrowserView(sid: string, everyMs = 250,
+  async *studioBrowserView(sid: string, everyMs = 50,
                            signal?: AbortSignal): AsyncGenerator<StudioBrowserFrame> {
     const r = await fetch(
       `/api/studio/browser/view?sid=${encodeURIComponent(sid)}&every_ms=${everyMs}`,
@@ -2366,9 +2463,9 @@ export const api = {
   /** Named "before task N" states, newest first. Persisted, so these survive
    *  both a reload and an agent restart. */
   studioCheckpoints: (sid: string, signal?: AbortSignal) =>
-    j<{ checkpoints?: StudioCheckpoint[]; error?: string }>(
+    j<StudioCheckpointList>(
       `/api/studio/checkpoints?sid=${encodeURIComponent(sid)}`,
-      signal ? { signal } : undefined),
+      { cache: 'no-store', ...(signal ? { signal } : {}) }),
   /** Put one turn's files back. The server captures what it replaces as a
    *  checkpoint of its own first, so this is always reversible from the same
    *  panel — `undo.id` is that checkpoint. */
@@ -2718,6 +2815,35 @@ export const api = {
    *  whose slides did not exist in the file. */
   artifactPreview: (artifactId: string) =>
     j<DocPreview>(`/api/artifact/${encodeURIComponent(artifactId)}/preview`),
+  /** The same honest preview for a Documents-library row: the slide outline of
+   *  a deck, the page text of a PDF, the sheets of a workbook — read from the
+   *  stored file, never from a run's model-written metadata. */
+  documentPreview: (docId: string) =>
+    j<DocPreview>(`/api/documents/${encodeURIComponent(docId)}/preview`),
+  /** Slide images for a deck (rasterised server-side by PowerPoint). `count` is
+   *  0 when the deck could not be rasterised — the caller falls back to the
+   *  text outline. */
+  artifactSlides: (artifactId: string) =>
+    j<{ count: number; rasterised: boolean }>(
+      `/api/artifact/${encodeURIComponent(artifactId)}/slides`),
+  documentSlides: (docId: string) =>
+    j<{ count: number; rasterised: boolean }>(
+      `/api/documents/${encodeURIComponent(docId)}/slides`),
+  /** One slide as a PNG blob (1-based). */
+  artifactSlideBlob: async (artifactId: string, n: number): Promise<Blob> => {
+    const r = await fetch(
+      `/api/artifact/${encodeURIComponent(artifactId)}/slide/${n}`,
+      { headers: headers() });
+    if (!r.ok) throw new Error(await reason(r));
+    return await r.blob();
+  },
+  documentSlideBlob: async (docId: string, n: number): Promise<Blob> => {
+    const r = await fetch(
+      `/api/documents/${encodeURIComponent(docId)}/slide/${n}`,
+      { headers: headers() });
+    if (!r.ok) throw new Error(await reason(r));
+    return await r.blob();
+  },
   /** The artifact's own bytes, for a viewer that renders them itself.
    *  `download=0` makes the server answer inline with the real content type,
    *  which is what lets the browser's built-in PDF viewer open it — an
@@ -2755,8 +2881,11 @@ export const api = {
       incomplete_detail?: string[];
       /** Stopped by the operator before finishing. */
       stopped?: boolean;
-      nodes: { id: string; skill: string; status: string }[];
-    }>(`/api/sessions/${encodeURIComponent(sid)}/produced`),
+      nodes: { id: string; skill: string; status: string;
+               duration?: number | null }[];
+      /** The sources the researchers actually opened, for the receipt. */
+      sources?: { url: string; title?: string }[];
+    }>(`/api/sessions/${encodeURIComponent(sid)}/produced`, { cache: 'no-store' }),
   safe,
   /** POST /api/chat as an async generator of SSE events.
       Pass an AbortSignal to cancel mid-run (the generator closes the

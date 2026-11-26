@@ -26,6 +26,7 @@ ported verbatim from S9SharedCode/code/browser/ and untouched.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -183,6 +184,95 @@ def _is_useful_extract(content: str, goal: str) -> bool:
     return True
 
 
+# ── goal → starting URL ───────────────────────────────────────────────────────
+# A Planner emits a browser node as `{"skill": "browser", "goal": "Go to Amazon,
+# search for …", "inputs": ["USER_QUERY"]}` — a natural-language goal and the
+# run's USER_QUERY token, with NO `metadata.url`. The skill used to read
+# `inputs[0]` as the URL, so it navigated to the literal string "USER_QUERY" and
+# every layer failed with "Cannot navigate to invalid URL", and the node was
+# skipped. The goal names the destination; resolve a starting URL from it so the
+# a11y/vision driver can do the actual searching/extracting.
+_KNOWN_SITES = {
+    "amazon": "https://www.amazon.com",
+    "google": "https://www.google.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "youtube": "https://www.youtube.com",
+    "github": "https://github.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "reddit": "https://www.reddit.com",
+    "twitter": "https://twitter.com",
+    "facebook": "https://www.facebook.com",
+    "instagram": "https://www.instagram.com",
+    "linkedin": "https://www.linkedin.com",
+    "netflix": "https://www.netflix.com",
+    "spotify": "https://open.spotify.com",
+    "ebay": "https://www.ebay.com",
+    "walmart": "https://www.walmart.com",
+    "nytimes": "https://www.nytimes.com",
+    "bbc": "https://www.bbc.com",
+    "cnn": "https://www.cnn.com",
+    "apple": "https://www.apple.com",
+    "microsoft": "https://www.microsoft.com",
+    "openai": "https://openai.com",
+    "arxiv": "https://arxiv.org",
+    "medium": "https://medium.com",
+    "quora": "https://www.quora.com",
+    "goodreads": "https://www.goodreads.com",
+    "imdb": "https://www.imdb.com",
+}
+_TLDS = {"com", "org", "net", "io", "gov", "edu", "co", "ai", "dev",
+         "app", "info", "biz", "xyz", "me"}
+_SITE_NAME = re.compile(r"\b([a-z0-9-]+\.)+[a-z]{2,}\b", re.I)
+
+
+def _is_http_url(s: str) -> bool:
+    return bool(s) and bool(re.match(r"^https?://\S+$", s.strip(), re.I))
+
+
+def _resolve_url(node: NodeSpec) -> str:
+    """The URL to start from: an explicit `metadata.url` or a real http(s)
+    input, else the first input verbatim (which the caller then treats as a
+    goal, not a URL, when it is not one)."""
+    meta_url = str(node.metadata.get("url") or "").strip()
+    if _is_http_url(meta_url):
+        return meta_url
+    for raw in (node.inputs or []):
+        s = str(raw).strip()
+        if _is_http_url(s):
+            return s
+    if meta_url:
+        return meta_url
+    return str(node.inputs[0]).strip() if node.inputs else ""
+
+
+def _derive_start_url(goal: str) -> str:
+    """A starting URL implied by a natural-language goal, or '' if none.
+
+    A named site wins (so "go to amazon and search …" starts at amazon.com and
+    the driver searches from there). A bare domain is next. Otherwise the goal
+    is treated as a web search, which the a11y/vision layers can read results
+    from — never the literal "USER_QUERY" token."""
+    g = (goal or "").strip()
+    if not g:
+        return ""
+    low = g.lower()
+    for site, home in _KNOWN_SITES.items():
+        if re.search(rf"\b{re.escape(site)}\b", low):
+            return home
+    m = _SITE_NAME.search(g)
+    if m:
+        dom = m.group(0).lower()
+        if dom.rsplit(".", 1)[-1] in _TLDS:
+            return f"https://{dom}"
+    # No destination named: search the web for the goal's subject.
+    from urllib.parse import quote_plus
+    q = re.sub(
+        r"^\s*(please\s+)?(go to|open|browse|visit|navigate to|search( for)?|"
+        r"find(\s+me)?|look up|look for|check|show me|tell me)\s+", "", low).strip()
+    q = (q or low).strip(" .,!?:;")
+    return f"https://html.duckduckgo.com/html/?q={quote_plus(q)}" if q else ""
+
+
 # ── the skill ────────────────────────────────────────────────────────────────
 class BrowserSkill:
     NAME = "browser"
@@ -216,16 +306,28 @@ class BrowserSkill:
 
     # ── public entry point ─────────────────────────────────────────────────
     async def run(self, node: NodeSpec) -> AgentResult:
-        url = node.metadata.get("url") or (node.inputs[0] if node.inputs else "")
-        goal = node.metadata.get("goal") or "extract main content"
+        url = _resolve_url(node)
+        goal = (node.metadata.get("goal") or node.metadata.get("question")
+                or node.metadata.get("query") or "").strip()
+        # A Planner goal carries the destination but no URL (inputs are the
+        # USER_QUERY token). Derive the starting URL from the goal; a derived
+        # URL must still escalate to the interaction layers, because a homepage
+        # extract cannot satisfy "go to amazon and search for …". Only a real
+        # goal derives a URL — an empty node (no url, no goal) is still an error.
+        url_is_derived = not _is_http_url(url)
+        if url_is_derived and goal:
+            url = _derive_start_url(goal) or url
         # Optional escape hatch: skip the natural cascade and pin to a specific
         # layer. Values: 'extract' | 'a11y' | 'vision'. Anything else is ignored.
         # 'extract' never escalates; 'a11y' never runs vision; 'vision' skips a11y.
         force_path = node.metadata.get("force_path")
         if not url:
-            return self._pack_error("", goal, "interaction_failed",
-                                    "no url given (metadata.url or inputs[0])",
+            return self._pack_error("", goal or "extract main content",
+                                    "interaction_failed",
+                                    "no url or destination given (metadata.url, "
+                                    "an http input, or a goal that names a site)",
                                     path="extract")
+        goal = goal or "extract main content"
         t0 = time.time()
         import uuid as _uuid
         client = V9Client(base_url=self.gateway_url, agent=self.agent_tag,
@@ -254,7 +356,7 @@ class BrowserSkill:
                                         f"gateway_blocked: {block} marker on {final_url}",
                                         elapsed=time.time() - t0, path="extract")
             content = _extract(html)
-            if _is_useful_extract(content, goal):
+            if _is_useful_extract(content, goal) and not url_is_derived:
                 return self._pack(url, goal, "extract", turns=0,
                                   content=content, final_url=final_url,
                                   elapsed=time.time() - t0)

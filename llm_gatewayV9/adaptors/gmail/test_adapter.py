@@ -53,7 +53,10 @@ def test_normalize_row():
     m = GmailAdaptor().normalize(ROW)
     assert m.channel == "gmail"
     assert m.sender_id == "rohan@example.com"
-    assert m.chat_id == "t1"
+    # chat_id is the SENDER (so a reply goes to the right address); the thread
+    # is carried separately for threading.
+    assert m.chat_id == "rohan@example.com"
+    assert m.thread_id == "t1"
     assert m.text == "see you soon"  # snippet wins over subject
     assert m.msg_id == "m1"
 

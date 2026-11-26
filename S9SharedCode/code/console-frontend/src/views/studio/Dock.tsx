@@ -77,10 +77,12 @@ export interface DockProps {
   height: number;
   setHeight: (n: number) => void;
   onOpenPath?: (p: string) => void;
+  /** Render as a right-hand column (OpenCode-style) instead of a bottom bar. */
+  side?: boolean;
 }
 
 export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
-                       runs, height, setHeight, onOpenPath }: DockProps) {
+                       runs, height, setHeight, onOpenPath, side = false }: DockProps) {
   const [shells, setShells] = useState<Shell[]>([]);
   const [activeShell, setActiveShell] = useState(0);
   const [problems, setProblems] = useState<ProblemRow[]>([]);
@@ -233,7 +235,9 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
 
   return (
     <section aria-label="Dock"
-             className="flex flex-none flex-col border-t border-glass-border bg-surface-0">
+             className={'flex flex-col bg-void '
+               + (side ? 'h-full w-full border-l border-glass-border'
+                       : 'flex-none border-t border-glass-border')}>
       {open && (
         <div role="separator" aria-orientation="horizontal" tabIndex={0}
              aria-label="Dock height"
@@ -243,9 +247,9 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
                if (e.key === 'ArrowUp') { e.preventDefault(); setHeight(bound(height + 24)); }
                if (e.key === 'ArrowDown') { e.preventDefault(); setHeight(bound(height - 24)); }
              }}
-             className="h-[4px] flex-none cursor-row-resize bg-glass-border hover:bg-accent" />
+             className="h-[4px] flex-none cursor-row-resize bg-white/10 hover:bg-zinc-100" />
       )}
-      <div className="flex flex-none items-center gap-1 px-2 py-1">
+      <div className="hidden">
         {tabs.map((t) => (
           <button key={t.id} type="button"
                   onClick={() => { setTab(t.id); setOpen(true); }}
@@ -274,13 +278,13 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
             <button type="button" onClick={() => addShell(roots[0]?.path || '',
                                                          roots[0]?.name || 'default')}
                     title="New shell in the first folder"
-                    className="rounded-lg border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-300 hover:bg-white/5">
+                    className="rounded-md border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-300 hover:bg-white/5">
               + shell
             </button>
             {roots.length > 1 && roots.map((r) => (
               <button key={r.path} type="button" onClick={() => addShell(r.path, r.name)}
                       title={`New shell in ${r.path}`}
-                      className="rounded-lg border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-300 hover:bg-white/5">
+                      className="rounded-md border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-300 hover:bg-white/5">
                 + {r.name}
               </button>
             ))}
@@ -288,13 +292,13 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
         )}
         {tab === 'checks' && (
           <button type="button" onClick={() => void runChecks()} disabled={checksBusy}
-                  className="rounded-lg border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-300 hover:bg-white/5 disabled:opacity-50">
+                  className="rounded-md border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-300 hover:bg-white/5 disabled:opacity-50">
             {checksBusy ? 'running…' : 'run checks'}
           </button>
         )}
         <button type="button" onClick={() => setOpen(!open)}
                 aria-label={open ? 'Collapse the dock' : 'Expand the dock'}
-                className="flex items-center justify-center rounded-lg border border-glass-border px-1.5 py-0.5 text-zinc-300 hover:bg-white/5">
+                className="flex items-center justify-center rounded-md border border-glass-border px-1.5 py-0.5 text-zinc-300 hover:bg-white/5">
           {open ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
         </button>
       </div>
@@ -305,7 +309,7 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
             <span key={s.id}
                   className={'flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] '
                     + (i === activeShell
-                      ? 'border-accent/50 bg-accent/10 text-zinc-100'
+                      ? 'border-white/30 bg-white/[0.06] text-zinc-100'
                       : 'border-glass-border text-zinc-muted')}>
               <button type="button" onClick={() => setActiveShell(i)}
                       title={s.cwd || 'the server default folder'}>{s.label}</button>
@@ -351,7 +355,7 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
                       </span>
                       <button type="button"
                               onClick={() => p.path && onOpenPath?.(p.path)}
-                              className="flex-none max-w-[260px] truncate text-zinc-300 hover:text-accent">
+                              className="flex-none max-w-[260px] truncate text-zinc-300 hover:text-zinc-400">
                         {p.path || 'file'}{p.line ? `:${p.line}` : ''}
                       </button>
                       <span className="min-w-0 flex-1 break-words text-zinc-muted">
@@ -373,7 +377,7 @@ export function Dock({ sid, roots, tab, setTab, open, setOpen, buffers,
                   <select aria-label="Which run's output"
                           value={output.run}
                           onChange={(e) => void loadOutput(e.target.value)}
-                          className="rounded-lg border border-glass-border bg-surface-1 px-1.5 py-0.5 text-[12px] text-zinc-200">
+                          className="rounded-md border border-glass-border bg-surface-1 px-1.5 py-0.5 text-[12px] text-zinc-200">
                     {runs.map((r) => (
                       <option key={r.id} value={r.id}>
                         {r.id} · {(r.question || '').slice(0, 40)}

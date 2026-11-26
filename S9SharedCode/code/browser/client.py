@@ -71,9 +71,17 @@ class V9Client:
         if not tok:
             try:
                 from pathlib import Path
-                p = (Path(__file__).resolve().parents[2] / "llm_gatewayV9"
-                     / "state" / "gateway.token")
-                tok = p.read_text(encoding="utf-8").strip()
+                # The gateway lives at <repo>/llm_gatewayV9/state/gateway.token.
+                # Walk up from this file to find it: the code is nested under
+                # S9SharedCode/code/browser, so a fixed parents[N] breaks the
+                # moment the tree is re-nested (parents[2] pointed at
+                # S9SharedCode/, not the repo root, and every a11y/vision call
+                # 401'd with an empty token while extract-only pages still worked).
+                for base in Path(__file__).resolve().parents:
+                    p = base / "llm_gatewayV9" / "state" / "gateway.token"
+                    if p.exists():
+                        tok = p.read_text(encoding="utf-8").strip()
+                        break
             except Exception:
                 tok = ""
         return {"X-Gateway-Token": tok} if tok else {}

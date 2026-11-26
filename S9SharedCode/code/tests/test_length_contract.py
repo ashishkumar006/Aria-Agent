@@ -13,6 +13,11 @@ import skills
     # An explicit number always wins over the tier heuristics.
     ("about 2000 words on X", "author", 2000, 2000),
     ("5 page report on X", "author", 2000, 2600),
+    # The hyphenated form is the one people actually type, and it used to parse
+    # as NO length at all ("20-page" -> 0), so a "20-page" brief shipped 845
+    # words. At ~450 words/page that is 9,000.
+    ("a 20-page report on X", "author", 9000, 9000),
+    ("a 12-page PDF on X", "author", 5400, 5400),
     # Depth words are FLOORS now, not targets. They used to be 8000/30000.
     ("an extensive deep-dive", "author", 3000, 3000),
     ("a thorough comprehensive study", "author", 6000, 6000),

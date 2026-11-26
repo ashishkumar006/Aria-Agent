@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  LayoutGrid, Loader2, Plus, RefreshCw, Sparkles, Trash2, X,
+  LayoutGrid, Loader2, Plus, RefreshCw, Sparkles, Trash2, X, Pencil, Check,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Rail, TopBar, Empty, Pill, Skel, SkipLink } from '../components/ui';
@@ -52,6 +52,12 @@ export default function Apps() {
      keep-alive Apps view stays mounted and opens the app when it lands. */
   const [building, setBuilding] = useState<{ name: string } | null>(null);
   const [buildError, setBuildError] = useState('');
+  const [editOpen, setEditOpen] = useState(false);
+  const [editName, setEditName] = useState('');
+  const [editSchedule, setEditSchedule] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState('');
   const detailReq = useRef(0);
   const descriptionRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -76,6 +82,8 @@ export default function Apps() {
     setDetailError('');
     setActionError('');
     setItemFilter('');
+    setEditOpen(false);
+    setEditError('');
     setDetailLoading(true);
     try {
       const d = await api.trackerApp(id);
@@ -144,6 +152,36 @@ export default function Apps() {
       setActionError(String((e as Error)?.message || e));
     } finally { setBusy(false); }
   }, [busy, load, openApp, openId]);
+
+  const startEdit = useCallback(() => {
+    if (!detail) return;
+    setEditName(detail.name || '');
+    setEditSchedule(detail.schedule || 'manual');
+    setEditDescription(detail.description || '');
+    setEditError('');
+    setEditOpen(true);
+  }, [detail]);
+
+  const saveEdit = useCallback(async () => {
+    if (!openId || editBusy) return;
+    if (!editName.trim()) { setEditError('Name cannot be empty'); return; }
+    setEditBusy(true);
+    setEditError('');
+    try {
+      const res = await api.appPatch(openId, {
+        name: editName.trim(),
+        schedule: editSchedule.trim() || 'manual',
+        description: editDescription,
+      });
+      if (res.error) throw new Error(res.error);
+      if (res.app) setDetail(res.app);
+      else await openApp(openId);
+      await load();
+      setEditOpen(false);
+    } catch (e) {
+      setEditError(String((e as Error)?.message || e));
+    } finally { setEditBusy(false); }
+  }, [openId, editBusy, editName, editSchedule, editDescription, load, openApp]);
 
   const closeCreate = useCallback(() => {
     setCreateOpen(false);
@@ -328,22 +366,54 @@ export default function Apps() {
           {openId && detail && (
             <>
               <Pane id="apps.header">
-              <div className="mb-3 flex flex-wrap items-start gap-2 rounded-[10px] border border-white/10 bg-[#0e0e12] px-3.5 py-3">
-                <div className="min-w-0 flex-1">
-                  <h1 className="truncate text-[15px] font-semibold text-zinc-100">{detail.name}</h1>
-                  <p className="mt-0.5 text-[11.5px] leading-snug text-zinc-500">
-                    {detail.description
-                      || (detail.kind === 'a2ui'
-                        ? 'Agent-built interactive app.'
-                        : `${detail.kind} tracker`)}
-                  </p>
-                </div>
-                <Pill tone={detail.kind === 'a2ui' ? 'info' : 'muted'}>
-                  {detail.kind === 'a2ui' ? 'agent-built' : detail.kind}
-                </Pill>
-                <span className="text-[10.5px] text-zinc-500">
-                  {detail.schedule} · {detail.next_refresh ? `next ${fmtTs(detail.next_refresh)}` : 'manual'}
-                </span>
+              <div className="mb-3 rounded-[10px] border border-white/10 bg-[#0e0e12] px-3.5 py-3">
+                {editOpen ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input value={editName} onChange={(e) => setEditName(e.target.value)}
+                        aria-label="App name" placeholder="App name"
+                        className="h-8 min-w-0 flex-1 rounded border border-white/10 bg-black/40 px-2.5 text-xs outline-none focus:border-violet-400" />
+                      <input value={editSchedule} onChange={(e) => setEditSchedule(e.target.value)}
+                        aria-label="Refresh schedule" placeholder="manual · daily@HH:MM · every Nm"
+                        className="h-8 w-52 rounded border border-white/10 bg-black/40 px-2.5 text-[11px] outline-none focus:border-violet-400" />
+                    </div>
+                    <textarea value={editDescription} onChange={(e) => setEditDescription(e.target.value)}
+                      rows={2} aria-label="App description" placeholder="Description"
+                      className="w-full resize-y rounded border border-white/10 bg-black/40 p-2.5 text-[12px] leading-relaxed outline-none focus:border-violet-400" />
+                    {editError && (
+                      <p role="alert" className="rounded border border-rose-400/30 bg-rose-400/5 px-2.5 py-1.5 text-[11px] text-rose-200">{editError}</p>
+                    )}
+                    <div className="flex items-center justify-end gap-2">
+                      <button type="button" onClick={() => { setEditOpen(false); setEditError(''); }} disabled={editBusy}
+                        className="rounded border border-white/15 px-3 py-1.5 text-[11px] text-zinc-300 hover:border-white/30 disabled:opacity-40">Cancel</button>
+                      <button type="button" onClick={() => void saveEdit()} disabled={editBusy || !editName.trim()}
+                        className="flex items-center gap-1.5 rounded bg-violet-400 px-3.5 py-1.5 text-[11.5px] font-bold text-[#0b0b0e] hover:brightness-110 disabled:opacity-40">
+                        {editBusy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                        {editBusy ? 'Saving…' : 'Save'}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <h1 className="truncate text-[15px] font-semibold text-zinc-100">{detail.name}</h1>
+                      <p className="mt-0.5 text-[11.5px] leading-snug text-zinc-500">
+                        {detail.description
+                          || (detail.kind === 'a2ui'
+                            ? 'Agent-built interactive app.'
+                            : `${detail.kind} tracker`)}
+                      </p>
+                    </div>
+                    <Pill tone={detail.kind === 'a2ui' ? 'info' : 'muted'}>
+                      {detail.kind === 'a2ui' ? 'agent-built' : detail.kind}
+                    </Pill>
+                    <span className="text-[10.5px] text-zinc-500">
+                      {detail.schedule} · {detail.next_refresh ? `next ${fmtTs(detail.next_refresh)}` : 'manual'}
+                    </span>
+                    <button type="button" onClick={startEdit} aria-label="Edit app details"
+                      className="rounded p-1 text-zinc-500 hover:text-zinc-200"><Pencil size={13} /></button>
+                  </div>
+                )}
               </div>
               </Pane>
 
@@ -361,7 +431,7 @@ export default function Apps() {
               {isA2ui ? (
                 <div className="rounded-[10px] border border-white/10 bg-[#08080a] p-3.5">
                   {surface ? (
-                    <A2ui surface={surface} onAction={(a, args) => void runAction(a, args)} />
+                    <A2ui surface={surface} busy={busy} onAction={(a, args) => void runAction(a, args)} />
                   ) : (
                     <Empty icon={<Sparkles size={28} />} title="No surface yet"
                       sub="Refresh this app to rebuild its interface." />

@@ -224,7 +224,7 @@ def test_embed():
 def test_channels_inventory():
     need_live()
     chans = _get(f"{BASE}/v1/channels", timeout=15).json()["channels"]
-    assert len(chans) == 16, f"got {len(chans)}"
+    assert len(chans) == 22, f"got {len(chans)}"
     for c in chans:
         note("channels", c["name"], "LIVE" if c.get("configured") else "UNKEYED",
              f"needs {(c.get('required_keys') or ['none'])[0] if not c.get('configured') else 'keys present'}")

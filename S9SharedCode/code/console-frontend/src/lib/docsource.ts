@@ -96,13 +96,20 @@ export const isNativeViewable = (t: DocumentTarget): boolean =>
  *  preview" strip beneath it. Exactly one panel is now possible by
  *  construction, and the truth table is testable without a browser.
  */
-export type Panel = 'pdf' | 'image' | 'frame' | 'raster';
+export type Panel = 'pdf' | 'image' | 'frame' | 'raster' | 'slides';
 export function pickPanel(
   format: string | undefined,
   { failed = false, pages = false }: { failed?: boolean; pages?: boolean } = {},
 ): Panel {
   const f = (format || '').toLowerCase();
   if (f === 'pdf') return failed || pages ? 'raster' : 'pdf';
+  // A deck has no browser-native rendering and no server rasteriser on this
+  // machine (no LibreOffice/PowerPoint), so the old 'raster' panel drew a red
+  // "no server-side preview" strip under a file that opens fine in PowerPoint.
+  // Show the slide OUTLINE instead - the titles, bullets and notes the server
+  // already extracts from the file's own XML (docpreview._pptx). It is honest
+  // (read from the artifact, not the model's `slides` metadata) and useful.
+  if (f === 'pptx') return 'slides';
   // An image gets its own panel rather than the sandboxed frame, because the
   // frame renders it as a browser document: white margins, a scroll pair, and
   // no fit-to-width. This is the panel the Chat transcript needed — a fetched

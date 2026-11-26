@@ -113,7 +113,7 @@ class GmailAdaptor(BaseAdaptor):
         sender = row.sender_id or row.sender or row.From
         thread = row.thread_id or row.threadId or row.id
         return ChannelMessage(
-            channel=self.name, sender_id=sender, chat_id=thread,
+            channel=self.name, sender_id=sender, chat_id=sender,
             text=row.snippet or row.subject or row.Subject,
             thread_id=thread or None, msg_id=row.id,
             ts=time.time(), trust_level=classify(self.name, sender),

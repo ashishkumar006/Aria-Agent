@@ -140,6 +140,16 @@ DEFINITIONS: dict[str, dict] = {
                        "behaviour: whole results re-sent until the node is out "
                        "of context.",
     },
+    "agent.llm_compaction": {
+        "type": "bool",
+        "default": True,
+        "description": "When the coding agent's context approaches its budget, "
+                       "summarize the older turns into one structured state "
+                       "summary using prompts/compaction.md (goals, files, "
+                       "decisions, tests, next step) instead of only head+tail "
+                       "clipping. Falls back to mechanical compaction if the "
+                       "summarizer fails. Off = mechanical tiers only.",
+    },
     "agent.stop_in_nodes": {
         "type": "bool",
         "default": True,

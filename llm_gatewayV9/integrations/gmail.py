@@ -22,7 +22,9 @@ GW_ENV = Path(__file__).resolve().parent.parent / ".env"
 
 
 def send_email(*, to: str, subject: str, body: str,
-               thread_id: str | None = None) -> dict[str, Any]:
+               thread_id: str | None = None, attachment_b64: str = "",
+               attachment_name: str = "",
+               attachments: list[dict] | None = None) -> dict[str, Any]:
     try:
         token = _need("GMAIL_TOKEN")
     except _MissingKey:
@@ -31,6 +33,29 @@ def send_email(*, to: str, subject: str, body: str,
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(body)
+    # Build the attachment list: an explicit `attachments` list wins; otherwise
+    # the single attachment_b64/attachment_name pair (legacy shape).
+    atts: list[dict] = list(attachments or [])
+    if attachment_b64 and not atts:
+        atts = [{"name": attachment_name or "attachment",
+                 "data_b64": attachment_b64}]
+    if atts:
+        import mimetypes
+        for att in atts[:10]:
+            if not isinstance(att, dict):
+                continue
+            data_b64 = str(att.get("data_b64") or "")
+            if not data_b64:
+                continue
+            try:
+                data = base64.b64decode(data_b64)
+            except Exception:
+                continue
+            name = (str(att.get("name") or "") or "attachment").strip()
+            ctype, _ = mimetypes.guess_type(name)
+            maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+            msg.add_attachment(data, maintype=maintype or "application",
+                               subtype=subtype or "octet-stream", filename=name)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
     url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
     payload: dict[str, Any] = {"raw": raw}
@@ -57,7 +82,40 @@ def send_email(*, to: str, subject: str, body: str,
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     return {"ok": True, "to": to, "subject": subject, "id": data.get("id"),
-            "thread_id": thread_id}
+            "thread_id": thread_id, "attached": bool(atts),
+            "attachment_count": len(atts),
+            "attachment_name": attachment_name if (attachment_b64 and not attachments) else ""}
+
+
+def profile() -> dict[str, Any]:
+    """The signed-in mailbox: emailAddress, messagesTotal, threadsTotal.
+
+    This is how you answer "which account is connected?" — the address the
+    OAuth token actually belongs to, not the client id.
+    """
+    try:
+        token = _need("GMAIL_TOKEN")
+    except _MissingKey:
+        return _fail("GMAIL_TOKEN not set (Gmail OAuth access token)")
+    try:
+        with pooled_http(20.0) as client:
+            r = client.get("https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                           headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 401:
+                # Hourly expiry: renew once, then retry (same as query/send).
+                res = refresh(write_env=True)
+                if not res.get("ok"):
+                    return {"ok": False,
+                            "error": f"GMAIL_TOKEN expired; refresh failed: {res.get('error')}"}
+                r = client.get("https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                               headers={"Authorization": f"Bearer {res['access_token']}"})
+            r.raise_for_status()
+            x = r.json()
+        return {"ok": True, "email": x.get("emailAddress"),
+                "messages_total": x.get("messagesTotal"),
+                "threads_total": x.get("threadsTotal")}
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"{type(e).__name__}: {e}")
 
 
 def query(*, api_method: str, query: str = "", max_results: int = 5) -> dict[str, Any]:
@@ -114,6 +172,7 @@ def refresh(*, write_env: bool = True) -> dict[str, Any]:
     if not all(vals.values()):
         return {"ok": False, "error": "GMAIL_REFRESH_TOKEN / GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET not set"}
     try:
+        r = None
         with pooled_http(20.0) as client:
             r = client.post("https://oauth2.googleapis.com/token", data={
                 "client_id": vals["GMAIL_CLIENT_ID"],
@@ -127,7 +186,16 @@ def refresh(*, write_env: bool = True) -> dict[str, Any]:
         if not new_token:
             return {"ok": False, "error": f"no access_token in response: {resp}"}
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        # Fold the upstream body in: "400 Bad Request" alone does not say
+        # whether the refresh token was revoked (invalid_grant) or the client
+        # credentials are wrong — and those need different fixes.
+        detail = ""
+        try:
+            detail = (r.text[:200] if r is not None else "")
+        except Exception:
+            detail = ""
+        return {"ok": False,
+                "error": f"{type(e).__name__}: {e}" + (f" | {detail}" if detail else "")}
     if write_env:
         try:
             text = GW_ENV.read_text(encoding="utf-8") if GW_ENV.exists() else ""

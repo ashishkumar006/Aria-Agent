@@ -11,18 +11,25 @@ The shape
              → POST /api/channel/inbound         (this gateway forwards)
              → route_inbound: ack thread first   (this module)
              → then a trust-gated chat turn
-             → POST /api/chat/simple/stream (self, loopback)
-                                    → memory, docs, tools, thread history
+             → POST /api/chat (the full DAG, self, loopback)
+                                    → planner → skills → formatter, with
+                                      memory, docs, tools, thread history
              → POST /v1/channels/{name}/send     → back to the user
 
 The chat turn goes through the agent's own HTTP API rather than a reimplementation
-of `chat_simple_stream`. That is deliberate: it reuses the whole pipeline (per-thread
+of the run. That is deliberate: it reuses the whole pipeline (per-thread
 history, memory recall, document grounding, the tool loop, cost recording) with no
 second implementation to keep in step, and the loopback call costs nothing.
 
-The lightweight stream is the right target, not `POST /api/chat`: that route runs
-the full research DAG (planner, researcher, formatter, critic), and "what time is
-it" should not cost a multi-node run.
+The full DAG (`POST /api/chat`, `run_kind="chat"`) is the target, the SAME path
+the console's own chat mode uses — so a channel message can plan a multi-node
+run (research → author, coder → sandbox, a tool-using action) exactly as the
+console can. It was originally the lightweight `/api/chat/simple/stream` (one
+LLM call) to keep "what time is it" cheap, but that meant a channel could not
+reach the DAG's capabilities at all. Parity with the console is the goal now;
+the cost of a trivial turn is a planner + formatter hop, which the free tier
+absorbs. The webhook still answers immediately (the turn runs on a daemon
+thread), so a slow DAG run never trips a platform retry.
 
 Safety properties
 -----------------
@@ -333,29 +340,33 @@ def _describe_attachments(attachments: list | None) -> str:
 
 def _ask_agent(text: str, conversation_id: str,
                attachments: list | None = None) -> tuple[str, str, list]:
-    """Drive the agent's own chat API over loopback.
+    """Drive the agent's own full DAG chat API over loopback.
 
     Returns (answer, error, produced_files). The third element is the artifact
     handles the answer produced, so a channel reply can attach them - a
     document rendered on a Telegram request used to stay on the server and the
     user got a caption with nothing attached.
 
-    Reusing `/api/chat/simple/stream` rather than reimplementing the turn is the
-    point: one implementation of history, memory, documents, the tool loop and
-    cost. Streamed rather than buffered, so a long answer is not cut off by a
-    proxy timeout and the tool-progress frames are visible as they happen."""
+    Reusing `/api/chat` (the full planner→skills→formatter DAG, `run_kind="chat"`)
+    rather than reimplementing the turn is the point: one implementation of
+    history, memory, documents, the tool loop and cost, and a channel message
+    can reach every capability the console can. Streamed rather than buffered, so
+    a long answer is not cut off by a proxy timeout. The DAG emits `log`/`meta`/
+    `done`/`error` frames (not `delta`); the answer arrives whole on `done`,
+    which also carries the produced files."""
     import httpx
     from agent_server import _self_token
 
     body = {"query": (text or "") + _describe_attachments(attachments),
-            "conversation_id": conversation_id}
+            "conversation_id": conversation_id,
+            "run_kind": "chat"}
     answer_parts: list[str] = []
     produced: list[dict] = []
     err = ""
     try:
         with httpx.Client(timeout=600.0,
                           headers={"X-Aria-Token": _self_token()}) as c:
-            with c.stream("POST", f"{_self_base()}/api/chat/simple/stream",
+            with c.stream("POST", f"{_self_base()}/api/chat",
                           json=body) as r:
                 if r.status_code != 200:
                     # A 502 here is the gateway being down; 400 is a bad
@@ -376,6 +387,9 @@ def _ask_agent(text: str, conversation_id: str,
                         continue
                     t = frame.get("type")
                     if t == "delta":
+                        # The lightweight route streamed deltas; the DAG does not,
+                        # but accumulating them here keeps this correct if a delta
+                        # ever appears and does no harm otherwise.
                         answer_parts.append(str(frame.get("text") or ""))
                     elif t == "done":
                         # Files the answer produced (a rendered PDF, a deck).

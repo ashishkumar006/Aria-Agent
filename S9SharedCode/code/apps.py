@@ -492,6 +492,42 @@ def save_a2ui_surface(app_id: str, surface: dict, state: dict | None = None,
         return spec
 
 
+def update_app_meta(app_id: str, *, name: str | None = None,
+                    schedule: str | None = None, description: str | None = None,
+                    refresh_prompt: str | None = None) -> dict | None:
+    """Edit an app's identity (name/schedule/description/refresh_prompt) without
+    rebuilding its surface. Returns the updated spec, or None if unknown.
+    Used by PATCH and by action/refresh runs that return a changed identity."""
+    with _lock:
+        spec = get_spec(app_id)
+        if spec is None:
+            return None
+        if name is not None and name.strip():
+            spec["name"] = name.strip()[:80]
+        if description is not None:
+            spec["description"] = str(description)[:1000]
+        if refresh_prompt is not None:
+            spec["refresh_prompt"] = str(refresh_prompt)[:4000]
+        if schedule is not None and schedule.strip():
+            sched = schedule.strip()
+            if sched != "manual":
+                try:
+                    _next_fire(sched, time.time())
+                except Exception:
+                    raise ValueError("invalid schedule")
+                _im = re.match(r"^every\s+(\d+)\s*([smh]?)$", sched.lower())
+                if _im:
+                    _secs = int(_im.group(1)) * {"s": 1, "m": 60, "h": 3600}[_im.group(2) or "m"]
+                    if _secs < 60:
+                        raise ValueError("app schedule interval must be >= 60s")
+            if sched != spec.get("schedule"):
+                spec["schedule"] = sched
+                spec["next_refresh"] = _next_fire(sched, time.time())
+        spec["updated"] = time.time()
+        _write_json(_spec_path(app_id), spec)
+        return spec
+
+
 def refresh_app(app_id: str) -> dict:
     """Run one refresh now. Returns a summary; persists snapshot + history.
     Failures are recorded in the data file, never raised out of the worker

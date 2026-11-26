@@ -1,6 +1,6 @@
 """V10 adaptor-plane contract tests. No network, no secrets, no gateway process.
 
-Covers: registry shape (16 adaptors, no secret values), envelope defaults,
+Covers: registry shape (22 adaptors, no secret values), envelope defaults,
 trust store isolation, per-adaptor normalize()/verify_webhook() fixtures,
 NotConfigured/NotIntegrated behavior with keys stripped, policy engine
 semantics, and the Tier-1 integration fail-soft shapes.
@@ -49,7 +49,7 @@ def _clean_env(monkeypatch):
 # ── registry ──────────────────────────────────────────────────────────────
 
 def test_registry_has_16_adaptors():
-    assert len(registry.names()) == 16
+    assert len(registry.names()) == 22
     for expected in ["telegram", "discord", "matrix", "line", "webhook",
                      "webui", "slack", "signal", "gmail", "imap",
                      "twilio_sms", "whatsapp_twilio", "local_mic", "teams",
@@ -64,7 +64,7 @@ def test_inventory_never_leaks_values():
         inv = registry.inventory()
     finally:
         del os.environ["TELEGRAM_BOT_TOKEN"]
-    assert len(inv) == 16
+    assert len(inv) == 22
     assert "SECRET-VALUE-12345" not in str(inv)  # names ok, values never
     for c in inv:
         assert set(c) >= {"name", "available", "configured", "required_keys"}

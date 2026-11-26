@@ -45,6 +45,33 @@ MAX_TOOL_HOPS = 6  # hard cap so a model that loves tool-use can't cost a fortun
 # verification, not making progress. Global hop caps don't catch it
 # because each call looks like forward motion.
 MAX_SAME_CALL_REPEATS = 2
+# Tools that change the workspace. A successful one invalidates the repeat
+# counters: `edit_file` then `run_checks` then `edit_file` then `run_checks` is
+# three identical CHECK calls, and all three are meaningful — the second and
+# third are measuring different code. Without this, a normal
+# fix-then-rerun cycle trips the loop guard and the run ends early with
+# "repeated an already-successful call".
+_WRITE_TOOLS = frozenset({
+    "create_file", "edit_file", "update_file", "write_file", "apply_symbol_edit",
+    "delete_file", "make_dir", "apply_rename",
+})
+# When the model repeats an already-successful call but the last test/check run
+# still failed, don't dead-end: hand it the failing output plus a corrective
+# instruction and let it change strategy, up to this many times. Observed live:
+# a coding agent looped re-editing source while its flawed tests could never
+# pass, and the old guard aborted the run instead of letting it fix the tests.
+MAX_STALL_RECOVERIES = 2
+# Idempotent reads are EXEMPT from the repeat guard. Re-listing a directory or
+# re-reading a file is normal orientation, not a stall — and because the guard
+# judges the whole batch, aborting on a repeated read also discarded the
+# productive create_file/edit_file calls sitting beside it in the same turn
+# (observed live: a good code model re-called list_dir and the loop died before
+# its writes ever ran). Reads are cheap and bounded by the hop cap; only
+# side-effecting repeats are treated as a stall.
+_REPEAT_EXEMPT_READS = frozenset({
+    "list_dir", "read_file", "search_files", "read_artifact", "git_inspect",
+    "document_symbols", "find_references", "blast_radius",
+})
 # How many tool calls from ONE assistant turn are dispatched at the same time.
 # A coding agent asked to "read these files" emits several read_file calls in a
 # single turn; running them serially makes the wall-clock cost the sum of the
@@ -78,6 +105,33 @@ PROGRESS_LEDGER_CALLS = 12
 # files whole while still bounding a runaway tool. Distinct from the TRUNCATED
 # copy shown in stream events (~400 chars), which is display only.
 MAX_TOOL_RESULT_MESSAGE_CHARS = 32_000
+# ── context compaction ───────────────────────────────────────────────────────
+# Folding handles the bytes that are SIX THOUSAND CHARACTERS OR MORE. These
+# knobs handle the long tail: results of 900 chars to 6 kB, and the long
+# assistant-authored "said" text that re-enters every prompt. Neither was
+# touched by the old elision — elision replaced a 900-char README preview with
+# a marker telling the model to call the tool again, which was a worse answer
+# than a truncated one.
+#
+# The newest tool round is never compacted: that is the material the model is
+# writing from right now. Older rounds get:
+#   * tool results → head + tail + a byte count, so the model keeps the
+#     load-bearing first lines (file header, JSON keys) and the end
+#     (the interesting value of a check run, the verdict line of a tool
+#     result), and loses only the middle.
+#   * assistant "said" text → head + tail + a count, so the task framing and
+#     the verdict survive, and the middle goes.
+# Keys, ids and tool-pair structure are always preserved: the MCP pairing
+# remains valid after the rewrite.
+COMPACT_WHEN_CHARS = 400_000        # ~100k tokens; comfortably under the elision point
+COMPACT_TOOL_MIN = 900              # don't bother with snippets
+COMPACT_TOOL_KEEP_HEAD = 700
+COMPACT_TOOL_KEEP_TAIL = 300
+COMPACT_SAID_MIN = 400
+COMPACT_SAID_KEEP_HEAD = 250
+COMPACT_SAID_KEEP_TAIL = 150
+# Only kick in when the context is actually large — a small prompt spends
+# nothing, so compaction is free of cost there.
 # ── consume-then-fold ───────────────────────────────────────────────────────
 # The problem this measures. A node's tool results are appended to `messages`
 # and re-sent on EVERY later hop, so a researcher that batch-fetches 20 pages
@@ -380,6 +434,147 @@ def _outcome_brief(text: str) -> str:
     return ", ".join(bits)[:90]
 
 
+# A model call that fails on the SERVER's side is worth retrying; one that fails
+# because the request itself is wrong is not. The distinction is made from the
+# error text because the gateway seam raises RuntimeError with the HTTP status
+# in it, and a dedicated exception type would have to be threaded through every
+# provider adapter to say the same thing.
+_LLM_MAX_ATTEMPTS = 5
+_LLM_RETRY_BASE_S = 1.0
+# A rate limit is a wait, not a verdict: a free tier usually admits the same
+# request seconds later, and the alternative is throwing away a run that is
+# already deep into its work.
+_LLM_RATE_LIMIT_ATTEMPTS = 6
+_LLM_RATE_LIMIT_BASE_S = 5.0
+# Ceiling on a single rate-limit wait. Long enough to cross a free-tier window,
+# short enough that the console still looks alive.
+_LLM_RATE_LIMIT_MAX_S = 120.0
+# Empty completions (no text, no tool call) are their own retry: a different
+# request shape is tried, not the same one.
+_EMPTY_REPLY_RETRIES = 2
+# Times a run will re-ask when the model sends its thinking as the answer.
+_MAX_REASONING_LEAKS = 3
+# Openers that read as deliberation rather than as a reply. Deliberately few
+# and specific: a false positive costs one extra model call, a false negative
+# shows the person a wall of thinking where the answer should be.
+_REASONING_OPENERS = (
+    "we need to", "we need build", "we need create", "we need add",
+    "we need implement", "we need to build", "let me ", "i need to ",
+    "i should ", "first, i", "first i", "okay, i", "so i need",
+    "the user wants me to", "the user asked me to",
+    "so ruff", "so the", "so i", "so we", "i'll ", "i will ",
+    "let's ", "we should ", "need to ", "need build",
+)
+# A wall of text with no code fence and several of these is deliberation, not an
+# answer — live: 32,783 characters of planning returned as the reply.
+_REASONING_MARKERS = ("let me", "i need", "we need", "i should", "we should",
+                      "probably", "maybe", "let's", "i'll", "need to")
+# A coding agent's answers are summaries. Past this many characters the reply is
+# the model thinking on the page — live: 32,783 characters of planning with one
+# code fence in it, returned as the answer to a build task.
+_LONG_CODING_ANSWER_CHARS = 8000
+
+
+def _looks_like_reasoning(text: str, short_answer_guard: bool = False) -> bool:
+    """True when a reply reads as the model's deliberation, not its answer.
+
+    Heuristic by construction, and only ever used to *retry* — never to
+    rewrite or truncate what the person is shown. Long, opener-led, no code
+    fence: an answer that cites files or shows a diff is left alone.
+    """
+    body = (text or "").strip()
+    if len(body) < 200:
+        return False
+    # A coding agent's answer is a summary: paths, names, what changed. A reply
+    # of many thousands of characters is the model thinking on the page, even
+    # when it happens to include a snippet. Opt-in, because the authoring path
+    # legitimately returns documents.
+    if short_answer_guard and len(body) > _LONG_CODING_ANSWER_CHARS:
+        return True
+    # A reply that carries a code fence is showing work, not deliberating —
+    # naming a file is NOT such a signal, because thinking out loud names files
+    # constantly ("the caller in cli.py uses two of them").
+    if "```" in body:
+        return False
+    head = body[:200].lower()
+    if any(head.startswith(op) or op in head[:120] for op in _REASONING_OPENERS):
+        return True
+    # No recognisable opener, but a wall of text with no code that keeps
+    # deliberating ("probably", "maybe", "let me") is the same thing wearing a
+    # different first sentence — live: 32k characters starting "So ruff is a
+    # separate executable, not a module…".
+    if len(body) > 2000:
+        low = body.lower()
+        hits = sum(1 for m in _REASONING_MARKERS if m in low[:4000])
+        if hits >= 3:
+            return True
+    return False
+_TRANSIENT_LLM_MARKS = (
+    "http 429", "http 500", "http 502", "http 503", "http 504", "http 408",
+    "rate limit", "ratelimit", "too many requests", "overloaded",
+    "temporarily unavailable", "service unavailable", "bad gateway",
+    "gateway time-out", "gateway timeout", "timed out", "timeout",
+    "connection reset", "connection aborted", "connection refused",
+    "connection error", "remote end closed", "incomplete chunked",
+    "getaddrinfo", "nodename nor servname", "temporary failure in name",
+    # The provider client wraps every upstream fault as "kilo failed: <exc>" and
+    # sometimes masks the cause (a 429 body rendered as KeyError 'name'). No
+    # message with that prefix is the request's fault, so all of them are worth
+    # another attempt.
+    "kilo failed",
+)
+
+
+def _retry_after_seconds(e: BaseException) -> int:
+    """Seconds the provider asked us to wait, when it said so.
+
+    A 429 that names a delay is not a guess: waiting what it asked for is both
+    kinder and more likely to work than exponential backoff. Accepts the common
+    spellings ("retry in 45s", "try again in 30 seconds", `"retry_after": 60`)
+    and answers 0 when it said nothing.
+    """
+    text = str(e or "")
+    m = re.search(r"retry[-_ ]?after\D{0,12}(\d{1,5})", text, re.I)
+    if not m:
+        m = re.search(r"(?:retry|try again|wait)\D{0,24}?(\d{1,5})\s*(?:s|sec|secs|seconds)\b",
+                      text, re.I)
+    if not m:
+        return 0
+    try:
+        return max(1, min(int(m.group(1)), 300))
+    except ValueError:
+        return 0
+
+
+def _is_rate_limit_error(e: BaseException) -> bool:
+    """True when the provider refused for rate reasons rather than availability.
+
+    "Quota exceeded" is deliberately NOT here: an exhausted quota does not clear
+    in three seconds, and retrying it only delays the honest error.
+    """
+    text = str(e or "").lower()
+    return any(mark in text for mark in (
+        "429", "rate limit", "rate_limit", "too many requests"))
+
+
+def _is_transient_llm_error(e: BaseException) -> bool:
+    """True when a failed model call is worth another attempt.
+
+    Conservative on purpose: a 400/401/403/404 in the text means the request was
+    wrong, and retrying it only spends the user's time. Anything that looks like
+    an availability problem — a 5xx, a 429, a timeout, a dropped connection — is
+    retried.
+    """
+    text = str(e or "").lower()
+    if not text:
+        return False
+    m = re.search(r"\bhttp (\d{3})\b", text)
+    if m:
+        code = int(m.group(1))
+        return code >= 500 or code in (408, 409, 425, 429)
+    return any(mark in text for mark in _TRANSIENT_LLM_MARKS)
+
+
 def _context_chars(messages: list[dict]) -> int:
     """Approximate prompt size in characters, tool calls included."""
     total = 0
@@ -395,6 +590,169 @@ def _context_chars(messages: list[dict]) -> int:
                 pass
     return total
 
+
+def _tool_round_spans(messages: list[dict]) -> list[list[int]]:
+    """Indices of `tool` messages that belong to one assistant tool round.
+
+    A round is the contiguous run of `tool` messages that follows one
+    assistant message carrying `tool_calls`. Newest last. Grouped so the
+    most recent batch can stay whole while older batches get compressed.
+    """
+    rounds: list[list[int]] = []
+    current: list[int] = []
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            if current:
+                rounds.append(current)
+                current = []
+            continue
+        if m.get("role") == "assistant" and "tool_calls" in m:
+            if current:
+                rounds.append(current)
+            current = []
+        elif m.get("role") == "tool":
+            current.append(i)
+        else:
+            if current:
+                rounds.append(current)
+                current = []
+    if current:
+        rounds.append(current)
+    return rounds
+
+
+def _clamp_head_tail(body: str, head: int, tail: int, note: str) -> str:
+    keep = head + tail + len(note) + 4
+    if len(body) <= keep:
+        return body
+    return body[:head] + f"\n[…{note}: {len(body) - head - tail} chars elided]\n" + body[-tail:]
+
+
+async def _llm_compact(messages: list[dict], compaction_fn) -> bool:
+    """Replace all but the newest tool round with one instruction-driven
+    summary (prompts/compaction.md). Whole old rounds are dropped together so
+    assistant tool_call / tool-result pairing stays valid; the summary is
+    inserted as a single user message of established facts. Returns True when
+    the history was rewritten. Any failure leaves messages untouched so the
+    mechanical tiers remain the safety net."""
+    rounds = _tool_round_spans(messages)
+    if len(rounds) < 2:
+        return False
+    last_start = rounds[-1][0]
+    old = messages[1:last_start]
+    if not old:
+        return False
+    try:
+        summary = await compaction_fn(old)
+    except Exception:
+        return False
+    if not summary or not str(summary).strip():
+        return False
+    messages[1:last_start] = [{
+        "role": "user",
+        "content": ("[CONTEXT SUMMARY of earlier turns - treat as established "
+                    "facts; re-read a narrow range if you need exact text]\n"
+                    + str(summary).strip()),
+    }]
+    return True
+
+
+def _compact_context(messages: list[dict], budget_chars: int) -> bool:
+    """Compress old tool results and old assistant tool-call narration when
+    the prompt is carrying too much. The newest tool round and the most
+    recent assistant tool-call turn are always left whole — that is the
+    working set the model is writing from right now. Everything ahead of
+    the boundary is history; losing detail there is the whole point of
+    compaction.
+    Returns True when at least one message changed.
+    """
+    changed = False
+    if _context_chars(messages) <= budget_chars:
+        return False
+    rounds = _tool_round_spans(messages)
+    if not rounds:
+        return False
+
+    # Indices the model needs in full: the messages sitting inside the
+    # newest round of tool calls, plus the newest assistant turn that
+    # carries tool_calls (the turn that opened that round).
+    keep_assistants = set()
+    last_round = rounds[-1]
+    for i in range(len(messages)):
+        m = messages[i]
+        if isinstance(m, dict) and m.get("role") == "assistant" \
+                and isinstance(m.get("tool_calls"), list) and m["tool_calls"]:
+            keep_assistants.add(i)
+
+    def _inside_newest_round(idx: int) -> bool:
+        start = 0
+        for r in rounds:
+            if r[0] <= idx <= r[-1]:
+                return r is last_round
+            start = r[-1] + 1
+        return False
+
+    for idx, m in enumerate(messages):
+        if not isinstance(m, dict):
+            continue
+
+        # Assistant narration leading to a tool call: compress it. The
+        # progress ledger carries the operative facts; the prose was never
+        # load-bearing, just noisy.
+        body = m.get("content")
+        if m.get("role") == "assistant" \
+                and isinstance(m.get("tool_calls"), list) and m["tool_calls"]:
+            if isinstance(body, str) and len(body) > COMPACT_SAID_MIN \
+                    and idx != max(k for k in keep_assistants):
+                new = _clamp_head_tail(body, COMPACT_SAID_KEEP_HEAD,
+                                       COMPACT_SAID_KEEP_TAIL,
+                                       "context compacted")
+                if new != body:
+                    m["content"] = new
+                    changed = True
+            # Old tool-call arguments carry full file bodies (create_file /
+            # update_file / edit_file content). Left whole they accumulate and
+            # inflate the prompt with text that is already on disk and
+            # re-readable. Clamp them in old rounds; the newest round stays whole.
+            if idx != max(k for k in keep_assistants):
+                for tc in m["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    raw_args = fn.get("arguments", tc.get("arguments"))
+                    was_str = isinstance(raw_args, str)
+                    args = raw_args
+                    if was_str:
+                        try:
+                            args = json.loads(raw_args)
+                        except Exception:
+                            args = None
+                    if isinstance(args, dict):
+                        for k in ("content", "replace", "code", "new_str",
+                                  "find", "old_code"):
+                            v = args.get(k)
+                            if isinstance(v, str) and len(v) > 400:
+                                args[k] = v[:200] + f"…[{len(v) - 200} chars compacted]"
+                                changed = True
+                        if was_str:
+                            fn["arguments"] = json.dumps(args)
+                        else:
+                            tc["arguments"] = args
+            continue
+
+        if m.get("role") != "tool" \
+                or not isinstance(body, str) \
+                or len(body) < COMPACT_TOOL_MIN \
+                or _inside_newest_round(idx):
+            continue
+
+        new = _clamp_head_tail(body, COMPACT_TOOL_KEEP_HEAD,
+                               COMPACT_TOOL_KEEP_TAIL,
+                               "context compacted")
+        if new != body:
+            m["content"] = new
+            changed = True
+    return changed
 
 def _elide_oldest_tool_output(messages: list[dict]) -> bool:
     """Replace the oldest substantive tool result with a short marker.
@@ -454,10 +812,13 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                          prepare_fn=None,
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
+                         max_context_tokens: int = 0,
                          max_tool_result_chars: int | None = None,
                          capture_transcript: bool = False,
                          max_seconds: float = 0,
-                         max_total_tokens: int = 0) -> dict:
+                         max_total_tokens: int = 0,
+                         compaction_fn=None,
+                          short_answers: bool = False) -> dict:
     """The tool-use loop, factored for testability: `chat_fn(messages)`
     returns a gateway reply dict; `dispatch_fn(name, args)` returns result
     text. Returns the FINAL reply dict. Stops early with an explicit error
@@ -521,6 +882,8 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     last_reply: dict = {}
     repeats: dict[str, int] = {}
     succeeded: set[str] = set()
+    stall_recoveries = 0
+    last_verify_failure = ""
     # What this run has already done, as a short factual ledger handed back to
     # the model on the next hop so it does not repeat work it cannot see.
     ledger: list[str] = []
@@ -531,6 +894,10 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     # Runs page needs the node's true total, so accumulate across turns.
     usage_in = 0
     usage_out = 0
+    # Live prompt size in TOKENS, anchored to the gateway's real input_tokens
+    # after each model call; between calls we add ~len/4 for appended tool text.
+    # Compaction keys off this (real) rather than a pure char guess.
+    ctx_tokens = 0
 
     def _absorb(rep: dict) -> None:
         nonlocal usage_in, usage_out
@@ -576,6 +943,8 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
     # means exactly that many model calls (the old check allowed one extra).
     no_progress = 0
     empty_retries = 0
+    # Times the model has answered with its own thinking instead of an answer.
+    reasoning_leaks = 0
     # Consecutive hops on which the streamed call raised. One is a bad moment;
     # two is a backend that cannot stream this payload. See the except below.
     stream_failures = 0
@@ -627,14 +996,35 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                   f"handles, -{_saved:,} chars this hop "
                   f"(process total: {_fold_notes['n']} folded / "
                   f"{_fold_notes['chars']:,} chars)")
-        # Context budget: elide the oldest tool output until the prompt fits.
-        # Without this an uncapped run feeds every prior result back on every
+        # Context budget. Two tiers before the hard ceiling:
+        #   1) Compaction — approaching the limit, compress older tool results
+        #      and the assistant's own narration (the progress ledger keeps the
+        #      facts, so prose is the thing losing bytes).
+        #   2) Elision — still over, replace the oldest remaining result with a
+        #      "call again narrower" marker.
+        # Without both, an uncapped run feeds every prior result back on every
         # hop until the gateway rejects the request outright, losing the run.
-        if max_context_chars > 0:
-            while (_context_chars(messages) > max_context_chars
+        if max_context_chars > 0 or max_context_tokens > 0:
+            # The compaction limit IS the model's max context size. Prefer the
+            # REAL token count (gateway input_tokens) when the caller supplies the
+            # model window in tokens; fall back to the char budget otherwise.
+            compact_target = max_context_chars or max_context_tokens * 4
+            _over = _context_chars(messages) > compact_target or (
+                max_context_tokens > 0
+                and ctx_tokens > max_context_tokens * 4 // 5)
+            # Instruction-driven compaction first (prompts/compaction.md): an
+            # LLM summarizes the old rounds into one structured state message,
+            # preserving goals/decisions/files/tests instead of blind clipping.
+            # Falls back to the mechanical tiers below if absent or it fails.
+            if compaction_fn is not None and _over:
+                await _llm_compact(messages, compaction_fn)
+            _compact_context(messages, compact_target)
+            while (max_context_chars > 0
+                   and _context_chars(messages) > max_context_chars
                    and _elide_oldest_tool_output(messages)):
                 pass
-            if _context_chars(messages) > max_context_chars:
+            ctx_tokens = _context_chars(messages) // 4
+            if max_context_chars > 0 and _context_chars(messages) > max_context_chars:
                 return _finish({"text": "", "tool_calls": [],
                         "provider": last_reply.get("provider", ""),
                         "input_tokens": usage_in,
@@ -642,35 +1032,89 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                         "error": f"context budget exceeded "
                                  f"({_context_chars(messages)} chars) — "
                                  "answer from what you already have"})
-        if chat_stream_fn is not None and not _batched_once:
+        # A model call that fails for a reason on the SERVER's side (a 502 from a
+        # free provider, a rate limit, a dropped connection) must not throw away
+        # a run that is already 40 tool calls deep. Live 2026-11-22: a
+        # `gateway HTTP 502: {"detail":"kilo failed: "}` at hop 9 of a large
+        # build killed the run after 191s and left the user with nothing.
+        # Retried with backoff; anything else (a bad request, a refusal) is
+        # raised at once, because retrying it changes nothing.
+        attempts = 0
+        while True:
+            attempts += 1
             try:
-                # The streamed path forwards each text delta through on_event as
-                # it arrives, so the answer appears token by token instead of in
-                # one lump after the model has finished.
-                reply = await chat_stream_fn(
-                    messages, lambda d: _emit("text", {"delta": d}))
-            except Exception:
-                # A backend that cannot stream with tools (or a mid-stream drop)
-                # must not fail the run: fall back to the batched call for THIS
-                # hop. It used to also switch streaming off for every remaining
-                # hop, which is what made a Discuss turn feel dead: one empty
-                # or dropped stream at hop 1 meant the answer to the user's
-                # actual question arrived as one lump at the end, even though
-                # the next three hops were perfectly streamable. Two
-                # consecutive failures is a capability problem; one is a bad
-                # moment, and the retry on the next hop is free.
-                stream_failures += 1
-                if stream_failures >= 2:
-                    chat_stream_fn = None
-                reply = await chat_fn(messages)
-            else:
-                stream_failures = 0
-        else:
-            reply = await chat_fn(messages)
+                if chat_stream_fn is not None and not _batched_once:
+                    try:
+                        # The streamed path forwards each text delta through
+                        # on_event as it arrives, so the answer appears token by
+                        # token instead of in one lump after the model has
+                        # finished.
+                        reply = await chat_stream_fn(
+                            messages, lambda d: _emit("text", {"delta": d}))
+                    except Exception:
+                        # A backend that cannot stream with tools (or a
+                        # mid-stream drop) must not fail the run: fall back to
+                        # the batched call for THIS hop. It used to also switch
+                        # streaming off for every remaining hop, which is what
+                        # made a Discuss turn feel dead: one empty or dropped
+                        # stream at hop 1 meant the answer to the user's actual
+                        # question arrived as one lump at the end, even though
+                        # the next three hops were perfectly streamable. Two
+                        # consecutive failures is a capability problem; one is a
+                        # bad moment, and the retry on the next hop is free.
+                        stream_failures += 1
+                        if stream_failures >= 2:
+                            chat_stream_fn = None
+                        reply = await chat_fn(messages)
+                    else:
+                        stream_failures = 0
+                else:
+                    reply = await chat_fn(messages)
+                break
+            except Exception as e:
+                # A free tier's rate limit is a WAIT, not a verdict: the same
+                # request usually succeeds a few seconds later. Five attempts
+                # with a longer base is what keeps a 40-call run alive through
+                # one — live 2026-11-22, a 429 at call 12 of a large build ended
+                # the run with an empty answer.
+                rate_limited = _is_rate_limit_error(e)
+                limit = _LLM_RATE_LIMIT_ATTEMPTS if rate_limited else _LLM_MAX_ATTEMPTS
+                if attempts >= limit or cancel_requested() \
+                        or not _is_transient_llm_error(e):
+                    raise
+                base = _LLM_RATE_LIMIT_BASE_S if rate_limited else _LLM_RETRY_BASE_S
+                delay = base * (2 ** (attempts - 1))
+                if rate_limited:
+                    # Wait what it asked for when it said, else back off — and
+                    # never wait so long that the person thinks it died.
+                    delay = _retry_after_seconds(e) or min(delay, _LLM_RATE_LIMIT_MAX_S)
+                _emit("status", {"text": (
+                    f"model call failed ({str(e)[:120]}) — retrying in "
+                    f"{delay:.0f}s ({attempts}/{limit - 1})")})
+                await asyncio.sleep(delay)
         _batched_once = False
         last_reply = reply
         _absorb(reply)
+        # Anchor the live context size to the gateway's REAL prompt tokens for
+        # this call (corrects the between-call char estimate).
+        if int(reply.get("input_tokens") or 0) > 0:
+            ctx_tokens = int(reply["input_tokens"])
         tool_calls = reply.get("tool_calls") or []
+        # A tool call with no usable name is malformed, and letting it through
+        # poisons the rest of the run: the assistant turn carries a call the
+    # provider then refuses ("function.name must be a string"), so every later
+    # request in the same conversation 400s. Drop it here and say so, which
+    # keeps the history valid and tells the model what to fix.
+        dropped_calls = [tc for tc in tool_calls
+                         if not str((tc or {}).get("name") or "").strip()]
+        if dropped_calls:
+            tool_calls = [tc for tc in tool_calls if tc not in dropped_calls]
+            reply = dict(reply)
+            reply["tool_calls"] = tool_calls
+            last_reply = reply
+            _emit("status", {"text": (
+                f"ignored {len(dropped_calls)} tool call(s) with no name — "
+                "call the tool by its name")})
         if not tool_calls:
             _from_text = _text_tool_calls(reply.get("text") or "")
             if _from_text:
@@ -681,13 +1125,48 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 reply = dict(reply)
                 reply["text"] = ""
                 last_reply = reply
+        # Reasoning arriving as the ANSWER. Some providers stream their thinking
+        # in `content` instead of a reasoning field, so the run ends with a
+        # paragraph of deliberation where the answer should be — and the parser
+        # did nothing wrong, it was handed prose. Live: "We need build project.
+        # Need inspect environment…" became the reply to a build task.
+        #
+        # This is a parser-level repair, not a prompt rule: the text is moved to
+            # the thinking channel and the hop is retried, so the model gets to
+            # answer. Bounded, because a model that always does this is a model
+            # that cannot finish, and one honest attempt is worth spending.
+        if not tool_calls and _looks_like_reasoning(reply.get("text") or "",
+                                                  short_answers):
+            if reasoning_leaks < _MAX_REASONING_LEAKS:
+                reasoning_leaks += 1
+                # Keep going rather than ending: the model is mid-thought, often
+                # right after a failing check, and a fresh turn with its own
+                # words in the history is what lets it act. Ending here is how a
+                # run stopped with 72 failing tests it had just written.
+                _emit("thinking", {"text": str(reply.get("text") or "")[:4000]})
+                messages.append({"role": "assistant",
+                                 "content": str(reply.get("text") or "")})
+                _emit("status", {"text": "the model sent its thinking as the "
+                                         "answer — continuing"})
+                await asyncio.sleep(_LLM_RETRY_BASE_S)
+                continue
+            # Out of retries: say so. Passing the deliberation through as the
+            # answer is the one outcome that looks like success while saying
+            # nothing — the person reads a wall of thinking and believes the run
+            # finished.
+            return _finish({
+                "text": "", "tool_calls": [],
+                "provider": last_reply.get("provider", ""),
+                "input_tokens": usage_in, "output_tokens": usage_out,
+                "error": "the model answered with its own reasoning "
+                         f"{reasoning_leaks + 1} times and produced no answer"})
+
         if not tool_calls and not str(reply.get("text") or "").strip():
-            # An empty reply is not an answer. On the streaming path the
             # upstream occasionally completes with zero text and zero calls
             # (observed with Gemini: 55s, output_tokens=0), which surfaced as
             # "ran out of steps" even though no tool had run. Retry once on the
             # batched path, which is also what happens if the stream raises.
-            if empty_retries < 1:
+            if empty_retries < _EMPTY_REPLY_RETRIES:
                 empty_retries += 1
                 hop -= 1
                 # The retry goes out on the batched path — a different request
@@ -695,14 +1174,18 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 # but streaming is NOT switched off. Disabling it here is what
                 # turned one bad completion into a silent console for the rest
                 # of the turn, and the user's own question is usually several
-                # hops later.
+                # hops later. Two empty completions in a row is a provider bad
+                # moment, not a verdict: the second retry is cheap and the run
+                # it saves is 40 tool calls deep.
                 _batched_once = True
+                await asyncio.sleep(_LLM_RETRY_BASE_S * (empty_retries + 1))
                 continue
             return _finish({"text": "", "tool_calls": [],
                     "provider": reply.get("provider", ""),
                     "input_tokens": usage_in,
                     "output_tokens": usage_out,
-                    "error": "the model returned an empty reply twice "
+                    "error": f"the model returned an empty reply "
+                             f"{empty_retries + 1} times "
                              "(no text and no tool call)"})
         if not tool_calls:
             # No tool calls = the run is over. Replace the single turn's
@@ -711,6 +1194,7 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             reply = dict(reply)
             reply["input_tokens"] = usage_in
             reply["output_tokens"] = usage_out
+            reply["context_chars"] = _context_chars(messages)
             return _finish(reply)
 
         # Prepare EVERY call before dispatching any: the repeat guard is cheap
@@ -718,12 +1202,13 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
         # rewrite can still change what a tool receives (once a call is out
         # over the wire it is too late).
         prepared: list[dict] = []
+        _recover = False
         for tc in tool_calls:
             _name = tc.get("name", "")
             _raw = tc.get("arguments") or {}
             key = _call_key(_name, _raw)
             repeats[key] = repeats.get(key, 0) + 1
-            if repeats[key] > MAX_SAME_CALL_REPEATS:
+            if repeats[key] > MAX_SAME_CALL_REPEATS and _name not in _REPEAT_EXEMPT_READS:
                 # A repeat of a call that already SUCCEEDED is not a stall, it
                 # is a model that has what it needs and is looping anyway.
                 # Observed live: render_document returned 200 and stored the
@@ -731,19 +1216,30 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 # aborted the loop - so the node died holding a real document
                 # and the receipt reported nothing. Break out and keep it.
                 if key in succeeded:
+                    if stall_recoveries < MAX_STALL_RECOVERIES and last_verify_failure:
+                        # The edit already applied but the model is re-issuing
+                        # it - usually because tests still fail and it is fixing
+                        # the wrong thing. Redirect instead of aborting.
+                        stall_recoveries += 1
+                        repeats[key] = 0
+                        _recover = True
+                        break
                     # A repeat of a call that already SUCCEEDED is not a stall, it
                     # is a model that has what it needs and is looping anyway.
                     # Observed live: render_document returned 200 and stored the
                     # PDF, the model called it again unchanged, and this guard
                     # aborted the loop - so the node died holding a real document
-                    # and the receipt reported nothing. Break out and keep it.
-                    return _finish({"text": reply.get("text", "") or "",
-                            "tool_calls": [],
-                            "provider": reply.get("provider", ""),
+                    # and the receipt reported nothing. Break out and keep it —
+                    # but FIRST ask the caller for one final tool-less pass so the
+                    # run ends with an answer rather than a cut-off reply.
+                    return _finish({"text": "", "tool_calls": [],
+                            "provider": last_reply.get("provider", ""),
                             "input_tokens": usage_in,
                             "output_tokens": usage_out,
                             "note": ("repeated an already-successful call; "
-                                     "stopping the loop")})
+                                     "final pass requested"),
+                            "needs_wrap_up": True,
+                            "wrap_up_messages": list(messages)})
                 return _finish({"text": "", "tool_calls": [],
                         "provider": reply.get("provider", ""),
                         "input_tokens": usage_in,
@@ -761,6 +1257,24 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                              "key": key, "skey": _call_key(_name, _args),
                              "id": (tc.get("id") or
                                     f"t{hop}_{len(prepared)}")})
+
+        # A bounded recovery: the model re-issued an already-successful call
+        # while verification still fails. Skip dispatching the duplicate (and
+        # its assistant turn, to keep tool_call/tool pairing valid) and hand the
+        # model the failing output plus a directive to fix the root cause.
+        if _recover:
+            note = ("[harness] You re-issued a tool call that already succeeded, "
+                    "but the task is not finished. ")
+            if last_verify_failure:
+                note += ("Your last test/check run still fails:\n"
+                         + last_verify_failure + "\n")
+            note += ("Change strategy: fix the ROOT CAUSE (for example tests "
+                     "sharing one storage file, or actions that cannot be "
+                     "serialized), not the same edit again. Give tests an "
+                     "isolated storage path (tmp_path). Do not repeat the "
+                     "identical call.")
+            messages.append({"role": "user", "content": note})
+            continue
 
         # A Stop that lands after the model has asked for tools must not fire
         # them: these are side-effecting calls — file writes, renders,
@@ -856,8 +1370,19 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
                 *(_run_one(p) for p in prepared))
 
         for p, ok, result_text, latency in results:
+            if p["name"] in ("run_command", "run_checks") and (
+                    not ok or '"ok": false' in result_text
+                    or "failed" in result_text.lower()):
+                last_verify_failure = result_text[:1500]
             if ok:
                 succeeded.add(p["skey"])
+                if p["name"] in _WRITE_TOOLS:
+                    # The tree moved, so a later identical check is a new
+                    # measurement rather than the same call twice. The write's
+                    # OWN counter is kept: create_file called three times with
+                    # the same arguments is a loop, and clearing it here is what
+                    # would let that run forever.
+                    repeats = {k: v for k, v in repeats.items() if k == p["skey"]}
                 # name(args) -> what it actually returned. The outcome is the
                 # part the model cannot recover from the result alone: it tells a
                 # truncated read apart from a complete one, which is what stops
@@ -915,6 +1440,31 @@ async def run_tool_loop(*, messages: list[dict], chat_fn, dispatch_fn,
             # id. Recorded at append so it survives a replay of the transcript.
             if _tc_id:
                 tool_names_by_id[_tc_id] = p["name"]
+            # Between model calls, grow the token estimate by the appended text.
+            ctx_tokens += len(body) // 4
+            # Recompute after EVERY tool result. Trigger off REAL tokens when the
+            # caller supplies the model window (max_context_tokens), else chars.
+            if max_context_chars > 0 or max_context_tokens > 0:
+                _ct = max_context_chars or max_context_tokens * 4
+                _over = _context_chars(messages) > _ct or (
+                    max_context_tokens > 0
+                    and ctx_tokens > max_context_tokens * 4 // 5)
+                if _over:
+                    if compaction_fn is not None:
+                        await _llm_compact(messages, compaction_fn)
+                    _compact_context(messages, _ct)
+                    while (max_context_chars > 0
+                           and _context_chars(messages) > max_context_chars
+                           and _elide_oldest_tool_output(messages)):
+                        pass
+                    ctx_tokens = _context_chars(messages) // 4
+                if on_event is not None:
+                    try:
+                        on_event("context", {"chars": _context_chars(messages),
+                                             "cap": max_context_chars,
+                                             "tokens": ctx_tokens})
+                    except Exception:
+                        pass
 
         # Progress guard for the uncapped loop. `succeeded` only grows on a NEW
         # successful call, so a hop that merely re-reads (even at a fresh
@@ -963,6 +1513,50 @@ def _context_node_affinity():
         return None
 
 
+async def _stream_wrap_up(*, messages, agent, session_id, provider_pin,
+                          model=None, route_affinity=None,
+                          max_tokens=2048, temperature=0.3,
+                          on_event=None) -> dict:
+    """One final, tool-less pass at the model — the honest end of a turn that
+    was looping a call it had already completed.
+
+    The model was being asked for one more thing when it had nothing left to do;
+    the answer the user gets used to be the stall note. This issues the final
+    pass with no tool schema at all, streams the deltas through the same
+    `on_event("text", ...)` path the rest of the run uses, and returns the
+    closing reply in the loop's own shape. If the caller passes `on_event`,
+    the deltas go through it; either way the text is collected here.
+    """
+    parts: list[str] = []
+    async for ev in LLM().stream_chat(
+            messages=messages,
+            tools=None,
+            agent=agent, session=session_id,
+            provider=provider_pin, model=model,
+            route_affinity=route_affinity,
+            max_tokens=max_tokens, temperature=temperature):
+        kind = ev.get("type")
+        if kind == "text":
+            chunk = ev.get("text") or ""
+            parts.append(chunk)
+            if on_event is not None:
+                try:
+                    on_event("text", {"delta": chunk})
+                except Exception:
+                    pass
+        elif kind == "done":
+            return {
+                "text": "".join(parts),
+                "provider": ev.get("provider") or "",
+                "input_tokens": ev.get("input_tokens") or 0,
+                "output_tokens": ev.get("output_tokens")
+                    or len("".join(parts)) // 4,
+            }
+    return {"text": "".join(parts), "provider": "",
+            "input_tokens": 0,
+            "output_tokens": len("".join(parts)) // 4}
+
+
 async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          agent: str, session_id: str,
                          provider_pin: str | None = None,
@@ -982,11 +1576,14 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                          browser_sid: str = "",
                          allowed_tools: set[str] | None = None,
                          max_context_chars: int = 0,
+                         max_context_tokens: int = 0,
                          max_tool_result_chars: int | None = None,
                          capture_transcript: bool = False,
                          stream: bool = False,
                          max_seconds: float = 0,
-                         max_total_tokens: int = 0) -> dict:
+                         max_total_tokens: int = 0,
+                         compaction_fn=None,
+                         short_answers: bool = False) -> dict:
     """Multi-turn chat: dispatch tool_calls via MCP, keep going until the
     model returns text. Returns the FINAL gateway reply dict (so callers
     can read `text`, `provider`, etc. the same way they would for a
@@ -1130,29 +1727,22 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
 
                 async def _chat_stream(messages: list[dict],
                                        on_text=None) -> dict:
-                    # Same reply shape as _chat, but assembled from the stream.
-                    # Usage is absent from a streamed response, so output tokens
-                    # are estimated; the loop's own accounting overwrites them
-                    # with the sum across hops either way.
+                    # Same reply shape as _chat, assembled from the stream. The
+                    # gateway now forwards the provider's real usage on `done`;
+                    # capture it so the loop's accounting is exact. Only fall
+                    # back to a char estimate if a backend omits usage.
                     parts: list[str] = []
                     reasoning: list[str] = []
                     tool_calls: list[dict] = []
                     provider = ""
-                    # Which model actually answered (distinct from the `model`
-                    # this closure was called with: rebinding that would pin the
-                    # pinned value for every later hop).
+                    usage_in_hop = 0
+                    usage_out_hop = 0
                     answered = ""
                     async for ev in LLM().stream_chat(
                             messages=messages, tools=tools_payload,
                             agent=agent, session=session_id,
                             provider=provider_pin, model=model,
                             max_tokens=max_tokens, temperature=temperature,
-                            # The streamed branch is the same loop's hops, so it
-                            # must carry the same affinity. Without it the code
-                            # agent — the longest, most repetitive prompt in the
-                            # system, and the one path that always streams —
-                            # would keep bouncing across providers and cache on
-                            # none of them.
                             route_affinity=route_affinity):
                         kind = ev.get("type")
                         if kind == "text":
@@ -1161,9 +1751,6 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                             if on_text and chunk:
                                 on_text(chunk)
                         elif kind == "thinking":
-                            # The model's reasoning. Forwarded live on its own
-                            # event (the panel shows it collapsed) and kept so the
-                            # final reply can report it too.
                             piece = ev.get("text") or ""
                             if piece:
                                 reasoning.append(piece)
@@ -1176,16 +1763,15 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                             tool_calls = ev.get("tool_calls") or []
                         elif kind == "done":
                             provider = ev.get("provider") or provider
-                            # Which model actually answered. With "Auto" the
-                            # caller pinned none, so this is the only way the
-                            # panel can say what replied.
                             answered = ev.get("model") or answered
+                            usage_in_hop = int(ev.get("input_tokens") or 0)
+                            usage_out_hop = int(ev.get("output_tokens") or 0)
                     text = "".join(parts)
                     return {"text": text, "tool_calls": tool_calls,
                             "provider": provider, "model": answered,
                             "reasoning": "".join(reasoning),
-                            "input_tokens": 0,
-                            "output_tokens": len(text) // 4}
+                            "input_tokens": usage_in_hop,
+                            "output_tokens": usage_out_hop or len(text) // 4}
 
                 loop_result = await run_tool_loop(
                     messages=_messages, chat_fn=_chat,
@@ -1198,10 +1784,49 @@ async def run_with_tools(*, prompt: str = "", tools_payload: list[dict],
                     prepare_fn=prepare_fn,
                     allowed_tools=allowed_tools,
                     max_context_chars=max_context_chars,
+                    max_context_tokens=max_context_tokens,
                     max_tool_result_chars=max_tool_result_chars,
                     capture_transcript=capture_transcript,
                     max_seconds=max_seconds,
-                    max_total_tokens=max_total_tokens)
+                    max_total_tokens=max_total_tokens,
+                    compaction_fn=compaction_fn,
+                    short_answers=short_answers)
+                if loop_result and loop_result.get("needs_wrap_up"):
+                    # The model repeated an already-successful call with no
+                    # closing answer. Give it one final tool-less pass so the
+                    # turn ends with a real answer rather than the stall
+                    # note. Streams through the same event path as the rest of
+                    # the turn; if it fails, the honest stall outcome stands.
+                    instruction = {
+                        "role": "user",
+                        "content": ("Stop calling tools. You have everything you "
+                                    "need: write your final answer now."),
+                    }
+
+                    try:
+                        wrap = await _stream_wrap_up(
+                            messages=list(loop_result.get("wrap_up_messages") or _messages)
+                            + [instruction],
+                            agent=agent, session_id=session_id,
+                            provider_pin=provider_pin, model=model,
+                            route_affinity=route_affinity,
+                            max_tokens=max_tokens, temperature=temperature,
+                            on_event=on_event)
+                        loop_result = dict(loop_result)
+                        loop_result["text"] = wrap.get("text") or ""
+                        loop_result["provider"] = (wrap.get("provider")
+                                                   or loop_result.get("provider", ""))
+                        loop_result["input_tokens"] = (int(loop_result.get("input_tokens") or 0)
+                                                       + int(wrap.get("input_tokens") or 0))
+                        loop_result["output_tokens"] = (int(loop_result.get("output_tokens") or 0)
+                                                        + int(wrap.get("output_tokens") or 0))
+                        loop_result["wrap_up"] = True
+                        loop_result.pop("needs_wrap_up", None)
+                        loop_result.pop("wrap_up_messages", None)
+                    except Exception as _e:
+                        print(f"[mcp] wrap-up pass failed: "
+                              f"{type(_e).__name__}: {_e}")
+                        loop_result["wrap_up_failed"] = True
     except McpUnavailable:
         raise
     except BaseException as e:

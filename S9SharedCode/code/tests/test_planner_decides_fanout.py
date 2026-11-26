@@ -87,27 +87,7 @@ def test_the_planner_prompt_no_longer_prescribes_a_range():
         assert must in prompt, must
 
 
-def test_the_prompt_ties_facet_count_to_page_count():
-    """Facet count is banded, not open-ended.
-
-    This used to assert a 25-60 range for book-length documents. That was
-    reversed on measurement: 20 narrow facets produced 13,031 words for 1.1M
-    tokens while 12 produced 8,129 words for 1M, because each extra node
-    re-reads the same background pages. 6-10 BROAD facets is the current
-    target, and the non-overlap rule is what stops coverage being bought
-    twice."""
-    prompt = PROMPT.read_text(encoding="utf-8")
-    low = prompt.lower()
-    assert re.search(r"pages?\s*x\s*450|evidence needed|words of evidence",
-                  prompt, re.I), (
-        "facet count must be DERIVED from the document target, not a "
-        "fixed band: 6 facets x the 1,500-word floor cannot produce a "
-        "60-page document")
-    assert "not overlap" in low or "must not overlap" in low, (
-        "the non-overlap rule is gone; two facets fetching the same pages "
-        "pays for them twice and keeps one half")
-    assert "broad" in low, (
-        "facets must be broad subject areas, not single details, or each "
-        "researcher has too little to write about")
-    for must in ("retriever", "researcher", "author", "formatter", "deck"):
-        assert must in prompt, must
+# Facet sizing (pages×450 arithmetic, non-overlap, "broad") was removed with the
+# rest of the planner's prescriptive strategy; the planner now decides the fleet
+# from the request. The remaining fan-out invariants (no hard cap, no slicing,
+# deferral preserves nodes) are asserted above.

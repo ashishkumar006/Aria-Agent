@@ -477,10 +477,13 @@ _READ = {
     "log": (["log", "--oneline", "-n", "30"], False),
     "branch": (["branch", "--show-current"], False),
     "branches": (["branch", "--list"], False),
+    # Workspaces (OpenCode-style): each is an isolated git worktree on its own
+    # branch. Read-only here; creating/removing are actions below.
+    "worktrees": (["worktree", "list", "--porcelain"], False),
 }
 GIT_ACTIONS = sorted(list(_READ) + [
     "stage", "unstage", "commit", "stash", "stash_pop", "branch_create",
-    "branch_switch", "restore",
+    "branch_switch", "restore", "worktree_add", "worktree_remove",
 ])
 REFUSED = {
     "push": "pushing publishes to a remote other people read — do it yourself",
@@ -562,6 +565,28 @@ def git_argv(action: str, args: dict | None = None) -> dict:
         return {"ok": True, "argv": ["restore", "--"] + paths,
                 "moves_head": True, "needs_confirm": True,
                 "summary": f"discard the changes in {len(paths)} file(s)"}
+    if a == "worktree_add":
+        # A workspace is an isolated worktree on its own branch. The branch is
+        # `opencode/<name>` (OpenCode's convention); the path is chosen by the
+        # caller and must be OUTSIDE the repo (the route enforces that).
+        name = _branch_name(args.get("name"))
+        path = str(args.get("path") or "").strip()
+        if not name:
+            return {"ok": False, "error": "a workspace needs a name"}
+        if not path:
+            return {"ok": False, "error": "a workspace needs a target path"}
+        branch = name if name.startswith("opencode/") else f"opencode/{name}"
+        return {"ok": True,
+                "argv": ["worktree", "add", "-b", branch, path],
+                "moves_head": False, "needs_confirm": False,
+                "summary": f"create workspace {name} on {branch}"}
+    if a == "worktree_remove":
+        path = str(args.get("path") or "").strip()
+        if not path:
+            return {"ok": False, "error": "which workspace?"}
+        return {"ok": True, "argv": ["worktree", "remove", path],
+                "moves_head": False, "needs_confirm": True,
+                "summary": f"remove workspace {path}"}
     return {"ok": False, "error": f"unhandled git action {a!r}"}
 
 

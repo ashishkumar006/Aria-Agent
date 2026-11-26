@@ -35,7 +35,7 @@ Verified against the current tree, with the file that proves it.
 | **Editable Monaco**, not a viewer | `console-frontend/src/components/MonacoEditor.tsx:281` (`readOnly: false`), per-file `createModel`/`setModel` (345-348), `setModelLanguage` (355), real markers via `setModelMarkers` (366), minimap (293) |
 | Save writes back with conflict guard | `api.codeWrite(..., {confirm:true, mtime})` (`Code.tsx:1888`); 409 on mtime drift (`agent_server.py:7297`); atomic write + `STATE_DIR/code-backups` |
 | **Real PTY terminal** | `@app.websocket("/api/terminal")` (`agent_server.py:371`) → `terminal.py:52 PtySession` (pywinpty); `@xterm/xterm ^6.0` already wired in `TerminalDock.tsx` with `addon-fit` + `addon-webgl` |
-| Agent tool loop with rich frames | `POST /api/code/agent` (`agent_server.py:7683`); frames `status, tool_call, tool_result, plan, permission, write, thinking, delta, verify, done, error` (`_sse`, 14220); `_CODE_AGENT_MAX_HOPS=60` (6165), context cap 600k (6170), verify-fix rounds 2 (6185) |
+| Agent tool loop with rich frames | `POST /api/code/agent` (`agent_server.py:7683`); frames `status, tool_call, tool_result, plan, permission, write, thinking, delta, verify, done, error` (`_sse`, 14220); `_CODE_AGENT_MAX_HOPS=0` (no ceiling, since 2026-11-07 — the user removed the 60-hop cap), `max_tokens` default 8192 per hop (gateway clamps to the provider's window), context cap 600k (6170), verify-fix rounds 2 (6185) |
 | 17 coding MCP tools the agent can call | `mcp_server.py`: `read_file` 1807, `list_dir` 1862, `search_files` 1599, `create_file` 2422, `update_file` 2448, `edit_file` 2459, `delete_file` 1580, `make_dir` 2438, `run_command` 2109, `run_checks` 2013, `git_inspect` 2192, `document_symbols` 2306, `find_references` 2324, `blast_radius` 2346, `preview_edit` 2366, `apply_symbol_edit` 2398, `find_symbol` 2239 |
 | Per-hunk revert, keep, revert-all | `GET /api/code/agent/changes` 7448, `POST …/keep` 7464, `…/revert-hunk {path,hunk}` 7608, `…/revert` 7644 |
 | Gutter change marks from the last agent edit | `MonacoEditor.tsx:406-438` (`aria-agent-{add,mod,del}-gutter`), `lib/diffMarks.ts` |
@@ -307,8 +307,13 @@ What `/studio` is now:
   The same composer card is pinned under a transcript, so the thing you type into never
   moves.
 * **Right = the workbench**, brought out when there is a file to look at and dismissed
-  when there isn't. Buffers survive hiding. Its drawer holds the tree, the workspace
-  search and the Changes panel; the editor has `source ⇄ review`.
+  when there isn't. Buffers survive hiding. Its sections — Files, Search, Changes, Git,
+  Browser, Runs — live behind a 46px icon-only activity bar on its far right (added
+  2026-11-07). Clicking one opens its panel sliding in from the right; clicking the
+  active one closes it; the agent opens the same panel when it has something to show.
+  The divider between the panel and the editor resizes it (200–520px, persisted per
+  browser as `aria.studio.drawer`; keyboard: arrows nudge, Shift+arrows move far,
+  Home/End bound it). Buffers survive hiding, as before. The editor has `source ⇄ review`.
 * Type scale 12.5–15px body, 24px hero, real padding. The dense 10.5px chrome is gone.
 
 Two defects this layout exposed, both fixed and both silent before:
@@ -333,6 +338,55 @@ behind the file's own Revert. `studio_review.pending_diff()` recomputes baseline
 for both the listing and the apply, which is also what makes `hunk_id` the handle that
 protects a click from landing on a region that moved.
 
+**The activity bar (2026-11-07).** The labelled strip above the editor — five text
+buttons plus a close — was what the user saw as clutter. It is now a 46px icon-only
+activity bar on the far right, always visible and independent of the workbench: the
+sections open on their own to the left of the bar, as a resizable pixel pane
+(`useSplitPx`, 200–520px, persisted as `aria.studio.drawer`), without dragging the
+editor, the dock and the tabs in with them. Clicking the active icon closes the
+panel; the agent opens the same panel when it has something to show. The divider
+is a real `role="separator"` (arrows nudge by 16px, Shift by 64px, Home/End bound
+it). The workbench (editor, dock, tabs) keeps its own show/hide toggle at the
+bottom of the bar. The palette was aligned to the console's neutral hex vocabulary
+in the same pass. **Runs joined the bar the same day**: a ScrollText icon with a
+blue live counter, opening the RUNS panel (`RunsPanel.tsx`) — this session's runs,
+one click from the list into the full frame log (timeline fold + raw per-frame
+view), live-following, ledger cost, stop-at-next-hop. `browser.tools` was also
+flipped on in the same session, and `state/code-studio/` was wiped clean at the
+user's explicit instruction ("Everything in studio").
+
+**The session column (2026-11-07, same day).** Next to the bar sits an always-open
+`Session` panel (`SessionPanel.tsx`): the selected model's real context window read
+from the gateway's catalogue (no invented meter — the 600k-char elision ceiling is
+gone from every surface), the project
+folders/branch/unreviewed count, the approve section (`Changes waiting` + the
+per-file +/− rows — moved out of the transcript where it cost the conversation
+half its height), and this session's runs with live/finished/stopped/error
+glyphs. Resizable 220–420px, persisted as `aria.studio.sessionpanel`. It steps
+aside when any section panel opens (the two trade places) and returns when
+the last section closes; at rest the studio shows conversation + session
+column + activity bar. The coding
+agent's default 60-hop ceiling was removed (`_CODE_AGENT_MAX_HOPS` 0 = no
+ceiling; explicit positive values still clamp to 200); the composer's `hop N/M`
+chip hides itself at the unbounded default and the transcript shows `N steps`
+without a fake ratio. The left rail groups sessions by their first folder with a
+per-folder live/finished/stopped/error state column driven by new `live`/
+`last_status` fields on `/api/studio/sessions`. Rows are single lines under a
+folder group. A session switch never flashes the empty hero: the panel paints
+a skeleton until the run list lands (verified at 60–240 ms on a warm page), then
+the replay mounts atomically. The Usage rows show everything derived from the
+registry (tokens in/out, tool calls, elapsed) and from the gateway ledger for
+the newest finished run (cost + cache reads/creates); a ledger that cannot be
+read says `unknown`, it does not draw $0.
+
+**The transcript reads like the product now.** File paths in answers render as
+buttons that open the review surface (foldered refs directly, bare filenames via
+the mentions route with one exact match required — anything else gets an honest
+note in the transcript). The tool/thinking disclosure is a single expandable
+"thinking…" line whose body is the tool timeline, not a second card. Streaming
+batches deltas at 45ms and the view only chases the bottom when the reader is
+already within 160px of it — scrolling up to reread while the agent types no
+longer yanks you down.
 
 ---
 
@@ -524,3 +578,110 @@ sessions" — is exactly what slice 9's session-scoped context exists to prevent
 * Bounded and visible: snapshot chars per action, frames kept per session, idle TTL, contexts
   and shells per session, and a per-call timeout — each shown in the UI rather than enforced
   invisibly, because an unlabelled ceiling is the thing that makes a browser tool feel cursed.
+
+## 12. The console-wide sweep and studio polish pass (2026-11-09)
+
+Prompted by five named complaints plus a full console test order, this pass
+changed and proved the following. The complaint history matters, so this
+records both: what was asked, and what it turned out to cost.
+
+**Asked: a "+" to start a session inside a folder group.** Shipped on the
+folder group's header in the session rail. First attempt bound the
+sessions index's folder NAME as a path — every existing row stores names
+only — and the new session opened "no folder yet" with no error to read.
+Fixed by resolving the absolute path from the roots API of any session in
+the group at click time; a name that cannot be resolved refuses with a
+status line instead of an empty session. A second trap, from the test side
+rather than the product: after a remount the rail is new DOM, and a click
+dispatched on the found-but-detached node never reaches React's delegated
+listener — the plus worked only once the node was re-queried after the
+switch. The folder group's count pill and collapse behaviour are unchanged.
+
+**Asked: remove the dots in the session rail.** Removed the per-row status
+glyph entirely; the folder group keeps its blue live-count pill (not a
+dot) and the row keeps the timestamp and the hover archive verb.
+
+**Asked: the file tree should look like VS Code.** The Explorer now paints
+file-type glyphs coloured by extension, tan folder open/closed icons,
+indent guides on the same 12px ladder the rows indent by, a full-width
+active-file highlight, a collapse-all verb, and its own `EXPLORER`
+micro-label where the VS Code tree keeps it. The 4000-row virtualization
+from before is untouched.
+
+**Asked: clicking a file link opens "a big section engulfing the actual
+agent".** Reproduced, then redesigned: a transcript file-link never opens
+the workbench now. It expands an inline single-section diff inside the
+answer — green added / red removed lines, per-hunk Keep/Undo
+(fingerprint ids), file-level Keep/Revert, fold, close. Unchanged files
+honestly render "nothing unreviewed for this file" with an open-in-editor
+verb. This is a different review posture from the Monaco side-by-side
+review editor, which remains the explicit "open the file" destination and
+keeps its F8/Esc keyboard verbs.
+
+**Asked: make this section (the drawer) and other sections more visually
+appealing.** Both drawers and the session column now draw from one
+vocabulary: accent Tile + micro-label card heads, hairline-divider section
+labels, and a whisper of violet at the panel's top corner. The git
+drawer was rebuilt end to end — branch chip, segmented
+Changes/Log/Journal switch, VS Code SCM letters (A/M/D/U) on tinted chips,
+violet stage checkbox, draft-in-input, violet commit primary, timelines in
+log and journal. Branch display was wrong in two places
+(`## master...origin/master`); both now parse porcelain and show `master`.
+
+**Asked: test the entire console, every section, completely.** Sixteen
+sections were driven live (Studio already examined this pass; the other
+fifteen were loaded and interacted with, several with real actions and
+reverted round trips). §11 of TEST.md records each: what was clicked, what
+must not be changed (scheduler jobs, flags, computer control, API tokens),
+and which artifacts this pass left behind. Two settings surfaces were
+deliberately left alone: the feature flags (byte-flipped per the repo's
+own discipline, never from a browser) and the Computer-control enable
+path, which stays off on this host.
+
+**The Authoring pipeline ran end-to-end during the sweep** and completed:
+"One sentence about the Moon" → planner/retriever/researchers on the DAG →
+`One-Sentence-About-the-Moon.pdf` (52 words, 201,534 tokens, "finished
+while you were away · 1 file"). The artifact has no delete affordance in
+the Authoring UI and remains in Recent Documents; it is the test artifact
+for this pass.
+
+## 13. The stuck-run and stale-context diagnosis (2026-11-09)
+
+Two defects reached the user with screenshots: a run that died with
+"repeated an already-successful call; final pass requested" instead of a
+closing answer, and a CONTEXT meter that never moved between turns. They
+were unrelated symptoms of two independent failures, both in this order:
+
+**The wrap-up pass never ran (the error the user screenshotted).** When a
+chat or agent loop re-issues a call it had already completed successfully,
+the stall guard returns `needs_wrap_up` and `run_with_tools` asks the model
+for one final tool-less pass. That call chain passed `cache_system` into
+`_RoutedLLM.stream_chat()` — a kwarg only the batched `chat()` honors — so
+the wrap-up raised TypeError **on every stalled run since the path shipped**,
+and the user got the raw stall note as the "answer" every time, plus a
+verify-OK caption that made it look survivable. Fixed by forwarding only
+`stream_chat`'s locked signature; a regression test pins the guard
+(`cache_system` may not reappear in the forwarded kwargs). The stall guard
+itself and the rail-level keep-the-result behavior are unchanged — they were
+correct; the closing pass was broken.
+
+**The CONTEXT meter (and the "1 agent" footer, and the session panel's
+"WORKING" pill) never cleared.** The studio's liveness reads went through
+the SPA's 30 s read-through cache (`DEFAULT_TTL_MS`, keyed on the identical
+URL — e.g. `/api/studio/runs?sid=st-…` — every call, all day). Any turn-end
+refetch inside 30 s of the last one returned the pre-turn payload (`live=1`)
+no matter what the server's current truth was, so the footer and pill
+latched to "working" indefinitely and the meter's `newestFinished` never
+advanced. Three layered fixes: the liveness GETs (`studioRuns`,
+`studioChanges`, `studioCheckpoints`, `studioRunFrames`) now pass
+`cache: 'no-store'`; `useStudioRuns.watch()` always settles the list from a
+final reload when its retry windows see no live window (every gateway-503
+fast fail hit this path); and every finished/errored turn now reloads the
+runs list from `notePending` (the turn-end hook) instead of touching only
+the CHANGES slice. A 503 before the first model call (`status: error,
+input_tokens: 0`) is filtered from the meter's baseline — those attempts
+know nothing about the conversation's context and formerly pinned the
+caption/bar to a misleading 0%.
+
+The gateway's 30 s cache remains in place for everything that is not a
+liveness read; the agent restart to pick up `mcp_runner` is the usual one.

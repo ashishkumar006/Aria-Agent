@@ -47,7 +47,11 @@ QUESTION = "ZZALPHAZZ deployment"
 
 
 @pytest.fixture()
-def plane(tmp_path):
+def plane(tmp_path, monkeypatch):
+    # The stub embedder tags every vector "test-model". Declare that as the
+    # live model so the mixed-model guard keeps these records — it excludes
+    # vectors whose model differs from the live one, which is the point.
+    monkeypatch.setenv("EMBED_OLLAMA_MODEL", "test-model")
     return MemoryPlane(tmp_path, embed_fn=_embed)
 
 
@@ -182,6 +186,67 @@ async def test_non_document_memories_are_unaffected_by_doc_filter(plane):
                               doc_ids=set())
     assert any("standalone fact" in (h.descriptor or "") for h in hits), \
         "a doc filter suppressed an ordinary fact"
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_fetches_deep_enough_for_a_common_term(plane):
+    """A document-scoped query for a term that appears in MANY documents must
+    still return the scoped document's matching chunk.
+
+    The drawer search returns a GLOBAL top-K and the doc_ids allowlist is
+    applied to that result. With a shallow fetch (top_k*2), a chunk that
+    genuinely matches but ranks below the cut was never fetched, so the scope
+    removed everything and the document returned zero hits - even though it
+    contained the term. Regression: a single common word ("conduction")
+    matched 73 chunks library-wide; the wanted one ranked ~22nd and vanished.
+    """
+    common = "ZZCOMMONZZ"
+    target = (f"{common} boundary condition applied on the surface of the "
+              f"plate, with the temperature held fixed along the edge.")
+    # One target chunk in doc-TARGET, buried under many other documents that
+    # also contain the common term and therefore outrank it globally.
+    id_target = await _write_chunk(plane, "doc-TARGET", 0, target)
+    for i in range(40):
+        await _write_chunk(plane, f"doc-NOISE-{i}", 0,
+                           f"{common} filler chunk number {i} about nothing.")
+
+    hits = await plane.search(common, drawers=["document"], top_k=5,
+                              doc_ids={"doc-TARGET"})
+    assert id_target in _ids(hits), \
+        ("a scoped search for a common term dropped the matching chunk: the "
+         "deep fetch for a doc_ids scope is too shallow")
+
+
+@pytest.mark.asyncio
+async def test_result_diversifies_across_documents(plane):
+    """One document's many matching chunks must not fill every slot.
+
+    A single long document can hold dozens of chunks that all match a common
+    term. Without a per-document cap they occupy the whole result and a
+    genuinely-matching chunk from another document never surfaces. The cut is
+    smaller than doc-BIG's chunk count, so the cap is what lets doc-SMALL in.
+    """
+    common = "ZZSHAREDZZ"
+    # doc-BIG matches strongly on every chunk; doc-SMALL matches once.
+    for i in range(8):
+        await _write_chunk(plane, "doc-BIG", i,
+                           f"{common} {common} big-document chunk {i}.")
+    await _write_chunk(plane, "doc-SMALL", 0,
+                       f"{common} small-document chunk, different document.")
+
+    hits = await plane.search(common, drawers=["document"], top_k=4)
+    from collections import Counter
+    per_doc = Counter(h.doc.doc_id for h in hits if h.doc)
+    assert "doc-SMALL" in per_doc, \
+        f"one document crowded out another matching document: {per_doc}"
+    assert per_doc["doc-BIG"] < len(hits), \
+        f"one document filled every slot: {per_doc}"
+    # The cap never starves a single-document corpus: backfill returns all of
+    # doc-BIG's chunks when it is the only matching document.
+    only_big = await plane.search(common, drawers=["document"], top_k=8,
+                                  doc_ids={"doc-BIG"})
+    assert len(only_big) == 8, \
+        f"cap shrank a single-document result: got {len(only_big)} of 8"
 
 
 # ── per-conversation chat toggle ────────────────────────────────────────────

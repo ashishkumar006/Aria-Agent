@@ -116,6 +116,12 @@ def _calc_plan(expression: str, elements: list[dict] | None = None) -> Determini
     """
     # Normalize × and ÷ to * and /, drop spaces.
     expr = expression.replace("×", "*").replace("÷", "/").replace("x", "*").replace(" ", "")
+    # A goal like 'compute three things: 7*8, then ...' makes the regex
+    # capture only whitespace -> empty expression -> a no-op plan that clicks
+    # Clear+Equals and reports success with the display unchanged. Bail to the
+    # LLM judge (L2b) instead of faking a result.
+    if not re.search(r"\d", expr):
+        return None
     table = elements if elements else []
 
     def idx(ch: str) -> int | None:

@@ -361,6 +361,40 @@ def test_a_sane_branch_name_is_accepted():
     assert got["ok"] and got["argv"] == ["branch", "feature/studio-8"]
 
 
+# ── workspaces (git worktrees) ────────────────────────────────────────
+def test_worktrees_are_listed_read_only():
+    got = F.git_argv("worktrees")
+    assert got["ok"] and got["argv"][:2] == ["worktree", "list"]
+    assert got["needs_confirm"] is False
+
+
+def test_a_workspace_is_a_worktree_on_an_opencode_branch():
+    got = F.git_argv("worktree_add", {"name": "feature-x",
+                                      "path": r"C:\repos\app-feature-x"})
+    assert got["ok"], got
+    assert got["argv"] == ["worktree", "add", "-b", "opencode/feature-x",
+                           r"C:\repos\app-feature-x"]
+    # A new workspace must not move the branch you are on.
+    assert got["moves_head"] is False
+
+
+def test_a_workspace_name_is_namespaced_once():
+    got = F.git_argv("worktree_add", {"name": "opencode/feature-x",
+                                      "path": r"C:\repos\app-feature-x"})
+    assert got["argv"][3] == "opencode/feature-x", got["argv"]
+
+
+def test_removing_a_workspace_asks_first():
+    got = F.git_argv("worktree_remove", {"path": r"C:\repos\app-feature-x"})
+    assert got["ok"] and got["needs_confirm"] is True, got
+    assert got["argv"] == ["worktree", "remove", r"C:\repos\app-feature-x"]
+
+
+def test_a_workspace_add_without_a_path_is_refused():
+    assert not F.git_argv("worktree_add", {"name": "x"})["ok"]
+    assert not F.git_argv("worktree_remove", {})["ok"]
+
+
 def test_status_porcelain_keeps_the_states_a_panel_cannot_act_on():
     rows = F.status_paths("## main...origin/main\n"
                           "M  a.py\n M b.py\n?? c.py\nUU d.py\n D e.py\n"

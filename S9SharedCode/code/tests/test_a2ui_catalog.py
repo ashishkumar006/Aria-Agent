@@ -150,6 +150,11 @@ def test_all_catalog_components_are_accepted_at_the_shape_level():
                   if "child" in spec["props"] else [])
         props = {}
         for pname, ptype in spec["props"].items():
+            # Image.src is the one admitted URL sink and must be an https://
+            # URL; a bare "x" (the text|literal default) is correctly refused.
+            if name == "Image" and pname == "src":
+                props[pname] = "https://example.com/x.png"
+                continue
             if ptype == "ids":
                 props[pname] = ["leaf"]
             elif ptype == "id":

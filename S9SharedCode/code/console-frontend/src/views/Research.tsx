@@ -212,6 +212,9 @@ const [viewFile, setViewFile] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const reqRef = useRef(0);
+  /** The session this pane is showing, for async guards that must not confuse
+   *  two topics (a slow /produced for topic A must not write into topic B). */
+  const activeSidRef = useRef('');
   /* Which view the LIVE stream is allowed to write into. Bumped whenever the
      user switches topic or starts a new one, so the run in progress keeps
      streaming (and keeps its ledger entry) without painting its answer into a
@@ -355,6 +358,24 @@ const [viewFile, setViewFile] = useState<string | null>(null);
       const g = await api.graph(id);
       if (seq !== pollSeq.current) return null;
       setGraph(g);
+      /* The SSE stream can stay open after the DAG finishes (the server does
+         not always send a done frame), which left the view "running" forever
+         even though every node was terminal. Flip to done from the graph. */
+      const nodes = g?.nodes || [];
+      if (nodes.length && nodes.every((nd) => isTerminal(nd.status))) {
+        setRunning(false);
+        setStatus((s) => (s === 'running' ? 'done' : s));
+        stopPoll();
+        const fmt = nodes
+          .filter((nd) => /format/i.test(nd.skill || '') && isTerminal(nd.status))
+          .pop();
+        if (fmt) {
+          const nd = await api.node(id, fmt.id).catch(() => null);
+          const text = extractReport(nd?.result?.output);
+          if (text) setAnswer((prev) => prev || text);
+        }
+        refreshTopics();
+      }
       return g;
     } catch {
       return null; // keep last frame
@@ -411,6 +432,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
     setRunning(false);
     cidRef.current = '';
     setSid('');
+    activeSidRef.current = '';
     setTopic('');
     /* Clear the brief too. Opening a topic seeds the composer with its title,
        so without this "New topic" dropped the user into a fresh pane with the
@@ -451,6 +473,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
        answered. */
     setRunning(false);
     setSid(s.session_id);
+    activeSidRef.current = s.session_id;
     setTopic(displayTopic(s));
     // Only seed the brief when the box is empty. Overwriting whatever the
     // user had typed meant that peeking at a past report silently replaced
@@ -473,8 +496,13 @@ const [viewFile, setViewFile] = useState<string | null>(null);
        run you opened again from the sidebar lost its files even though the
        server still had them. Read the produced record. */
     void api.runProduced(s.session_id).then((snap) => {
-      if (reqRef.current !== req) return;
+      if (activeSidRef.current !== s.session_id) return;
       if (snap?.files?.length) setFiles(snap.files);
+      /* The stored answer is the reliable fallback: the node fetch below can
+         fail (or the formatter id may be missing), and the answer is already
+         persisted on the produced record. Without this, reopening a finished
+         topic showed "Ask a topic to begin" over a real answer. */
+      if (snap?.answer) setAnswer((prev) => prev || snap.answer || '');
       /* Reopening a finished run must tell the same story the live stream
          told. The "this answer is incomplete" warning and the operator's stop
          notice used to arrive once, in the SSE frame, and were gone after a
@@ -489,7 +517,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
     }).catch(() => { /* no files, or unreadable: the row simply stays empty */ });
     try {
       const g = await api.graph(s.session_id);
-      if (reqRef.current !== req) return;
+      if (activeSidRef.current !== s.session_id) return;
       setGraph(g);
       // An empty node list is the same "no graph" as a null payload
       // (the server returns 200 + empty nodes for a session whose
@@ -507,7 +535,7 @@ const [viewFile, setViewFile] = useState<string | null>(null);
       if (last) {
         try {
           const nd = await api.node(s.session_id, last.id);
-          if (reqRef.current === req) setAnswer(extractReport(nd?.result?.output));
+          if (activeSidRef.current === s.session_id) setAnswer(extractReport(nd?.result?.output));
         } catch { /* report stays empty */ }
       }
     } catch (e) {

@@ -74,6 +74,22 @@ function notice(j: Job): { text: string; bad: boolean } | null {
   return { text: 'paused', bad: false };
 }
 
+/* A row whose query is an instruction to the agent ("remind me to X") is
+   re-executed at fire time and schedules itself again, so the user receives a
+   confirmation instead of the reminder. The scheduler now converts those to
+   nudges, but a row armed before that fix is still in the store and must be
+   called out rather than listed as healthy. */
+const REMINDER_IMPERATIVE = /^\s*(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?(?:remind\s+(?:me|us)|reminder\s+(?:to|for)|nudge\s+me|ping\s+me|tell\s+me\s+to)\b/i;
+function selfScheduling(j: Job): boolean {
+  if (isWake(j)) return false;
+  const q = String(j.query || '');
+  if (!REMINDER_IMPERATIVE.test(q)) return false;
+  // If the row also carries the words to send AND they differ from the query,
+  // the nudge path is doing its job; only a row with no message loops.
+  const msg = String(j.notify_policy?.message || '').trim();
+  return !msg;
+}
+
 /* Order the list the way the user reads it: what is about to happen first,
    and what already happened last.
 
@@ -283,6 +299,19 @@ export default function Scheduler() {
                         <span className="min-w-0 flex-1 truncate" title={`${watchSummary(j)} · ${JSON.stringify(j.watch || {})}`}>
                           · {watchSummary(j)}
                         </span>
+                      </div>
+                    )}
+                    {j.notify_policy?.message && (
+                      <div className="mt-1 truncate text-[10.5px] text-zinc-300"
+                           title={j.notify_policy.message}>
+                        <span className="text-zinc-500">says: </span>
+                        {j.notify_policy.message}
+                      </div>
+                    )}
+                    {selfScheduling(j) && (
+                      <div className="mt-1 text-[10.5px] text-red-300"
+                           title="This row's query is an instruction to Aria, so it re-schedules itself at every fire instead of reminding you. Cancel it and ask again - new reminders are stored as text to say.">
+                        re-schedules itself - cancel and re-create
                       </div>
                     )}
                     {n && (

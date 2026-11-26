@@ -327,6 +327,20 @@ CATALOG: dict[str, dict[str, Any]] = {
         "props": {"label": "text|literal", "value": "number",
                   "min": "number", "max": "number"},
     },
+
+    # ── media ───────────────────────────────────────────────────────────────
+    # The single admitted URL sink. An Image is rendered as a plain <img> with
+    # no referrer and no script, exactly like the chat markdown sandbox, and
+    # the validator refuses any non-https src. This is a bounded relaxation of
+    # the no-URL rule, not an open one: every other component still rejects
+    # src/href/url.
+    "Image": {
+        "aria_widget": "image",
+        "doc": ("A picture from an https URL (the only URL this catalog admits). "
+                "Rendered as a plain image with no referrer; non-https is refused."),
+        "props": {"src": "text|literal", "alt": "text|literal",
+                  "caption": "text|literal"},
+    },
 }
 
 # Components whose `children`/`child` property is a list of ids / one id.
@@ -409,8 +423,9 @@ def catalog_prompt() -> str:
         "every control value under the Action's `input` key.",
         "  * Every Action must include a non-empty `action` string. Without "
         "it the button cannot send anything.",
-        "  * Never emit HTML, styles, class names, URLs, or event handler "
-        "names. They are rejected.",
+        "  * Never emit HTML, styles, class names, or event handler names. "
+        "The only URL allowed is an https `src` on the Image component; every "
+        "other URL is rejected.",
         "",
         # Composition guidance, in the one block both prompt paths append
         # (`prompts/app_builder.md` and `a2ui_surfaces.generation_prompt`).
@@ -517,10 +532,18 @@ def validate_components(components: Any) -> list[dict[str, Any]]:
         for key in raw:
             if key in ("id", "component"):
                 continue
-            if key in FORBIDDEN_PROPS:
+            # Image.src is the one admitted URL sink; every other component
+            # still refuses src/href/url outright.
+            if key in FORBIDDEN_PROPS and not (name == "Image" and key == "src"):
                 raise CatalogError(
                     f"{cid}: property {key!r} is not allowed. This catalog is "
                     f"declarative; markup, styles and handlers are refused.")
+            if name == "Image" and key == "src":
+                value = raw[key]
+                if not isinstance(value, str) or not value.lower().startswith("https://"):
+                    raise CatalogError(
+                        f"{cid} (Image): src must be an https:// URL; "
+                        f"other schemes and relative paths are refused.")
             if key not in spec["props"]:
                 raise CatalogError(
                     f"{cid} ({name}): unknown property {key!r}. Allowed: "

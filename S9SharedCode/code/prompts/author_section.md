@@ -53,15 +53,17 @@ content. Return ONLY a JSON object — no prose around it:
   (1.6%)" as a sentence and leaving it there is the failure this rule exists to
   catch: the numbers are already in your hand, so draw them. Before you return,
   look at what you wrote and add the chart you skipped.
-- An `image` block lifts a figure out of a document the user uploaded. Use it
-  ONLY when the prompt ends with a FIGURES AVAILABLE list and you copy a
-  `document` id, `page` and `index` straight out of it. When a handle is listed
-  and its document or shape matches something your section discusses, place it —
-  a figure the user uploaded and the document never uses is a part of the
-  document that went missing. There is no image search and no URL fetching: an
-  id you did not read from that list cannot resolve, and the figure is dropped.
-  Give every image a caption, and put the figure's own numbers in prose or a
-  `table` so the document still reads if the figure is unavailable.
+- An `image` block places a figure. You have NO tools in this call, so the only
+  handles that resolve are the ones in the FIGURES AVAILABLE list at the end of
+  this prompt. That list may hold figures the user uploaded OR figures fetched
+  from the web for this document — it is authoritative either way. Copy a
+  `document`, `page` and `index` straight out of it. When a listed figure matches
+  something your section discusses, place it: a figure fetched for this document
+  and never used is a part of the document that went missing. If there is no
+  FIGURES AVAILABLE list, or none of its handles fit this section, write without
+  an image rather than inventing one. Give every image a caption, and put the
+  figure's own numbers in prose or a `table` so the document still reads if the
+  figure is unavailable.
 - Never put a filename, an artifact id, a fenced JSON block, or a receipt
   inside the blocks. Blocks are reader content only.
 - **No LaTeX, and no backslashes inside the text.** Inside a JSON string `\t`,

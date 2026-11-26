@@ -42,12 +42,13 @@ import flow                       # noqa: E402
 
 PROMPTS = CODE / "prompts"
 
-# The planner's own output vocabulary. These four strings are VALUES of the
+# The planner's own output vocabulary. These strings are VALUES of the
 # `metadata.action` field it must emit for a `computer` node, not tools it can
 # call — which is why the no-tools rule below carves them out instead of being
-# bent. planner.md says the same thing in prose.
+# bent. `studio_coder` is a SKILL the planner dispatches that happens to share a
+# name with the tool it uses internally; naming the skill is required, not a leak.
 GRAPH_VOCAB = frozenset({"run_command", "read_file", "write_file", "open_app",
-                         "drive_app"})
+                         "drive_app", "studio_coder"})
 
 # Names a worker prompt may mention that are not in ITS OWN grant, each because
 # the text is about another skill's gated host rather than a tool this node can
@@ -103,27 +104,11 @@ def test_planner_skill_table_covers_every_skill_the_registry_can_run():
     assert not missing, f"planner.md has no row for: {missing}"
 
 
-def test_planner_arithmetic_uses_the_measured_figure_not_an_invented_one():
-    text = _read("planner.md")
-    ev = f"{skills.RESEARCHER_EVIDENCE_WORDS:,}"
-    assert ev in text, f"planner.md should size the fleet on {ev} words/researcher"
-    assert str(skills.WORDS_PER_PAGE) in text, \
-        "the pages->words figure must be the shared WORDS_PER_PAGE"
-    # The false attribution, not the post-mortem that names it. The file is
-    # allowed to say what used to be wrong; it is not allowed to size a fleet
-    # on a floor no prompt or cap sets.
-    assert "floor the Researcher prompt sets" not in text.replace("\n", " "), \
-        "planner.md is justifying a number by a prompt that does not contain it"
-    assert "18 facets" not in text, "the worked example must follow the measured figure"
-
-
-def test_planner_states_the_real_limits():
-    """Not "no ceiling": the run stops scheduling at MAX_NODES, waves are
-    MAX_CONCURRENCY wide, and one document is written at up to 160 sections."""
-    text = _read("planner.md")
-    assert str(flow.MAX_NODES) in text, "the node stop is a planning fact"
-    assert str(flow.MAX_CONCURRENCY) in text, "wave width is a planning fact"
-    assert "160 section" in text, "the section ceiling is a planning fact"
+# The lean planner (capability + output contract only) no longer sizes the
+# research fleet with pages×450 arithmetic or states node/section ceilings —
+# that strategy was removed on purpose so the planner decides. The invariants
+# that remain are enforced above: every skill has a row, and the planner names
+# no tool it cannot dispatch.
 
 
 # ── the workers: name what you are given ────────────────────────────────────

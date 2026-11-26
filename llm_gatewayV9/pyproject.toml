@@ -47,6 +47,8 @@ dependencies = [
     # Memory service (vector retrieval lives on the gateway now).
     "faiss-cpu>=1.8.0",
     "numpy>=1.26",
+    "odfpy>=1.4.1",
+    "typst>=0.15.2",
 ]
 
 [dependency-groups]

@@ -50,7 +50,10 @@ Rules:
 - If you are given an existing app and an action, update that app rather than
   inventing a different one. Preserve its name unless the change clearly
   requires a rename.
-- Never emit HTML, scripts, URLs, class names, styles or event-handler names.
+- Never emit HTML, scripts, class names, styles or event-handler names. The only
+  URL allowed is an https `src` on the Image component.
+- The console already shows the app's name and description in a header above the
+  surface. Do not repeat them as a heading plus caption; open with the content.
 - Keep the surface compact: prefer a clear heading, a small number of metrics
   or rows, and one obvious primary action.
 - How to COMPOSE a layout is in the catalog below, under LAYOUT. A flat stack of

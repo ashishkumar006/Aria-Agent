@@ -54,6 +54,27 @@ MAX_L3_CALLS = 6  # max vision escalations per run
 MAX_TURNS_HARD = 12
 
 
+# When the planner omits `metadata.app`, fall back to the app named in the goal
+# ("Open Notepad …" -> "Notepad") so the launch cascade (cua-driver launch_app /
+# shell start) still fires instead of targeting whatever window is current and
+# gambling on vision. Conservative on purpose: a single word after an
+# open/launch/start verb, minus articles — the planner setting metadata.app is
+# the primary path; this is the fallback.
+_APP_FROM_GOAL_RE = re.compile(
+    r"\b(?:open|launch|start|fire\s+up)\s+([A-Za-z][A-Za-z0-9]{1,})", re.I)
+_APP_STOPWORDS = {"a", "an", "the", "my", "this", "that", "new", "up", "app"}
+
+
+def _app_from_goal(goal: str) -> str | None:
+    m = _APP_FROM_GOAL_RE.search(goal or "")
+    if not m:
+        return None
+    cand = m.group(1).strip()
+    if not cand or cand.lower() in _APP_STOPWORDS:
+        return None
+    return cand
+
+
 def _driver_refusal(res: dict | None) -> str:
     """A cua-driver refusal is an HTTP success with a refusal body.
 
@@ -74,7 +95,7 @@ def _driver_refusal(res: dict | None) -> str:
 
 def _wants_foreground(res: dict | None) -> bool:
     esc = (res or {}).get("escalation") or {}
-    return str(esc.get("target") or "").lower() == "foreground"
+    return str(esc.get("target") or esc.get("recommended") or "").lower() == "foreground"
 
 
 def _pick_editable(elements: list[dict] | None,
@@ -222,6 +243,15 @@ class ComputerUseSkill:
         trace.append("daemon up")
 
         # 2) Pick a target app (launch if needed).
+        # If the planner didn't name the app (metadata.app), recover it from the
+        # goal so the launch cascade (cua-driver launch_app / shell start) still
+        # fires — otherwise the engine targets the current window and the judge
+        # has to open the app via the UI (vision), which is flaky.
+        if not app_hint:
+            _from_goal = _app_from_goal(goal)
+            if _from_goal:
+                app_hint = _from_goal
+                trace.append(f"app from goal: {app_hint}")
         pid, window_id = self._acquire_target(app_hint)
         if pid is None:
             return self._done(False, "no-target",
@@ -243,12 +273,12 @@ class ComputerUseSkill:
         repeat_count = 0
         max_turns = min(max_turns, MAX_TURNS_HARD)
         for turn in range(max_turns):
-            # Re-ensure the daemon each turn: on this Windows build the
-            # cua-driver daemon self-terminates ~30s after a UIA timeout, so a
-            # long cascade can lose its pipe mid-run. Restart it if needed.
-            if not daemon.ensure_daemon():
-                return self._done(False, "daemon-error", trace=trace,
-                                      error="cua-driver daemon unavailable")
+            need = goal
+            # No per-turn ensure_daemon() here: daemon.call() already probes the
+            # pipe and restarts a dead/zombie daemon before every invocation, so
+            # an explicit re-probe just added two subprocess spawns per turn. A
+            # daemon that dies mid-run is recovered by the scan's call() below;
+            # if it cannot restart, that raises DaemonError -> daemon-error.
             # SCAN (Invariant 1). The driver occasionally returns an empty AX
             # tree on the first scan right after launch; retry a couple times
             # (with a short settle delay) before treating it as truly empty.
@@ -374,6 +404,18 @@ class ComputerUseSkill:
 
             # L2b a11y (workhorse). Escalate to L3 if AX empty or judge says so.
             if count == 0:
+                # A SUSPENDED target (Windows suspended it to save resources)
+    # looks running but has an empty AX tree. Resume ONLY the target pid
+    # once and re-scan; never touch other suspended windows.
+                # SUSPENDED-TARGET RECOVERY (see _resume_suspended): empty AX
+    # tree = the target is likely suspended. Resume ONLY the target pid
+    # once, re-scan; if still empty it is genuinely empty -> escalate.
+                if getattr(self, "_resumed_pid", None) != pid:
+                    self._resume_suspended(pid)
+                    self._resumed_pid = pid
+                    trace.append("target looked suspended -> resumed; re-scanning")
+                    time.sleep(1.5)
+                    continue
                 l2b_failures += 1
                 if vision_fb.should_escalate(l2b_failures, "ax_tree_empty"):
                     # The first scan after launch can return an empty AX tree
@@ -419,21 +461,27 @@ class ComputerUseSkill:
                             trace.append(f"L3 cap {MAX_L3_CALLS} hit → abort")
                             return self._done(False, "max-turns", trace=trace,
                                                   error="L3 vision call cap reached")
-                        trace.append("L2b empty → L3 vision")
+                        trace.append("L2b empty → L3 vision (one action)")
                         l3_calls += 1
-                        res = self._layer_vision(goal, pid, window_id, state)
-                        if res.success:
-                            return self._done(True, "L3", output=res.output, trace=trace)
-                        return self._done(False, "L3", trace=trace,
+                        res = self._layer_vision(goal, pid, window_id, state, need=need)
+                        if not res.success:
+                            return self._done(False, "L3", trace=trace,
                                               error=res.error or "vision fallback failed")
+                        if (res.output or {}).get("verdict") == "done":
+                            return self._done(True, "L3", output=res.output, trace=trace)
+                        trace.append("L3 acted → back to L2 with fresh scan")
+                        last_state = state
+                        continue
+
                     trace.append("L2b empty but no screenshot → stay on a11y")
                 continue
 
             # L2b judgment call (cheap text model).
             # Pre-filter the AX tree by goal keywords to bound the LLM context
             # (charter §10: biggest cost knob is perception interpretation).
-            filtered = layers.filter_ax_markdown(tree_md, query=goal, max_chars=12000)
-            judge = self._judge_a11y(goal, filtered, pid, app_hint or "app")
+            filtered = layers.filter_ax_markdown(tree_md, max_chars=60000)
+            judge = self._judge_a11y(goal, filtered, pid, app_hint or "app", last_act,
+                                   vision_ctx=getattr(self, "_last_vision", ""))
             if judge is None:
                 l2b_failures += 1
                 trace.append("L2b judge returned no action")
@@ -442,11 +490,18 @@ class ComputerUseSkill:
                         return self._done(False, "max-turns", trace=trace,
                                               error="L3 vision call cap reached")
                     if self._has_screenshot(state):
-                        trace.append("L2b retries exhausted → L3 vision")
+                        trace.append("L2b escalate → L3 vision (one action)")
                         l3_calls += 1
-                        res = self._layer_vision(goal, pid, window_id, state)
-                        return self._done(res.success, "L3", output=res.output,
-                                              trace=trace, error=res.error)
+                        res = self._layer_vision(goal, pid, window_id, state, need=need)
+                        if not res.success:
+                            return self._done(False, "L3", trace=trace,
+                                              error=res.error or "vision failed")
+                        if (res.output or {}).get("verdict") == "done":
+                            return self._done(True, "L3", output=res.output, trace=trace)
+                        trace.append("L3 acted → back to L2 with fresh scan")
+                        last_state = state
+                        continue
+
                     trace.append("L2b retries exhausted; no screenshot for L3 → abort")
                     return self._done(False, "L2b", trace=trace,
                                           error="a11y judge unavailable and no screenshot for vision fallback")
@@ -454,22 +509,30 @@ class ComputerUseSkill:
 
             verdict = judge.get("verdict")
             if verdict == "done":
-                trace.append("L2b: goal met")
+                _why = str(judge.get("thinking") or "").strip()[:240]
+                trace.append("L2b: goal met" + (f" — {_why}" if _why else ""))
                 out = dict(judge)
                 if self._dry_run_plan:
                     out["dry_run_plan"] = self._dry_run_plan
                 return self._done(True, "L2b", output=out, trace=trace)
             if verdict == "escalate":
                 l2b_failures += 1
+                need = str(judge.get("action", {}).get("note") or goal)
                 trace.append(f"L2b escalate: {judge.get('action', {}).get('note')}")
                 if vision_fb.should_escalate(l2b_failures, "element_missing"):
                     if l3_calls >= MAX_L3_CALLS:
                         return self._done(False, "max-turns", trace=trace,
                                               error="L3 vision call cap reached")
                     l3_calls += 1
-                    res = self._layer_vision(goal, pid, window_id, state)
-                    return self._done(res.success, "L3", output=res.output,
-                                          trace=trace, error=res.error)
+                    res = self._layer_vision(goal, pid, window_id, state, need=need)
+                    if not res.success:
+                        return self._done(False, "L3", trace=trace,
+                                          error=res.error or "vision failed")
+                    if (res.output or {}).get("verdict") == "done":
+                        return self._done(True, "L3", output=res.output, trace=trace)
+                    trace.append("L3 acted → back to L2 with fresh scan")
+                    last_state = state
+                    continue
                 continue
 
             # ACT (Invariant 2: re-scan happens next loop iteration)
@@ -488,13 +551,6 @@ class ComputerUseSkill:
                 and last_act.get("type") == "click"
                 and act.get("element_index") == last_act.get("element_index")
             )
-            if same_click_as_last and last_act_ok:
-                trace.append(f"repeat of last click ({act.get('element_index')}) "
-                             f"→ treating as done (avoid toggle loop)")
-                out = dict(judge)
-                out["verdict"] = "done"
-                out["success"] = True
-                return self._done(True, "L2b", output=out, trace=trace)
             # Generic loop-guard: same action key 3x in a row -> abort.
             try:
                 import json as _j
@@ -510,7 +566,14 @@ class ComputerUseSkill:
                 trace.append(f"loop-guard: same action {repeat_count}x → abort")
                 return self._done(False, "aborted", trace=trace,
                                       error=f"loop-guard: repeated action {act.get('type')} {repeat_count}x")
-            ok = self._dispatch_action(pid, window_id, act, snapshot_id)
+            if same_click_as_last and last_act_ok:
+                # Do NOT re-dispatch the same click (that just toggles/repeats),
+                # and do NOT fake success: re-scan and let the judge choose again.
+                trace.append("repeat click → re-asking judge with fresh scan")
+                last_state = state
+                continue
+            ok = self._dispatch_action(pid, window_id, act, snapshot_id,
+                                       turn_state=state)
             last_act, last_act_ok = act, ok
             trace.append(f"act {act.get('type')} -> {'ok' if ok else 'fail'}")
             if not ok:
@@ -778,11 +841,22 @@ class ComputerUseSkill:
         return pid, window_id
 
     # ── L2b judgment (cheap text LLM) ────────────────────
-    def _judge_a11y(self, goal: str, tree_md: str, pid: int, app_name: str) -> dict | None:
+    def _judge_a11y(self, goal: str, tree_md: str, pid: int, app_name: str,
+                    last_act: dict | None = None,
+                    vision_ctx: str = "") -> dict | None:
         if self._llm_chat is None:
             return None
         user = P.USER_A11Y_TEMPLATE.format(goal=goal, app_name=app_name, pid=pid,
                                            tree_markdown=tree_md)
+        if last_act:
+            user += ("\n\nNOTE: your previous action was "
+                     f"{last_act.get('type')} {last_act.get('element_index', last_act.get('value',''))}. "
+                     "It did NOT complete the goal. Choose a DIFFERENT next action "
+                     "(do not repeat the same element), or set verdict=done if the goal "
+                     "is already met by what is on screen.")
+        if vision_ctx:
+            user += (f"\n\nVISION LAYER: {vision_ctx}. The screen changed after that; "
+                     "re-read the tree above before deciding.")
         try:
             return self._llm_chat(P.SYSTEM_A11Y, user, P.ACTION_SCHEMA_JSON)
         except Exception:
@@ -795,7 +869,7 @@ class ComputerUseSkill:
         return bool(state.get("screenshot") or state.get("image")
                     or state.get("screenshot_png_b64"))
 
-    def _best_screenshot(self, state: dict, pid: int, window_id) -> tuple[str | None, list[dict]]:
+    def _best_screenshot(self, state: dict, pid: int, window_id) -> tuple[str | None, list[dict], bool]:
         """Return (screenshot_png_b64, elements), preferring the window state
         but falling back to a fresh desktop screenshot. cua-driver returns
         screenshots on ``get_desktop_state`` even when ``get_window_state``
@@ -805,7 +879,7 @@ class ComputerUseSkill:
                or state.get("screenshot_png_b64"))
         elements = state.get("elements") or []
         if raw:
-            return raw, elements
+            return raw, elements, False
         # Window state had no screenshot — fetch the desktop shot. Set-of-marks
         # will be drawn over the (empty) element list, which is fine: the vision
         # model can still locate the target by pixel coordinates.
@@ -814,24 +888,143 @@ class ComputerUseSkill:
             desk_raw = (desk.get("screenshot") or desk.get("image")
                         or desk.get("screenshot_png_b64"))
             if desk_raw:
-                return desk_raw, elements
+                return desk_raw, elements, True
         except Exception:
             pass
-        return raw, elements
+        return raw, elements, False
 
-    def _layer_vision(self, goal: str, pid: int, window_id, state: dict) -> ComputerResult:
+    @staticmethod
+    def _window_logical_origin(pid, scale):
+        """The visible window's top-left in LOGICAL screen coords (for the
+        resized logical screenshot). Element bboxes are window-relative, so
+        they must be offset by this to land on the real window."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            best = None
+            EP = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, lp):
+                nonlocal best
+                wp = wintypes.DWORD(); u.GetWindowThreadProcessId(hwnd, ctypes.byref(wp))
+                if wp.value == pid and u.IsWindowVisible(hwnd):
+                    rr = wintypes.RECT(); u.GetWindowRect(hwnd, ctypes.byref(rr))
+                    area = (rr.right-rr.left)*(rr.bottom-rr.top)
+                    if best is None or area > best[0]:
+                        best = (area, rr.left, rr.top)
+                return True
+            u.EnumWindows(EP(_cb), 0)
+            if best and scale:
+                return int(best[1]/scale), int(best[2]/scale)
+        except Exception:
+            pass
+        return 0, 0
+
+    @staticmethod
+    def _resume_suspended(pid):
+        """Resume a SUSPENDED process (un-suspend its threads).
+
+        WHY (observed live): Windows suspends background UWP apps to save /
+        optimise performance. A suspended process STILL appears in the window
+        list, so the layer reads it as "running" and L2 escalates — but its
+        accessibility tree is EMPTY, so it fails with "no clickable target"
+        even though the app is fine, merely suspended (seen with Settings).
+
+        FIX: when the TARGET's AX tree is empty (the suspended signature),
+        call this to un-suspend ONLY the target pid, then re-scan (see the
+        `count == 0` branch in run()). NEVER touch unrelated suspended
+        windows (e.g. GlobalDesktopSpotlight) — they are suspended for a
+        reason and resuming them would interfere with Windows' scheduling.
+
+        STATUS: implemented + compiles (computer-use suite green) but NOT yet
+        verified end-to-end against a real suspended target — the live test
+        could not force a suspend (the Settings process is "SystemSettings",
+        not "Settings"). Verify when a target is next found suspended. """
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            TH32CS_SNAPTHREAD = 0x00000004
+            class _TE(ctypes.Structure):
+                _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                            ("th32ThreadID", wintypes.DWORD), ("th32OwnerProcessID", wintypes.DWORD),
+                            ("tpBasePri", wintypes.LONG), ("tpDeltaPri", wintypes.LONG),
+                            ("dwFlags", wintypes.DWORD)]
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+            if snap == -1:
+                return
+            try:
+                te = _TE(); te.dwSize = ctypes.sizeof(te)
+                if k32.Thread32First(snap, ctypes.byref(te)):
+                    while True:
+                        if te.th32OwnerProcessID == pid:
+                            h = k32.OpenThread(0x0001, False, te.th32ThreadID)
+                            if h:
+                                k32.ResumeThread(h); k32.CloseHandle(h)
+                        if not k32.Thread32Next(snap, ctypes.byref(te)):
+                            break
+            finally:
+                k32.CloseHandle(snap)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _resize_to_logical(b64, elements, is_desktop):
+        """Resize the screenshot to the LOGICAL coordinate space so the
+        element bboxes, the model's returned pixels and the click all align.
+        The AX coords are logical (DPI-scaled); screenshots are physical, so
+        without this the marks land at 1/scale in the top-left."""
+        try:
+            import io as _io, base64 as _b64
+            from PIL import Image
+            img = Image.open(_io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+            if is_desktop:
+                import ctypes
+                lw = int(ctypes.windll.user32.GetSystemMetrics(0))
+                lh = int(ctypes.windll.user32.GetSystemMetrics(1))
+            else:
+                lw = lh = 0
+                for e in elements:
+                    bb = (e.get("frame") or e.get("bbox") or e.get("bounds")
+                          or e.get("rectangle") or e.get("rect") or {})
+                    px, py, pw, ph = layers.vision._parse_bbox(bb)
+                    if px is not None:
+                        lw = max(lw, px + pw); lh = max(lh, py + ph)
+            if lw and lh and (lw, lh) != img.size:
+                img = img.resize((lw, lh), Image.LANCZOS)
+                buf = _io.BytesIO(); img.save(buf, format="PNG")
+                return _b64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            pass
+        return b64
+
+    def _layer_vision(self, goal: str, pid: int, window_id, state: dict,
+                      need: str = "") -> ComputerResult:
         # NOTE: helper — constructs ComputerResult directly (NOT via _done):
         # only run() exits may stop the recorder.
-        b64, elements = self._best_screenshot(state, pid, window_id)
+        b64, elements, is_desktop = self._best_screenshot(state, pid, window_id)
         if not b64 or self._llm_vision is None:
             return ComputerResult(False, "L3", error="no screenshot or vision LLM")
         # Normalise to a base64 string (strip data: prefix if present).
         if isinstance(b64, str) and b64.startswith("data:"):
             b64 = b64.split(",", 1)[1] if "," in b64 else b64
+        b64 = self._resize_to_logical(b64, elements, is_desktop)
         # Draw set-of-marks: numbered dashed boxes over UI elements.
-        annotated_b64, legend = layers.draw_set_of_marks(b64, elements)
+        _scale = 1.0
+        try:
+            from PIL import Image as _I
+            import io as _io, base64 as _b64
+            _pw = _I.open(_io.BytesIO(_b64.b64decode(b64))).size[0]
+            import ctypes
+            _lw = int(ctypes.windll.user32.GetSystemMetrics(0))
+            if _lw:
+                _scale = _pw / _lw
+        except Exception:
+            pass
+        _off = self._window_logical_origin(pid, _scale) if is_desktop else (0, 0)
+        annotated_b64, legend = layers.draw_set_of_marks(b64, elements, offset=_off)
         screenshot = f"data:image/png;base64,{annotated_b64}"
-        prompt = P.USER_VISION_TEMPLATE.format(goal=goal, legend=legend)
+        prompt = P.USER_VISION_TEMPLATE.format(goal=goal, legend=legend, need=need or goal)
         try:
             verdict = self._llm_vision(screenshot, prompt, P.SYSTEM_VISION)
         except Exception as e:
@@ -876,7 +1069,7 @@ class ComputerUseSkill:
                                        error="vision click awaiting approval")
             try:
                 args = {"pid": pid, "x": act["x"], "y": act["y"]}
-                if window_id is not None:
+                if window_id is not None and not is_desktop:
                     args["window_id"] = window_id
                 # A coordinate click must NOT carry snapshot_id: the driver
                 # reads a snapshot as an element-handle claim and refuses it
@@ -884,6 +1077,18 @@ class ComputerUseSkill:
                 # successful L3 vision target into a failed click.
                 _call_checked("click", args)
                 self.safety.record_action("click", args, "done")
+                _lbl = ""
+                for _e in elements:
+                    _bb = (_e.get("frame") or _e.get("bbox") or _e.get("bounds")
+                           or _e.get("rectangle") or _e.get("rect") or {})
+                    _px, _py, _pw, _ph = layers.vision._parse_bbox(_bb)
+                    if (_px is not None and _px <= act["x"] <= _px + _pw
+                            and _py <= act["y"] <= _py + _ph):
+                        _lbl = str(_e.get("label") or _e.get("name")
+                                   or _e.get("role") or "")
+                        break
+                self._last_vision = (f"vision clicked {_lbl or 'a point'} "
+                                     f"at ({act['x']},{act['y']})")
                 return ComputerResult(True, "L3", output=verdict)
             except Exception as e:
                 self.safety.record_action(
@@ -893,7 +1098,8 @@ class ComputerUseSkill:
 
     # ── action dispatch (cua-driver primitives) ─────────
     def _dispatch_action(self, pid: int, window_id, act: dict,
-                          snapshot_id: str | None = None) -> bool:
+                          snapshot_id: str | None = None, *,
+                          turn_state: dict | None = None) -> bool:
         # DRY-RUN: describe the intended action, never touch the desktop.
         if self.safety.mode == "dry-run":
             trace = f"[dry-run] would {act.get('type')} " \
@@ -912,6 +1118,13 @@ class ComputerUseSkill:
             aid = self.safety.create_approval(t or "", dict(act))
             self._dry_run_plan.append(f"[pending {aid}] {t} skipped awaiting approval")
             return False
+        # A judge action (no `match` key) addresses the index the LLM just read
+        # from THIS turn's opening scan, and no action has fired yet this turn,
+        # so that snapshot/element_token is still current — reuse it instead of
+        # paying for a second ~1.9s UIA scan. Deterministic `match` actions are
+        # the exception: the tree reflows after every click, so they must always
+        # re-fetch + re-resolve (turn_state is never passed on that path).
+        reuse = turn_state if (turn_state is not None and not act.get("match")) else None
         # Cua Driver 0.17 requires snapshot_id + window_id for element actions.
         # Coordinate clicks (x,y without element_index) must NOT carry snapshot_id,
         # or the driver refuses with "snapshot_id requires element_index".
@@ -939,9 +1152,10 @@ class ComputerUseSkill:
                 # this, multi-click plans mis-click and produce wrong results.
                 if act.get("element_index") is not None:
                     try:
-                        fresh = daemon.call("get_window_state",
-                                            {"pid": pid, "window_id": window_id,
-                                             "include_screenshot": True}, timeout=20)
+                        fresh = reuse if reuse is not None else daemon.call(
+                            "get_window_state",
+                            {"pid": pid, "window_id": window_id,
+                             "include_screenshot": False}, timeout=20)
                         if fresh.get("snapshot_id"):
                             args["snapshot_id"] = fresh["snapshot_id"]
                         if act.get("match") and fresh.get("elements"):
@@ -961,10 +1175,10 @@ class ComputerUseSkill:
                 # native and XAML controls accept; it needs a FRESH
                 # element_token because the next snapshot invalidates it.
                 text = act.get("value", "")
-                fresh = _call_checked(
+                fresh = reuse if reuse is not None else _call_checked(
                     "get_window_state",
                     {"pid": pid, "window_id": window_id,
-                     "include_screenshot": True}, timeout=20)
+                     "include_screenshot": False}, timeout=20)
                 els = fresh.get("elements") or []
                 el = _pick_editable(els, act.get("element_index"))
                 if act.get("match") and els:
@@ -1017,10 +1231,10 @@ class ComputerUseSkill:
                 eidx = act.get("element_index")
                 fresh = None
                 if eidx is not None:
-                    fresh = _call_checked(
+                    fresh = reuse if reuse is not None else _call_checked(
                         "get_window_state",
                         {"pid": pid, "window_id": window_id,
-                         "include_screenshot": True}, timeout=20)
+                         "include_screenshot": False}, timeout=20)
                     els = fresh.get("elements") or []
                     if act.get("match") and els:
                         new_idx = layers.resolve_index(els, act)
@@ -1053,7 +1267,7 @@ class ComputerUseSkill:
                     fresh = _call_checked(
                         "get_window_state",
                         {"pid": pid, "window_id": window_id,
-                         "include_screenshot": True}, timeout=20)
+                         "include_screenshot": False}, timeout=20)
                     el = _pick_editable(fresh.get("elements"))
                     token = (el or {}).get("element_token")
                     if not token:
@@ -1064,18 +1278,11 @@ class ComputerUseSkill:
                     retry["text"] = args["text"]
                     _call_type(retry)
             elif t == "press_key":
-                # Re-fetch a fresh snapshot for key presses too — a stale
-                # snapshot_id from the turn's initial scan can cause the
-                # driver to refuse the keypress (same expiry as clicks).
+                # Global key press (no element): do NOT pass snapshot_id —
+                # the driver refuses "snapshot_id requires element_index" for a
+                # non-element key. _call_key escalates to foreground delivery
+                # when the surface drops background keys.
                 pargs = dict(base)
-                try:
-                    fresh = daemon.call("get_window_state",
-                                        {"pid": pid, "window_id": window_id,
-                                         "include_screenshot": True}, timeout=20)
-                    if fresh.get("snapshot_id"):
-                        pargs["snapshot_id"] = fresh["snapshot_id"]
-                except Exception:
-                    pass
                 # Accept both `key` (driver shape, used by extract.py) and
                 # `value` (judge/deterministic shape) — same physical key.
                 _key = act.get("key", act.get("value"))
@@ -1099,9 +1306,10 @@ class ComputerUseSkill:
                     # Fresh snapshot like click/type/press_key — a stale
                     # turn-start snapshot gets element scrolls refused.
                     try:
-                        _fresh = daemon.call("get_window_state",
-                                             {"pid": pid, "window_id": window_id,
-                                              "include_screenshot": True}, timeout=20)
+                        _fresh = reuse if reuse is not None else daemon.call(
+                            "get_window_state",
+                            {"pid": pid, "window_id": window_id,
+                             "include_screenshot": False}, timeout=20)
                         if _fresh.get("snapshot_id"):
                             _sargs["snapshot_id"] = _fresh["snapshot_id"]
                     except Exception:
@@ -1116,6 +1324,26 @@ class ComputerUseSkill:
                 except (TypeError, ValueError):
                     _secs = 1.0
                 time.sleep(max(0.0, min(_secs, 5.0)))
+            elif t == "open_app":
+                # Deterministic app launch — no vision, no Start-menu hunting.
+                # The agent calls this when the goal needs an app that is not
+                # running (or the current target window is not that app): the
+                # old behaviour escalated to L3 to find the Start menu, and a
+                # flaky vision call then dead-ended the whole run. Opening the
+                # app directly (gated L0 open_app) is reliable and instant; the
+                # cascade re-scans and finds the new window on the next turn.
+                app = str(act.get("app") or act.get("value") or "").strip()
+                if not app:
+                    self._last_dispatch_error = "open_app requires an app name"
+                    return False
+                res = self.shell_open_app(app)
+                if not (isinstance(res, dict)
+                        and res.get("status") in ("done", "dry-run", "pending")):
+                    self._last_dispatch_error = (
+                        f"open_app {app!r} failed: "
+                        f"{str(res)[:200]}")
+                    return False
+                return True
             else:
                 self._last_dispatch_error = f"unsupported action type {t!r}"
                 return False

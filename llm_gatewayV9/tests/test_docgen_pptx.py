@@ -11,6 +11,8 @@ These tests pin the properties that make a deck readable on a projector, and
 the one that matters most: nothing a section says may be dropped or packed.
 """
 import io
+import re
+import zipfile
 
 import pytest
 
@@ -661,3 +663,94 @@ def test_the_card_holds_every_bullet():
     assert (card.top + card.height) >= (body.top + body.height), (
         f"card ends at {(card.top+card.height)/914400:.2f}in but the list "
         f"runs to {(body.top+body.height)/914400:.2f}in")
+
+
+# ── the designed surface: backgrounds, theme, dividers ────────────────────
+# A deck that is stark white on every slide, carries the stock Office theme
+# underneath its explicit runs, and renders a heading-only section as a
+# near-empty page reads as converted, not designed. These pin the visual
+# system the renderer now owns.
+
+def _deck_raw(blocks, title="How LLMs Work", **extra):
+    spec = {"title": title, "blocks": blocks, **extra}
+    blob, name, _ct = docgen.generate("pptx", spec)
+    return Presentation(io.BytesIO(blob)), blob
+
+
+def _slide_xml(blob, i):
+    return zipfile.ZipFile(io.BytesIO(blob)).read(
+        f"ppt/slides/slide{i}.xml").decode("utf-8")
+
+
+def _bg_hex(blob, i):
+    m = re.search(r'<p:bg>.*?<a:srgbClr val="([0-9A-Fa-f]{6})"',
+                  _slide_xml(blob, i), re.S)
+    return m.group(1).upper() if m else None
+
+
+def _theme(blob):
+    return zipfile.ZipFile(io.BytesIO(blob)).read(
+        "ppt/theme/theme1.xml").decode("utf-8")
+
+
+def test_no_slide_is_left_on_stark_white():
+    prs, blob = _deck_raw(_sections(2))
+    for i in range(1, len(prs.slides) + 1):
+        assert "<p:bg>" in _slide_xml(blob, i), f"slide {i} has no background"
+        assert _bg_hex(blob, i) not in (None, "FFFFFF"), \
+            f"slide {i} background is stark white"
+
+
+def test_the_theme_is_the_deck_palette_not_office():
+    prs, blob = _deck_raw(_sections(1), style="whitepaper")
+    theme = _theme(blob)
+    assert "4F81BD" not in theme and "Calibri" not in theme, \
+        "the stock Office theme survived under the explicit runs"
+    a1 = re.search(r'<a:accent1><a:srgbClr val="([0-9A-Fa-f]{6})"', theme)
+    assert a1 and a1.group(1).upper() == "0F6E5C", a1
+    assert '<a:majorFont><a:latin typeface="Georgia"' in theme
+    assert '<a:minorFont><a:latin typeface="Georgia"' in theme
+
+
+def test_style_changes_the_deck_palette():
+    def accent(style):
+        _prs, blob = _deck_raw(_sections(1), style=style)
+        return re.search(r'<a:accent1><a:srgbClr val="([0-9A-Fa-f]{6})"',
+                         _theme(blob)).group(1).upper()
+    assert accent("report") != accent("manual"), \
+        "every style renders the same palette"
+
+
+def test_a_heading_only_section_is_a_full_accent_divider():
+    prs, blob = _deck_raw([
+        {"type": "heading", "level": 1, "text": "Part One"},
+        {"type": "heading", "level": 1, "text": "Detail"},
+        {"type": "bullets", "items": ["a", "b"]},
+    ])
+    div = list(prs.slides)[1]
+    assert div.slide_layout.name == "Section Header", div.slide_layout.name
+    ph = [p for p in div.placeholders if int(p.placeholder_format.idx) == 0][0]
+    assert ph.text_frame.text.strip() == "Part One"
+    assert str(ph.text_frame.paragraphs[0].runs[0].font.color.rgb) == "FFFFFF"
+    assert _bg_hex(blob, 2) == "5B4BD6", "divider is not on the full accent"
+    # A section WITH a body is still a content slide, not a divider.
+    assert list(prs.slides)[2].slide_layout.name == "Title Only"
+
+
+def test_a_divider_keeps_its_speaker_note():
+    prs, blob = _deck_raw([
+        {"type": "heading", "level": 1, "text": "Part"},
+        {"type": "note", "text": "Transition line."},
+        {"type": "heading", "level": 1, "text": "Body"},
+        {"type": "bullets", "items": ["x"]},
+    ])
+    notes = [s.notes_slide.notes_text_frame.text for s in prs.slides
+             if s.has_notes_slide]
+    assert any("Transition line." in n for n in notes), notes
+
+
+def test_the_cover_panel_is_a_gradient():
+    prs, blob = _deck_raw(_sections(1))
+    cover = list(prs.slides)[0]
+    grad = [sh for sh in cover.shapes if "gradFill" in sh._element.xml]
+    assert grad, "the cover panel is a flat swatch, not a gradient"

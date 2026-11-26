@@ -334,6 +334,6 @@ def test_both_mechanisms_are_off_by_default_for_a_budgeted_caller():
     import inspect
     src = inspect.getsource(mr.run_tool_loop)
     fold_at = src.index("_fold_consumed(")
-    elide_at = src.index("if max_context_chars > 0:")
+    elide_at = src.index("if max_context_chars > 0 or max_context_tokens > 0:")
     assert fold_at < elide_at, (
         "folding must run before the budgeted elision, not inside it")

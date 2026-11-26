@@ -23,6 +23,8 @@ slow embed can never block other writers.
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import threading
 from collections.abc import Awaitable, Callable
@@ -79,6 +81,16 @@ def tokens(text: str) -> set[str]:
     }
 
 
+def token_list(text: str) -> list[str]:
+    """Same normalisation as :func:`tokens` but keeps repeats and order, so
+    term frequency survives for BM25. ``tokens`` collapses to a set, which
+    throws away exactly the signal BM25 scores on."""
+    return [
+        w for w in re.findall(r"\w+", (text or "").lower())
+        if w not in _STOPWORDS and len(w) > 2
+    ]
+
+
 # Sentinel distinguishing "no vector attempted yet" (embed inside) from
 # "vector attempted, none available" (skip vector path). The plane embeds
 # once and fans the result out to every drawer service.
@@ -122,6 +134,14 @@ def _expired(rec: MemoryRecord, now: datetime) -> bool:
 # domains — deliberately untuned; tune only against a labeled eval set).
 RRF_K = 60
 
+# BM25 (Robertson & Walker) defaults: k1 saturates term frequency so a word
+# repeated 50× is not 50× a word repeated once; b normalises document length
+# so a long chunk does not outrank a short fact just by containing more words.
+# Untuned — tune only against a labeled eval set, never to make one query look
+# better.
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+
 
 def rrf_fuse(vec_hits: list[MemoryRecord],
              kw_hits: list[MemoryRecord],
@@ -159,6 +179,13 @@ class MemoryService:
         # Separate from _write_lock on purpose: see
         # _persist_embedded. Lock order is always persist → write.
         self._persist_lock = threading.Lock()
+        # Cached BM25 inverted index over this drawer's searchable text.
+        # Keyed on the store file's (mtime_ns, size) — the same key the store
+        # uses for its parsed-record cache — so any write invalidates it and
+        # a query never re-tokenises the whole 86 MB document drawer. Built
+        # lazily on first keyword search; None until then.
+        self._kw_key: tuple[int, int] | None = None
+        self._kw_index: dict | None = None
         try:
             self.index: VectorIndex | None = VectorIndex(
                 self.state_dir, expected_dim=expected_dim)
@@ -320,6 +347,11 @@ class MemoryService:
             return ""
 
     def _embed_dim(self) -> int:
+        # The live index's width, not the pinned constant: a service built with
+        # a different expected_dim indexes vectors of that width, and the
+        # comparability guard must judge against what the index actually holds.
+        if self.index is not None and self.index.dim is not None:
+            return self.index.dim
         return EMBED_DIM
 
     # ── scoping ────────────────────────────────────────────────────────────
@@ -530,27 +562,131 @@ class MemoryService:
 
     # ── reads ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _search_text(rec: MemoryRecord) -> str:
+        """The full text a keyword query should match against.
+
+        Document chunks store the whole body in ``value['chunk']`` but only a
+        200-char prefix in ``descriptor`` (and no keywords), so scoring the
+        descriptor alone made every chunk body past char 200 invisible to
+        keyword recall — the vector path embedded the full text, the keyword
+        path did not. Use the chunk when present (it is a superset of the
+        descriptor, so adding both would double-count the prefix), else the
+        descriptor, plus any explicit keywords.
+        """
+        value = rec.value if isinstance(rec.value, dict) else {}
+        chunk = value.get("chunk")
+        body = chunk if isinstance(chunk, str) and chunk.strip() \
+            else (rec.descriptor or "")
+        kws = " ".join(rec.keywords or [])
+        return f"{body} {kws}".strip()
+
+    def _kw_build(self, items: list[MemoryRecord]) -> dict:
+        """Build the BM25 inverted index over one drawer's live records.
+
+        Superseded rows are excluded here (corrected claims never surface),
+        so corpus statistics — N, document frequency, average length — reflect
+        the live store. Visibility (expiry/session) and kind filters are
+        applied per query, not baked in, so one cached index serves every
+        caller.
+        """
+        postings: dict[str, dict[str, int]] = {}
+        lengths: dict[str, int] = {}
+        by_id: dict[str, MemoryRecord] = {}
+        for rec in items:
+            if rec.superseded_by is not None:
+                continue
+            toks = token_list(self._search_text(rec))
+            by_id[rec.id] = rec
+            lengths[rec.id] = len(toks)
+            tf: dict[str, int] = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+            for t, n in tf.items():
+                postings.setdefault(t, {})[rec.id] = n
+        n_docs = len(by_id)
+        avgdl = (sum(lengths.values()) / n_docs) if n_docs else 0.0
+        df = {t: len(p) for t, p in postings.items()}
+        return {"postings": postings, "lengths": lengths, "by_id": by_id,
+                "N": n_docs, "avgdl": avgdl, "df": df}
+
+    def _kw_get(self) -> dict:
+        """Return the cached inverted index, rebuilding only when the store
+        file changed. Keyed on (mtime_ns, size) exactly like the store's own
+        record cache; every writer goes through the store's atomic replace,
+        so a stale key cannot survive a write."""
+        try:
+            st = self.store.path.stat()
+            key: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if self._kw_index is not None and key == self._kw_key:
+            return self._kw_index
+        self._kw_index = self._kw_build(self.store.load())
+        self._kw_key = key
+        return self._kw_index
+
     def _keyword_search(self, query: str, history: list[dict] | None, *,
                         kinds: list[str] | None,
                         top_k: int,
                         session_id: str | None) -> list[MemoryRecord]:
-        items = self._visible(self.store.load(), session_id)
-        if kinds:
-            items = [i for i in items if i.kind in kinds]
+        """BM25 over the full searchable text, fused with the vector path by
+        RRF in :meth:`read`.
+
+        Replaces raw token-overlap counting on the descriptor. Two things
+        change: chunk bodies are now searchable (see :meth:`_search_text`),
+        and scoring is length-normalised TF × IDF instead of a flat overlap
+        count. IDF is the score gate — a token in nearly every record
+        (``df ≈ N``) gets ``log(1 + ~0) ≈ 0`` weight, so ubiquitous words
+        cannot drag unrelated records into recall, while a rare identifier
+        dominates. No hard cutoff, so a genuine rare-token match is never
+        suppressed.
+        """
         qtoks = tokens(query)
         if history:
             for h in history[-3:]:
                 qtoks |= tokens(json.dumps(h, default=str))
-        scored: list[tuple[int, MemoryRecord]] = []
-        for item in items:
-            if item.superseded_by is not None:
-                continue  # corrected claims never surface in recall
-            itoks = {w.lower() for w in item.keywords} | tokens(item.descriptor)
-            score = len(qtoks & itoks)
-            if score > 0:
-                scored.append((score, item))
-        scored.sort(key=lambda x: -x[0])
-        return [i for _, i in scored[:top_k]]
+        if not qtoks:
+            return []
+        index = self._kw_get()
+        n_docs = index["N"]
+        if not n_docs:
+            return []
+        postings = index["postings"]
+        df = index["df"]
+        lengths = index["lengths"]
+        by_id = index["by_id"]
+        avgdl = index["avgdl"] or 1.0
+        # Accumulate BM25 over the union of postings for the query tokens.
+        # Each unique query term contributes once (short queries; matches the
+        # old set-overlap semantics), weighted by its corpus IDF.
+        cand: dict[str, float] = {}
+        for t in qtoks:
+            post = postings.get(t)
+            if not post:
+                continue
+            idf = math.log(1.0 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
+            for rid, tf in post.items():
+                norm = _BM25_K1 * (1.0 - _BM25_B
+                                   + _BM25_B * (lengths[rid] / avgdl))
+                cand[rid] = cand.get(rid, 0.0) + \
+                    idf * (tf * (_BM25_K1 + 1.0)) / (tf + norm)
+        if not cand:
+            return []
+        visible = {i.id for i in
+                   self._visible(list(by_id.values()), session_id)}
+        scored: list[tuple[float, str, MemoryRecord]] = []
+        for rid, score in cand.items():
+            if score <= 0.0 or rid not in visible:
+                continue
+            rec = by_id[rid]
+            if kinds and rec.kind not in kinds:
+                continue
+            scored.append((score, rid, rec))
+        # Deterministic tiebreak on id: qtoks is a set, so candidate insertion
+        # order is not stable across runs; sorting on (-score, id) is.
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [r for _, _, r in scored[:top_k]]
 
     async def _vector_search(self, query: str, *,
                              kinds: list[str] | None, top_k: int,
@@ -588,7 +724,9 @@ class MemoryService:
         live = self._embed_model()
         if live:
             by_id = {i.id: i for i in self.store.load()}
-            hits = [(score, hid) for score, hid in hits
+            # idx.search yields (id, score); unpack in that order so the lookup
+            # keys on the id, not the score.
+            hits = [(hid, score) for hid, score in hits
                     if (by_id.get(hid) is None
                         or self._matches_index(by_id[hid]))]
         by_id = {item.id: item

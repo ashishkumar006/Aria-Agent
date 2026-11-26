@@ -428,6 +428,12 @@ class Registry:
                 src.unlink()
         except Exception:
             pass
+        try:
+            cap = self.root / f"{doc_id}.captions.json"
+            if cap.exists():
+                cap.unlink()
+        except Exception:
+            pass
         return True
 
     # ── folders ─────────────────────────────────────────────────────────────
@@ -619,6 +625,28 @@ class Registry:
         p = self.root / f"{doc_id}.source"
         return p.read_bytes() if p.exists() else None
 
+    # ── image captions (index-time, persisted) ──────────────────────────────
+    # A caption is generated once by the indexing worker (alt-text or a vision
+    # call) and persisted here, keyed by the picture's content hash. The chunk
+    # list is rebuilt from these on every re-parse, so a non-deterministic model
+    # answer never shifts chunk indices between the indexer and the detail
+    # route. Reading is unconditional: once a caption is part of a document's
+    # index it stays part of it; the master flag gates GENERATION only.
+    def read_captions(self, doc_id: str) -> list[dict]:
+        p = self.root / f"{doc_id}.captions.json"
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def write_captions(self, doc_id: str, rows: list[dict]) -> None:
+        with self._lock:
+            self._write_json(self.root / f"{doc_id}.captions.json",
+                             json.dumps(rows, indent=2))
+
 
 def _known(raw: dict, cls):
     """Build a dataclass from stored dict, ignoring keys added by later
@@ -669,6 +697,40 @@ class ParseTimeout(RuntimeError):
 PARSE_TIMEOUT_S = float(os.getenv("DOCUMENT_PARSE_TIMEOUT_S", "300") or 300)
 
 
+# ── image-content retrieval: the one central master switch ───────────────────
+# Off by default. When off, the indexing worker generates no captions and a
+# fresh document chunks exactly as it always did — no extra blocks, no sidecar,
+# no residue. When on, embedded pictures (and bare image uploads) are described
+# at index time — alt-text first, a vision call otherwise — and the description
+# becomes a searchable chunk. Read fresh each call so a test (or an operator
+# restarting with a different env) flips it without code changes.
+def image_caption_enabled() -> bool:
+    return str(os.getenv("DOCUMENT_IMAGE_CAPTION", "0") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def image_caption_blocks(reg: "Registry", doc: "Document") -> list:
+    """Persisted image captions as searchable blocks, in stable order.
+
+    Pure read of the sidecar — no network, no generation — so the indexer and
+    the detail route build the identical chunk list from it. Empty when the
+    document has no captions (the flag-off / pre-feature case), which is what
+    keeps the feature residue-free."""
+    from documents.chunker import Block
+    rows = reg.read_captions(doc.id)
+    out: list = []
+    for r in rows:
+        text = str(r.get("caption") or "").strip()
+        if not text:
+            continue
+        out.append(Block(kind="para", text=text,
+                         page=int(r.get("page") or 0),
+                         meta={"image": True,
+                               "image_sha": str(r.get("sha") or ""),
+                               "image_caption_source": str(r.get("source") or "")}))
+    return out
+
+
 def _parse_with_timeout(filename: str, data: bytes,
                         timeout_s: float | None = None):
     """Parse `data`, giving up after `timeout_s`.
@@ -706,11 +768,16 @@ class Indexer:
     """Parses, chunks and embeds one document at a time."""
 
     def __init__(self, registry: Registry, *, batch_size: int = BATCH_DEFAULT,
-                 embed=None):
+                 embed=None, caption=None):
         self.registry = registry
         self.batch_size = max(1, min(batch_size, BATCH_MAX))
         # Injected for tests; production passes the gateway's batch client.
         self._embed = embed
+        # Optional index-time image captioner: `caption(doc, parsed)` generates
+        # and persists descriptions for embedded pictures. None (the default,
+        # and every test) means no captioning — the chunk list is the parse
+        # alone, exactly as before the feature existed.
+        self._caption = caption
 
     def _embed_batch(self, texts: list[str]):
         if self._embed is None:
@@ -757,7 +824,19 @@ class Indexer:
                 return reg.set_status(doc_id, FAILED,
                                       f"could not parse the file: {e}")
             reg.update(doc_id, warnings=parsed.warnings)
-            if not parsed.blocks:
+            # Image-content retrieval: generate captions once (worker thread,
+            # best-effort) then read them back as blocks. Generation is gated by
+            # the master flag inside the captioner; the read is unconditional so
+            # an already-captioned document keeps its chunks. A caption failure
+            # must never fail the document — the text still indexes.
+            if self._caption is not None:
+                try:
+                    self._caption(doc, parsed)
+                except Exception as e:              # noqa: BLE001
+                    print(f"[index] {doc_id} captioning skipped: "
+                          f"{type(e).__name__}: {e}", flush=True)
+            blocks = list(parsed.blocks) + image_caption_blocks(reg, doc)
+            if not blocks:
                 if doc.doc_type == "image":
                     # An image is a figure source, not a text source: having no
                     # blocks is what it means to succeed. Marking it failed made
@@ -779,7 +858,7 @@ class Indexer:
                      else ""))
 
             reg.set_status(doc_id, CHUNKING)
-            chunks = chunk_blocks(parsed.blocks)
+            chunks = chunk_blocks(blocks)
             if not chunks:
                 return reg.set_status(doc_id, FAILED, "produced no chunks")
             reg.update(doc_id, chunk_count=len(chunks),

@@ -59,7 +59,9 @@ def test_checks_share_the_agents_detector():
     the agent says fail."""
     from mcp_server import _CHECK_PROFILES
     src = inspect.getsource(agent_server.code_checks)
-    assert "_CHECK_PROFILES" in src
+    # The panel imports the agent's detector rather than redefining the rule,
+    # so the two can never disagree about what counts as "has a checker".
+    assert "detect_checks" in src
     assert len(_CHECK_PROFILES) >= 6, "the detector lost entries"
 
 

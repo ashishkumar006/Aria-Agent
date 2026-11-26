@@ -561,15 +561,78 @@ def test_the_self_token_is_empty_when_neither_exists(monkeypatch, tmp_path):
     assert agent_server._self_token() == ""
 
 
-def test_the_chat_turn_targets_the_lightweight_stream_not_the_dag():
-    """`POST /api/chat` runs the full research DAG. "what time is it" must not
-    cost a planner/researcher/formatter run."""
+def test_the_chat_turn_targets_the_dag_for_console_parity():
+    """A channel message must reach the SAME full DAG the console chat uses
+    (`POST /api/chat`, `run_kind="chat"`), so it can plan a multi-node run —
+    research → author, coder → sandbox, a tool-using action — exactly as the
+    console can. It was originally the lightweight `/api/chat/simple/stream`
+    (one LLM call), which could not reach the DAG's capabilities at all."""
     src = Path(channel_chat.__file__).read_text(encoding="utf-8")
-    assert "/api/chat/simple/stream" in src, (
-        "the channel turn must use the lightweight chat stream")
-    assert '"/api/chat"' not in src and "'/api/chat'" not in src, (
-        "the channel turn targets the research DAG endpoint; a Telegram "
-        "message would launch a multi-node paid run")
+    # The actual stream call must target /api/chat (the DAG), not the old
+    # lightweight route. Assert the code, not the prose that explains the change.
+    assert 'f"{_self_base()}/api/chat"' in src, (
+        "the channel turn must open a stream to the full DAG endpoint (/api/chat)")
+    assert 'simple/stream"' not in src, (
+        "the channel turn still calls the lightweight stream; it cannot reach "
+        "the DAG's capabilities")
+    assert '"run_kind": "chat"' in src, (
+        "the DAG run must be tagged run_kind=chat (the console's chat mode)")
+
+
+def test_ask_agent_reads_the_dag_done_frame(monkeypatch):
+    """The DAG streams log/meta/done (not delta); the answer and the produced
+    files arrive whole on `done`. A channel turn must read them there — waiting
+    for deltas that never come would yield an empty reply."""
+    import httpx
+
+    frames = [
+        'data: {"type":"log","text":"planner"}',
+        'data: {"type":"meta","elapsed_s":3.2,"cost_usd":0.001}',
+        'data: {"type":"done","answer":"42","session_id":"s8-x",'
+        '"files":[{"artifact":"art:0123456789abcdef",'
+        '"filename":"a.pdf","format":"pdf"}]}',
+    ]
+
+    class _Resp:
+        status_code = 200
+
+        def iter_lines(self):
+            for f in frames:
+                yield f
+
+    class _Stream:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return _Resp()
+
+        def __exit__(self, *a):
+            return False
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def stream(self, method, url, json=None):
+            assert url.endswith("/api/chat"), url
+            assert (json or {}).get("run_kind") == "chat"
+            return _Stream()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+    answer, err, produced = channel_chat._ask_agent("what is 6*7?", "ct-1")
+
+    assert err == ""
+    assert answer == "42"
+    assert produced and produced[0]["artifact"] == "art:0123456789abcdef"
+    assert produced[0]["filename"] == "a.pdf"
 
 
 # ── a long answer is split, not cut at 3500 ───────────────────────────────

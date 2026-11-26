@@ -353,6 +353,118 @@ def test_chat_reaches_the_payload_with_the_switch_on(monkeypatch):
     assert {"search_images", "fetch_image"} <= got, sorted(got)[:12]
 
 
+# ── the unattended pass: stale cache + unverifiable candidates ──────────────
+def test_the_figure_pass_clears_stale_topic_images(flag_state, monkeypatch):
+    """`_FIGURE_TOPIC_IMAGES` is a module-level cache keyed by the first four
+    words of a section title. Without a clear, a later run with a similarly
+    named section was shown the PREVIOUS document's picture."""
+    import skills
+
+    class _Empty:
+        @staticmethod
+        def search_images(*a, **k):
+            return {"ok": True, "results": []}
+
+    monkeypatch.setitem(sys.modules, "mcp_server", _Empty)
+    skills._FIGURE_TOPIC_IMAGES["chapter one"] = "https://old/figure.png"
+    skills._acquire_figures("a report with photographs", ["Chapter One"])
+    assert "chapter one" not in skills._FIGURE_TOPIC_IMAGES
+
+
+def test_an_unverifiable_figure_is_still_used(flag_state, monkeypatch):
+    """A vision outage must not silently drop every figure in a long document.
+
+    `_image_matches_topic` returns None when the check cannot run. The pass
+    accepts the top relevance-ranked candidate in that case rather than
+    returning nothing."""
+    import skills
+
+    class _Fake:
+        @staticmethod
+        def search_images(query, max_results=8, commercial_only=False):
+            return {"ok": True, "results": [{
+                "image_url": "https://example.com/a.png",
+                "width": 800, "height": 600,
+                "creator": "A", "license": "CC0"}]}
+
+        @staticmethod
+        def fetch_image(*a, **k):
+            return {"ok": True, "document": "doc-1"}
+
+    monkeypatch.setitem(sys.modules, "mcp_server", _Fake)
+    monkeypatch.setattr(skills, "_image_matches_topic",
+                        lambda url, topic: None, raising=False)
+    out = skills._acquire_figures("a report with photographs", ["Chapter One"])
+    assert 'document="doc-1"' in out, "an unverified figure was dropped"
+
+
+def test_image_matches_topic_distinguishes_no_from_unavailable(monkeypatch):
+    """None (could not verify) is not False (looked and said no)."""
+    import gateway
+    import skills
+
+    class _LLM:
+        reply = "NO"
+        boom = False
+
+        def vision(self, url, prompt, **kw):
+            if self.boom:
+                raise RuntimeError("vision unavailable")
+            return {"text": self.reply}
+
+    monkeypatch.setattr(gateway, "LLM", lambda: _LLM())
+    assert skills._image_matches_topic("https://x/a.png", "batteries") is False
+    _LLM.reply = "YES"
+    assert skills._image_matches_topic("https://x/a.png", "batteries") is True
+    _LLM.boom = True
+    assert skills._image_matches_topic("https://x/a.png", "batteries") is None
+
+
+def test_the_figure_search_query_is_short_enough_for_a_keyword_engine():
+    """Openverse returns ZERO for the full section heading but plenty for a
+    short keyword query. The pre-pass must not search with the heading."""
+    import skills
+
+    heading = "Cost trends and economic viability of grid-scale battery storage"
+    q = skills._figure_search_query(heading, 5)
+    assert 0 < len(q.split()) <= 5
+    assert "grid-scale" in q or "battery" in q or "cost" in q
+    # The subject of an English section heading is usually at the end.
+    assert skills._figure_search_query(heading, 3, from_end=True) == \
+        "grid-scale battery storage"
+
+
+def test_the_figure_pass_tries_a_second_query_when_the_first_is_empty(
+        flag_state, monkeypatch):
+    """A specific heading can return nothing; the pass must fall back to a
+    shorter query rather than silently producing a text-only document."""
+    import skills
+
+    calls: list = []
+
+    class _Fake:
+        @staticmethod
+        def search_images(query, max_results=8, commercial_only=False):
+            calls.append(query)
+            if "comparative" in query.lower():
+                return {"ok": True, "results": []}
+            return {"ok": True, "results": [{
+                "image_url": "https://example.com/b.png", "width": 800,
+                "height": 600, "creator": "B", "license": "CC0"}]}
+
+        @staticmethod
+        def fetch_image(*a, **k):
+            return {"ok": True, "document": "doc-b"}
+
+    monkeypatch.setitem(sys.modules, "mcp_server", _Fake)
+    monkeypatch.setattr(skills, "_image_matches_topic",
+                        lambda url, topic: True, raising=False)
+    out = skills._acquire_figures(
+        "a report with figures", ["Comparative analysis of battery chemistries"])
+    assert len(calls) >= 2, calls
+    assert 'document="doc-b"' in out
+
+
 def test_the_one_image_switch_withholds_them_from_chat_too(monkeypatch):
     """Off must be off on every surface, not just the author's: a switch that
     only one caller honours is a default, not a kill switch."""

@@ -2,7 +2,7 @@
 skip providers that lack a requested capability (tools/reasoning/structured/caching)."""
 from __future__ import annotations
 import time
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 
 
 LIMITS = {
@@ -87,6 +87,7 @@ class RateState:
         self.tokens_minute = deque()
         self.calls_today = 0
         self.tokens_today = 0
+        self._tpm = 0  # running sum of tokens_minute, avoids O(n) re-sum per pick
         self.day_start = self._day_start()
         self.last_call = 0.0
         self.unavailable_until = 0.0
@@ -107,7 +108,7 @@ class RateState:
         while self.calls_minute and self.calls_minute[0] < cutoff:
             self.calls_minute.popleft()
         while self.tokens_minute and self.tokens_minute[0][0] < cutoff:
-            self.tokens_minute.popleft()
+            self._tpm -= self.tokens_minute.popleft()[1]
 
     def can_use(self, limits, est_tokens=0, ignore_pacing=False):
         """Is this provider usable right now?
@@ -136,8 +137,7 @@ class RateState:
             return False, "RPM limit"
         if self.calls_today >= limits["rpd"]:
             return False, "RPD limit"
-        tpm = sum(t for _, t in self.tokens_minute)
-        if tpm + est_tokens > limits["tpm"]:
+        if self._tpm + est_tokens > limits["tpm"]:
             return False, "TPM limit"
         if "tokens_per_day" in limits and self.tokens_today + est_tokens > limits["tokens_per_day"]:
             return False, "daily token cap"
@@ -147,6 +147,7 @@ class RateState:
         now = time.time()
         self.calls_minute.append(now)
         self.tokens_minute.append((now, tokens))
+        self._tpm += tokens
         self.calls_today += 1
         self.tokens_today += tokens
         self.last_call = now
@@ -158,13 +159,12 @@ class RateState:
     def snapshot(self, limits):
         self.gc()
         now = time.time()
-        tpm = sum(t for _, t in self.tokens_minute)
         return {
             "rpm_used": len(self.calls_minute),
             "rpm_limit": limits["rpm"],
             "rpd_used": self.calls_today,
             "rpd_limit": limits["rpd"],
-            "tpm_used": tpm,
+            "tpm_used": self._tpm,
             "tpm_limit": limits["tpm"],
             "tokens_today": self.tokens_today,
             "tokens_per_day": limits.get("tokens_per_day"),
@@ -182,7 +182,8 @@ class Router:
         self.state = defaultdict(RateState)
         # affinity id -> (provider, last_used_monotonic). Per-Router, so a
         # per-user pool never inherits another user's provider history.
-        self.affinity: dict[str, tuple[str, float]] = {}
+        # OrderedDict = O(1) LRU eviction instead of sorting the whole map.
+        self.affinity: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
 
     def candidates(self, override=None):
         if override:
@@ -196,7 +197,7 @@ class Router:
         return list(self.order)
 
     def pick(self, est_tokens, candidates, required_caps: list[str] | None = None,
-             preferred: str | None = None):
+             preferred: str | None = None, model: str | None = None):
         """Choose the least-recently-loaded usable candidate (fewest calls
         in the last minute, then longest idle) instead of strict priority
         order — concurrent calls spread across providers in parallel
@@ -217,6 +218,19 @@ class Router:
             limits = limits_for(name)
             prov = self.providers[name]
             caps = getattr(prov, "capabilities", {})
+            # V9: capability is per REQUESTED MODEL, not per provider default.
+            # A provider such as Kilo serves hundreds of models behind one
+            # configured default ("openrouter/free"); gating on that default
+            # made every vision-capable model under it unreachable (the router
+            # skipped Kilo with "no_vision" even when the caller pinned
+            # nvidia/nemotron-3.5-super-vl). Recompute the caps for the model
+            # the caller actually asked for, so the gate matches the request.
+            if model:
+                try:
+                    import providers as _P
+                    caps = _P.model_capabilities(name, model, caps)
+                except Exception:
+                    pass
             if required_caps:
                 missing = [c for c in required_caps if not caps.get(c)]
                 if missing:
@@ -255,6 +269,7 @@ class Router:
         if time.time() - when > AFFINITY_TTL_S:
             self.affinity.pop(affinity, None)
             return None
+        self.affinity.move_to_end(affinity)
         return name if name in self.providers else None
 
     def note_affinity(self, affinity: str | None, provider: str) -> None:
@@ -268,10 +283,9 @@ class Router:
         if not affinity or provider not in self.providers:
             return
         self.affinity[affinity] = (provider, time.time())
-        if len(self.affinity) > AFFINITY_MAX:
-            for stale in sorted(self.affinity, key=lambda k: self.affinity[k][1])[
-                    :len(self.affinity) - AFFINITY_MAX]:
-                self.affinity.pop(stale, None)
+        self.affinity.move_to_end(affinity)
+        while len(self.affinity) > AFFINITY_MAX:
+            self.affinity.popitem(last=False)
 
     def all_status(self):
         out = {}

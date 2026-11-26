@@ -103,6 +103,15 @@ def _blob_name(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()[:32]
 
 
+def sha_of(data: bytes) -> str:
+    """The fingerprint a checkpoint keeps for a file it expects to remove.
+
+    Public because the caller that performs a rename records the destination's
+    fingerprint, and two spellings of one hash is how a guard silently stops
+    matching."""
+    return hashlib.sha256(data).hexdigest()[:32]
+
+
 def _put_blob(bucket: str, data: bytes) -> str:
     """Content-addressed write; returns the name. Identical bytes across two
     turns or two checkpoints cost the disk one copy."""
@@ -814,6 +823,7 @@ def _cp_load(bucket: str) -> dict:
         got = {"bucket": bucket, "turns": 0, "checkpoints": []}
     got.setdefault("turns", 0)
     got.setdefault("checkpoints", [])
+    got.setdefault("acted", [])
     return got
 
 
@@ -859,6 +869,12 @@ def checkpoint_record(sid: str, turn: str, client_path: str,
                               f"before task {data['turns']}"),
                      "when": time.time(), "files": []}
             data["checkpoints"].append(found)
+            # New work ends the undo/redo walk: the cursor goes back to the
+            # newest checkpoint and a redo no longer has anything to replay.
+            # A restore's own snapshot is not new work, so it keeps the walk
+            # intact — that is what makes undo → redo → undo work.
+            if not turn.startswith("undo-"):
+                data["acted"] = []
         names = {str(f.get("path") or "") for f in found["files"]}
         if client_path and client_path not in names:
             blob = (_put_blob(bucket, before)
@@ -871,15 +887,90 @@ def checkpoint_record(sid: str, turn: str, client_path: str,
         return str(found["id"])
 
 
+def checkpoint_mark_removed(sid: str, turn: str, client_path: str,
+                            removed: str, removed_sha: str = "",
+                            abs_removed: str = "") -> str:
+    """Note that restoring this checkpoint must ALSO remove another path.
+
+    A rename is one act, not two: the file at `client_path` is restored and the
+    name it moved to goes away. A checkpoint that only recorded the first half
+    made `/undo` after a rename leave BOTH names on disk — a duplicate, which is
+    the opposite of undoing. The hash is the guard: if the moved file was edited
+    after the rename, restore leaves it alone rather than deleting work nobody
+    reviewed.
+
+    Called right after the rename, when the destination finally exists."""
+    if not turn or not removed:
+        return ""
+    bucket = _bucket(sid)
+    with _LOCK:
+        data = _cp_load(bucket)
+        found = next((c for c in data["checkpoints"]
+                      if c.get("turn") == turn), None)
+        if found is None:
+            return ""
+        entry = next((f for f in (found.get("files") or [])
+                      if isinstance(f, dict)
+                      and str(f.get("path") or "") == client_path), None)
+        if entry is None:
+            return ""
+        entry["removed"] = removed
+        entry["removed_abs"] = str(abs_removed or "")
+        entry["removed_sha"] = removed_sha or ""
+        _cp_save(bucket, data)
+        return str(found["id"])
+
+
 def checkpoints(sid: str) -> list[dict]:
     bucket = _bucket(sid)
     data = _cp_load(bucket)
     return [{"id": str(c.get("id") or ""), "name": str(c.get("name") or ""),
              "turn": str(c.get("turn") or ""), "when": c.get("when") or 0,
+             # "" = a task's own "before" state, "redo" = a state a later redo
+             # can replay, "undo" = the state a redo came from, undoable.
+             "capture": str(c.get("capture") or ""),
              "files": len(c.get("files") or []),
              "bytes": sum(int(f.get("bytes") or 0) for f in (c.get("files") or [])
                           if isinstance(f, dict))}
             for c in reversed(data["checkpoints"])]
+
+
+def _cp_set_capture(bucket: str, turn: str, kind: str) -> None:
+    """Tag a restore's snapshot with the direction it can be taken in.
+
+    Both directions write a snapshot, and without a tag they are
+    indistinguishable: `/redo` would offer the snapshot a redo just wrote and
+    undo the redo instead of finishing the replay."""
+    if not turn:
+        return
+    with _LOCK:
+        data = _cp_load(bucket)
+        found = next((c for c in data["checkpoints"]
+                      if c.get("turn") == turn), None)
+        if found is None:
+            return
+        found["capture"] = kind
+        _cp_save(bucket, data)
+
+
+def acted(sid: str) -> list[str]:
+    """Checkpoint ids the undo/redo walk has already passed.
+
+    Checkpoints are never removed, so without a cursor every `/undo` would pick
+    the same newest entry and the second one would be a no-op. The list answers
+    "where is the walk": `/undo` takes the newest entry that is not in it,
+    `/redo` takes the newest restore-snapshot that is not in it."""
+    return [str(x) for x in (_cp_load(_bucket(sid)).get("acted") or [])]
+
+
+def _mark_acted(bucket: str, cp_id: str) -> None:
+    if not cp_id:
+        return
+    with _LOCK:
+        data = _cp_load(bucket)
+        if cp_id not in data["acted"]:
+            data["acted"].append(cp_id)
+            _cp_save(bucket, data)
 
 
 def checkpoint_detail(sid: str, cp_id: str) -> dict:
@@ -891,6 +982,7 @@ def checkpoint_detail(sid: str, cp_id: str) -> dict:
     return {**found, "files": [{"path": str(f.get("path") or ""),
                                 "existed": bool(f.get("existed")),
                                 "abs": str(f.get("abs") or ""),
+                                "removed": str(f.get("removed") or ""),
                                 "bytes": int(f.get("bytes") or 0)}
                                for f in (found.get("files") or [])
                                if isinstance(f, dict)]}
@@ -925,28 +1017,82 @@ def restore_checkpoint(sid: str, cp_id: str, resolve) -> dict:
             return None
 
     undo_turn = f"undo-{cp_id}-{int(time.time())}"
-    restored, failed, skipped = [], [], []
+    restored, removed, failed, skipped = [], [], [], []
+
+    def _read(target):
+        try:
+            return target.read_bytes() if target.is_file() else None
+        except OSError:
+            return None
+
+    def _undo_target(path: str, abs_rec: str):
+        try:
+            return resolve(path, abs_rec)
+        except Exception:
+            return None
+
+    # Capture the state a redo would need, inverting each entry. A rename entry
+    # means "restore this path and remove the name it moved to", so its snapshot
+    # has to mean the opposite — put the moved file back and remove this path.
+    # Getting the inversion wrong is not a harmless cosmetic slip: capturing the
+    # removal side as a deletion left a redo that deleted both files.
     for f in files:
         path = str(f.get("path") or "")
         target = _target(f)
         if target is None:
             skipped.append({"path": path, "reason": "outside this session's folders"})
             continue
-        try:
-            current = target.read_bytes() if target.is_file() else None
-        except OSError as exc:
-            skipped.append({"path": path, "reason": f"cannot be read: {exc}"})
+        removed_path = str(f.get("removed") or "")
+        if not removed_path:
+            current = _read(target)
+            checkpoint_record(sid, undo_turn, path, current,
+                              current is not None, str(target))
             continue
-        checkpoint_record(sid, undo_turn, path, current, current is not None,
-                          str(target))
+        rm_target = _undo_target(removed_path, str(f.get("removed_abs") or ""))
+        current = _read(target)
+        if rm_target is None:
+            checkpoint_record(sid, undo_turn, path, current,
+                              current is not None, str(target))
+            continue
+        moved = _read(rm_target)
+        checkpoint_record(sid, undo_turn, removed_path, moved,
+                          moved is not None, str(rm_target))
+        checkpoint_mark_removed(sid, undo_turn, removed_path, path,
+                                sha_of(current or b"") if current is not None
+                                else "", str(target))
     undo_id = next((str(c.get("id")) for c in _cp_load(bucket)["checkpoints"]
                     if c.get("turn") == undo_turn), "")
+    # Direction: undoing a task leaves a state to replay forward; redoing a
+    # replay leaves the state to come back to. Same snapshot shape, opposite
+    # meaning, so the tag is what keeps the two walks from stealing each other's
+    # steps.
+    _cp_set_capture(bucket, undo_turn,
+                    "undo" if str(found.get("capture") or "") == "redo" else "redo")
 
     for f in files:
         path = str(f.get("path") or "")
         target = _target(f)
         if target is None:
             continue
+        # A rename has a second half: the name the file moved to. Undo it only
+        # when the file still holds what the rename put there — an edit after
+        # the rename means this is now somebody's work, not the rename's result.
+        removed_path = str(f.get("removed") or "")
+        if removed_path:
+            rm_target = _undo_target(removed_path, str(f.get("removed_abs") or ""))
+            if rm_target is not None and rm_target.is_file():
+                want = str(f.get("removed_sha") or "")
+                if want and sha_of(_read(rm_target) or b"") != want:
+                    skipped.append({"path": removed_path,
+                                    "reason": "changed after the rename, so "
+                                              "it was left alone"})
+                else:
+                    try:
+                        rm_target.unlink()
+                    except OSError as exc:
+                        failed.append({"path": removed_path, "reason": str(exc)})
+                    else:
+                        removed.append(removed_path)
         data_bytes = _get_blob(bucket, str(f.get("blob") or ""))
         if not f.get("existed"):
             try:
@@ -976,14 +1122,17 @@ def restore_checkpoint(sid: str, cp_id: str, resolve) -> dict:
     # a Revert that restores the state we just restored away.
     with _LOCK:
         table = _load_bucket(bucket)
-        for path in restored:
+        for path in restored + removed:
             entry = table.pop(path, None)
             if entry is not None:
                 _hydrate(entry)
         _persist(bucket)
         _cp_save(bucket, _cp_load(bucket))
         sweep_blobs(bucket)
+    # The walk moves past this checkpoint, so `/undo` cannot land on it again.
+    _mark_acted(bucket, cp_id)
     return {"ok": not failed, "checkpoint": cp_id, "name": found.get("name"),
-            "restored": restored, "failed": failed, "skipped": skipped,
+            "restored": restored, "removed": removed, "failed": failed,
+            "skipped": skipped, "acted": acted(sid),
             "undo": {"id": undo_id, "turn": undo_turn,
                      "name": f"before restoring {found.get('name')}"}}

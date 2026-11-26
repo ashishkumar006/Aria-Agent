@@ -53,12 +53,13 @@ Final paragraph of the document. Nothing more to add.
 @pytest.mark.parametrize("name, expect", [
     ("a.pdf", "pdf"), ("a.docx", "docx"), ("a.md", "md"), ("a.txt", "txt"),
     ("a.html", "html"), ("a.csv", "csv"), ("a.tsv", "csv"), ("a.xlsx", "xlsx"),
+    ("a.pptx", "pptx"), ("a.ppt", "pptx"),
 ])
 def test_extension_dispatch(name, expect):
     assert P.detect_type(name) == expect
 
 
-@pytest.mark.parametrize("name", ["a.exe", "a.zip", "a", "a.pptx", "a.doc"])
+@pytest.mark.parametrize("name", ["a.exe", "a.zip", "a", "a.doc"])
 def test_unsupported_types_are_rejected_loudly(name):
     with pytest.raises(P.UnsupportedDocument) as e:
         P.detect_type(name)
@@ -526,3 +527,92 @@ def test_bom_and_windows_line_endings_do_not_break_anything():
             name = "a.md" if src is MD else "a.txt"
             res = P.parse(name, data)
             assert res.blocks, (enc, name)
+
+
+# ── PPTX ─────────────────────────────────────────────────────────────────────
+
+def _tiny_png() -> bytes:
+    import struct
+    import zlib
+    w = h = 8
+    raw = b"".join(b"\x00" + bytes((200, 30, 30)) * w for _ in range(h))
+
+    def chunk(tag, data):
+        b = tag + data
+        return struct.pack(">I", len(data)) + b + struct.pack(">I", zlib.crc32(b))
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _make_pptx(tmp_path) -> bytes:
+    pytest.importorskip("pptx")
+    from pptx import Presentation
+    from pptx.util import Inches
+    prs = Presentation()
+    s1 = prs.slides.add_slide(prs.slide_layouts[1])
+    s1.shapes.title.text = "Q3 Revenue"
+    s1.placeholders[1].text = "Revenue grew 12 percent."
+    img = tmp_path / "f.png"
+    img.write_bytes(_tiny_png())
+    s1.shapes.add_picture(str(img), Inches(1), Inches(3), width=Inches(2))
+    s1.notes_slide.notes_text_frame.text = "Mention the EMEA driver."
+    s2 = prs.slides.add_slide(prs.slide_layouts[5])
+    s2.shapes.title.text = "Breakdown"
+    t = s2.shapes.add_table(2, 2, Inches(1), Inches(2),
+                            Inches(4), Inches(1)).table
+    t.cell(0, 0).text = "Region"
+    t.cell(0, 1).text = "Rev"
+    t.cell(1, 0).text = "EMEA"
+    t.cell(1, 1).text = "5M"
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def test_pptx_titles_are_headings_and_slides_are_pages(tmp_path):
+    res = P.parse("deck.pptx", _make_pptx(tmp_path))
+    assert res.doc_type == "pptx"
+    heads = [(b.text, b.page) for b in res.blocks if b.kind == "heading"]
+    assert ("Q3 Revenue", 1) in heads
+    assert ("Breakdown", 2) in heads
+    assert res.meta["slides"] == 2
+
+
+def test_pptx_body_table_and_notes_are_indexed(tmp_path):
+    res = P.parse("deck.pptx", _make_pptx(tmp_path))
+    assert any(b.kind == "para" and "Revenue grew" in b.text and b.page == 1
+               for b in res.blocks)
+    tbl = next(b for b in res.blocks if b.kind == "table")
+    assert tbl.page == 2 and tbl.header == ["Region", "Rev"]
+    assert ["EMEA", "5M"] in tbl.rows
+    notes = [b for b in res.blocks if b.meta.get("notes")]
+    assert notes and "EMEA driver" in notes[0].text
+
+
+def test_pptx_pictures_are_counted_and_warned_not_ocr(tmp_path):
+    res = P.parse("deck.pptx", _make_pptx(tmp_path))
+    assert res.meta["pictures"] == 1
+    assert any("not OCR-indexed" in w for w in res.warnings)
+
+
+def test_legacy_ppt_asks_for_conversion_not_a_zip_error():
+    res = P.parse("old.ppt", b"\xd0\xcf\x11\xe0not a zip package")
+    assert not res.blocks
+    assert any("legacy .ppt" in w and ".pptx" in w for w in res.warnings)
+
+
+def test_corrupt_pptx_reports_instead_of_raising():
+    res = P.parse("a.pptx", b"PK\x03\x04 truncated garbage")
+    assert not res.blocks
+    assert res.warnings
+
+
+def test_pptx_output_chunks_cleanly(tmp_path):
+    res = P.parse("deck.pptx", _make_pptx(tmp_path))
+    chunks = chunk_blocks(res.blocks, target_words=40)
+    assert chunks
+    for c in chunks:
+        assert c.text.strip()
+        assert len(c.text) < P.MAX_CHUNK_CHARS * 2

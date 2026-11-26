@@ -4,7 +4,7 @@ Each parser returns a list of `documents.chunker.Block` — structure preserved,
 not flattened to a wall of text. The chunker needs to know where a heading
 ends and a paragraph begins; a PDF's raw text stream gives it no way to tell.
 
-Supported: PDF, DOCX, MD, TXT, HTML, CSV, XLSX.
+Supported: PDF, DOCX, PPTX, MD, TXT, HTML, CSV, XLSX.
 
 Every parser is best-effort but never silent: parse problems (an unreadable
 page, a skipped sheet) are collected into `warnings` on the result so the
@@ -14,8 +14,10 @@ half its content.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import re
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +37,8 @@ SUPPORTED = {
     ".tsv": "csv",
     ".xlsx": "xlsx",
     ".xlsm": "xlsx",
+    ".pptx": "pptx",
+    ".ppt": "pptx",
     # An upload is also a figure source: `docgen` lifts an embedded raster out
     # of a stored document by (page, index), and a bare image is one figure on
     # one page. These carry no text, so they never surface in a search — they
@@ -47,7 +51,8 @@ SUPPORTED = {
 }
 
 SUPPORTED_HUMAN = ("PDF", "DOCX", "Markdown", "plain text", "HTML",
-                   "CSV/TSV", "Excel (xlsx)", "PNG/JPG image (as a figure)")
+                   "CSV/TSV", "Excel (xlsx)", "PowerPoint (pptx)",
+                   "PNG/JPG image (as a figure)")
 
 # The gateway's embed endpoint rejects anything over this per input.
 MAX_CHUNK_CHARS = 8000
@@ -89,7 +94,7 @@ def parse(filename: str, data: bytes) -> ParseResult:
     fn = {
         "pdf": parse_pdf, "docx": parse_docx, "md": parse_markdown,
         "txt": parse_text, "html": parse_html, "csv": parse_csv,
-        "xlsx": parse_xlsx, "image": parse_image,
+        "xlsx": parse_xlsx, "pptx": parse_pptx, "image": parse_image,
     }[kind]
     res = fn(data)
     res.doc_type = kind
@@ -1207,6 +1212,387 @@ def parse_docx(data: bytes) -> ParseResult:
         res.blocks = _blocks_from_text("\n".join(p.text for p in d.paragraphs))
         res.warnings.append("no styled paragraphs found; used plain text")
     return res
+
+
+# ── PPTX ─────────────────────────────────────────────────────────────────────
+
+def parse_pptx(data: bytes) -> ParseResult:
+    """A PowerPoint deck: each slide is a page, its title a section heading.
+
+    Slide text, tables and speaker notes are indexed. Pictures are counted and
+    surfaced as figure handles by docgen, but text inside an image is not
+    OCR-read (there is no OCR engine here), so the result says so rather than
+    implying a scanned slide was understood."""
+    res = ParseResult()
+    # Legacy binary .ppt is an OLE stream, not the ZIP package python-pptx
+    # reads. Say so precisely instead of failing with a generic zip error.
+    if data[:4] == b"\xd0\xcf\x11\xe0":
+        res.warnings.append(
+            "legacy .ppt is not supported; re-save the deck as .pptx")
+        return res
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    except ImportError:
+        res.warnings.append("python-pptx unavailable; cannot read this deck")
+        return res
+    try:
+        prs = Presentation(io.BytesIO(data))
+    except Exception as e:
+        res.warnings.append(f"could not read the PPTX: {e}")
+        return res
+
+    pictures = 0
+
+    def _walk(shapes, page, out, skip_id=None):
+        nonlocal pictures
+        for shape in shapes:
+            if skip_id is not None and getattr(shape, "shape_id", None) == skip_id:
+                continue
+            try:
+                st = shape.shape_type
+            except Exception:
+                st = None
+            if st == MSO_SHAPE_TYPE.GROUP:
+                _walk(shape.shapes, page, out, skip_id)
+                continue
+            if st == MSO_SHAPE_TYPE.PICTURE:
+                pictures += 1
+                continue
+            if getattr(shape, "has_table", False):
+                rows = []
+                for r in shape.table.rows:
+                    cells = [_clean(c.text or "") for c in r.cells]
+                    if any(cells):
+                        rows.append(cells)
+                if rows:
+                    width = max(len(r) for r in rows)
+                    rows = [(r + [""] * width)[:width] for r in rows]
+                    out.append(Block(kind="table", header=rows[0], rows=rows,
+                                     page=page))
+                continue
+            if getattr(shape, "has_text_frame", False):
+                tf = shape.text_frame
+                paras = [_clean(p.text or "") for p in tf.paragraphs]
+                paras = [p for p in paras if p]
+                if not paras:
+                    continue
+                bulleted = any((p.level or 0) > 0 for p in tf.paragraphs)
+                out.append(Block(kind="list" if bulleted else "para",
+                                 text="\n".join(paras), page=page))
+
+    for n, slide in enumerate(prs.slides, start=1):
+        blocks: list[Block] = []
+        # Emit the title first so the heading precedes the body even when the
+        # title shape is not first in z-order; the walk then skips it.
+        skip_id = None
+        try:
+            title = slide.shapes.title
+        except Exception:
+            title = None
+        if title is not None:
+            skip_id = getattr(title, "shape_id", None)
+            if getattr(title, "has_text_frame", False):
+                t = _clean(title.text_frame.text or "")
+                if t:
+                    blocks.append(Block(kind="heading", text=t, level=1, page=n))
+        _walk(slide.shapes, n, blocks, skip_id)
+        try:
+            if slide.has_notes_slide:
+                ntf = slide.notes_slide.notes_text_frame
+                notes = _clean(ntf.text or "") if ntf is not None else ""
+                if notes:
+                    blocks.append(Block(kind="para", text=notes, page=n,
+                                        meta={"notes": True}))
+        except Exception:
+            pass
+        res.blocks.extend(blocks)
+
+    res.meta["slides"] = len(prs.slides)
+    res.meta["pictures"] = pictures
+    if pictures:
+        res.warnings.append(
+            f"{pictures} embedded image(s) are available as figures; "
+            f"text inside images is not OCR-indexed")
+    return res
+
+
+# ── embedded picture extraction (for index-time captioning) ──────────────────
+# These helpers are deliberately separate from the block parsers above: the
+# block parse must stay pure CPU and deterministic (the detail route re-runs it
+# on the event loop), while captioning is a network step the indexing worker
+# owns. They expose the bytes + alt-text a captioner needs, keyed by content
+# hash so a caption survives a re-parse regardless of shape enumeration order.
+
+_CAPTIONABLE_EXT = {"png", "jpeg", "jpg"}
+
+# PowerPoint (and python-pptx) default a picture's alt-text to its filename or
+# a generic placeholder ("image.png", "Picture 3"). Those carry no description,
+# so treating them as alt-text would both pollute the index with filenames and
+# suppress the vision call that would actually describe the picture.
+_ALT_FILENAME = re.compile(
+    r"^[\w\-. ()]+\.(png|jpe?g|gif|bmp|tiff?|emf|wmf|svg|webp)$", re.I)
+_ALT_GENERIC = re.compile(r"^(picture|image|graphic|photo|figure|img)\s*[\d#]*$", re.I)
+
+
+def _meaningful_alt(text: str) -> str:
+    t = _clean(text or "")
+    if not t or _ALT_FILENAME.match(t) or _ALT_GENERIC.match(t):
+        return ""
+    return t
+
+
+def _picture_alt(shape) -> str:
+    """The accessibility alt-text an author wrote on a picture, if any.
+
+    Lives on the picture's own `cNvPr descr` attribute. Reading it is free and
+    often the only text describing an image, so it is preferred over a vision
+    call when present — but a filename or auto-placeholder is not a description
+    and is discarded so the picture still gets captioned."""
+    try:
+        for el in shape._element.iter():
+            if el.tag.endswith("}cNvPr"):
+                return _meaningful_alt(el.get("descr") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def iter_pptx_pictures(data: bytes) -> list[dict]:
+    """Every captionable raster in a PPTX as {page, index, sha, alt, blob, ext}.
+
+    `page` is the slide number (matching the text parser); `index` is the
+    picture's ordinal within that slide. Only PNG/JPEG are returned — the
+    formats a vision model accepts and the renderer can embed. A shape that
+    cannot be read is skipped, never fatal: one broken picture must not stop
+    the rest of the deck from being captioned."""
+    if data[:4] == b"\xd0\xcf\x11\xe0":      # legacy OLE .ppt
+        return []
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    except ImportError:
+        return []
+    try:
+        prs = Presentation(io.BytesIO(data))
+    except Exception:
+        return []
+    out: list[dict] = []
+
+    def _walk(shapes, page, acc):
+        for shape in shapes:
+            try:
+                st = shape.shape_type
+            except Exception:
+                st = None
+            if st == MSO_SHAPE_TYPE.GROUP:
+                _walk(shape.shapes, page, acc)
+                continue
+            if st != MSO_SHAPE_TYPE.PICTURE:
+                continue
+            try:
+                img = shape.image
+                blob, ext = img.blob, (img.ext or "").lower()
+            except Exception:
+                continue
+            if ext not in _CAPTIONABLE_EXT or not blob:
+                continue
+            acc.append({
+                "page": page, "index": len(acc),
+                "sha": hashlib.sha256(blob).hexdigest(),
+                "alt": _picture_alt(shape), "blob": blob,
+                "ext": "jpeg" if ext == "jpg" else ext,
+            })
+
+    for n, slide in enumerate(prs.slides, start=1):
+        acc: list[dict] = []
+        try:
+            _walk(slide.shapes, n, acc)
+        except Exception:
+            pass
+        out.extend(acc)
+    return out
+
+
+def _rasterize_metafile(blob: bytes) -> bytes | None:
+    """EMF/WMF vector metafile -> PNG bytes, or None if it cannot be read.
+
+    Word stores charts and pasted diagrams as EMF/WMF metafiles, which a vision
+    model cannot read. Pillow renders them through the Windows GDI backend; a
+    file it cannot rasterise yields None so the caller skips it rather than
+    captioning a blank or corrupt image."""
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(blob))
+        im.load()
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "PNG")
+        return buf.getvalue()
+    except Exception:                               # noqa: BLE001
+        return None
+
+
+def iter_docx_figures(data: bytes) -> list[dict]:
+    """Every captionable image in a DOCX as {page, index, sha, alt, blob, ext}.
+
+    Word keeps embedded pictures in `word/media/`. Raster formats pass through;
+    EMF/WMF metafiles (charts, pasted diagrams) are rasterised to PNG because a
+    vision model cannot read a metafile. An unreadable image is skipped, never
+    fatal. The sha is taken over the bytes actually captioned (the PNG for a
+    metafile), so re-indexing is idempotent even though the source is a vector."""
+    if data[:4] != b"PK\x03\x04":                   # not a zip/OOXML container
+        return []
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:                               # noqa: BLE001
+        return []
+    names = [n for n in z.namelist()
+             if n.startswith("word/media/") and not n.endswith("/")]
+    out: list[dict] = []
+    for n in sorted(names):
+        ext = n.rsplit(".", 1)[-1].lower() if "." in n else ""
+        try:
+            blob = z.read(n)
+        except Exception:                           # noqa: BLE001
+            continue
+        if ext in ("emf", "wmf"):
+            png = _rasterize_metafile(blob)
+            if not png:
+                continue
+            blob, ext = png, "png"
+        elif ext == "jpg":
+            ext = "jpeg"
+        if ext not in _CAPTIONABLE_EXT or not blob:
+            continue
+        out.append({"page": 1, "index": len(out),
+                    "sha": hashlib.sha256(blob).hexdigest(),
+                    "alt": "", "blob": blob, "ext": ext})
+    return out
+
+
+def image_figure(data: bytes) -> dict | None:
+    """A bare image upload as a single captionable figure, or None.
+
+    The same magic-byte gate `parse_image` uses, so a mislabelled file is not
+    handed to a vision model as though it were a picture."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        ext = "png"
+    elif data[:2] == b"\xff\xd8":
+        ext = "jpeg"
+    else:
+        return None
+    return {"page": 1, "index": 0, "sha": hashlib.sha256(data).hexdigest(),
+            "alt": "", "blob": data, "ext": ext}
+
+
+# ── PDF visual content ───────────────────────────────────────────────────────
+# A PDF carries two kinds of visual content a text-only parse loses: embedded
+# figures (charts, diagrams, scanned equations) and whole pages that are pure
+# images (no text layer at all — the "scanned page needs OCR" case). Both are
+# recovered here as PNG/JPEG blobs the indexing worker sends to a vision model.
+# PyMuPDF (fitz) is imported lazily: the agent process may not ship it, and a
+# missing renderer must degrade to "no visual content", never crash the parse.
+
+def iter_pdf_figures(data: bytes) -> list[dict]:
+    """Embedded raster images in a PDF as {page, index, sha, blob, ext, alt}.
+
+    `page` is the 1-based PDF page; `index` is the image's ordinal on it. Only
+    PNG/JPEG (what a vision model accepts) are returned; vector art and tiny
+    icons/bullets (< 1 KB) are skipped. Alt-text is always empty — the PDF
+    format has no per-image description for a model to read, so these always go
+    to a vision call."""
+    try:
+        import fitz
+    except Exception:
+        return []
+    out: list[dict] = []
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return out
+    try:
+        for pno, page in enumerate(doc, start=1):
+            try:
+                imgs = page.get_images(full=True)
+            except Exception:
+                continue
+            for img in imgs:
+                xref = img[0] if img else None
+                if xref is None:
+                    continue
+                # A full-page image is a scanned page, not a figure — it is
+                # handled by iter_pdf_scanned_pages (OCR), which transcribes the
+                # whole page. Captioning it here too would double-process the
+                # page and describe the scan instead of reading it.
+                try:
+                    rects = page.get_image_rects(xref)
+                except Exception:
+                    rects = []
+                if rects:
+                    r = rects[0]
+                    page_area = page.rect.width * page.rect.height
+                    if page_area > 0 and (r.width * r.height) / page_area > 0.8:
+                        continue
+                try:
+                    base = doc.extract_image(xref)
+                except Exception:
+                    continue
+                ext = (base.get("ext") or "").lower()
+                if ext not in _CAPTIONABLE_EXT:
+                    continue
+                blob = base.get("image") or b""
+                if len(blob) < 1024:            # decorative icon/bullet
+                    continue
+                out.append({"page": pno, "index": len(out),
+                            "sha": hashlib.sha256(blob).hexdigest(),
+                            "alt": "", "blob": blob,
+                            "ext": "jpeg" if ext == "jpg" else ext})
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return out
+
+
+def iter_pdf_scanned_pages(data: bytes) -> list[dict]:
+    """Pages with no extractable text layer, rendered to PNG for OCR.
+
+    Each {page, index, sha, blob, ext:'png'}. A page that already has a text
+    layer is skipped — OCR is only for the pages a text extractor returns
+    nothing from, which is exactly the "scanned page needs OCR" case. Rendered
+    at 2x so small print survives the vision model's downscaling."""
+    try:
+        import fitz
+    except Exception:
+        return []
+    out: list[dict] = []
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return out
+    try:
+        for pno, page in enumerate(doc, start=1):
+            try:
+                text = page.get_text() or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                continue
+            try:
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                blob = pix.tobytes("png")
+            except Exception:
+                continue
+            out.append({"page": pno, "index": 0,
+                        "sha": hashlib.sha256(blob).hexdigest(),
+                        "blob": blob, "ext": "png"})
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return out
 
 
 # ── CSV / TSV ────────────────────────────────────────────────────────────────

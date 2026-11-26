@@ -201,3 +201,53 @@ def test_the_worker_refreshes_a_due_app(apps, monkeypatch):
     apps._worker_loop()
 
     assert refreshed == ["tile"]
+
+
+# ── update_app_meta: identity edits without a rebuild ──────────────────────
+
+def test_update_app_meta_edits_identity_and_persists(apps):
+    s = apps.create_app({"name": "T", "kind": "openrouter_free",
+                         "schedule": "manual"})
+    out = apps.update_app_meta(s["id"], name="New Name", description="d",
+                               refresh_prompt="rp")
+    assert out["name"] == "New Name"
+    assert out["description"] == "d"
+    assert out["refresh_prompt"] == "rp"
+    # Persisted to disk, not just returned (verify the store, not the reply).
+    assert apps.get_spec(s["id"])["name"] == "New Name"
+
+
+def test_update_app_meta_unknown_app_returns_none(apps):
+    assert apps.update_app_meta("no-such-app", name="x") is None
+
+
+def test_update_app_meta_null_name_leaves_the_name(apps):
+    s = apps.create_app({"name": "Keep", "kind": "openrouter_free"})
+    out = apps.update_app_meta(s["id"], name=None)
+    assert out["name"] == "Keep"
+
+
+def test_update_app_meta_blank_name_is_ignored(apps):
+    s = apps.create_app({"name": "Keep", "kind": "openrouter_free"})
+    out = apps.update_app_meta(s["id"], name="   ")
+    assert out["name"] == "Keep"
+
+
+def test_update_app_meta_invalid_schedule_raises(apps):
+    s = apps.create_app({"name": "T", "kind": "openrouter_free"})
+    with pytest.raises(ValueError):
+        apps.update_app_meta(s["id"], schedule="sometimes")
+
+
+def test_update_app_meta_subminute_interval_raises(apps):
+    s = apps.create_app({"name": "T", "kind": "openrouter_free"})
+    with pytest.raises(ValueError, match="60s"):
+        apps.update_app_meta(s["id"], schedule="every 1s")
+
+
+def test_update_app_meta_valid_schedule_recomputes_next_refresh(apps):
+    s = apps.create_app({"name": "T", "kind": "openrouter_free",
+                         "schedule": "manual"})
+    out = apps.update_app_meta(s["id"], schedule="every 5m")
+    assert out["schedule"] == "every 5m"
+    assert out.get("next_refresh"), "next_refresh was not recomputed"

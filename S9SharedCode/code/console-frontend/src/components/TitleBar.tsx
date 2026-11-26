@@ -46,6 +46,8 @@ const TITLES: Record<string, string> = {
   '/code': 'Code',
   '/studio': 'Studio',
   '/authoring': 'Authoring',
+  '/architecture': 'Architecture',
+  '/model-lab': 'Model Lab',
 };
 
 export default function TitleBar() {

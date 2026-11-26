@@ -40,7 +40,7 @@ class VisionFallback:
 
 
 def draw_set_of_marks(screenshot_b64: str, elements: list[dict],
-                      max_boxes: int = 40) -> tuple[str, str]:
+                      max_boxes: int = 40, offset=(0, 0)) -> tuple[str, str]:
     """Draw numbered dashed boxes over UI elements on a screenshot.
 
     Args:
@@ -75,6 +75,7 @@ def draw_set_of_marks(screenshot_b64: str, elements: list[dict],
         x, y, w, h = _parse_bbox(bbox)
         if x is None:
             continue
+        x += offset[0]; y += offset[1]
         # Draw a dashed rectangle (approximate with short segments).
         _draw_dashed_rect(draw, x, y, x + w, y + h, fill=(255, 0, 0), width=2)
         # Number label near top-left.

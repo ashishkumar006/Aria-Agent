@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, RefreshCw, X } from 'lucide-react';
 import {
   api, type StudioBrowserEvent, type StudioBrowserShot,
   type StudioBrowserStatus,
@@ -33,18 +33,18 @@ export function BrowserPane({ sid, onFocusChange }: {
   onFocusChange?: (running: boolean) => void;
 }) {
   const [status, setStatus] = useState<StudioBrowserStatus | null>(null);
-  const [view, setView] = useState<'live' | 'console' | 'network' | 'shots'>('live');
+  const [view] = useState<'live' | 'console' | 'network' | 'shots'>('live');
   const [frame, setFrame] = useState<string>('');
-  const [frameUrl, setFrameUrl] = useState('');
+  const [, setFrameUrl] = useState('');
   const [streamErr, setStreamErr] = useState('');
-  const [casting, setCasting] = useState(false);
+  const [, setCasting] = useState(false);
   const [events, setEvents] = useState<StudioBrowserEvent[]>([]);
   const [dropped, setDropped] = useState(0);
   const [shots, setShots] = useState<StudioBrowserShot[]>([]);
   const [more, setMore] = useState(0);
   const [urlBar, setUrlBar] = useState('');
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState('');
+  const [, setNote] = useState('');
   const [pick, setPick] = useState<StudioBrowserShot | null>(null);
   const abort = useRef<AbortController | null>(null);
 
@@ -72,7 +72,7 @@ export function BrowserPane({ sid, onFocusChange }: {
     abort.current = ctrl;
     setStreamErr('');
     try {
-      for await (const f of api.studioBrowserView(sid, 250, ctrl.signal)) {
+      for await (const f of api.studioBrowserView(sid, 50, ctrl.signal)) {
         if (ctrl.signal.aborted) return;
         const kind = String(f.type || '');
         if (kind === 'cast') setCasting(true);
@@ -81,7 +81,10 @@ export function BrowserPane({ sid, onFocusChange }: {
           setFrameUrl(f.url || '');
         } else if (kind === 'unsupported') {
           setCasting(false);
-          setStreamErr(f.note || 'this runtime cannot screencast');
+          setStreamErr(status?.running
+            ? 'This browser cannot be viewed live here. The agent can still file screenshots.'
+            : 'No browser is open in this session yet. Type an address above to start one, '
+              + 'or ask the agent to open a page — it is the same browser either way.');
         } else if (kind === 'disabled') {
           setCasting(false);
           setStreamErr('browser.tools is off, so there is no browser to show');
@@ -167,6 +170,26 @@ export function BrowserPane({ sid, onFocusChange }: {
   const s = status || {};
   const tabs = (s.tabs || 0);
 
+  /* The screencast is a picture; this is the mouse and keyboard behind it.
+     Coordinates are mapped from the displayed image back to page space. */
+  const sendInput = useCallback((ev: { kind: string; x?: number; y?: number; dx?: number; dy?: number; text?: string; key?: string }) => {
+    void api.studioBrowserInput(sid, ev).catch(() => {});
+  }, [sid]);
+
+  const toPage = (e: React.MouseEvent<HTMLImageElement> | React.WheelEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const nw = img.naturalWidth || rect.width || 1;
+    const nh = img.naturalHeight || rect.height || 1;
+    const scale = Math.min(rect.width / nw, rect.height / nh) || 1;
+  const ox = rect.left + (rect.width - nw * scale) / 2;
+    const oy = rect.top + (rect.height - nh * scale) / 2;
+    const vp = (status?.viewport || {}) as { width?: number; height?: number };
+    const vx = (vp.width || nw) / nw;
+    const vy = (vp.height || nh) / nh;
+    return { x: (e.clientX - ox) / scale * vx, y: (e.clientY - oy) / scale * vy };
+  };
+
   /* One sentence when the feature is off. Before this the pane said it three
      times — in the live-view box, in the footer strip and above it as a
      paragraph — while still drawing a URL bar, a tab strip and a +/close pair
@@ -191,49 +214,27 @@ export function BrowserPane({ sid, onFocusChange }: {
       {/* The URL bar is the takeover. It drives the same browser the agent is
           holding, which is the only reason "take over" means anything here. */}
       <div className="flex flex-none items-center gap-1 px-2 py-1.5">
+        <button type="button" onClick={() => void tabOp('back')} disabled={busy}
+                aria-label="Back" title="Back"
+                className="flex h-6 w-6 flex-none items-center justify-center rounded-md text-zinc-400 hover:bg-white/5 hover:text-zinc-100 disabled:opacity-30">
+          <ArrowLeft size={13} />
+        </button>
+        <button type="button" onClick={() => void tabOp('forward')} disabled={busy}
+                aria-label="Forward" title="Forward"
+                className="flex h-6 w-6 flex-none items-center justify-center rounded-md text-zinc-400 hover:bg-white/5 hover:text-zinc-100 disabled:opacity-30">
+          <ArrowRight size={13} />
+        </button>
+        <button type="button" onClick={() => void tabOp('reload')} disabled={busy}
+                aria-label="Reload" title="Reload"
+                className="flex h-6 w-6 flex-none items-center justify-center rounded-md text-zinc-400 hover:bg-white/5 hover:text-zinc-100 disabled:opacity-30">
+          <RefreshCw size={13} />
+        </button>
         <input value={urlBar}
                onChange={(e) => setUrlBar(e.target.value)}
                onKeyDown={(e) => { if (e.key === 'Enter') void navigate(); }}
-               placeholder="http://localhost:5173 or any url"
+               placeholder="Search or enter a URL"
                aria-label="Browser address"
-               className="min-w-0 flex-1 rounded-md border border-glass-border bg-surface-2 px-2 py-1 text-[12px] outline-none" />
-        <button type="button" onClick={() => void navigate()} disabled={busy || !urlBar.trim()}
-                className="rounded-lg border border-glass-border px-2 py-1 text-[12px] text-zinc-200 hover:bg-white/5 disabled:opacity-40">
-          go
-        </button>
-      </div>
-
-      <div className="flex flex-none items-center gap-1 border-y border-glass-border px-2 py-1">
-        {(['live', 'console', 'network', 'shots'] as const).map((k) => (
-          <button key={k} type="button" onClick={() => setView(k)}
-                  aria-selected={view === k}
-                  className={'rounded-md border px-2 py-0.5 text-[12px] '
-                    + (view === k ? 'border-glass-border bg-white/10 text-zinc-50'
-                      : 'border-transparent text-zinc-muted hover:bg-white/5 hover:text-zinc-200')}>
-            {k}
-            {k === 'console' && !!s.console_errors
-              ? <span className="ml-1 text-danger">{s.console_errors}</span> : null}
-          </button>
-        ))}
-        <span className="min-w-0 flex-1" />
-        <span className="flex items-center gap-1 text-[11px] text-zinc-muted"
-              title="A browser is a Chromium process. It closes with the session or when idle, never silently.">
-          {s.running
-            ? <><span className="h-1.5 w-1.5 rounded-full bg-ok" /> live
-               {s.headed ? ' · visible' : ' · headless'}</>
-            : <><span className="h-1.5 w-1.5 rounded-full bg-zinc-600" /> no browser</>}
-        </span>
-        <button type="button" onClick={() => void tabOp('new')} disabled={busy || tabs >= 8}
-                title="New tab"
-                className="rounded-lg border border-glass-border px-1.5 py-0.5 text-[11px] hover:bg-white/5 disabled:opacity-40">
-          +
-        </button>
-        <button type="button" onClick={() => void api.studioBrowserClose(sid).then(() => refreshStatus())}
-                disabled={!s.running}
-                title="Close this session's browser"
-                className="rounded-lg border border-glass-border px-1.5 py-0.5 text-[11px] text-zinc-muted hover:bg-white/5 disabled:opacity-40">
-          close
-        </button>
+               className="min-w-0 flex-1 rounded-md border border-glass-border bg-surface-1 px-2 py-1 text-[12px] outline-none" />
       </div>
 
       {tabs > 1 && (
@@ -244,12 +245,12 @@ export function BrowserPane({ sid, onFocusChange }: {
                     aria-pressed={i === (s.active || 0)}
                     className={'flex flex-none items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] '
                       + (i === (s.active || 0)
-                        ? 'border-accent/50 bg-accent/10 text-zinc-100'
+                        ? 'border-white/30 bg-white/[0.06] text-zinc-100'
                         : 'border-glass-border text-zinc-muted hover:bg-white/5')}>
               tab {i + 1}
               <span role="button" aria-label={`Close tab ${i + 1}`}
                     onClick={(e) => { e.stopPropagation(); void tabOp('close', i); }}
-                    className="hover:text-danger"><X size={11} /></span>
+                    className="flex h-4 w-4 items-center justify-center rounded hover:bg-white/10 hover:text-danger"><X size={11} /></span>
             </button>
           ))}
         </div>
@@ -257,18 +258,18 @@ export function BrowserPane({ sid, onFocusChange }: {
 
       <div className="min-h-0 flex-1 overflow-auto">
         {view === 'live' && (
-          <div className="flex flex-col items-center gap-2 p-2">
+          <div className="relative min-h-0 flex-1 p-1">
             {frame ? (
-              <>
-                <img src={frame} alt="The page the session's browser is showing"
-                     className="max-h-[520px] w-auto max-w-full rounded-md border border-glass-border" />
-                <p className="text-[11px] text-zinc-muted">
-                  {casting
-                    ? `live · ${s.cast_fps || 4} fps · ${(s.cast_frames || 0)} frames`
-                    : 'not streaming'}
-                  {frameUrl ? ` · ${frameUrl.slice(0, 90)}` : ''}
-                </p>
-              </>
+              <img src={frame} alt="The page the session's browser is showing"
+                   className="h-full w-full cursor-crosshair object-contain"
+                   tabIndex={0}
+                   onClick={(e) => { const p = toPage(e); sendInput({ kind: 'click', x: p.x, y: p.y }); }}
+                   onWheel={(e) => { sendInput({ kind: 'wheel', dx: e.deltaX, dy: e.deltaY }); }}
+                   onKeyDown={(e) => {
+                     if (e.key.length === 1) sendInput({ kind: 'type', text: e.key });
+                     else sendInput({ kind: 'key', key: e.key });
+                   }}
+                   title="Click to interact · type to send keys" />
             ) : (
               /* One empty state, not three. The box used to sit under a
                  paragraph and above a "not streaming" line, all saying that
@@ -349,7 +350,7 @@ export function BrowserPane({ sid, onFocusChange }: {
               <div className="grid grid-cols-3 gap-2">
                 {shots.map((sh) => (
                   <button key={sh.name} type="button" onClick={() => setPick(sh)}
-                          className="overflow-hidden rounded-md border border-glass-border hover:border-accent/50">
+                          className="overflow-hidden rounded-md border border-glass-border hover:border-white/30">
                     <img src={sh.url} alt="" loading="lazy"
                          className="h-[70px] w-full object-cover object-top" />
                     <span className="block truncate px-1 py-0.5 text-[11px] text-zinc-muted">
@@ -373,12 +374,6 @@ export function BrowserPane({ sid, onFocusChange }: {
           </div>
         )}
       </div>
-
-      {(note || streamErr || s.error) && (
-        <p className="flex-none border-t border-glass-border bg-surface-1/60 px-2 py-1 text-[11px] text-zinc-300">
-          {note || s.error || streamErr}
-        </p>
-      )}
     </div>
   );
 }

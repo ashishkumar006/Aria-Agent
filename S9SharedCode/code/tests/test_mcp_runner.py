@@ -22,6 +22,86 @@ def _tc(name, args=None, tid="t1"):
     return {"id": tid, "name": name, "arguments": args or {}}
 
 
+def _big(n: int) -> str:
+    return "x" * n
+
+
+def _build_heavy_loop() -> list[dict]:
+    """Four tool rounds with heavy bodies everywhere — the shape an agent
+    loop builds up after a few hops on a fat repo."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "inspect the repo"},
+        {"role": "assistant", "content": "I will look at the file first. " + _big(2000),
+         "tool_calls": [_tc("read_file", {"path": "a.py"}, "t1")]},
+        {"role": "tool", "tool_call_id": "t1", "content": "a.py:1:\n" + _big(5000)},
+        {"role": "assistant", "content": "ok got it — " + _big(2500),
+         "tool_calls": [_tc("search_files", {"pattern": "def x"}, "t2")]},
+        {"role": "tool", "tool_call_id": "t2", "content": "def x():\n" + _big(4000)},
+        {"role": "assistant", "content": "found it — " + _big(2500),
+         "tool_calls": [_tc("read_file", {"path": "b.py"}, "t3")]},
+        {"role": "tool", "tool_call_id": "t3", "content": "b.py:\n" + _big(4000)},
+        {"role": "assistant", "content": "now edit it — " + _big(2500),
+         "tool_calls": [_tc("update_file", {"path": "b.py", "content": "x"}, "t4")]},
+        {"role": "tool", "tool_call_id": "t4", "content": "wrote b.py"},
+    ]
+    return msgs
+
+
+def test_compact_context_shrinks_old_rounds_leaves_newest():
+    msgs = _build_heavy_loop()
+    before = mr._context_chars(msgs)
+    # Tight budget — forces compaction.
+    assert mr._compact_context(msgs, budget_chars=1000) is True
+    after = mr._context_chars(msgs)
+    assert after < before
+    # The newest tool round and its opening assistant turn stay whole.
+    # The newest tool round and its opening assistant turn stay whole — the
+    # assistant turn opens that round, and the last message IS that round's
+    # opening assistant message, so neither is touched.
+    assert msgs[-1]["content"] == "wrote b.py"
+    assert msgs[-2]["content"] == "now edit it — " + _big(2500)
+    # Structure preserved: same count of messages, same roles.
+    assert [m["role"] for m in msgs] == [m["role"] for m in _build_heavy_loop()]
+    # Every assistant still carries its tool_calls payload.
+    for m in msgs:
+        if m["role"] == "assistant":
+            assert "tool_calls" in m and m["tool_calls"], m
+
+
+def test_compact_context_preserves_small_prompt():
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok", "tool_calls": [_tc("list_dir", {}, "t1")]},
+        {"role": "tool", "tool_call_id": "t1", "content": "a.py b.py c.py"},
+    ]
+    before = mr._context_chars(msgs)
+    assert mr._compact_context(msgs, budget_chars=10_000) is False
+    assert mr._context_chars(msgs) == before
+
+
+def test_compact_context_does_not_orphan_tool_pair():
+    """Compacting content must never rewrite a tool_call_id out of existence
+    or plant a tool_call without matching tool response."""
+    msgs = _build_heavy_loop()
+    mr._compact_context(msgs, budget_chars=1000)
+    call_ids = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
+    emit_ids = {m["tool_calls"][0]["id"] for m in msgs
+                if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list)}
+    assert call_ids == emit_ids, (call_ids, emit_ids)
+
+
+def test_compact_context_under_limit_is_a_noop():
+    msgs = _build_heavy_loop()
+    # Loose budget — nothing exceeds the threshold.
+    import copy
+    snap = copy.deepcopy(msgs)
+    changed = mr._compact_context(msgs, budget_chars=10**9)
+    assert changed is False
+    assert msgs == snap
+
+
 class _Script:
     """Scripted chat_fn: pops replies in order, repeats the last forever."""
 
@@ -169,8 +249,11 @@ class TestProgressLedger:
 
         class _Spy:
             async def __call__(self, messages):
+                # A SIDE-EFFECTING tool: idempotent reads are exempt from the
+                # repeat guard, so only a write/render repeat exercises it.
                 return {"text": "", "provider": "f",
-                        "tool_calls": [_tc("read_file", {"path": "README.md"})]}
+                        "tool_calls": [_tc("create_file",
+                                           {"path": "x.py", "content": "x"})]}
 
         async def _dispatch(name, args):
             return "SAME RESULT EVERY TIME"
@@ -180,6 +263,167 @@ class TestProgressLedger:
             chat_fn=_Spy(), dispatch_fn=_dispatch, max_hops=0))
         assert "already-successful" in (out.get("note") or "")
         assert not out["text"].strip(), "the model produced no answer here"
+
+    def test_reasoning_sent_as_the_answer_is_retried(self):
+        """Some providers stream thinking in `content`; the run must not show it.
+
+        Live: a build task ended with "We need build project. Need inspect
+        environment…" as the reply. The repair is in the loop, not the prompt.
+        """
+        reasoning = (
+            "We need to build project. Need inspect environment. We have empty "
+            "app only? User says empty folder but app exists. Need create ledger "
+            "package etc. Need understand expected hidden tests likely. Need "
+            "implement robustly, and be careful about money types and about what "
+            "the CLI prints, so I should look at the folder before writing."
+        )
+        replies = [
+            {"text": reasoning, "provider": "f"},
+            {"text": "Created the package with 37 tests passing.", "provider": "f"},
+        ]
+        events: list[dict] = []
+
+        async def _chat(messages):
+            return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat,
+            dispatch_fn=lambda n, a: (_ for _ in ()).throw(
+                AssertionError("no tools expected")),
+            on_event=lambda kind, payload: events.append((kind, payload)),
+            max_hops=4))
+        assert out["text"] == "Created the package with 37 tests passing."
+        assert any(k == "thinking" for k, _ in events), events
+
+    def test_reasoning_does_not_end_the_run(self):
+        """A thinking-only reply continues the loop; it must not stop it.
+
+        Live: the run stopped with 72 failing tests it had just written, because
+        its next message was analysis of the failures.
+        """
+        reasoning = (
+            "We need to look at the failures now. The scanner tests expect a "
+            "Token shape we did not build, so I need to read the scanner and the "
+            "tests and decide which side is wrong before I change anything, and "
+            "then run the checks again to see whether the parser tests pass."
+        )
+        replies = [
+            {"text": reasoning, "provider": "f"},
+            {"text": "", "provider": "f",
+             "tool_calls": [_tc("run_checks", {"path": "."})]},
+            {"text": "Fixed the scanner; 148 tests pass.", "provider": "f"},
+        ]
+
+        async def _chat(messages):
+            return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=lambda n, a: "ok",
+            max_hops=6, short_answers=True))
+        assert out["text"] == "Fixed the scanner; 148 tests pass."
+        assert "reasoning" not in (out.get("error") or "")
+
+    def test_a_thinking_loop_eventually_fails_honestly(self):
+        reasoning = (
+            "We need to think about this more carefully. Let me consider the "
+            "options, and maybe the design is wrong, so I should look again at "
+            "the code before I decide what to do next. The scanner tests expect "
+            "a token shape we did not build, so I need to weigh changing the "
+            "tests against changing the scanner, and then run the checks again "
+            "to see whether the parser and evaluator agree with whatever I pick."
+        )
+
+        async def _chat(messages):
+            return {"text": reasoning, "provider": "f"}
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat,
+            dispatch_fn=lambda n, a: (_ for _ in ()).throw(
+                AssertionError("no tools expected")),
+            max_hops=8, short_answers=True))
+        assert out["text"] == ""
+        assert "reasoning" in (out.get("error") or "")
+
+    def test_a_tool_call_with_no_name_is_dropped_not_dispatched(self):
+        """A nameless call used to poison the run.
+
+        The assistant turn kept a call the provider then refused ("function.name
+        must be a string"), so every later request in the conversation 400'd.
+        Live: a model emitted `tool_calls[0]` with an empty name.
+        """
+        replies = [
+            {"text": "", "provider": "f",
+             "tool_calls": [{"id": "x", "name": "", "arguments": {}}]},
+            {"text": "answering without the broken call", "provider": "f"},
+        ]
+        dispatched: list[str] = []
+
+        async def _chat(messages):
+            return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        async def _dispatch(name, args):
+            dispatched.append(name)
+            return "ok"
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=_dispatch, max_hops=4))
+        assert dispatched == [], dispatched
+        assert out["text"] == "answering without the broken call"
+
+    def test_repeated_reasoning_fails_honestly(self):
+        """When the model only ever sends thinking, say so.
+
+        Returning the deliberation as the answer is the one outcome that looks
+        like success while saying nothing.
+        """
+        reasoning = (
+            "We need to build project. Need inspect environment. We have empty "
+            "app only? Need create the package now, with the scanner, the parser "
+            "and the evaluator, then tests for each of them, then run the checks "
+            "until they pass, and only then answer the user."
+        )
+
+        async def _chat(messages):
+            return {"text": reasoning, "provider": "f"}
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat,
+            dispatch_fn=lambda n, a: (_ for _ in ()).throw(
+                AssertionError("no tools expected")),
+            max_hops=6))
+        assert out["text"] == ""
+        assert "reasoning" in (out.get("error") or "")
+
+    def test_fix_rerun_cycles_do_not_trip_the_repeat_guard(self):
+        """edit → check → edit → check is the normal loop, and the third check
+        measures different code than the first. It used to end the run with
+        "repeated an already-successful call"."""
+
+        def edit(i):
+            return {"text": "", "provider": "f",
+                    "tool_calls": [_tc("edit_file",
+                                       {"path": "a.py", "find": f"x{i}",
+                                        "replace": f"y{i}"})]}
+
+        check = {"text": "", "provider": "f",
+                 "tool_calls": [_tc("run_checks", {"path": "."})]}
+        replies = [edit(1), check, edit(2), check, edit(3), check,
+                   {"text": "all green", "provider": "f"}]
+
+        async def _chat(messages):
+            return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        seen: list[str] = []
+
+        async def _dispatch(name, args):
+            seen.append(name)
+            return "ok"
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=_dispatch, max_hops=12))
+        assert out["text"] == "all green"
+        assert "already-successful" not in (out.get("note") or "")
+        assert seen.count("run_checks") == 3, seen
 
 
 class TestRunToolLoop:
@@ -254,6 +498,71 @@ class TestRunToolLoop:
         assert "error" not in out, out
         assert "already-successful" in (out.get("note") or "")
         assert len(dispatched) <= mr.MAX_SAME_CALL_REPEATS + 1
+
+    def test_repeat_of_successful_call_requests_a_final_answer(self):
+        """The succeeded repeat branch marks the reply for one final tool-less
+        pass — the loop does the honest thing and ends with no answer, but the
+        caller was told to close the answer rather than die in silence.
+        `run_with_tools` is the layer that issues the pass; the loop's job is
+        to carry the marker."""
+        dispatched: list = []
+
+        async def _dispatch(name, args):
+            dispatched.append((name, args))
+            return "rendered ok"
+
+        stall = {"text": "", "tool_calls": [_tc("render_document")],
+                 "provider": "f"}
+        chat = _Script([stall])
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=chat, dispatch_fn=_dispatch))
+        assert out.get("needs_wrap_up") is True
+        assert isinstance(out.get("wrap_up_messages"), list)
+        assert "final pass requested" in (out.get("note") or "")
+        assert len(dispatched) <= mr.MAX_SAME_CALL_REPEATS + 1
+
+    def test_wrap_up_streams_text_with_no_tools(self, monkeypatch):
+        """The marker message reaches a real tool-less call; the closing text
+        is collected and the on_event path carries it live. No network, no
+        MCP child — a stubbed LLM with the same event shape."""
+        seen = []
+
+        async def _fake_stream_chat(**kw):
+            seen.append(kw)
+            for ev in [
+                {"type": "text", "text": "Here is your answer."},
+                {"type": "text", "text": " And one more line."},
+                {"type": "done", "provider": "fake", "model": "fake-1",
+                 "input_tokens": 8, "output_tokens": 6},
+            ]:
+                yield ev
+
+        class _FakeLLM:
+            def stream_chat(self, **kw):
+                return _fake_stream_chat(**kw)
+
+        monkeypatch.setattr(mr, "LLM", lambda: _FakeLLM())
+        events = []
+        reply = asyncio.run(mr._stream_wrap_up(
+            messages=[{"role": "user", "content": "answer it"}],
+            agent="code", session_id="s1", provider_pin=None, model="fake-1",
+            route_affinity="code:s1", max_tokens=8, temperature=0.0,
+            on_event=lambda k, p: events.append((k, p))))
+        assert reply["text"] == "Here is your answer. And one more line."
+        assert reply["provider"] == "fake"
+        assert reply["input_tokens"] == 8
+        assert reply["output_tokens"] == 6
+        assert seen and seen[0]["tools"] is None
+        # stream_chat() is a closed signature; a kwarg it cannot honour
+        # (cache_system leaked here once) raises TypeError before the model
+        # ever runs — the turn ends with the stall note, never an answer.
+        assert set(seen[0]) <= {"messages", "tools", "tool_choice",
+                                "provider", "model", "max_tokens",
+                                "temperature", "agent", "session",
+                                "route_affinity"}
+        assert "cache_system" not in seen[0]
+        assert [e[0] for e in events] == ["text", "text"]
+        assert events[0][1]["delta"] == "Here is your answer."
 
     def test_varying_args_do_not_trip_stall(self):
         """Pagination-style varying args must keep working."""
@@ -517,7 +826,27 @@ class TestTextReplayedToolCalls:
             messages=[], chat_fn=_chat, dispatch_fn=lambda n, a: "x",
             max_hops=2))
         assert out["text"] == ""
-        assert "empty reply twice" in out["error"]
+        # Three attempts now (an empty completion is a provider bad moment, not
+        # a verdict), and the message says how many times it came back empty.
+        assert "empty reply" in out["error"]
+        assert "3 times" in out["error"]
+
+    def test_a_later_hop_can_still_answer_after_two_empties(self):
+        """Two empty completions must not end a run that would have recovered."""
+        replies = [
+            {"text": "", "tool_calls": [], "provider": "f"},
+            {"text": "", "tool_calls": [], "provider": "f"},
+            {"text": "third time lucky", "provider": "f", "tool_calls": []},
+        ]
+
+        async def _chat(messages):
+            return replies.pop(0)
+
+        out = asyncio.run(mr.run_tool_loop(
+            messages=[], chat_fn=_chat, dispatch_fn=lambda n, a: "x",
+            max_hops=3))
+        assert out["text"] == "third time lucky"
+        assert not out.get("error")
 
     def test_marker_inside_ordinary_prose_is_not_a_call(self):
         text = 'Use [tool call] open_app({"app": "Spotify"}) to open it.'
@@ -567,3 +896,36 @@ def test_the_run_time_ceiling_stops_an_unbounded_chat():
         messages=[{"role": "user", "content": "go"}], chat_fn=chat,
         dispatch_fn=dispatch, max_hops=0, max_seconds=0.01))
     assert "time ceiling" in (out.get("error") or ""), out
+
+
+def test_stall_with_failing_tests_recovers_instead_of_aborting():
+    """A repeated already-successful edit WHILE the last test run failed must
+    redirect the model (corrective note + another chance), not dead-end. This is
+    the live case: an agent looped re-editing source while its flawed tests could
+    never pass, and the old guard aborted the run."""
+    seen: list = []
+
+    class _Spy:
+        async def __call__(self, messages):
+            seen.append(list(messages))
+            n = len(seen)
+            if n == 1:
+                return {"text": "", "provider": "f", "tool_calls": [
+                    _tc("run_command", {"command": "pytest"}, tid="r1"),
+                    _tc("edit_file", {"path": "a.py", "find": "x", "replace": "y"}, tid="e1")]}
+            if n in (2, 3):
+                return {"text": "", "provider": "f", "tool_calls": [
+                    _tc("edit_file", {"path": "a.py", "find": "x", "replace": "y"}, tid="e2")]}
+            return {"text": "fixed the tests", "provider": "f"}
+
+    async def _dispatch(name, args):
+        if name == "run_command":
+            return '{"ok": false, "exit_code": 1, "stdout": "1 failed"}'
+        return '{"ok": true, "replacements": 1}'
+
+    out = asyncio.run(mr.run_tool_loop(
+        messages=[{"role": "user", "content": "build it"}],
+        chat_fn=_Spy(), dispatch_fn=_dispatch, max_hops=10))
+    assert out.get("text") == "fixed the tests", out
+    assert any("[harness]" in str(m.get("content") or "") for m in seen[-1]), \
+        "the recovery note must be handed back to the model"

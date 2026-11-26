@@ -62,7 +62,11 @@ def test_the_prompt_never_names_directories_the_agent_cannot_see():
     assert "All tool paths are relative to the project root" not in src, (
         "the prompt still tells the model it is in the repo when the shipped "
         "default is an empty scratch folder")
-    assert "scratch workspace" in src
+    # The anchor is that the workspace IS the agent's root: a named folder
+    # it can list for itself, or the empty default — never a repo elsewhere.
+    # (Line-wrapped in the source; match the wrapped-safe piece.)
+    assert "current directory IS the workspace" in src
+    assert "This workspace is EMPTY: that is expected" in src
 
 
 def test_apply_symbol_edit_proposals_carry_a_real_diff(ws):

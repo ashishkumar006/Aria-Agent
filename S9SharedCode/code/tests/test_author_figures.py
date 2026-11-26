@@ -171,6 +171,11 @@ def test_only_the_document_writers_pay_for_the_listing(monkeypatch):
     """A researcher does not place figures; fetching handles for it would cost
     a gateway round trip per document on every research node."""
     run_src = inspect.getsource(skills.run_skill)
-    gate = run_src[run_src.index('skill.name in ("author", "deck")'):]
-    assert "_figures_context" in gate[:400], (
+    # Anchor on the listing itself, not on the first author/deck gate: several
+    # gates now share that condition (the format fragment, the length
+    # contract, the render fallback), and the listing's own gate is what this
+    # test is about.
+    idx = run_src.index("figures = _figures_context(doc_ids)")
+    gate = run_src[max(0, idx - 400):idx]
+    assert 'skill.name in ("author", "deck")' in gate, (
         "the listing is no longer computed inside the writing-skill gate")

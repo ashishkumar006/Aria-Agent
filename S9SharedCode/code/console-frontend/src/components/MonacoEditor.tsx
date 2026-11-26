@@ -164,6 +164,10 @@ export interface CodeEditorProps {
   /** Fires when folding changes; the count of collapsed regions, for the
      status bar. Monaco owns folding, so only it can report this. */
   onFoldChange?: (collapsed: number) => void;
+  /** The compact reading size: 13.5px on a #1E1E1E surface, the way a code
+   *  block in a chat reads. The editing surface stays at 16px — a preview you
+   *  read should not be set at the size you write in. */
+  dense?: boolean;
 }
 
 /* ── theme ───────────────────────────────────────────────────────────── */
@@ -181,43 +185,66 @@ export interface CodeEditorProps {
 const ARIA_THEME = {
   base: 'vs-dark' as const,
   inherit: true,
+  /* Syntax colors are OpenCode's dark-theme tokens (packages/ui/src/styles/
+     tokens/colors.css): grey-600 comments, blue-400 keywords, green-400
+     strings, yellow-300 numbers, cyan-300 types, purple-400 functions. */
   rules: [
-    { token: 'comment', foreground: '6a9955', fontStyle: 'italic' },
-    { token: 'keyword', foreground: '569cd6' },
-    { token: 'number', foreground: 'b5cea8' },
-    { token: 'string', foreground: 'ce9178' },
-    { token: 'type', foreground: '4ec9b0' },
+    { token: 'comment', foreground: '808080', fontStyle: 'italic' },
+    { token: 'keyword', foreground: 'a2bcff' },
+    { token: 'number', foreground: 'f7e5b5' },
+    { token: 'string', foreground: '96e3a6' },
+    { token: 'type', foreground: 'a3e4ef' },
+    { token: 'function', foreground: '9e99f7' },
+    { token: 'variable', foreground: 'fafafa' },
+    { token: 'operator', foreground: 'aeaeae' },
   ],
   colors: {
-    'editor.background': '#10131c',
-    'editor.foreground': '#cccccc',
-    'editorLineNumber.foreground': '#6e7681',
-    'editorLineNumber.activeForeground': '#cccccc',
-    'editorCursor.foreground': '#aeafad',
-    'editor.selectionBackground': '#264f78',
-    'editor.inactiveSelectionBackground': '#3a3d41',
-    'editor.lineHighlightBackground': '#ffffff0a',
+    /* OpenCode dark surfaces: base grey-1100 (#161616), layer-01 #242424,
+       layer-02 #2e2e2e; text #fafafa / muted #aeaeae; borders #ffffff1a. */
+    'editor.background': '#0e0e12',
+    'editor.foreground': '#fafafa',
+    'editorLineNumber.foreground': '#808080',
+    'editorLineNumber.activeForeground': '#fafafa',
+    'editorCursor.foreground': '#a78bfa',
+    'editor.selectionBackground': '#8b7cf644',
+    'editor.selectionHighlightBackground': '#8b7cf622',
+    'editor.wordHighlightBackground': '#8b7cf622',
+    'editor.findMatchBackground': '#8b7cf655',
+    'editor.findMatchHighlightBackground': '#8b7cf633',
+    'editor.inactiveSelectionBackground': '#ffffff14',
+    'editor.lineHighlightBackground': '#ffffff08',
     'editor.lineHighlightBorder': '#00000000',
-    'editorGutter.background': '#10131c',
+    'editorGutter.background': '#0e0e12',
     'editorWidget.background': '#171c28',
-    'editorWidget.foreground': '#cccccc',
-    'editorWidget.border': '#2b3448',
+    'editorWidget.foreground': '#fafafa',
+    'editorWidget.border': '#ffffff1a',
     'editorSuggestWidget.background': '#171c28',
-    'editorSuggestWidget.selectedBackground': '#1e3a5f',
+    'editorSuggestWidget.selectedBackground': '#1e2435',
     'editorHoverWidget.background': '#171c28',
-    'editorStickyScroll.background': '#10131c',
-    'editorStickyScrollHover.background': '#1e2435',
-    'scrollbarSlider.background': '#4e5a7280',
-    'scrollbarSlider.hoverBackground': '#64708ab3',
-    'scrollbarSlider.activeBackground': '#bfc8da66',
-    'minimap.background': '#10131c',
+    'editorStickyScroll.background': '#0e0e12',
+    'editorStickyScrollHover.background': '#171c28',
+    'scrollbarSlider.background': '#ffffff14',
+    'scrollbarSlider.hoverBackground': '#ffffff24',
+    'scrollbarSlider.activeBackground': '#ffffff33',
+    'minimap.background': '#0e0e12',
     'editorOverviewRuler.border': '#00000000',
-    'editorIndentGuide.background': '#2a3448',
-    'editorIndentGuide.background1': '#2a3448',
-    'editorIndentGuide.activeBackground': '#55627a',
-    'editorIndentGuide.activeBackground1': '#55627a',
-    'editorBracketMatch.background': '#0064001a',
-    'editorBracketMatch.border': '#888888',
+    'editorIndentGuide.background': '#ffffff14',
+    'editorIndentGuide.background1': '#ffffff14',
+    'editorIndentGuide.activeBackground': '#ffffff33',
+    'editorIndentGuide.activeBackground1': '#ffffff33',
+    'editorBracketMatch.background': '#3b5cf626',
+    'editorBracketMatch.border': '#a2bcff',
+    /* Diff palette (OpenCode's diff tokens): green-400 additions, red-500
+       removals, with a stronger gutter bar. */
+    'diffEditor.insertedTextBackground': '#96e3a626',
+    'diffEditor.removedTextBackground': '#f1747126',
+    'diffEditor.insertedTextBorder': '#96e3a655',
+    'diffEditor.removedTextBorder': '#f1747155',
+    'diffEditor.border': '#ffffff1a',
+    'diffEditorGutter.insertedLineBackground': '#96e3a655',
+    'diffEditorGutter.removedLineBackground': '#f1747155',
+    'diffEditorOverview.insertedForeground': '#96e3a6',
+    'diffEditorOverview.removedForeground': '#f17471',
   },
 };
 
@@ -227,7 +254,7 @@ monaco.editor.defineTheme('aria-dark', ARIA_THEME);
 
 export default function MonacoEditor({
   body, lang, path, wrap = false, problems = [], marks = null, ariaLabel,
-  onChange, onCursor, onHandle, onFoldChange,
+  onChange, onCursor, onHandle, onFoldChange, dense = false,
 }: CodeEditorProps) {
   const host = useRef<HTMLDivElement | null>(null);
   const edRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -309,16 +336,16 @@ export default function MonacoEditor({
       autoSurround: 'languageDefined',
       bracketPairColorization: { enabled: true },
       guides: { bracketPairs: true, indentation: true },
-      stickyScroll: { enabled: true, maxLineCount: 4 },
+      stickyScroll: { enabled: false },
       folding: true,
       foldingHighlight: true,
       showFoldingControls: 'always',
-      minimap: { enabled: true, size: 'proportional' },
+      minimap: { enabled: false },
       occurrencesHighlight: 'singleFile',
       selectionHighlight: true,
       renderWhitespace: 'selection',
       roundedSelection: true,
-      smoothScrolling: true,
+      smoothScrolling: false,
       cursorBlinking: 'smooth',
       cursorSmoothCaretAnimation: 'on',
       multiCursorModifier: 'ctrlCmd',
@@ -330,13 +357,14 @@ export default function MonacoEditor({
       lineDecorationsWidth: 6,
       padding: { top: 8, bottom: 40 },
       fontFamily: '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-      fontSize: 12.5,
-      lineHeight: 20,
+      fontSize: dense ? 13.5 : 16,
+      lineHeight: dense ? 21 : 26,
       tabSize: 4,
       insertSpaces: true,
       detectIndentation: true,
       fixedOverflowWidgets: true,
-      scrollbar: { alwaysConsumeMouseWheel: false, vertical: 'visible' },
+      scrollbar: { alwaysConsumeMouseWheel: false, vertical: 'visible',
+                   verticalScrollbarSize: 4, horizontalScrollbarSize: 4 },
       ariaLabel,
     });
     edRef.current = ed;
@@ -559,6 +587,7 @@ export default function MonacoEditor({
     /* The host div is the containment anchor the parent's window-level
        keydown handler uses to ask "is the focus in the editor?".
        `data-editor-host` matches Code.tsx's ED_HOST selector. */
-    <div data-editor-host="" ref={host} className="absolute inset-0" />
+    <div data-editor-host="" ref={host}
+         className={dense ? 'absolute inset-0 monaco-dense' : 'absolute inset-0'} />
   );
 }

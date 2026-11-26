@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { baseName, isUnderRoot, joinPath, langFor, relWithinRoot, rootNameOf } from './studioSession';
+import { baseName, isUnderRoot, joinPath, langFor, relWithinRoot, rootNameOf, sessionName } from './studioSession';
 
 /* Path arithmetic for the studio: which file a click opens, which folder a
  * save is confined to, and how a buffer decides its language. Small functions
@@ -36,5 +36,30 @@ describe('studio paths', () => {
     expect(langFor('data.jsonl')).toBe('plaintext');
     expect(baseName('a/b/c.tsx')).toBe('c.tsx');
     expect(baseName('')).toBe('');
+  });
+});
+
+/* Every surface that names a session must name it the same way. The tabs said
+ * "Untitled session" while the switcher said the folder, which is how one row of
+ * the UI ended up with ten identical labels. */
+describe('sessionName', () => {
+  it('prefers an explicit label', () => {
+    expect(sessionName({ label: 'Auth refactor', paths: ['C:/w/app'] }))
+      .toBe('Auth refactor');
+  });
+
+  it('falls back to the one folder it works in', () => {
+    expect(sessionName({ label: '', paths: ['C:/Users/me/kvstore'] })).toBe('kvstore');
+    expect(sessionName({ label: '', paths: ['C:/Users/me/kvstore/'] })).toBe('kvstore');
+  });
+
+  it('counts the folders when there are several', () => {
+    expect(sessionName({ label: '', paths: ['C:/a/one', 'C:/b/two', 'C:/c/three'] }))
+      .toBe('one +2');
+  });
+
+  it('is untitled only when there is nothing to name it after', () => {
+    expect(sessionName({ label: '   ', paths: [] })).toBe('Untitled session');
+    expect(sessionName({})).toBe('Untitled session');
   });
 });

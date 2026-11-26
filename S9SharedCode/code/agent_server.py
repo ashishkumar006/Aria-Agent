@@ -1774,12 +1774,36 @@ async def session_produced(session_id: str):
     detail = [str(x) for x in (status.get("detail") or [])]
     stopped = any(str(d.get("status", "")).lower() == "skipped"
                   for _, d in g.nodes(data=True)) and not answer
+    # Per-node timing and the sources the researchers actually opened. The
+    # Authoring receipt needs both: "what did this run do" is the node list with
+    # durations, and "what did it check" is the deduplicated source URLs.
+    nodes_out = []
+    sources: list[dict] = []
+    seen_urls: set[str] = set()
+    for nid, d in g.nodes(data=True):
+        started = d.get("started_at")
+        completed = d.get("completed_at")
+        dur = None
+        if isinstance(started, (int, float)) and isinstance(completed, (int, float)):
+            dur = max(0.0, round(float(completed) - float(started), 1))
+        nodes_out.append({"id": nid, "skill": d.get("skill", ""),
+                          "status": d.get("status", ""), "duration": dur})
+        out = getattr(d.get("result"), "output", None)
+        if not isinstance(out, dict):
+            continue
+        for s in (out.get("sources") or []):
+            if not isinstance(s, dict):
+                continue
+            url = str(s.get("url") or "").strip()
+            if not url or url in seen_urls or not re.match(r"^https?://", url):
+                continue
+            seen_urls.add(url)
+            sources.append({"url": url,
+                            "title": str(s.get("title") or "")[:200]})
     return {"session_id": session_id, "files": files, "answer": answer,
             "live": live, "degraded": degraded, "incomplete_detail": detail,
             "stopped": bool(stopped),
-            "nodes": [{"id": nid, "skill": d.get("skill", ""),
-                       "status": d.get("status", "")}
-                      for nid, d in g.nodes(data=True)]}
+            "nodes": nodes_out, "sources": sources[:60]}
 @app.get("/api/artifact/{artifact_id}/preview")
 async def preview_artifact(artifact_id: str):
     """Describe a rendered document's actual contents, for the console's
@@ -1814,6 +1838,101 @@ async def preview_artifact(artifact_id: str):
     out = _dp.preview(data, ctype)
     _arts.put_cache(artifact_id, "preview", out)
     return JSONResponse(content=out, headers={"X-Artifact-Cache": "miss"})
+
+
+# ── PPTX slide rasterisation (PowerPoint COM) ────────────────────────────────
+# A deck has no browser-native rendering. PowerPoint is installed here, so a
+# .pptx is exported to one PNG per slide (pptx_raster) and the console shows
+# the slides as images. Falls back to the text outline when PowerPoint is not
+# available or the file is not a deck.
+def _is_pptx(data: bytes, ctype: str) -> bool:
+    return "pptx" in (ctype or "").lower() or "presentationml" in (ctype or "").lower()
+
+
+def _raster_slides(data: bytes, ctype: str) -> list[bytes]:
+    if not data or not _is_pptx(data, ctype):
+        return []
+    import pptx_raster
+    try:
+        return pptx_raster.slide_pngs(data)
+    except Exception:
+        return []
+
+
+def _doc_source_bytes(doc_id: str) -> bytes:
+    """Raw bytes of a stored document, via the gateway (same source the preview
+    endpoint uses). Empty on failure — the caller falls back to the outline."""
+    try:
+        import gateway as _gw
+        r = _gw._client().get(f"{_gw.GATEWAY_URL}/v1/documents/{doc_id}/source")
+        return r.content if r.status_code == 200 else b""
+    except Exception:
+        return b""
+
+
+@app.get("/api/artifact/{artifact_id}/slides")
+async def artifact_slides(artifact_id: str):
+    """How many slides this deck has, and whether PowerPoint could rasterise it.
+
+    Returns {"count": N, "rasterised": bool}. count==0 means the client should
+    show the text outline instead (no PowerPoint, or not a deck)."""
+    if not re.match(r"^art:[0-9a-fA-F]{16}$", artifact_id or ""):
+        return JSONResponse(status_code=400, content={"error": "malformed artifact id"})
+    import artifacts as _arts
+    try:
+        data = _arts.get_bytes(artifact_id)
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"error": "no such artifact"})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    try:
+        ctype = _arts.get_meta(artifact_id).content_type or ""
+    except Exception:
+        ctype = ""
+    pngs = await asyncio.to_thread(_raster_slides, data, ctype)
+    return JSONResponse(content={"count": len(pngs), "rasterised": bool(pngs)})
+
+
+@app.get("/api/artifact/{artifact_id}/slide/{n}")
+async def artifact_slide(artifact_id: str, n: int):
+    """One slide as a PNG (1-based)."""
+    if not re.match(r"^art:[0-9a-fA-F]{16}$", artifact_id or ""):
+        return JSONResponse(status_code=400, content={"error": "malformed artifact id"})
+    if n < 1:
+        return JSONResponse(status_code=400, content={"error": "slide number must be >= 1"})
+    import artifacts as _arts
+    try:
+        data = _arts.get_bytes(artifact_id)
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"error": "no such artifact"})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    try:
+        ctype = _arts.get_meta(artifact_id).content_type or ""
+    except Exception:
+        ctype = ""
+    pngs = await asyncio.to_thread(_raster_slides, data, ctype)
+    if n > len(pngs) or not pngs[n - 1]:
+        return JSONResponse(status_code=404,
+                            content={"error": f"no slide {n}"})
+    return Response(content=pngs[n - 1], media_type="image/png")
+
+
+@app.get("/api/documents/{doc_id}/slides")
+async def document_slides(doc_id: str):
+    """Slide count for a stored deck (Documents library)."""
+    data = await asyncio.to_thread(_doc_source_bytes, doc_id)
+    pngs = await asyncio.to_thread(_raster_slides, data, "")
+    return JSONResponse(content={"count": len(pngs), "rasterised": bool(pngs)})
+
+
+@app.get("/api/documents/{doc_id}/slide/{n}")
+async def document_slide(doc_id: str, n: int):
+    data = await asyncio.to_thread(_doc_source_bytes, doc_id)
+    pngs = await asyncio.to_thread(_raster_slides, data, "")
+    if n < 1 or n > len(pngs) or not pngs[n - 1]:
+        return JSONResponse(status_code=404, content={"error": f"no slide {n}"})
+    return Response(content=pngs[n - 1], media_type="image/png")
 
 
 @app.post("/api/artifact/{artifact_id}/documents")
@@ -1935,6 +2054,28 @@ async def health(req: Request):
     # different application that still "works".
     return {"agent": "ready", "gateway_up": gateway_up,
             "spa_built": _SPA_INDEX.exists()}
+
+
+@app.get("/api/model-lab/status")
+async def model_lab_status():
+    """Is the local Model Lab playground (port 7861) running?
+
+    The Model Lab page embeds it in an iframe; a blank iframe is
+    indistinguishable from a broken page, so the UI asks here first and shows a
+    helpful placeholder when it is down. Pure localhost socket probe — no model,
+    no network egress.
+    """
+    import socket
+    port = int(os.environ.get("MODEL_LAB_PORT", "7861") or "7861")
+    up = False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            up = True
+    except OSError:
+        up = False
+    return {"up": up, "url": f"http://127.0.0.1:{port}"}
+
+
 @app.get("/api/cost")
 async def cost_dashboard(session: str | None = None, agent: str | None = None,
                         conversation_id: str | None = None):
@@ -2416,8 +2557,14 @@ def _reconcile_orphaned_runs() -> dict:
                 continue          # recently written: a run may be in flight
             dirty = False
             for _nid, data in list(g.nodes(data=True)):
-                status = str(data.get("status", ""))
-                if not any(t in status.lower() for t in _LIVEISH):
+                status = str(data.get("status", "")).lower()
+                # On a graph untouched for STALE_RUN_S, no run is writing to it,
+                # so any node that has NOT SETTLED is orphaned — including
+                # `pending` nodes that never started. A killed run leaves them
+                # pending, and the Runs page then showed the dead run as
+                # "queued" forever; `_LIVEISH` (running/active/…) alone never
+                # matched them, so they were never reconciled.
+                if status in _SETTLED or status == "interrupted":
                     continue
                 # Re-check against the live file: another process may have
                 # touched it between the read above and now.
@@ -3187,6 +3334,18 @@ async def apps_action(app_id: str, req: Request):
     event = {"action": action[:80],
              "input": {str(k)[:80]: str(v)[:4000]
                        for k, v in list(raw_input.items())[:40]}}
+    # Coalesce concurrent identical clicks (double-submit, two tabs, a client
+    # retry) so one action pays for one builder run. Released the moment the
+    # run ends, so an intentional repeat afterwards still runs — a counter
+    # clicked twice in sequence must still count twice.
+    import uuid
+    _idem = "app-action:%s:%s" % (
+        app_id, _req_digest(action + "|" + json.dumps(event["input"],
+                                                      sort_keys=True)))
+    _owner = uuid.uuid4().hex
+    if _inflight_run_claim(_idem, _owner):
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "an identical action is already running"})
     try:
         # A user click is deterministic work, but it still runs through the
         # DAG's app_builder node rather than a chat tool. The node calls the
@@ -3208,6 +3367,8 @@ async def apps_action(app_id: str, req: Request):
     except Exception as e:                           # noqa: BLE001
         return JSONResponse(status_code=422, content={
             "ok": False, "error": f"{type(e).__name__}: {e}"[:400]})
+    finally:
+        _inflight_run_release(_idem, owner=_owner)
 @app.get("/api/apps/{app_id}")
 async def apps_detail(app_id: str):
     """Full app detail: spec + latest items + added/removed + history."""
@@ -3216,6 +3377,42 @@ async def apps_detail(app_id: str):
     if app is None:
         return JSONResponse(status_code=404, content={"error": "unknown app"})
     return app
+@app.patch("/api/apps/{app_id}")
+async def apps_patch(app_id: str, req: Request):
+    """Edit an app's identity (name/schedule/description/refresh_prompt)
+    without rebuilding its surface. A null field is left unchanged; name and
+    schedule cannot be blanked. 400 on an invalid field, 404 if unknown."""
+    import apps as _apps
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": "body must be an object"})
+    fields: dict = {}
+    for key in ("name", "schedule", "description", "refresh_prompt"):
+        if key not in body or body[key] is None:
+            continue
+        val = body[key]
+        if not isinstance(val, str):
+            return JSONResponse(status_code=400,
+                                content={"error": f"{key} must be a string"})
+        if key in ("name", "schedule") and not val.strip():
+            return JSONResponse(status_code=400,
+                                content={"error": f"{key} cannot be empty"})
+        fields[key] = val
+    if not fields:
+        return JSONResponse(status_code=400,
+                            content={"error": "nothing to update"})
+    try:
+        spec = _apps.update_app_meta(app_id, **fields)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    if spec is None:
+        return JSONResponse(status_code=404, content={"error": "unknown app"})
+    return {"ok": True, "spec": spec, "app": _apps.get_app(app_id),
+            "apps": _apps.list_apps()}
 @app.post("/api/apps/{app_id}/refresh")
 async def apps_refresh(app_id: str):
     """Refresh one app now (manual pull). Failures come back in the
@@ -3232,6 +3429,15 @@ async def apps_refresh(app_id: str):
         return JSONResponse(status_code=404, content={"error": "unknown app"})
     spec = app.get("spec") or {}
     if spec.get("kind") == "a2ui":
+        # Same double-bill guard as actions: coalesce concurrent manual
+        # refreshes of one app. Scheduled refreshes run in the worker thread
+        # and never take this claim, so they are unaffected.
+        import uuid
+        _idem = f"app-refresh:{app_id}"
+        _owner = uuid.uuid4().hex
+        if _inflight_run_claim(_idem, _owner):
+            return JSONResponse(status_code=409, content={
+                "id": app_id, "error": "a refresh is already running"})
         try:
             from section_runs import require_success
             _out, _run = await require_success(
@@ -3245,6 +3451,8 @@ async def apps_refresh(app_id: str):
         except Exception as e:                       # noqa: BLE001
             return JSONResponse(status_code=422, content={
                 "id": app_id, "error": f"{type(e).__name__}: {e}"[:400]})
+        finally:
+            _inflight_run_release(_idem, owner=_owner)
     try:
         return await asyncio.to_thread(_apps.refresh_app, app_id)
     except ValueError as e:
@@ -5843,6 +6051,247 @@ def _code_workspace() -> tuple[Path, tuple[Path, ...]]:
     return _CODE_BASE, _CODE_ALLOWED
 
 
+# The studio coding agent's system prompt lives in prompts/studio_coder.md.
+#
+# It used to be a 9,000-character inline string in `code_agent`, which meant
+# editing the prompt meant editing a 400-line function — and every "never do X"
+# was appended to the end of a Python expression rather than read as prose. The
+# per-request parts are `{{TOKEN}}` placeholders; everything else is the file.
+#
+# The file is re-read when its mtime changes, so a prompt edit takes effect on
+# the next message instead of at the next restart. If it is missing or empty the
+# run falls back to a short built-in prompt: a broken prompt file must not take
+# the editor down with it.
+_STUDIO_CODER_PROMPT_PATH = Path(__file__).with_name("prompts") / "studio_coder.md"
+_STUDIO_CODER_FALLBACK = (
+    "You are a coding agent inside this project's editor. You act ONLY through "
+    "tools; the harness executes them and returns observations.\n"
+    "{{LAYOUT}}\n"
+    "== 0. PLAN ==\n"
+    "- For work big enough to need a checklist, keep `update_plan` true as you go.\n\n"
+    "== 1. WORK ==\n"
+    "- Read before you write: `read_file` / `search_files` / `list_dir`.\n"
+    "- Edit with `edit_file` (start_line/end_line + the exact current code), "
+    "create with `create_file`.\n"
+    "- Verify with `run_checks` or a targeted `run_command`.\n"
+)
+_STUDIO_CODER_CACHE: dict[str, object] = {"mtime": -1.0, "text": ""}
+
+
+def studio_coder_prompt() -> str:
+    """The studio coding prompt, from prompts/studio_coder.md.
+
+    Cached on mtime rather than read per request: the file is a few kilobytes
+    and a request already does far more IO, but re-reading it also means an edit
+    is live without a restart, which is the whole reason it moved out of code.
+    """
+    try:
+        mtime = _STUDIO_CODER_PROMPT_PATH.stat().st_mtime
+    except OSError:
+        return _STUDIO_CODER_FALLBACK
+    if mtime != _STUDIO_CODER_CACHE["mtime"]:
+        try:
+            text = _STUDIO_CODER_PROMPT_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return _STUDIO_CODER_FALLBACK
+        _STUDIO_CODER_CACHE["mtime"] = mtime
+        _STUDIO_CODER_CACHE["text"] = text if text.strip() else _STUDIO_CODER_FALLBACK
+    return str(_STUDIO_CODER_CACHE["text"])
+
+
+def render_studio_coder_prompt(**parts: str) -> str:
+    """Fill the prompt's placeholders.
+
+    An unreplaced token would reach the model as literal `{{...}}` text, which
+    reads as a template bug rather than an instruction. Anything the caller did
+    not supply becomes empty — every optional block (git, browser) is a
+    placeholder precisely so the file needs no conditional syntax.
+    """
+    text = studio_coder_prompt()
+    for key, value in parts.items():
+        text = text.replace("{{" + key + "}}", str(value or ""))
+    # Anything still in {{PLACEHOLDER}} form was not wired by the caller. Drop
+    # it rather than shipping template syntax to the model: a literal token
+    # reads as a harness bug, and an empty block reads as nothing at all.
+    # test_studio_prompt_file.py asserts the file only uses tokens this function
+    # knows, so a new placeholder cannot be silently dropped.
+    text = re.sub(r"\{\{[A-Z][A-Z0-9_]*\}\}", "", text)
+    # The file ends with a newline; the prompt never did. One trailing newline
+    # is invisible to the model, but it is the difference between "moved" and
+    # "moved and changed" — which is the thing this extraction must not be.
+    return text.rstrip("\n")
+
+
+def _warm_code_index(*roots) -> None:
+    """Build the project map in the background.
+
+    The first build costs a few seconds per project; inside a tool call that is
+    a stall the user sees. Doing it when a folder is attached moves the cost to
+    a moment when nobody is waiting on it.
+    """
+    import threading
+
+    def _go() -> None:
+        try:
+            import code_index
+            for r in roots:
+                p = Path(str(r or ""))
+                if p.is_dir():
+                    code_index.refresh(p)
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_go, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _invalidate_code_index(sid: str) -> None:
+    """Drop the project map for a session's folders.
+
+    Called after anything that rewrites files the agent did not edit (a
+    checkpoint restore, a project-wide replace). A stale map would answer
+    symbol queries about bytes that are no longer on disk, which is worse than
+    a cache miss.
+    """
+    try:
+        import code_index
+        for r in _studio.roots_env(sid):
+            code_index.invalidate(Path(str(r)))
+    except Exception:
+        pass
+
+
+def _replay_frames(frames: list[dict]) -> list[dict]:
+    """Rebuild chat messages from a run's transcript frames.
+
+    A coding agent's next turn is a continuation, not a new conversation: the
+    model needs the tool calls it made AND the output they returned, not a
+    digest of them. Live symptom of the digest: asked to explain a codebase, it
+    investigated for 75 calls, and on the follow-up wrote "I don't see their
+    results in the conversation" and explored the same repository again.
+
+    Thinking frames are dropped: they are reasoning, not messages, and replaying
+    them as assistant text teaches the model to narrate instead of answer.
+    """
+    out: list[dict] = []
+    prose: list[str] = []
+    # Calls arrive as separate frames but were sent as ONE assistant message
+    # when the model made them in parallel. Splitting them into one message per
+    # call produced assistant→assistant pairs and orphaned tool results, which
+    # the provider refuses (masked as `kilo failed: 'name'`).
+    batch: list[dict] = []
+    used_ids: set[str] = set()
+
+    def emit_batch():
+        if not batch:
+            return
+        out.append({
+            "role": "assistant",
+            "content": "\n".join(prose).strip(),
+            "tool_calls": batch[:],
+        })
+        prose.clear()
+        batch.clear()
+
+    for f in frames:
+        kind = f.get("t") or f.get("type")
+        if kind == "text":
+            if batch:
+                emit_batch()
+            piece = str(f.get("text") or f.get("delta") or "")
+            if piece:
+                prose.append(piece)
+        elif kind == "tool_call":
+            # The gateway's canonical tool_call is FLAT — {"id", "name",
+            # "arguments"} (schemas.ToolCall) — and `_translate_messages` reads
+            # `tc["name"]`. The OpenAI wire shape nests it under `function`,
+            # which is what the gateway builds when it calls a provider; sending
+            # that shape BACK into the gateway raised KeyError('name'), surfaced
+        # as a 502 and made every turn after the first in a session fail.
+            args = f.get("arguments")
+            if not isinstance(args, dict):
+                try:
+                    args = json.loads(args) if isinstance(args, str) else {}
+                except Exception:
+                    args = {}
+            call_id = str(f.get("id") or "") or f"call_{len(out)}_{len(batch)}"
+            name = str(f.get("name") or "").strip()
+            if not name:
+                # A call with no name cannot be replayed: the provider refuses
+                # the whole request ("function.name must be a string"), which is
+                # how one malformed call took out every later turn.
+                continue
+            batch.append({
+                "id": call_id,
+                "name": name,
+                "arguments": args,
+            })
+        elif kind == "tool_result":
+            call_id = str(f.get("id") or "")
+            if not call_id:
+                # No id on the result: answer the oldest call still unanswered.
+                pending = [c["id"] for c in batch if c["id"] not in used_ids]
+                call_id = pending[0] if pending else (batch[-1]["id"] if batch else "")
+            used_ids.add(call_id)
+            emit_batch()
+            body = str(f.get("result") or f.get("error") or "") or "(no output)"
+            out.append({"role": "tool", "tool_call_id": call_id,
+                        "content": body[:20000]})
+    emit_batch()
+    if prose:
+        text = "\n".join(prose).strip()
+        # An assistant message with no content and no calls is rejected by most
+        # providers ("Invalid request"). A turn whose only output was a malformed
+        # call replays as exactly that, so drop it rather than poison the next
+        # request in a new turn.
+        if text:
+            out.append({"role": "assistant", "content": text})
+    return out
+
+
+def _msg_chars(msgs: list[dict]) -> int:
+    total = 0
+    for m in msgs:
+        c = m.get("content")
+        total += len(c) if isinstance(c, str) else 0
+        for tc in m.get("tool_calls") or []:
+            fn = (tc or {}).get("function") or {}
+            total += len(str(fn.get("name") or "")) + len(str(fn.get("arguments") or ""))
+    return total
+
+
+def _replay_prior_messages(sid: str, run_id: str, budget: int) -> list[dict]:
+    """Every earlier turn in this session, as messages, newest included.
+
+    Oldest first, so the conversation reads forwards. If the whole history does
+    not fit the budget, whole oldest messages are dropped rather than summarised
+    — a truncated transcript is honest about where it starts, and a digest is
+    not a transcript.
+    """
+    try:
+        runs = [r for r in _runs.list_runs(sid)
+                if not r.get("live") and str(r.get("id") or "") != str(run_id)]
+    except Exception:
+        return []
+    if not runs:
+        return []
+    runs.reverse()  # oldest first
+    msgs: list[dict] = []
+    for r in runs:
+        try:
+            got = _runs.frames(sid, str(r.get("id") or ""))
+        except Exception:
+            continue
+        msgs.extend(_replay_frames(got.get("frames") or []))
+    if not msgs:
+        return []
+    while _msg_chars(msgs) > budget and len(msgs) > 2:
+        msgs.pop(0)
+    return msgs
+
+
 def _studio_bind(sid: str = "") -> str:
     """Bind this request to a studio session and return the id it bound to.
 
@@ -6090,7 +6539,7 @@ CODE_AGENT_TOOLS = [
     # tell a definition from a call site, so it duplicates `search_files` while
     # being weaker than `find_references` (AST, excludes comments/strings).
     # Three tools for one question confused a small model; two do the job.
-    "document_symbols", "find_references", "blast_radius",
+    "project_map", "document_symbols", "find_references", "blast_radius",
     # understand the current state
     "git_inspect", "read_artifact",
     # propose without writing
@@ -6127,8 +6576,9 @@ if _browser_tools_enabled():
         print(f"[browser] sweeper not started: {_bs_exc!r}")
     # Registered-but-ungranted would be the opposite failure, so assert it
     # here rather than discovering it as a missing tool mid-run.
+    from skills import _TOOL_CATALOG as _catalog
     _missing = [n for n in _CODE_BROWSER_READ_TOOLS + _CODE_BROWSER_ACT_TOOLS
-                if n not in skills._TOOL_CATALOG]
+                if n not in _catalog]
     if _missing:
         print(f"[browser] WARNING: granted without a catalog entry: {_missing}")
 
@@ -6438,13 +6888,13 @@ def _code_review_restore(entry: dict) -> tuple[bool, str]:
     removed when the change created it."""
     return _review.restore_bytes(entry, _code_review_abs)
 
-# A finite default ceiling. "Unlimited" was tried and it is the wrong default
-# for an editor: a model that keeps calling tools looks busy, bills every hop,
-# and the user has no idea it will never answer. 60 model calls is far beyond a
-# real investigation (orient, search, read, edit, verify is ~10-20) and still
-# cheap to abandon. A caller that explicitly asks for `max_hops: 0` gets the
-# old unlimited behaviour, and a positive request is clamped to 200.
-_CODE_AGENT_MAX_HOPS = 60
+# No default ceiling on the tool loop. A bounded cap was the right call for a
+# small model that wanders and looks busy while billing every hop — but the
+# user wants the agent to keep working until the work is done, so the default
+# is now "no ceiling". A caller that explicitly asks for `max_hops: 0` gets
+# the same; a positive request is still clamped to 200 so an accidental
+# `max_hops: 99999` cannot bill an unbounded spree.
+_CODE_AGENT_MAX_HOPS = 0
 _CODE_AGENT_MAX_HOPS_CAP = 200
 # The accumulating tool transcript is bounded too: below this the oldest tool
 # results are elided, above it the run stops with a stated reason instead of
@@ -6461,10 +6911,32 @@ _CODE_AGENT_THINKING_CHARS = 8000
 # discovered Kilo ids (see route_for_model / CODE_MODEL_ROUTES), otherwise the
 # run falls through to the general ladder and lands on Gemini - whose
 # tool loop then 400s, because Gemini requires a thought_signature echoed back
-# on every functionCall. Measured fastest of the free roster; kept in step with
-# kilo_models._CODE_MODEL_PREFERENCE and the gateway's reported default_model.
-_CODE_AGENT_DEFAULT_MODEL = "cohere/north-mini-code:free"
+# on every functionCall. Default is beam (free tier, 1M ctx): the weak cohere
+# free default looped on multi-file tasks; beam carries them. The paid
+# beam-1.0-501b id 402s without credits, so use the free beam id.
+_CODE_AGENT_DEFAULT_MODEL = "reflection/beam-free"
 _CODE_VERIFY_FIX_ROUNDS = 2
+
+# Char budget per model ≈ its token window (context_length tokens * ~4 chars).
+# Compaction keys off this so it fires when the prompt nears the MODEL's real
+# max context, not a fixed guess. Cached; falls back to the legacy char cap.
+_MODEL_WINDOW_CACHE: dict = {}
+
+
+async def _model_context_chars(model: str) -> int:
+    if model in _MODEL_WINDOW_CACHE:
+        return _MODEL_WINDOW_CACHE[model]
+    chars = _CODE_AGENT_CONTEXT_CHARS
+    try:
+        data = await _gw_json("/v1/providers/kilo/models?all=true")
+        for m in data.get("models") or []:
+            if isinstance(m, dict) and m.get("context_length"):
+                _MODEL_WINDOW_CACHE[str(m.get("id"))] = int(m["context_length"]) * 4
+        chars = _MODEL_WINDOW_CACHE.get(model, chars)
+    except Exception:
+        pass
+    _MODEL_WINDOW_CACHE[model] = chars
+    return chars
 
 # A synthetic tool handled inside the agent process, not by the MCP child.
 # The plan is the model's visible working memory; it is not evidence of work.
@@ -6659,17 +7131,45 @@ def _code_fast_verify(paths, root: Path | None = None) -> dict:
     root = Path(root or _code_agent_root()).resolve()
 
     def _resolve(raw: str) -> tuple[Path | None, str]:
+        """Map a recorded write path to a file, trying both vocabularies.
+
+        A path is either tool-relative ("store.py", or "pkg/store.py") or a
+        client path with the root's name baked in ("kvstore/store.py"). Those
+        are the same string when the project folder and a package inside it
+        share a name — the case that made this check report `checked: 0` on a
+        project called `kvstore` holding a package called `kvstore`, which then
+        read as "not verified: no checker for the changed files".
+
+        So: strip the root name if that is what makes the file exist, and keep
+        the path whole if it is the path itself that exists. A path that exists
+        under neither reading did not change.
+        """
         rel = str(raw or "").replace("\\", "/").lstrip("/")
+        if not rel:
+            return root, ""
         name = root.name
+        candidates = [rel]
         if name and (rel == name or rel.startswith(name + "/")):
-            rel = rel[len(name):].lstrip("/")
+            candidates.append(rel[len(name):].lstrip("/"))
+        for cand in candidates:
+            try:
+                p = (root / cand).resolve() if cand else root
+            except OSError:
+                continue
+            if p != root and root not in p.parents:
+                continue
+            if p.is_file():
+                return p, (cand or ".")
+        # Nothing exists: report the first reading so the caller can say which
+        # path it was looking for.
+        rel2 = candidates[-1] if len(candidates) > 1 else rel
         try:
-            p = (root / rel).resolve() if rel else root
+            p = (root / rel2).resolve() if rel2 else root
         except OSError:
-            return None, rel
+            return None, rel2
         if p != root and root not in p.parents:
-            return None, rel
-        return p, rel
+            return None, rel2
+        return p, rel2
 
     def _rel_for(p: Path) -> str:
         try:
@@ -6894,7 +7394,96 @@ def _error_detail(exc: BaseException) -> str:
 # window would drop.
 _CODE_ASK_HISTORY_TURNS = 8
 _CODE_ASK_HISTORY_CHARS = 2_000
+# How much of the session's earlier turns is replayed verbatim into a new turn.
+# A coding agent's next turn continues the last one, so the default is "all of
+# it"; this is only the ceiling that keeps a 40-turn session from opening with a
+# request the gateway will refuse. The loop's own compaction takes over past it.
+_CODE_REPLAY_BUDGET_CHARS = 600_000
+# Attachments are re-sent with every turn of the conversation, so they are the
+# one input the person controls that grows without the agent asking for it. A
+# per-file cap alone is not a budget: three 120k files is ~90k tokens of context
+# on turn one and on turn twenty. This is the shared ceiling; whatever does not
+# fit is named, not silently dropped, so the agent knows to read it itself.
+_CODE_ATTACH_BUDGET = 200_000
 _CODE_MAX_FILES = 4000
+
+
+_TOOLCHAIN_CACHE: dict[str, str] = {}
+
+
+def _toolchain_line() -> str:
+    """One measured line about what is installed: python, pytest, ruff, git.
+
+    Cached per process, and probed with `shutil.which` + `--version` rather than
+    assumed. A model that has to discover this spends calls on it, and the calls
+    are not free: five in a row went by on one run before any file was written.
+    """
+    if "line" in _TOOLCHAIN_CACHE:
+        return _TOOLCHAIN_CACHE["line"]
+    import shutil
+    import subprocess
+    import sys as _sys
+
+    bits = [f"Python {_sys.version.split()[0]}"]
+    for tool, args in (("pytest", ("--version",)), ("ruff", ("--version",)),
+                       ("git", ("--version",))):
+        exe = shutil.which(tool)
+        if not exe:
+            bits.append(f"{tool} not installed")
+            continue
+        try:
+            out = subprocess.run([exe, *args], capture_output=True, text=True,
+                                 timeout=10)
+            first = (out.stdout or out.stderr or "").strip().splitlines()
+            text = (first[0].strip() if first else "")
+            if tool == "git":
+                text = text.replace("git version ", "").strip()
+            # `pytest --version` already prints "pytest 9.0.3"; prefixing the
+            # name again read as "pytest pytest 9.0.3".
+            bits.append(text if text.lower().startswith(tool) else f"{tool} {text}".strip())
+        except Exception:
+            bits.append(f"{tool} present")
+    line = "Toolchain: " + " · ".join(bits) + ". Run the project's checks with run_checks; do not probe for versions."
+    _TOOLCHAIN_CACHE["line"] = line
+    return line
+
+
+def _attachment_lines(files, budget: int = _CODE_ATTACH_BUDGET,
+                      per_file: int = 120_000) -> list[str]:
+    """The ATTACHED FILE blocks for one turn, under one shared budget.
+
+    Attachments travel with every turn, so an uncapped set is a cost paid on
+    every message and a window that shrinks as the conversation grows. The rule:
+    each file gets up to `per_file`, the whole set gets `budget`, and anything
+    left out is NAMED with its size — a silent drop reads as "the agent saw my
+    file" when it did not.
+
+    The list is ordered as given, which is the order the person attached them in;
+    the first files are the ones they cared about.
+    """
+    out: list[str] = []
+    spent = 0
+    for f in files or []:
+        if not isinstance(f, dict):
+            continue
+        path = str(f.get("path") or "")
+        if "content" not in f:
+            continue
+        content = str(f.get("content") or "")
+        left = budget - spent
+        if left <= 0:
+            out.append(f"\nATTACHED FILE: {path}\n(not included - the "
+                       f"attachment budget for this turn is spent. "
+                       f"Read it with read_file if you need it.)")
+            continue
+        text = content[:min(per_file, left)]
+        spent += len(text)
+        note = ""
+        if len(text) < len(content):
+            note = (f"\n[trimmed from {len(content)} chars to {len(text)} - read "
+                    f"the rest with read_file if it matters]")
+        out.append(f"\nATTACHED FILE: {path}\n{text}{note}")
+    return out
 def _code_rel_ok(rel: str) -> bool:
     """Validate a client-supplied workspace-relative path.
     Rejects absolute paths, drive letters, `..`, NUL bytes, backslashes and
@@ -7204,7 +7793,12 @@ async def studio_roots_add(req: Request):
     # the pending marks are dropped — but the checkpoint history stays, because
     # it records absolute paths and can still resolve what it captured.
     await asyncio.to_thread(_review.clear_pending, sid)
+    # …and the project map is built now rather than during the agent's first
+    # symbol query, where a cold build would look like a hung tool.
+    _warm_code_index(*[r["path"] for r in _studio_workspace_payload(sid)["roots"]])
     return _studio_workspace_payload(sid)
+
+
 @app.post("/api/studio/roots/remove")
 async def studio_roots_remove(req: Request):
     import asyncio
@@ -7225,6 +7819,151 @@ async def studio_roots_remove(req: Request):
     # from "this name now means something else" (the bug).
     await asyncio.to_thread(_review.clear_pending, sid)
     return _studio_workspace_payload(sid)
+
+
+_FS_PICKER_MAX = 300
+
+@app.get("/api/studio/fs/list")
+async def studio_fs_list(path: str = ""):
+    """A folder picker's read: the folders on this machine, names only.
+
+    What this is for: nobody should have to type `C:\\Users\\...` from
+    memory to open a project. What this is NOT: a file read — file contents
+    are never involved, and hidden entries are not listed. The Select button
+    is greyed for anything `validate_root` would refuse (the state dir, an
+    ancestor of it, the drive root) with the refusal text shown — the same
+    rule `/api/studio/roots` enforces, surfaced here instead of after the
+    fact. A folder that cannot be picked may still be walked through: the
+    user must be able to REACH their project to pick a subfolder of it.
+    """
+    import asyncio
+    import string
+
+    def _quick_dirs() -> list:
+        """The user's own folders, for the picker's quick-access column."""
+        home_dir = os.path.expanduser("~")
+        out = []
+        for name in ("Desktop", "Documents", "Downloads", "Pictures", "Music",
+                     "Videos"):
+            p = os.path.join(home_dir, name)
+            if not os.path.isdir(p):
+                continue
+            try:
+                reason = _studio.forbidden_root(p)
+            except Exception:
+                reason = "cannot be checked"
+            out.append({"name": name, "path": p, "selectable": not reason,
+                        "reason": reason})
+        return out
+
+    home = os.path.expanduser("~")
+    raw = (path or "").strip()
+    if not raw:
+        drives = []
+        for c in string.ascii_uppercase:
+            d = f"{c}:\\"
+            if os.path.exists(d):
+                drives.append({"name": d, "path": d, "selectable": False,
+                               "reason": "pick a folder on this drive, not the drive root"})
+        return {"path": "", "parent": "", "dirs": drives, "truncated": False,
+                "selectable": False,
+                "reason": "pick a folder on a drive, not the drive root",
+                "home": home, "quick": _quick_dirs()}
+
+    def _list() -> dict:
+        rp = Path(raw)
+        try:
+            rp = rp.resolve()
+        except OSError:
+            return {"error": "not a readable path", "status": 400}
+        if not rp.exists():
+            return {"error": f"does not exist: {raw}", "status": 404}
+        if not rp.is_dir():
+            return {"error": "not a folder", "status": 400}
+        try:
+            kids = [c for c in rp.iterdir()
+                    if c.is_dir() and not c.name.startswith(".")]
+        except (PermissionError, OSError) as e:
+            return {"error": f"cannot be read ({type(e).__name__})", "status": 403}
+        truncated = len(kids) > _FS_PICKER_MAX
+        items = []
+        for c in sorted(kids, key=lambda c: c.name.lower())[:_FS_PICKER_MAX]:
+            try:
+                reason = _studio.forbidden_root(c)
+            except Exception:
+                reason = "cannot be checked"
+            items.append({"name": c.name, "path": str(c),
+                          "selectable": not reason, "reason": reason})
+        parent = "" if rp.parent == rp else str(rp.parent)
+        try:
+            reason = _studio.forbidden_root(rp)
+        except Exception:
+            reason = "cannot be checked"
+        return {"path": str(rp), "parent": parent, "dirs": items,
+                "truncated": truncated,
+                "selectable": not reason, "reason": reason,
+                "home": home, "quick": _quick_dirs()}
+
+    got = await asyncio.to_thread(_list)
+    if "error" in got:
+        return JSONResponse(status_code=int(got.get("status") or 400),
+                            content={"error": got["error"]})
+    return got
+
+
+@app.post("/api/studio/pick-folder")
+async def studio_pick_folder():
+    """Open the OS folder picker on THIS machine and return what was picked.
+
+    The console is loopback-only and served by an agent running in the user's
+    own session, so "Open Folder…" can mean the real dialog instead of a
+    rebuilt one. No input is taken: the dialog starts at MyComputer, and the
+    caller gets back either {path}, {cancelled: true} or an error the console
+    falls back from (the in-app browser) when the OS dialog is unavailable.
+    The request blocks for as long as the user leaves the dialog open, capped
+    at 300s — an unanswered dialog is a cancelled one, not a hung agent.
+    """
+    import asyncio
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms | Out-Null;"
+        "[System.Windows.Forms.Application]::EnableVisualStyles() | Out-Null;"
+        "$owner = New-Object System.Windows.Forms.Form;"
+        "$owner.TopMost = $true;"
+        "$owner.ShowInTaskbar = $false;"
+        "$owner.Opacity = 0;"
+        "$owner.Show();"
+        "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
+        "$d.Description = 'Open a folder in Aria Studio';"
+        "$d.RootFolder = [System.Windows.Forms.Environment+SpecialFolder]::MyComputer;"
+        "$d.ShowNewFolderButton = $true;"
+        "$result = $d.ShowDialog($owner);"
+        "$owner.Close();"
+        "if ($result -eq [System.Windows.Forms.DialogResult]::OK)"
+        " { [Console]::Out.Write($d.SelectedPath) }"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "powershell", "-NoProfile", "-NonInteractive", "-Command", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+    except FileNotFoundError:
+        return JSONResponse(status_code=501, content={
+            "error": "the OS folder picker is not available on this platform"})
+    try:
+        out, _err = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return JSONResponse(status_code=504, content={
+            "error": "the folder picker was open for over 5 minutes — cancelled"})
+    path = out.decode("utf-8", "replace").strip()
+    if not path:
+        return {"cancelled": True}
+    return {"path": path}
+
+
 @app.get("/api/studio/sessions")
 async def studio_sessions(sid: str = ""):
     """Every studio session the index knows, newest first, with this one marked.
@@ -7241,12 +7980,43 @@ async def studio_sessions(sid: str = ""):
         one = str(r.get("sid") or "")
         if not one:
             continue
+        live = 0
+        try:
+            live = int(_runs.live_count(one) or 0)
+        except Exception:
+            live = 0
+        last_status = ""
+        try:
+            rr = await asyncio.to_thread(_runs.list_runs, one)
+            if rr:
+                last_status = str((rr[0] or {}).get("status") or "")
+        except Exception:
+            last_status = ""
+        # The same definition the Changes drawer renders: files whose bytes no
+        # longer match their baseline. Drives the rail's "finished, but it needs
+        # you" dot — a finished run with nothing unreviewed is not a to-do.
+        # Bound per listed session: `_code_agent_abs` resolves against the
+        # bound session's roots, so another session's folders would not see
+        # their files and every pending entry would fall back to its stored
+        # diff.
+        try:
+            _studio.bind(one)
+            pending_review = len((await asyncio.to_thread(
+                _review.changes_payload, one, "", _code_review_abs)
+            ).get("changes") or [])
+        except Exception:
+            pending_review = 0
+        finally:
+            _studio.bind(sid)
         out.append({"sid": one, "label": str(r.get("label") or ""),
                     "roots": int(r.get("roots") or 0),
                     "paths": [str(p) for p in (r.get("paths") or [])],
                     "archived": bool(r.get("archived")),
                     "created": r.get("created") or 0,
                     "updated": r.get("updated") or 0,
+                    "live": live,
+                    "pending_review": pending_review,
+                    "last_status": last_status,
                     "current": one == sid})
     return {"sessions": out, "current": sid}
 
@@ -7357,6 +8127,8 @@ async def studio_run_cost(run_id: str, sid: str = ""):
     return {"run": run_id, "unknown": False, "usd": round(usd, 6),
             "in_tok": sum(int(v.get("in_tok") or 0) for v in bd.values()),
             "out_tok": sum(int(v.get("out_tok") or 0) for v in bd.values()),
+            "cache_reads": sum(int(v.get("cache_reads") or 0) for v in bd.values()),
+            "cache_creates": sum(int(v.get("cache_creates") or 0) for v in bd.values()),
             "calls": sum(int(v.get("calls") or 0) for v in bd.values()),
             "by_agent": bd}
 
@@ -7412,9 +8184,11 @@ async def studio_live(sid: str = "", hold: float = 90.0):
             rows = await asyncio.to_thread(_runs.list_runs, bucket)
             live = sum(1 for r in rows if r.get("live"))
             payload = {"sid": bucket, "live": live,
-                       "runs": [{"id": r.get("id"), "status": r.get("status"),
-                                 "question": (r.get("question") or "")[:80]}
-                                for r in rows[:20]]}
+                       # Full rows, not a stripped id/status/question slice: the RUNS panel
+                       # replaces its list with this payload, and a slice leaves
+                       # every row that arrives after a watcher frame with no started /
+                       # tool_calls / tokens — the panel rendered 0 calls · 0 out.
+                       "runs": rows[:20]}
             key = json.dumps(payload, sort_keys=True)
             if key != last:
                 last = key
@@ -7735,6 +8509,17 @@ async def studio_files(req: Request):
                         name=f"before {kind} {src.name}")
                     src.rename(dst)
                     after = _DISPLAY.show(dst)
+                    # The rename has two halves and the checkpoint must know
+                    # both, or undo restores the old name and keeps the new one.
+                    # The destination's bytes fingerprint it, so a restore never
+                    # deletes a file that was edited after the rename.
+                    try:
+                        after_bytes = dst.read_bytes() if dst.is_file() else b""
+                    except OSError:
+                        after_bytes = b""
+                    _review.checkpoint_mark_removed(
+                        sid, turn, _DISPLAY.show(src), after,
+                        _review.sha_of(after_bytes), str(dst))
                     results.append({"op": kind, "ok": True, "from": frm, "to": to,
                                     "path": after})
                 elif kind == "delete":
@@ -7982,6 +8767,24 @@ async def studio_git(req: Request):
         return JSONResponse(status_code=409, content={
             "error": f"{roots[which].name} is not inside a git repository"})
 
+    # A workspace is a SIBLING worktree, never a directory inside the repo:
+    # `git worktree add` would otherwise nest a second checkout inside the first.
+    if action == "worktree_add":
+        target = str((args or {}).get("path") or "").strip()
+        if not os.path.isabs(target):
+            return JSONResponse(status_code=400, content={
+                "error": "a workspace path must be absolute"})
+        try:
+            inside = os.path.commonpath(
+                [os.path.normcase(str(repo)), os.path.normcase(target)]
+            ) == os.path.normcase(str(repo))
+        except ValueError:
+            inside = False
+        if inside:
+            return JSONResponse(status_code=400, content={
+                "error": "a workspace must live OUTSIDE the repository "
+                         "(a sibling directory), not inside it"})
+
     def _rel(paths):
         out = []
         for p in paths or []:
@@ -8168,7 +8971,51 @@ async def studio_browser_tab(req: Request):
         if action == "new":
             return await asyncio.to_thread(_brows.tab_new, sid,
                                            str((body or {}).get("url") or ""))
+        if action == "back":
+            return await asyncio.to_thread(_brows.back, sid)
+        if action == "forward":
+            return await asyncio.to_thread(_brows.forward, sid)
+        if action == "reload":
+            return await asyncio.to_thread(_brows.reload, sid)
         return await asyncio.to_thread(_brows.tabs, sid)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+@app.post("/api/studio/browser/input")
+async def studio_browser_input(req: Request):
+    """Forward a mouse / wheel / keyboard event from the screencast viewer.
+
+    The pane is a CDP screencast, so without this it is read-only. Coordinates
+    arrive in page space (the viewer maps its own pixels); the browser session
+    dispatches them to the real page.
+    """
+    import asyncio
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "body must be JSON"})
+    if not _browser_on():
+        return JSONResponse(status_code=403, content={"error": "browser.tools is off"})
+    sid = _studio_bind_body(body if isinstance(body, dict) else {})
+    kind = str((body or {}).get("kind") or "")
+    try:
+        if kind == "click":
+            return await asyncio.to_thread(
+                _brows.click_xy, sid,
+                float((body or {}).get("x") or 0), float((body or {}).get("y") or 0))
+        if kind == "wheel":
+            return await asyncio.to_thread(
+                _brows.wheel_xy, sid,
+                float((body or {}).get("dx") or 0), float((body or {}).get("dy") or 0))
+        if kind == "type":
+            return await asyncio.to_thread(
+                _brows.type_text, sid, str((body or {}).get("text") or ""))
+        if kind == "key":
+            return await asyncio.to_thread(
+                _brows.press_key, sid, str((body or {}).get("key") or ""))
+        return JSONResponse(status_code=400,
+                            content={"error": f"unknown input kind: {kind}"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
 
@@ -9112,11 +9959,16 @@ async def studio_changes_apply(req: Request):
 
 @app.get("/api/studio/checkpoints")
 async def studio_checkpoints(sid: str = ""):
-    """Named, persisted "before task N" states, newest first."""
+    """Named, persisted "before task N" states, newest first.
+
+    `acted` is the undo/redo cursor: the checkpoints the walk has already
+    passed. Checkpoints are never deleted, so a client that ignored it would
+    make every `/undo` after the first restore the same undo again."""
     import asyncio
     sid = _studio_bind(sid)
     return await asyncio.to_thread(lambda: {"sid": sid,
-                                            "checkpoints": _review.checkpoints(sid)})
+                                            "checkpoints": _review.checkpoints(sid),
+                                            "acted": _review.acted(sid)})
 
 
 @app.get("/api/studio/checkpoints/{cp_id}")
@@ -9160,6 +10012,8 @@ async def studio_checkpoint_restore(req: Request):
             "ok": False, "error": f"{type(exc).__name__}: {exc}"})
     if not got.get("ok") and got.get("code"):
         return JSONResponse(status_code=int(got["code"]), content=got)
+    # The restore rewrote files the agent never edited; the map is stale now.
+    _invalidate_code_index(sid)
     return got
 
 
@@ -9267,9 +10121,11 @@ async def code_agent(req: Request):
     browser_page = body.get("browser_page")
     if not isinstance(browser_page, dict):
         browser_page = None
-    # A bound on the loop. Small models loop rather than progress, and the
-    # failure is silent (a full budget burned, nothing found), so the cap has
-    # to be low enough to be cheap and high enough for a real investigation.
+    # The loop's ceiling. Default is now no ceiling (the coding agent runs
+    # until the work is done or the user stops it); an explicit positive value
+    # from the caller is honoured, and an explicit 0 means the same as today's
+    # default. A run can always be stopped from the panel, and the transcript
+    # says which hop it stopped on.
     raw_hops = body.get("max_hops")
     try:
         max_hops = (int(raw_hops) if raw_hops is not None
@@ -9387,12 +10243,26 @@ async def code_agent(req: Request):
         _ws_name = _ws_root.name or str(_ws_root)
         _layout = ("All tool paths are relative to your workspace folder "
                    f'("{_ws_name}"). Call list_dir(".") FIRST to see what is '
-                   "actually here, then work only inside this folder.")
-        if _ws_is_default:
-            _layout += (" This is the shipped scratch workspace: expect it to "
-                        "be empty. Create the files the user asks for with "
-                        "create_file and folders with make_dir; nothing needs "
-                        "to pre-exist.")
+                   "actually here, then work only inside this folder. The "
+                   "current directory IS the workspace: there is no /workspace "
+                   "or other root, and you must not cd. After orienting, create "
+                   "the files with create_file immediately - do not spend calls "
+                   "on shell orientation.")
+        # The toolchain, measured once per process. Models spend real calls
+        # discovering that python exists and that ruff is an executable rather
+        # than a module — live: five run_command calls in a row asking
+        # `python --version`, `pytest --version`, `where ruff`. A fact the
+        # harness already knows is a fact the prompt should carry.
+        _layout += " " + _toolchain_line()
+        try:
+            _ws_empty = not any(_ws_root.iterdir())
+        except OSError:
+            _ws_empty = False
+        if _ws_is_default or _ws_empty:
+            _layout += (" This workspace is EMPTY: that is expected, not an "
+                        "error. Do not re-list or search for existing files. "
+                        "Create the files the user asks for with create_file "
+                        "and folders with make_dir; nothing needs to pre-exist.")
         _search_example = 'search_files("some_name", ".")'
         _mode_name = ("read-only" if read_only
                       else "auto-all" if (auto_approve and auto_approve_exec)
@@ -9431,55 +10301,6 @@ async def code_agent(req: Request):
                 read_paths.add(_rp)
         written_paths: set[str] = set()
         plan_state: dict = {"steps": []}
-        system = (
-            "You are a coding agent working inside this project's own editor.\n"
-            "You have tools. Use them instead of guessing.\n"
-            "- You DO have tools that read the repository (list_dir, read_file, "
-            "search_files, document_symbols, ...). You CAN read files. Never "
-            "tell the user you have no file access - call the tool instead.\n\n"
-            "- To find something, call a tool. Never infer a file's contents "
-            "from its name, and never say a file does not exist before "
-            "list_dir or search_files has told you so.\n"
-            f"- {_layout}\n"
-            "- search_files(pattern, path): the FIRST argument is the text to "
-            f"look for, the second is the folder to search. {_search_example}. "
-            "Use `include=\"*.py\"` to scope it. "
-            "A path that does not exist just finds nothing.\n"
-            "- Orient ONCE. Call list_dir(\".\") a single time at the start; "
-            "the answer you need is almost always already in that listing. "
-            "Never list the same directory twice - if a listing did not "
-            "contain what you want, search instead of re-listing.\n"
-            "- If a search returns nothing, widen the path or try the other "
-            "top-level directory before saying something does not exist.\n"
-            "- Call several independent tools in ONE message when they do not "
-            "depend on each other - document_symbols and find_references on the "
-            "same file, for example. They run in parallel. Never call a tool "
-            "just to wait.\n"
-            "- read_file returns the file (whole when small); quote it "
-            "accurately and do not re-read the same lines again. A large file "
-            "is paginated: pass offset (1-based start line) and/or limit, and "
-            "use next_offset to read on.\n"
-            "- Once you have read what you need, answer from it; do not search "
-            "for lines you already have.\n"
-            "- Stop calling tools once you can answer. Your final message must "
-            "be the answer itself, never another tool call.\n"
-            "- If a check fails, read the failure and fix the cause.\n"
-            "- `run_checks` runs the project's own tests/typecheck. When a "
-            "specific command is needed (one test, a build target, a git "
-            "query), use `run_command`: it runs PowerShell in the workspace, "
-            "is approval-gated, and returns the real exit code and output. "
-            "Keep `cwd` inside the workspace; do not use the shell to edit "
-            "files - use the file tools so changes are reviewable.\n"
-            "- If you cannot find something, say what you searched.\n"
-            "- You CAN edit files (edit_file, create_file, make_dir, "
-            "update_file, delete_file, apply_symbol_edit). A write lands in "
-            "the workspace immediately; the user reviews it afterwards and "
-            "can keep or revert each change. So make each change deliberate "
-            "and single-purpose, and say in one line what you changed. Do "
-            "not rewrite whole files to make one edit.\n"
-            "- When you are done, answer. Keep it short and specific: file "
-            "paths, function names, line numbers.\n"
-        )
         _mode_rule = {
             "read-only": ("Do not attempt writes or commands: those tools are "
                           "not available in this run. Analyse and propose."),
@@ -9497,60 +10318,18 @@ async def code_agent(req: Request):
                     "refused. Do not assume a write landed until its tool "
                     "result says it did."),
         }[_mode_name]
-        system += (
-            f"\n- APPROVAL MODE: {_mode_text}\n"
-            f"- MODE BEHAVIOUR: {_mode_rule}\n"
-            "- PLAN: For any task that needs more than one step or touches "
-            "more than one file, call update_plan FIRST with 3-6 concrete "
-            "steps. Mark exactly one step doing at a time, update the plan "
-            "after each step, and do not mark a step done until it is "
-            "actually complete. Never answer as if the task is complete "
-            "while a step is blocked.\n"
-            "- READ BEFORE WRITE: read_file a file this run before editing, "
-            "updating, deleting or applying a symbol edit to it. The active "
-            "file and attached files count as read; everything else must be "
-            "read first.\n"
-            "- VERIFY: after every edit, run run_checks or a targeted test/"
-            "command. The harness also runs a fast syntax/type verification "
-            "after writes; if it fails, fix the cause. Do not claim success "
-            "while verification is failing.\n"
-            # Everything below is a claim about the SURFACE the person is
-            # using, and each line was written against what that surface
-            # actually does now — because a prompt that describes an editor
-            # the product does not have produces an agent that promises
-            # review it never gave anyone.
-            "- THE HUMAN IS IN AN EDITOR, NOT A CHAT: your writes appear in "
-            "their workbench as hunks they can Keep or Revert one at a time, "
-            "and every change you make is captured in a checkpoint they can "
-            "restore. You do not have to ask them to accept a diff, and you "
-            "must not tell them you saved something the review layer refused.\n"
-            "- AN @ IN THEIR MESSAGE IS A FILE they pointed you at; its "
-            "contents are already in your context, so do not re-read it to "
-            "prove you can. A path in this workspace is written `<folder>/"
-            "dir/file` to the human and `dir/file` to your tools — use the "
-            "tool form when calling a tool.\n"
-            "- A `#` means they attached real errors: the editor's problems "
-            "or the last check output. Fix THAT, and if you cannot reproduce "
-            "an attached error, say so rather than editing something else.\n"
-        )
-        if not read_only:
-            system += (
-                "- YOU CAN DRIVE GIT with `git_action`: status/diff/log/branches "
-                "to look, stage/unstage/branch_create to prepare, and "
-                "commit/stash/stash_pop/branch_switch/restore to move HEAD or "
-                "set work aside. The HEAD-moving ones pause for the human's "
-                "approval first, so propose them with a clear one-line summary "
-                "and a real commit message; do not ask the human to press the "
-                "Git panel's buttons for work you can do yourself. push, reset, "
-                "clean, rebase, merge and amend are refused - never route them "
-                "through `run_command`.\n"
-            )
+        # The prompt is prompts/studio_coder.md; only the parts that change per
+        # request are filled in here. The browser block is a placeholder so the
+        # file stays one document instead of growing a templating syntax, and
+        # the git rules live in the file's EXECUTE section now — they were a
+        # second copy of the same paragraph for a while.
+        _browser_rule = ""
         if _browser_tools_enabled():
             # Said only when it is true. This is the same class of bug the
             # audit kept finding: a capability claimed in a prompt and absent
             # from the payload, so the model apologises for not having a tool
             # it can see, or invents an outcome for one it cannot reach.
-            system += (
+            _browser_rule = (
                 "- YOU HAVE A BROWSER for this session: browser_open, "
                 "browser_snapshot, browser_click/fill/press, browser_console, "
                 "browser_network, browser_wait and browser_verify drive one "
@@ -9566,11 +10345,15 @@ async def code_agent(req: Request):
                 "after anything changes. Do not click Submit, Pay or Delete "
                 "on a real site without saying what you are about to press.\n"
             )
-
-        if head:
-            system += "\nWHAT YOU ALREADY HAVE:\n" + "\n\n".join(head)
-        if _brief:
-            system += "\n\nWORKSPACE BRIEF:\n" + _brief
+        system = render_studio_coder_prompt(
+            LAYOUT=_layout,
+            SEARCH_EXAMPLE=_search_example + ".",
+            APPROVAL_MODE=_mode_text,
+            MODE_BEHAVIOUR=_mode_rule,
+            BROWSER_RULE=_browser_rule,
+            HEAD=("\nWHAT YOU ALREADY HAVE:\n" + "\n\n".join(head)) if head else "",
+            WORKSPACE_BRIEF=("\n\nWORKSPACE BRIEF:\n" + _brief) if _brief else "",
+        )
         prior = body.get("history")
         messages: list[dict] = [{"role": "system", "content": system}]
         if isinstance(prior, list) and prior:
@@ -9583,6 +10366,15 @@ async def code_agent(req: Request):
                     messages.append({
                         "role": role,
                         "content": text[:_CODE_ASK_HISTORY_CHARS]})
+        # The earlier turns of THIS session, replayed whole: the model's own tool
+        # calls and the output they returned. A coding agent's next turn is a
+        # continuation, and a digest of the last one is what made it explore the
+        # same repository twice. Bounded by the run's own context budget, oldest
+        # messages dropped first — never summarised.
+        replay = _replay_prior_messages(code_sid, code_run_id,
+                                        _CODE_REPLAY_BUDGET_CHARS)
+        if replay:
+            messages.extend(replay)
         messages.append({"role": "user", "content": question})
         q: _aio.Queue = _aio.Queue()
 
@@ -9731,6 +10523,14 @@ async def code_agent(req: Request):
                 rp = _code_agent_rel(str(a.get("path") or ""))
                 if rp:
                     read_paths.add(rp)
+            # A full-content write means the model authored and therefore knows
+            # the file's current text; a follow-up edit_file on it must not be
+            # refused by the read-before-write guard (that refusal made the
+            # model loop re-issuing the same edit on a file it just created).
+            if ok and name in ("create_file", "update_file"):
+                rp = _code_agent_rel(str(a.get("path") or ""))
+                if rp:
+                    read_paths.add(rp)
             if ok and name in _CODE_WRITE_TOOLS and name != "make_dir":
                 cp = _code_client_path(str(a.get("path") or ""))
                 if cp:
@@ -9785,6 +10585,36 @@ async def code_agent(req: Request):
             from mcp_runner import run_with_tools
             from gateway import cancel_scope
             verify_rounds = 0
+
+            async def _compaction_fn(old):
+                # Instruction-driven compaction (prompts/compaction.md). Only
+                # invoked by the loop when context crosses the compact target;
+                # returns None to leave the mechanical tiers in charge.
+                import flags as _flags
+                if not _flags.get_value("agent.llm_compaction", True):
+                    return None
+                try:
+                    instr = (ROOT / "prompts" / "compaction.md").read_text(
+                        encoding="utf-8")
+                except OSError:
+                    return None
+                transcript = "\n\n".join(
+                    f"[{m.get('role')}] {str(m.get('content') or '')[:4000]}"
+                    for m in old if isinstance(m, dict))
+
+                def _call():
+                    from gateway import LLM
+                    return LLM().chat(system=instr, prompt=transcript,
+                                      agent="code",
+                                      model="nvidia/nemotron-3.5-lightning:free",
+                                      max_tokens=1500, temperature=0.2)
+                r = await _aio.to_thread(_call)
+                return (r or {}).get("text") or ""
+
+            # The context budget IS the model's max context size (chars). No
+            # client override: compaction keys off the real model window.
+            _ctx_cap = await _model_context_chars(
+                wanted_model or _CODE_AGENT_DEFAULT_MODEL)
             while True:
                 # The Stop button's other half. `mcp_runner` checks
                 # `cancel_requested()` before each hop and before each tool
@@ -9805,7 +10635,11 @@ async def code_agent(req: Request):
                     provider_pin=None,
                     model=wanted_model or _CODE_AGENT_DEFAULT_MODEL,
                     max_hops=max_hops,
-                    max_tokens=int(body.get("max_tokens") or 4000),
+                    # A hop that runs out of output used to look like the
+                    # model going silent, not like a cap — the gateway clamps
+                    # to the provider's window anyway, so asking generously
+                    # is free and long answers don't get cut in half.
+                    max_tokens=int(body.get("max_tokens") or 8192),
                     temperature=0.2,
                     sandbox_root=str(_code_agent_root()),
                     # The rest of the session's folders, so a studio session
@@ -9823,7 +10657,12 @@ async def code_agent(req: Request):
                     approve_fn=_approve,
                     extra_dispatch=_extra_dispatch,
                     allowed_tools=set(allowed_tools) | {"update_plan"},
-                    max_context_chars=_CODE_AGENT_CONTEXT_CHARS,
+                    short_answers=True,
+                    max_context_chars=_ctx_cap,
+                    # Real-token budget: the model's context window in tokens, so
+                    # compaction keys off the gateway's actual input_tokens.
+                    max_context_tokens=_ctx_cap // 4,
+                    compaction_fn=_compaction_fn,
                 )
                 if not written_paths:
                     return reply
@@ -9953,13 +10792,42 @@ async def code_agent(req: Request):
             if kind == "tool_call":
                 return _sse("tool_call", name=str(ev.get("name") or ""),
                             detail=_tool_detail(ev.get("arguments")),
+                            arguments=ev.get("arguments") or {},
                             id=str(ev.get("id") or ""))
             if kind == "tool_result":
                 tool_count["n"] += 1
+                raw_result = str(ev.get("result") or "")
+                raw_error = str(ev.get("error") or "")
+                # The text the MODEL sees is the result, or the error when there
+                # is no result. Dropping that fallback (a `result or ""` with no
+                # `or error`) sent the agent an EMPTY failure string for a
+                # refused edit — it could not tell what went wrong and retried
+                # the same call twice.
+                text = raw_result or raw_error
+                # A tool that ANSWERS with {"ok": false} failed, even though the
+                # call itself returned normally. run_checks is the common case:
+                # "no checker detected" has no `error` on the event, so the frame
+                # read ok=true and the panel drew a green tick over a failed
+                # check. Parse before clipping — a truncated JSON body cannot be
+                # parsed and must not be read as "probably fine".
+                says_failed = False
+                head = raw_result.lstrip()
+                if head.startswith("{"):
+                    try:
+                        parsed = json.loads(raw_result)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict) and parsed.get("ok") is False:
+                        says_failed = True
+                ok = not raw_error and not says_failed
                 return _sse("tool_result", name=str(ev.get("name") or ""),
-                            ok=not ev.get("error"),
+                            ok=ok,
                             id=str(ev.get("id") or ""),
-                            detail=str(ev.get("result") or ev.get("error") or "")[:1500])
+                            result=text[:1500],
+                            detail=text[:1500])
+            if kind == "context":
+                return _sse("context", chars=int(ev.get("chars") or 0),
+                            cap=int(ev.get("cap") or 0))
             if kind == "thinking":
                 # The model's own reasoning stream, forwarded on its own channel
                 # (the panel shows it collapsed). Never mixed into the answer.
@@ -10086,6 +10954,7 @@ async def code_agent(req: Request):
                        stopped=stopped[:400],
                        input_tokens=int(reply.get("input_tokens") or 0),
                        output_tokens=int(reply.get("output_tokens") or 0),
+                       context_chars=int(reply.get("context_chars") or 0),
                        tool_calls=tool_count["n"],
                        mode=_mode_name,
                        plan=plan_state["steps"] or None,
@@ -10234,10 +11103,8 @@ async def code_ask(req: Request):
             head = (f"\nACTIVE FILE: {cursor} (unsaved edits included)\n"
                     f"{buffer_text[:_CODE_MAX_BYTES]}")
             prompt_parts.append(head)
-        for f in files:
-            if "content" in f:
-                prompt_parts.append(
-                    f"\nATTACHED FILE: {f['path']}\n{f['content'][:120_000]}")
+        for line in _attachment_lines(files):
+            prompt_parts.append(line)
         if listing:
             prompt_parts.append(
                 "\nPROJECT FILES (names only - ask for any of these to be "
@@ -10334,21 +11201,13 @@ async def code_checks(req: Request):
         # Imported rather than duplicated: the editor and the agent's
         # run_checks tool must agree on what counts as "this project has a
         # checker", or the panel reports green while the agent reports fail.
+        # The rule itself (markers, dedupe, the test-file fallback) lives in
+        # mcp_server next to the tool that runs it.
         try:
-            from mcp_server import _CHECK_PROFILES
+            from mcp_server import detect_checks
         except Exception:
             return []
-        out = []
-        for marker, tool, args in _CHECK_PROFILES:
-            if not (d / marker).exists():
-                continue
-            exe = shutil.which(tool)
-            if not exe:
-                out.append({"marker": marker, "tool": tool, "available": False})
-                continue
-            out.append({"marker": marker, "tool": tool, "available": True,
-                        "argv": [exe, *args]})
-        return out
+        return detect_checks(d)
     def _run_checks():
         found = _detect(cwd)
         results = []
@@ -10364,7 +11223,9 @@ async def code_checks(req: Request):
             try:
                 proc = subprocess.run(f["argv"], cwd=str(cwd),
                                       capture_output=True, text=True,
-                                      timeout=240)
+                                      timeout=240,
+                                      env={**os.environ,
+                                           "PYTHONDONTWRITEBYTECODE": "1"})
             except subprocess.TimeoutExpired:
                 all_ok = False
                 results.append({"tool": f["tool"], "ok": False,
@@ -11373,11 +12234,14 @@ def _session_cost_breakdown(session_id: str) -> dict | None:
             if _r.status_code != 200:
                 return None
             for _ag, _rows in _r.json().items():
-                _acc = {"usd": 0.0, "in_tok": 0, "out_tok": 0, "calls": 0}
+                _acc = {"usd": 0.0, "in_tok": 0, "out_tok": 0, "calls": 0,
+                        "cache_reads": 0, "cache_creates": 0}
                 for _row in (_rows or []):
                     _acc["usd"] += float(_row.get("dollars") or 0.0)
                     _acc["in_tok"] += int(_row.get("in_tok") or 0)
                     _acc["out_tok"] += int(_row.get("out_tok") or 0)
+                    _acc["cache_reads"] += int(_row.get("cache_reads") or 0)
+                    _acc["cache_creates"] += int(_row.get("cache_creates") or 0)
                     _acc["calls"] += int(_row.get("calls") or 0)
                 out[_ag] = _acc
     except Exception:
@@ -12591,8 +13455,21 @@ _CHAT_SYSTEM = (
     "substitute web_search for an account query. "
     # Reminders, because they were the most visible gap: chat could LIST
     # reminders but had no way to create one, so "remind me at 6" failed.
-    "REMINDERS: when the user asks you to remember to do something at a time, "
-    "call schedule_task with their words as `query` and the time as `when`. "
+    #
+    # A reminder is TEXT TO SAY, not work to run. The instruction used to be
+    # "their words as `query`", and that produced the live loop behind
+    # sch-14effc0f: the job re-ran "remind me to stretch", the agent scheduled
+    # ANOTHER reminder, and the user received a scheduling confirmation with a
+    # dead id instead of the reminder. `query` is for jobs that must go and
+    # find something out; `message` is the sentence the user hears.
+    "REMINDERS: when the user asks to be reminded of something, call "
+    "schedule_task with `message` set to the SENTENCE THEY SHOULD READ "
+    "('Stretch and drink water.') and `query` set to the SAME reminder as a "
+    "one-line label ('Stretch and drink water'), NEVER 'remind me to ...'. A "
+    "query phrased as an instruction is re-executed at fire time and schedules "
+    "itself, which is how the user got a confirmation with a dead id instead "
+    "of a reminder. Use a work-shaped `query` only when the job must DO "
+    "something at that time ('check the weather and tell me if it rains'). "
     "Then tell them the schedule id. To remove one, call list_scheduled first, "
     "confirm which entry you mean, then cancel_scheduled with its id. "
     # The channel half, which the prompt used to omit entirely: schedule_task
@@ -16024,6 +16901,13 @@ def _clean_doc_setup(raw) -> dict | None:
         v = raw.get(key)
         if isinstance(v, str) and v:
             out[key] = v[:limit]
+    # The typesetting engine. The panel lets the user ask for a LaTeX-typeset
+    # PDF (real maths, TeX hyphenation, small caps, proper table rules); it
+    # overrides whatever the author model would have picked, because the user
+    # asked for it explicitly.
+    ts = str(raw.get("typeset") or "").strip().lower()
+    if ts in ("latex", "tex", "tectonic"):
+        out["typeset"] = "latex"
     # The panel sends a BOOLEAN for this one - the user is asking for a
     # running header, not choosing its words. The server fills in the text
     # from the document's own title, because a literal string sent from the
@@ -16492,11 +17376,14 @@ def _stream_run(query: str, conversation_id: str | None,
                         # validation becomes readable text instead of a wall of
                         # JSON in the transcript.
                         _dag_answer = str(answer_box.get("answer") or "")
-                        _dag_surface = (_extract_a2ui_surface(_dag_answer)
-                                        if run_kind == "chat" else None)
+                        # Extract a surface whenever the formatter emitted one.
+                        # It is opt-in (a research report is prose and never
+                        # carries a block), so this is not a research-vs-chat
+                        # gate — it is "did the formatter build a surface".
+                        _dag_surface = _extract_a2ui_surface(_dag_answer)
                         if _dag_surface:
                             _dag_answer = ""
-                        elif run_kind == "chat":
+                        else:
                             _dag_answer = _strip_a2ui_block(_dag_answer)
                         if fail_box["error"]:
                             _chat_pending_finish(
@@ -16646,11 +17533,10 @@ def _stream_run(query: str, conversation_id: str | None,
         # prose, and must not be rewritten by a block that merely looks like
         # JSON with a components key.
         _dag_answer = str(answer_box["answer"] or "")
-        _dag_surface = (_extract_a2ui_surface(_dag_answer)
-                        if run_kind == "chat" else None)
+        _dag_surface = _extract_a2ui_surface(_dag_answer)
         if _dag_surface:
             _dag_answer = ""
-        elif run_kind == "chat":
+        else:
             _dag_answer = _strip_a2ui_block(_dag_answer)
         # Smart notification: push a completion summary to Telegram if the
         # operator opted in (fire-and-forget, never blocks the response).

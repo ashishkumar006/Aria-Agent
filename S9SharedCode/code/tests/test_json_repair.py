@@ -79,3 +79,73 @@ def test_a_prose_skill_is_not_retried():
     (computer use) must not be billed for a second call it cannot satisfy."""
     skill = skills.SkillRegistry().get("computer")
     assert skill.name not in skills._JSON_CONTRACT_SKILLS
+
+
+# ── the LIGHTWEIGHT fix: kilo first, gemini if kilo is busy/down ────────────
+# The gateway treats a provider pin as a HARD binding (`router.candidates`
+# returns one entry), so the old "let the gateway fail over" comment was a
+# lie. The fallback has to be explicit, in this order.
+def test_the_lightweight_repair_falls_back_from_kilo_to_gemini():
+    calls: list = []
+
+    class _FakeLLM:
+        def chat(self, prompt=None, *, provider=None, **kw):
+            calls.append(provider)
+            if provider == "kilo":
+                raise RuntimeError("kilo 429")
+            return {"text": '{"ok": true}', "input_tokens": 1, "output_tokens": 2}
+
+    skill = skills.SkillRegistry().get("formatter")
+    orig = skills.LLM
+    skills.LLM = lambda *a, **k: _FakeLLM()
+    try:
+        got, ti, to = asyncio.run(skills._repair_json_with_model(
+            skill, '{"broken": ', "bad json", "s1"))
+    finally:
+        skills.LLM = orig
+    assert calls == ["kilo", "gemini"], calls
+    assert got == {"ok": True}
+    assert (ti, to) == (1, 2)
+
+
+def test_the_lightweight_repair_accepts_kilo_without_a_second_call():
+    calls: list = []
+
+    class _FakeLLM:
+        def chat(self, prompt=None, *, provider=None, **kw):
+            calls.append(provider)
+            return {"text": '{"ok": true}', "input_tokens": 1, "output_tokens": 1}
+
+    skill = skills.SkillRegistry().get("formatter")
+    orig = skills.LLM
+    skills.LLM = lambda *a, **k: _FakeLLM()
+    try:
+        got, _, _ = asyncio.run(skills._repair_json_with_model(
+            skill, '{"broken": ', "bad json", "s1"))
+    finally:
+        skills.LLM = orig
+    assert calls == ["kilo"], calls
+    assert got == {"ok": True}
+
+
+def test_the_lightweight_repair_tries_gemini_when_kilo_returns_junk():
+    """A 200 with unparseable text is not a success; the fallback still runs."""
+    calls: list = []
+
+    class _FakeLLM:
+        def chat(self, prompt=None, *, provider=None, **kw):
+            calls.append(provider)
+            if provider == "kilo":
+                return {"text": "sorry, I cannot do that"}
+            return {"text": '{"ok": true}', "input_tokens": 0, "output_tokens": 0}
+
+    skill = skills.SkillRegistry().get("formatter")
+    orig = skills.LLM
+    skills.LLM = lambda *a, **k: _FakeLLM()
+    try:
+        got, _, _ = asyncio.run(skills._repair_json_with_model(
+            skill, '{"broken": ', "bad json", "s1"))
+    finally:
+        skills.LLM = orig
+    assert calls == ["kilo", "gemini"], calls
+    assert got == {"ok": True}

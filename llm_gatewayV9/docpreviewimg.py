@@ -148,6 +148,20 @@ def _preview_pptx(spec: dict, max_pages: int) -> dict:
                          "subtitle": _as_text(spec.get("subtitle"), 300)}])
         cur: list[dict] = []
         for b in blocks:
+            # A LEVEL-1 HEADING IS A SLIDE, exactly as in build_pptx.
+            #
+            # This splitter only broke on `pagebreak`, and a deck's blocks
+            # almost never carry one - the author writes headings. So a live
+            # layout preview put the whole deck on page 1 and reported 2 pages
+            # for a file that downloads with 4, which is precisely the
+            # "the PPTX does not render properly" complaint: the preview was
+            # showing a draft the user never receives.
+            if b["type"] == "heading" and int(b.get("level") or 1) == 1 \
+                    and cur:
+                out.append(cur)
+                cur = []
+                cur.append(b)
+                continue
             if b["type"] == "pagebreak":
                 if cur:
                     out.append(cur)
@@ -268,13 +282,95 @@ def _preview_pptx(spec: dict, max_pages: int) -> dict:
                                  f'{_esc(_strip_md(c))}</text>')
                     y += lead
                 y += lead
+            elif t == "stats":
+                # The cards are the slide's whole point on a "the numbers"
+                # slide. The spec preview skipped this type entirely, so the
+                # one slide that exists to show three big figures previewed as
+                # a blank page under its title.
+                items_s = [it for it in (b.get("items") or [])
+                           if isinstance(it, dict)][:4]
+                if items_s:
+                    gap = 16.0
+                    cw = (W - 2 * margin - gap * (len(items_s) - 1)) / len(items_s)
+                    ch = min(H * 0.26, 118.0)
+                    for i, it in enumerate(items_s):
+                        cx = margin + i * (cw + gap)
+                        p.append(f'<rect x="{cx:.1f}" y="{y:.1f}" '
+                                 f'width="{cw:.1f}" height="{ch:.1f}" rx="10" '
+                                 f'fill="#f4f2fc" stroke="#ddd9f6"/>')
+                        p.append(f'<text x="{cx + 16:.1f}" y="{y + 46:.1f}" '
+                                 f'font-family="Helvetica, Arial, sans-serif" '
+                                 f'font-size="30" font-weight="700" '
+                                 f'fill="{accent}">{_esc(_strip_md(str(it.get("value") or "")))}</text>')
+                        p.append(f'<text x="{cx + 16:.1f}" y="{y + 78:.1f}" '
+                                 f'font-family="Helvetica, Arial, sans-serif" '
+                                 f'font-size="13" fill="#5c5c66">'
+                                 f'{_esc(_strip_md(str(it.get("label") or "")))}</text>')
+                    y += ch + lead
+            elif t == "columns":
+                items_c = [it for it in (b.get("items") or [])
+                           if isinstance(it, dict)][:3]
+                if items_c:
+                    gap = 16.0
+                    cw = (W - 2 * margin - gap * (len(items_c) - 1)) / len(items_c)
+                    ch = min(H * 0.32, 168.0)
+                    for i, it in enumerate(items_c):
+                        cx = margin + i * (cw + gap)
+                        p.append(f'<rect x="{cx:.1f}" y="{y:.1f}" '
+                                 f'width="{cw:.1f}" height="{ch:.1f}" rx="10" '
+                                 f'fill="#ffffff" stroke="#ddd9f6"/>')
+                        p.append(f'<rect x="{cx:.1f}" y="{y:.1f}" width="4" '
+                                 f'height="{ch:.1f}" fill="{accent}"/>')
+                        p.append(f'<text x="{cx + 16:.1f}" y="{y + 30:.1f}" '
+                                 f'font-family="Helvetica, Arial, sans-serif" '
+                                 f'font-size="15" font-weight="700" '
+                                 f'fill="{accent}">{_esc(_strip_md(str(it.get("title") or "")))}</text>')
+                        ty = y + 54
+                        for ln in wrap(_strip_md(str(it.get("body") or "")),
+                                       max(14, int(cw / 7.0)))[:5]:
+                            p.append(f'<text x="{cx + 16:.1f}" y="{ty:.1f}" '
+                                     f'font-family="Helvetica, Arial, sans-serif" '
+                                     f'font-size="12" fill="#1d1d22">'
+                                     f'{_esc(ln)}</text>')
+                            ty += 16
+                    y += ch + lead
+            elif t == "callout":
+                txt = _strip_md(str(b.get("text") or ""))
+                title = _strip_md(str(b.get("title") or "Note"))
+                lines = wrap(txt, col_chars - 2)[:4]
+                box_h = 40 + len(lines) * lead
+                p.append(f'<rect x="{margin}" y="{y:.1f}" '
+                         f'width="{W - 2 * margin:.1f}" height="{box_h:.1f}" '
+                         f'rx="8" fill="#f4f2fc" stroke="#ddd9f6"/>')
+                p.append(f'<text x="{margin + 18:.1f}" y="{y + 24:.1f}" '
+                         f'font-family="Helvetica, Arial, sans-serif" '
+                         f'font-size="10" font-weight="700" fill="{accent}">'
+                         f'{_esc(title.upper())}</text>')
+                ty = y + 44
+                for ln in lines:
+                    p.append(f'<text x="{margin + 18:.1f}" y="{ty:.1f}" '
+                             f'font-family="Helvetica, Arial, sans-serif" '
+                             f'font-size="{body:.0f}" fill="#1d1d22">'
+                             f'{_esc(ln)}</text>')
+                    ty += lead
+                y += box_h + lead
             elif t == "chart":
                 cats = b.get("categories") or []
                 series = b.get("series") or []
                 if cats and series:
                     vals = [_f(x) for x in (series[0].get("data") or [])]
                     top = max(vals) if vals else 1
-                    plot_h, plot_w = H * 0.42, W - 2 * margin - 60
+                    ctitle = _strip_md(str(b.get("title") or ""))
+                    if ctitle:
+                        # The chart's own title was dropped here, so a slide
+                        # whose meaning lives in "Queries per second" previewed
+                        # as unlabelled bars.
+                        p.append(f'<text x="{margin}" y="{y + 4:.0f}" '
+                                 f'font-family="Helvetica, Arial, sans-serif" '
+                                 f'font-size="14" font-weight="700" '
+                                 f'fill="#111114">{_esc(ctitle)}</text>')
+                        y += lead * 1.4
+                    plot_h, plot_w = H * 0.38, W - 2 * margin - 60
                     bw = plot_w / max(1, len(vals))
                     base = y + plot_h
                     for i, v in enumerate(vals[:40]):
@@ -303,6 +399,386 @@ def _preview_pptx(spec: dict, max_pages: int) -> dict:
                       "width_pt": round(W, 1), "height_pt": round(H, 1)})
     return {"mode": "pages", "pages": pages, "page_count": len(slides),
             "truncated": False, "note": "layout preview from the deck geometry"}
+
+
+# ── pptx: draw the FILE, not a re-guess ─────────────────────────────────────
+def _svg_from_pptx(blob: bytes, max_pages: int) -> dict | None:
+    """Rasterise the delivered .pptx's OWN shapes into SVG, one per slide.
+
+    The old preview walked the block spec and re-drew it with a second layout
+    function. That second renderer knew nothing about the deck's real chrome -
+    the split cover panel, the accent edge band, the tinted stat cards, the
+    section dividers - so a delivered deck with 19 shapes on a slide previewed
+    as a white page with a 6pt rule at the top. A preview that disagrees with
+    the file is worse than no preview: it is the thing the user checks the file
+    against.
+
+    Reading the shapes means the preview cannot drift: every rectangle, text
+    frame, table and picture is drawn at the position the .pptx records. What
+    it cannot do is evaluate theme inheritance or render a chart's plot, so
+    those fall back to the shape's own fill/text.
+    """
+    import base64
+
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from pptx.util import Emu
+
+    try:
+        prs = Presentation(io.BytesIO(blob))
+    except Exception:
+        return None
+
+    W = prs.slide_width or Emu(12192000)
+    H = prs.slide_height or Emu(6858000)
+    # TWO scales, and conflating them blanked every text run:
+    #   SP   EMU -> SVG points (960pt canvas whatever the real slide size)
+    #   ST   typographic scaling for a FONT SIZE, which is already in points,
+    #        so it only needs the canvas ratio (960pt / slide_width_in_72pt).
+    # A 16:9 slide is 960pt wide, so ST is 1.0; a 4:3 slide is 720pt, so ST is
+    # 1.33. Using the EMU ratio for fonts multiplied 40pt by 7.8e-5 and every
+    # size rendered as 0.0.
+    SP = 960.0 / float(W)
+    ST = 960.0 / (float(W) / 914400.0 * 72.0)
+
+    def px(v) -> float:
+        return float(v or 0) * SP
+
+    def rgb_of(fill) -> str | None:
+        """A solid fill's colour, or a gradient's FIRST stop.
+
+        The cover's accent panel is a gradient, and a gradient has no
+        `.fore_color.rgb` - so the panel was skipped entirely and the preview
+        lost the deck's most distinctive element. One stop is enough for a
+        preview whose job is composition.
+        """
+        try:
+            if fill.type is None:
+                return None
+            try:
+                c = fill.fore_color
+                if c.type is not None and c.rgb is not None:
+                    return "#%02x%02x%02x" % tuple(c.rgb)
+            except Exception:
+                pass
+            # MSO_FILL.GRADIENT == 3
+            stops = fill.gradient_stops
+            if stops:
+                c = stops[0].color
+                if c.rgb is not None:
+                    return "#%02x%02x%02x" % tuple(c.rgb)
+        except Exception:
+            return None
+        return None
+
+    def text_runs(tf) -> list[tuple[str, float, bool, str, str]]:
+        out = []
+        for para in tf.paragraphs:
+            txt = "".join(r.text for r in para.runs) or para.text or ""
+            if not txt.strip():
+                continue
+            r0 = para.runs[0] if para.runs else None
+            size = 12.0
+            bold = False
+            colour = "#111114"
+            font = "Helvetica, Arial, sans-serif"
+            if r0 is not None:
+                try:
+                    if r0.font.size is not None:
+                        size = float(r0.font.size.pt)
+                    elif para.font.size is not None:
+                        size = float(para.font.size.pt)
+                except Exception:
+                    pass
+                try:
+                    bold = bool(r0.font.bold)
+                except Exception:
+                    pass
+                try:
+                    if r0.font.color and r0.font.color.rgb is not None:
+                        colour = "#%02x%02x%02x" % tuple(r0.font.color.rgb)
+                except Exception:
+                    pass
+                try:
+                    if r0.font.name:
+                        font = f"{r0.font.name}, Helvetica, Arial, sans-serif"
+                except Exception:
+                    pass
+            out.append((txt, size, bold, colour, font))
+        return out
+
+    _FONT_CACHE: dict = {}
+
+    def _pillow_font(name: str, bold: bool, px_size: int):
+        key = (name, bold, px_size)
+        if key in _FONT_CACHE:
+            return _FONT_CACHE[key]
+        f = None
+        try:
+            from PIL import ImageFont
+            candidates = []
+            low = (name or "").lower()
+            if "georgia" in low:
+                candidates = ["georgiab.ttf", "georgia.ttf"] if bold                     else ["georgia.ttf", "georgiab.ttf"]
+            elif "segoe" in low:
+                candidates = ["segoeuib.ttf", "segoeui.ttf"] if bold                     else ["segoeui.ttf", "segoeuib.ttf"]
+            else:
+                candidates = ["arialbd.ttf", "arial.ttf"] if bold                     else ["arial.ttf", "arialbd.ttf"]
+            for c in candidates:
+                try:
+                    f = ImageFont.truetype(c, max(6, int(px_size)))
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            f = None
+        _FONT_CACHE[key] = f
+        return f
+
+    def _text_w(text: str, size: float, bold: bool, font: str) -> float:
+        """Width of `text` in points, from the real font when it is installed.
+
+        The 0.52em average is a decent guess for prose and a bad one for
+        digits: "$210-430/kWh" and "250-300 Wh/kg" measure wider than they
+        draw, so the preview wrapped them to two lines where the deck has one
+        and then squeezed them through the label below. Measuring the actual
+        face is the only way the preview agrees with the file.
+        """
+        f = _pillow_font(font, bold, int(size * 4))
+        if f is not None:
+            try:
+                return f.getlength(text) / 4.0
+            except Exception:
+                pass
+        return len(text) * size * 0.52
+
+    def wrap_pt(text: str, width: float, size: float,
+                bold: bool = False, font: str = "") -> list[str]:
+        """Greedy wrap at the measured width, breaking a too-long token."""
+        limit = max(4.0, width)
+        words, line, lines = text.split(), "", []
+        for wd in words:
+            trial = (line + " " + wd).strip()
+            if line and _text_w(trial, size, bold, font) > limit:
+                lines.append(line)
+                # A single word wider than the column breaks mid-word, which
+                # is what a renderer does with a long URL or a compound figure.
+                while _text_w(wd, size, bold, font) > limit and len(wd) > 1:
+                    cut = len(wd)
+                    while cut > 1 and _text_w(wd[:cut], size, bold,
+                                              font) > limit:
+                        cut -= 1
+                    lines.append(wd[:cut])
+                    wd = wd[cut:]
+                line = wd
+            else:
+                line = trial
+        if line:
+            lines.append(line)
+        return lines or [""]
+
+    def esc(s: Any) -> str:
+        return html.escape(str(s or ""), quote=True)
+
+    def shape_svg(sh) -> list[str]:
+        p: list[str] = []
+        try:
+            x, y, w, h = px(sh.left), px(sh.top), px(sh.width), px(sh.height)
+        except Exception:
+            return p
+        if w <= 0 or h <= 0:
+            return p
+        st = None
+        try:
+            st = sh.shape_type
+        except Exception:
+            st = None
+        # Pictures: emit the real bytes so a figure shows in the preview too.
+        if st == MSO_SHAPE_TYPE.PICTURE or sh.__class__.__name__ == "Picture":
+            try:
+                img = sh.image
+                b64 = base64.b64encode(img.blob).decode("ascii")
+                p.append(f'<image x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" '
+                         f'height="{h:.1f}" preserveAspectRatio="none" '
+                         f'href="data:image/{img.ext};base64,{b64}"/>')
+                return p
+            except Exception:
+                return p
+        # Tables: draw each cell so the preview matches the grid.
+        if getattr(sh, "has_table", False):
+            try:
+                tbl = sh.table
+                n_r = len(tbl.rows)
+                n_c = len(tbl.columns)
+                if n_r and n_c:
+                    rh = h / n_r
+                    cws = [px(c.width) for c in tbl.columns]
+                    tot = sum(cws) or w
+                    cws = [c * (w / tot) for c in cws]
+                    for ri, row in enumerate(tbl.rows):
+                        cxp = x
+                        for ci, cell in enumerate(row.cells):
+                            cw = cws[ci] if ci < len(cws) else w / n_c
+                            try:
+                                col = rgb_of(cell.fill) or "#ffffff"
+                            except Exception:
+                                col = "#ffffff"
+                            p.append(f'<rect x="{cxp:.1f}" y="{y + ri * rh:.1f}" '
+                                     f'width="{cw:.1f}" height="{rh:.1f}" '
+                                     f'fill="{col}" stroke="#e2e2ea" '
+                                     f'stroke-width="0.5"/>')
+                            for txt, size, bold, colour, font in \
+                                    text_runs(cell.text_frame)[:1]:
+                                wt = ' font-weight="700"' if bold else ''
+                                p.append(
+                                    f'<text x="{cxp + 4:.1f}" '
+                                    f'y="{y + ri * rh + rh * 0.66:.1f}" '
+                                    f'font-family="{esc(font)}" '
+                                    f'font-size="{size:.1f}"'
+                                    + wt +
+                                    f' fill="{colour}">{esc(txt)}</text>')
+                            cxp += cw
+                    return p
+            except Exception:
+                return p
+        # Charts: the shape records the plot type, not the points. Draw the
+        # frame and title so the slide's composition is honest, and let the
+        # caption carry the meaning.
+        if getattr(sh, "has_chart", False):
+            p.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" '
+                     f'height="{h:.1f}" fill="#ffffff" stroke="#e2e2ea" '
+                     f'stroke-width="0.75"/>')
+            try:
+                if sh.chart.has_title:
+                    t = sh.chart.chart_title.text_frame.text
+                    p.append(f'<text x="{x + w / 2:.1f}" y="{y + 16:.1f}" '
+                             f'text-anchor="middle" font-size="12" '
+                             f'font-weight="700" fill="#111114">'
+                             f'{esc(t)}</text>')
+            except Exception:
+                pass
+            p.append(f'<text x="{x + w / 2:.1f}" y="{y + h / 2:.1f}" '
+                     f'text-anchor="middle" font-size="10" fill="#9a9aa6">'
+                     f'(chart &mdash; open the file for the plotted data)</text>')
+            return p
+        # Autoshapes and text boxes: the fill first, then the text.
+        fill = None
+        if getattr(sh, "has_text_frame", False) is not None:
+            try:
+                fill = rgb_of(sh.fill)
+            except Exception:
+                fill = None
+        if fill and fill.lower() not in ("#ffffff",):
+            radius = ""
+            try:
+                if "ROUNDED" in str(getattr(sh, "auto_shape_type", "")):
+                    radius = f' rx="{min(w, h) * 0.06:.1f}"'
+            except Exception:
+                radius = ""
+            p.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" '
+                     f'height="{h:.1f}" fill="{fill}"{radius}/>')
+        if getattr(sh, "has_text_frame", False):
+            runs = text_runs(sh.text_frame)
+            # Lay the paragraph out FIRST so the block can be anchored inside
+            # the box the way PowerPoint anchors it. Rendering line-by-line
+            # from the box top ran a two-line cover title down through the
+            # accent rule that sits below the box.
+            laid: list[tuple[str, float, bool, str, str, float]] = []
+            for txt, size, bold, colour, font in runs:
+                # A PLACEHOLDER's size lives in the layout, not the run, so it
+                # reads as 0pt and the title vanished from the preview. Derive
+                # one from the box the layout allocated; `px()` already scaled
+                # the geometry, so no second multiply here.
+                # `font.size.pt` is ALREADY points; the only scaling type
+                # needs is the canvas ratio (1.0 on a 960pt-wide slide). When a
+                # run carries no size at all, derive one from the box.
+                size_pt = (size if size > 0.5
+                           else max(9.0, min(40.0, px(sh.height) * 0.72)))
+                # The font's own line height, not a flat 1.25: Georgia is
+                # 1.14em and Segoe UI 1.34em, and over-tightening the cover
+                # title was the other half of the collision.
+                lem = 1.14 if "Georgia" in font else (
+                    1.34 if "Segoe" in font else 1.22)
+                # The deck sized this box from its OWN line count, and the
+                # box height is evidence of how many lines the file has. Re-
+                # wrapping with a different character metric produced MORE
+                # lines than the box holds (a one-line "250-300 Wh/kg" became
+                # two and printed through the label below it), so cap the wrap
+                # at what the height allows and shrink the type until it fits.
+                max_lines = max(1, int((h - 2.0) / max(1.0, size_pt * lem)
+                                       + 0.35))
+                lines = wrap_pt(txt, w - 2, size_pt, bold, font)
+                guard = 0
+                while len(lines) > max_lines and size_pt > 8 and guard < 24:
+                    size_pt = max(8.0, size_pt - 1.0) * 1.0
+                    size_pt = round(size_pt - 0.0, 2)
+                    lines = wrap_pt(txt, w - 2, size_pt, bold, font)
+                    max_lines = max(1, int((h - 2.0) /
+                                           max(1.0, size_pt * lem) + 0.35))
+                    guard += 1
+                if len(lines) > max_lines:
+                    lines = lines[:max_lines]
+                for ln in lines:
+                    laid.append((ln, size_pt, bold, colour, font,
+                                 size_pt * lem))
+            if laid:
+                total = sum(x[5] for x in laid)
+                try:
+                    from pptx.enum.text import MSO_ANCHOR
+                    va = sh.text_frame.vertical_anchor
+                except Exception:
+                    va = None
+                if va == MSO_ANCHOR.MIDDLE:
+                    ty = y + max(0.0, (h - total) / 2.0)
+                elif va == MSO_ANCHOR.BOTTOM:
+                    ty = y + max(0.0, h - total)
+                else:
+                    ty = y
+                for ln, size_pt, bold, colour, font, lh in laid:
+                    ty += size_pt * 0.92      # baseline inside the line box
+                    wt2 = ' font-weight="700"' if bold else ''
+                    p.append(
+                        f'<text x="{x + 1:.1f}" y="{ty:.1f}" '
+                        f'font-family="{esc(font)}" '
+                        f'font-size="{size_pt:.1f}"'
+                        + wt2 +
+                        f' fill="{colour}">{esc(ln)}</text>')
+                    ty += lh - size_pt * 0.92
+        return p
+
+    pages = []
+    for i, slide in enumerate(prs.slides):
+        if i >= max_pages:
+            break
+        p = [f'<svg xmlns="http://www.w3.org/2000/svg" '
+             f'viewBox="0 0 {px(W):.0f} {px(H):.0f}" width="100%" role="img">',
+             f'<rect width="{px(W):.0f}" height="{px(H):.0f}" fill="#ffffff"/>']
+        # The slide's own background (the deck paints paper + accent edges).
+        try:
+            bg = slide.background.fill
+            col = rgb_of(bg)
+            if col and col.lower() != "#ffffff":
+                p.append(f'<rect width="{px(W):.0f}" height="{px(H):.0f}" '
+                         f'fill="{col}"/>')
+        except Exception:
+            pass
+        for sh in slide.shapes:
+            try:
+                p.extend(shape_svg(sh))
+            except Exception:
+                continue
+        p.append("</svg>")
+        svg = "".join(p)
+        if len(svg) > MAX_SVG_CHARS:
+            svg = svg[:MAX_SVG_CHARS] + "</svg>"
+        pages.append({"index": i, "kind": "svg", "data": svg,
+                      "width_pt": round(px(W), 1),
+                      "height_pt": round(px(H), 1)})
+    if not pages:
+        return None
+    return {"mode": "pages", "pages": pages, "page_count": len(pages),
+            "truncated": len(prs.slides) > len(pages),
+            "note": "rendered from the deck's own shapes"}
 
 
 # ── docx ────────────────────────────────────────────────────────────────────
@@ -401,13 +877,17 @@ def render_preview(fmt: str, blob: bytes | None, spec: dict | None,
             blob, _n = docgen.build_pdf(spec or {})
         return _preview_pdf(blob, max_pages)
     if fmt == "pptx":
-        # A delivered .pptx arrives with no usable spec, and previewing an
-        # empty spec gave the user a blank box labelled "0 slides" under a
-        # file that really had three. Read the artefact back into a spec so
-        # the SAME layout function that drew the deck draws its preview.
-        # A spec counts as "usable" only if it has something to draw: an
-        # artifact request carries keys like `artifact`, which are truthy but
-        # are not content.
+        # A DELIVERED deck is previewed from its own bytes. The old path
+        # rebuilt a spec from the file and re-drew it with a second layout
+        # function that knew nothing about the deck's chrome, so a real slide
+        # with 19 shapes previewed as white space. Reading the shapes cannot
+        # drift from the file.
+        if blob is not None:
+            from_file = _svg_from_pptx(blob, max_pages)
+            if from_file is not None:
+                return from_file
+        # No bytes (a live layout preview while the user is still choosing):
+        # fall back to drawing the geometry from the spec.
         has_content = bool(spec and (spec.get("title")
                                      or spec.get("blocks")))
         if blob is not None and not has_content:

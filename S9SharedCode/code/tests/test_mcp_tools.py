@@ -277,6 +277,20 @@ class TestSecretHygiene:
         files = [r["file"] for r in out.get("references", [])]
         assert files and all(".env" not in f for f in files), files
 
+    def test_create_file_points_at_the_right_tool(self, tmp_path, monkeypatch):
+        """A model that re-creates a file it just wrote needs the way forward.
+
+        Live: fields.py was created three times, then the run stopped with the
+        project half-built.
+        """
+        monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        with pytest.raises(ValueError) as e:
+            mcp.create_file("a.py", "y = 2\n")
+        msg = str(e.value)
+        assert "already exists" in msg
+        assert "edit_file" in msg and "update_file" in msg
+
     def test_write_tools_refuse_a_secret_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mcp, "SANDBOX", tmp_path)
         (tmp_path / ".env").write_text("A=1\n", encoding="utf-8")

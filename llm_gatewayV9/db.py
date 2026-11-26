@@ -1,34 +1,52 @@
-import sqlite3, time
+import sqlite3, time, threading
 from contextlib import contextmanager
 from pathlib import Path
 
 DB_PATH = str(Path(__file__).parent / "gateway_v8.db")
 
+# Thread-local pooled connections, keyed by DB_PATH. Opening a connection and
+# re-issuing the WAL/synchronous/busy_timeout PRAGMAs on EVERY ledger write cost
+# milliseconds per call on the request path. Configure once per thread per DB
+# and reuse; commit on success, rollback on error, never close (the pool lives
+# for the process). Keyed by path so tests that point DB_PATH at a temp file get
+# their own connection.
+_local = threading.local()
+
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH, timeout=10.0)
-    c.row_factory = sqlite3.Row
-    # WAL, and a busy timeout, because this database is written from inside
-    # async request handlers on a single event loop. In the default rollback
-    # journal a writer blocks every reader, so a ledger insert could hold up
-    # /health — and /health has a 1-second budget, so a held lock was reported
-    # to the console as "gateway unreachable" while the gateway was fine.
-    # WAL lets readers work against the previous snapshot while a writer is
-    # mid-transaction; NORMAL keeps that cheap without risking committed data.
-    # `timeout` makes a genuine contention wait a short retry instead of an
-    # immediate "database is locked" error.
-    try:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA synchronous=NORMAL")
-        c.execute("PRAGMA busy_timeout=10000")
-    except sqlite3.Error:
-        pass  # an older SQLite still works, just without the concurrency fix
+    store = getattr(_local, "conns", None)
+    if store is None:
+        store = _local.conns = {}
+    c = store.get(DB_PATH)
+    if c is None:
+        c = sqlite3.connect(DB_PATH, timeout=10.0)
+        c.row_factory = sqlite3.Row
+        # WAL, and a busy timeout, because this database is written from inside
+        # async request handlers on a single event loop. In the default rollback
+        # journal a writer blocks every reader, so a ledger insert could hold up
+        # /health — and /health has a 1-second budget, so a held lock was reported
+        # to the console as "gateway unreachable" while the gateway was fine.
+        # WAL lets readers work against the previous snapshot while a writer is
+        # mid-transaction; NORMAL keeps that cheap without risking committed data.
+        # `timeout` makes a genuine contention wait a short retry instead of an
+        # immediate "database is locked" error.
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+            c.execute("PRAGMA busy_timeout=10000")
+        except sqlite3.Error:
+            pass  # an older SQLite still works, just without the concurrency fix
+        store[DB_PATH] = c
     try:
         yield c
         c.commit()
-    finally:
-        c.close()
+    except BaseException:
+        try:
+            c.rollback()
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def init():
@@ -240,6 +258,8 @@ def by_agent(session=None, since=None):
     q = (
         "SELECT agent, provider, COUNT(*) AS calls, "
         "SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, "
+        "SUM(cache_read_tokens) AS cache_reads, "
+        "SUM(cache_create_tokens) AS cache_creates, "
         "SUM(latency_ms) AS total_latency_ms, "
         "SUM(retries) AS total_retries, "
         "SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok, "

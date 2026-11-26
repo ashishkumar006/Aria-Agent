@@ -135,9 +135,9 @@ export function SearchReplace({ sid, roots, onOpenPath, onChanged }: {
                onKeyDown={(e) => { if (e.key === 'Enter') void find(); }}
                placeholder={regex ? 'regular expression' : 'text in any folder here'}
                aria-label="Search the workspace"
-               className="min-w-0 flex-1 rounded-md border border-glass-border bg-surface-2 px-1.5 py-1 text-[12px] outline-none" />
+               className="min-w-0 flex-1 rounded-md border border-glass-border bg-surface-1 px-1.5 py-1 text-[12px] outline-none" />
         <button type="button" onClick={() => void find()} disabled={busy}
-                className="rounded-lg border border-glass-border px-1.5 text-[11px] text-zinc-200 disabled:opacity-40">
+                className="rounded-md border border-glass-border px-1.5 text-[11px] text-zinc-200 disabled:opacity-40">
           {busy ? '…' : 'find'}
         </button>
         <button type="button" aria-pressed={showReplace}
@@ -145,7 +145,7 @@ export function SearchReplace({ sid, roots, onOpenPath, onChanged }: {
                 onClick={() => setShowReplace((v) => !v)}
                 title="Show the replace controls"
                 className={'rounded-md border px-1.5 text-[11px] '
-                  + (showReplace ? 'border-accent/50 text-zinc-100'
+                  + (showReplace ? 'border-white/30 text-zinc-100'
                     : 'border-glass-border text-zinc-muted hover:bg-white/5')}>
           replace
         </button>
@@ -156,7 +156,7 @@ export function SearchReplace({ sid, roots, onOpenPath, onChanged }: {
         <Toggle on={caseOn} set={setCaseOn} label="match case" />
         <input value={glob} onChange={(e) => setGlob(e.target.value)}
                placeholder="*.py" aria-label="File filter"
-               className="w-[70px] rounded-md border border-glass-border bg-surface-2 px-1 py-0.5 text-[11px] outline-none" />
+               className="w-[70px] rounded-md border border-glass-border bg-surface-1 px-1 py-0.5 text-[11px] outline-none" />
         {/* No second run button: `find` above and Enter both re-run, and a
             third way to do the same thing is clutter, not affordance. */}
       </div>
@@ -166,17 +166,17 @@ export function SearchReplace({ sid, roots, onOpenPath, onChanged }: {
           <input value={repl} onChange={(e) => setRepl(e.target.value)}
                  placeholder={regex ? 'replacement — \\1 back-references work' : 'replacement'}
                  aria-label="Replacement text"
-                 className="min-w-0 flex-1 rounded-md border border-glass-border bg-surface-2 px-1.5 py-1 text-[12px] outline-none" />
+                 className="min-w-0 flex-1 rounded-md border border-glass-border bg-surface-1 px-1.5 py-1 text-[12px] outline-none" />
           <button type="button" disabled={!hits.length || busy}
                   onClick={() => void doPreview()}
-                  className="rounded-lg border border-glass-border px-1.5 text-[11px] text-zinc-200 hover:bg-white/5 disabled:opacity-40">
+                  className="rounded-md border border-glass-border px-1.5 text-[11px] text-zinc-200 hover:bg-white/5 disabled:opacity-40">
             preview
           </button>
         </div>
       )}
 
       {showReplace && preview && (
-        <div className="flex-none border-y border-glass-border bg-surface-1/60 px-2 py-1.5">
+        <div className="flex-none border-y border-glass-border bg-surface-0 px-2 py-1.5">
           <p className="text-[12px] text-zinc-200">
             {preview.count} occurrence(s) in {preview.files.length} file(s)
             {preview.refused.length
@@ -190,11 +190,11 @@ export function SearchReplace({ sid, roots, onOpenPath, onChanged }: {
           </ul>
           <div className="mt-1.5 flex gap-2">
             <button type="button" onClick={() => void doApply()} disabled={busy}
-                    className="rounded-lg bg-accent px-2.5 py-0.5 text-[12px] font-semibold text-black transition-colors hover:bg-accent/90 disabled:opacity-40">
+                    className="rounded-md bg-zinc-100 px-3 py-0.5 text-xs font-bold text-[#161616] transition-colors hover:brightness-110 disabled:opacity-40">
               apply
             </button>
             <button type="button" onClick={() => setPreview(null)}
-                    className="rounded-lg border border-glass-border px-2 py-0.5 text-[12px] text-zinc-300 hover:bg-white/5">
+                    className="rounded-md border border-glass-border px-2 py-0.5 text-[12px] text-zinc-300 hover:bg-white/5">
               cancel
             </button>
             <span className="min-w-0 flex-1 self-center text-[11px] leading-snug text-zinc-muted">
@@ -257,7 +257,7 @@ function Toggle({ on, set, label, title }: {
   return (
     <button type="button" aria-pressed={on} title={title} onClick={() => set(!on)}
             className={'rounded-md border px-1.5 py-0.5 '
-              + (on ? 'border-accent/50 bg-accent/10 text-zinc-100'
+              + (on ? 'border-white/30 bg-white/[0.06] text-zinc-100'
                 : 'border-glass-border text-zinc-muted hover:bg-white/5')}>
       {label}
     </button>

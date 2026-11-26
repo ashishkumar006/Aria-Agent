@@ -219,8 +219,13 @@ class TestMemoryContinuity:
         combined = "\n".join(planner_prompts).lower()
         assert "seville" in combined, \
             "memory hit not injected into planner prompt (S7 contract broken)"
-        # And confirm the formatter prompt is memory-free by design.
-        formatter_prompts = [c[1] for c in fake.calls if c[0] == "formatter"]
+        # And confirm the formatter prompt is memory-free by design. The
+        # formatter has read-only tools, so it runs through run_with_tools and
+        # its rendered prompt is recorded there, not on the plain LLM fake —
+        # check both so the assertion holds on either path.
+        formatter_prompts = [c[1] for c in
+                             (fake.calls + _fake_run_with_tools.calls)
+                             if c[0] == "formatter"]
         assert formatter_prompts, "formatter was never called"
         fmt_combined = "\n".join(formatter_prompts).lower()
         assert "memory hits" not in fmt_combined, \
@@ -318,7 +323,9 @@ class TestMemoryContinuity:
             "formatter": {"final_answer": "ok"},
         }
         _, fake = _run("hi", script, session_id="t-mem-5")
-        formatter_prompts = [c[1] for c in fake.calls if c[0] == "formatter"]
+        formatter_prompts = [c[1] for c in
+                             (fake.calls + _fake_run_with_tools.calls)
+                             if c[0] == "formatter"]
         assert formatter_prompts, "formatter was never called"
         combined = "\n".join(formatter_prompts)
         assert "ACTIVE POLICIES" in combined

@@ -2,18 +2,17 @@ import type { ReactNode } from 'react';
 
 /* The studio's chrome, in the console's own idiom.
 
-   Docs, Skills and Authoring share one visual grammar: 12px radii, a
-   surface-1 card with a 2px accent hairline along its top edge
+   Every console section draws its cards the same way: 10px radius, a surface-1
+   fill, a glass hairline, a 2px accent line along the top edge
    (`.instrument-card` in index.css), 10px uppercase micro-labels with wide
-   tracking, a bordered icon tile beside each label, and one violet primary
-   button per card. `/studio` was built against a different reference and had
-   none of it — flat 4-6px corners, every heading the same weight, six
-   bordered buttons competing in each panel — so moving between Studio and the
-   rest of Aria read as two different products.
+   tracking, a bordered icon tile beside each label, and a violet-400 primary
+   action. The section rails are a step darker (surface-0) and the page canvas
+   darker still (#090909, `bg-void`).
 
-   These are deliberately tiny. They exist so all ten studio panels can say
-   "card", "label", "primary action" once instead of each re-deriving the
-   scale, which is how the drift started. */
+   These helpers pin the studio to those same tokens, so the two cannot drift
+   into different palettes again; the studio keeps its own rail-free workbench
+   layout, which is a deliberate product decision (CODE_IDE_DESIGN §4.1), not a
+   styling one. */
 
 /** A panel: the console's card, without the hover lift (these are not tiles
  *  you click, and a workbench panel that rises under the cursor while you are
@@ -25,7 +24,7 @@ export function Panel({ children, className = '', accent }: {
 }) {
   return (
     <div
-      className={'relative overflow-hidden rounded-xl border border-edge bg-surface-1 ' + className}
+      className={'relative overflow-hidden rounded-[10px] border border-glass-border bg-surface-1 ' + className}
       style={accent ? ({ '--accent-line': accent } as React.CSSProperties) : undefined}
     >
       {accent && (
@@ -57,7 +56,7 @@ export function Tile({ children, tone = 'muted' }: {
   return (
     <span aria-hidden
           className={'flex h-6 w-6 flex-none items-center justify-center rounded-md border border-glass-border '
-            + (tone === 'accent' ? 'bg-accent/10 text-accent' : 'bg-white/[0.04] text-zinc-400')}>
+            + (tone === 'accent' ? 'bg-white/[0.06] text-zinc-400' : 'bg-white/[0.04] text-zinc-400')}>
       {children}
     </span>
   );
@@ -78,13 +77,13 @@ export function Head({ icon, children, right }: {
 }
 
 const BTN = {
-  primary: 'rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-black '
-    + 'transition-colors hover:bg-accent/90 disabled:opacity-40',
-  ghost: 'rounded-lg px-2 py-1 text-[12px] text-zinc-300 transition-colors '
+  primary: 'rounded-md bg-zinc-100 px-3.5 py-1.5 text-xs font-bold text-[#161616] '
+    + 'transition-colors hover:brightness-110 disabled:opacity-40',
+  ghost: 'rounded-md px-2 py-1 text-xs text-zinc-300 transition-colors '
     + 'hover:bg-white/5 hover:text-zinc-100 disabled:opacity-40',
-  outline: 'rounded-lg border border-glass-border px-2.5 py-1 text-[12px] text-zinc-200 '
-    + 'transition-colors hover:bg-white/5 disabled:opacity-40',
-  danger: 'rounded-lg border border-danger/40 bg-danger-dim px-2.5 py-1 text-[12px] '
+  outline: 'rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-zinc-200 '
+    + 'transition-colors hover:border-white/25 disabled:opacity-40',
+  danger: 'rounded-md border border-danger/40 bg-danger-dim px-2.5 py-1 text-xs '
     + 'text-danger transition-colors hover:bg-danger/20 disabled:opacity-40',
 } as const;
 

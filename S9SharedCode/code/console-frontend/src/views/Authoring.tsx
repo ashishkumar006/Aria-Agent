@@ -4,6 +4,7 @@ import {
   FileDown, Loader2, AlertTriangle, Sparkles, LayoutGrid, ScrollText,
   Terminal, Download, History, FileText, Table2, Presentation,
   Maximize2, MessageSquareText, Send, ArrowLeft,
+  Check, X, Clock, SkipForward,
 } from 'lucide-react';
 import { SkipLink, Rail, TopBar, Pill } from '../components/ui';
 import { useMainId, useSectionActive } from '../components/KeepAlive';
@@ -92,20 +93,138 @@ interface Run extends SessionSummary {
   live?: boolean;
   /** The node rollup from /produced, so a reopened run has a Run log. */
   logs?: string[];
+  /** Per-node status + duration, for the receipt's "what this run did".
+   *  Named `nodeList` because `SessionSummary` already has a numeric `nodes`
+   *  count and this interface extends it. */
+  nodeList?: RunNode[];
+  /** The sources the researchers actually opened, for the receipt. */
+  sources?: SourceRef[];
   kind?: Kind;
-}
+};
+
+/** One node in a produced run: what it was, how it ended, how long it took. */
+type RunNode = { id: string; skill: string; status: string; duration?: number | null };
+/** One source a researcher opened. */
+type SourceRef = { url: string; title?: string };
 
 /** What /produced says about one run. */
 type Produced = {
   files?: MadeFile[];
   answer?: string;
   live?: boolean;
-  nodes?: { id: string; skill: string; status: string }[];
+  nodes?: RunNode[];
+  sources?: SourceRef[];
 };
+
+/** A parsed run-log line: a node status or an info line. */
+type NodeStatus = 'running' | 'complete' | 'failed' | 'skipped';
+type LogLine = {
+  kind: 'node' | 'info' | 'error';
+  id?: string;
+  skill?: string;
+  status?: NodeStatus;
+  duration?: string;
+  detail?: string;
+  text: string;
+};
+
+const NODE_LINE_RE =
+  /^\[(n:\d+)\]\s+(\S+)\s+(running|complete|failed|skipped)\b\s*(?:\(([^)]+)\))?\s*(.*)$/;
+const SKIP_LINE_RE =
+  /^->\s+(n:\d+)\s+(\S+)\s+skipped\b\s*(?:\(([^)]+)\))?\s*(.*)$/;
+
+/** Parse one log line into a node status or an info line. */
+const parseLogLine = (text: string): LogLine => {
+  const t = text.trim();
+  let m = NODE_LINE_RE.exec(t);
+  if (m) {
+    return {
+      kind: 'node', id: m[1], skill: m[2], status: m[3] as NodeStatus,
+      duration: m[4] || undefined, detail: (m[5] || '').trim(), text,
+    };
+  }
+  m = SKIP_LINE_RE.exec(t);
+  if (m) {
+    return {
+      kind: 'node', id: m[1], skill: m[2], status: 'skipped',
+      duration: m[3] || undefined, detail: (m[4] || '').trim(), text,
+    };
+  }
+  if (/^\[error\]/i.test(t)) return { kind: 'error', text };
+  return { kind: 'info', text };
+};
+
+/** 1.2s / 1m 05s — compact, for the per-node stopwatch. */
+const fmtElapsed = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+};
+
+/** The receipt's structured header: what the run did, and what it checked. */
+function RunSummary({ nodes, sources }: {
+  nodes: RunNode[]; sources: SourceRef[];
+}) {
+  if (!nodes.length && !sources.length) return null;
+  return (
+    <div className="mb-4 border-b border-white/10 pb-3">
+      <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wide text-zinc-500">
+        What this run did
+      </div>
+      {nodes.length > 0 && (
+        <ul className="mb-3 space-y-0.5 text-[12px]">
+          {nodes.map((n) => {
+            const tone = n.status === 'complete' ? 'text-emerald-300'
+              : n.status === 'failed' ? 'text-red-300'
+              : n.status === 'skipped' ? 'text-zinc-500' : 'text-amber-300';
+            return (
+              <li key={n.id} className="flex items-baseline gap-2">
+                <span className="w-9 flex-none font-mono text-[10px] text-zinc-600">{n.id}</span>
+                <span className={tone}>{n.skill}</span>
+                <span className="text-zinc-600">{n.status}</span>
+                {n.duration != null && (
+                  <span className="ml-auto flex-none tabular-nums text-zinc-600">
+                    {n.duration}s
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {sources.length > 0 && (
+        <>
+          <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wide text-zinc-500">
+            Sources checked ({sources.length})
+          </div>
+          <ul className="space-y-1 text-[12px]">
+            {sources.map((s) => (
+              <li key={s.url} className="min-w-0">
+                <a
+                  href={s.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  title={s.url}
+                  className="block truncate text-sky-300/90 hover:text-sky-200 hover:underline"
+                >
+                  {s.title || s.url}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
 
 /** The log of a run that is no longer streaming: the nodes it ran. */
 const logLines = (nodes?: Produced['nodes']) =>
-  (nodes || []).map((n) => `[${n.id}] ${n.skill} ${n.status}`);
+  (nodes || []).map((n) => {
+    const d = n.duration != null ? ` (${n.duration}s)` : '';
+    return `[${n.id}] ${n.skill} ${n.status}${d}`;
+  });
 
 const kb = (n?: number) =>
   n == null ? '' : n >= 1024 * 1024
@@ -164,6 +283,8 @@ const withProduced = (r: Run, snap: Produced): Run => {
     answer: snap.answer || '',
     live: !!snap.live,
     logs: logLines(snap.nodes),
+    nodeList: snap.nodes || r.nodeList,
+    sources: snap.sources || r.sources,
     // What was ACTUALLY produced, not what the run was asked for.
     kind: (fs[0]?.format || r.kind || 'auto') as Kind,
   };
@@ -256,6 +377,11 @@ export default function Authoring() {
   const [note, setNote] = useState('');
   const [err, setErr] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
+  /** Ticks while a run is live, for the per-node stopwatch. */
+  const [now, setNow] = useState(() => Date.now());
+  /** The displayed run's node list and sources, for the receipt. */
+  const [runNodes, setRunNodes] = useState<RunNode[]>([]);
+  const [runSources, setRunSources] = useState<SourceRef[]>([]);
   const [answer, setAnswer] = useState('');
   const [files, setFiles] = useState<MadeFile[]>([]);
   const [follow, setFollow] = useState(true);
@@ -279,6 +405,8 @@ export default function Authoring() {
   const startRef = useRef<HTMLButtonElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
   const logBox = useRef<HTMLDivElement>(null);
+  /** When each node first appeared as running, for the live stopwatch. */
+  const nodeStarts = useRef(new Map<string, number>());
   const resultRef = useRef<HTMLDivElement>(null);
   const [busyFile, setBusyFile] = useState('');
   /* The document on screen, opened as a window over the page. */
@@ -542,6 +670,8 @@ export default function Authoring() {
     setAnswer(r.answer || '');
     /* the streamed log is newer than the row's node rollup: never blank it */
     setLogs((cur) => (r.logs?.length ? r.logs : cur));
+    setRunNodes(r.nodeList || []);
+    setRunSources(r.sources || []);
     const fs = r.files || [];
     setFiles(fs);
     setView(fs.length ? 'preview' : 'receipt');
@@ -711,6 +841,15 @@ export default function Authoring() {
     if (!running) startRef.current?.focus();
   }, [running]);
 
+  /* Live per-node stopwatch: tick only while a run is going and the log is
+     visible, so the elapsed beside a running node moves without re-rendering
+     the whole page every second otherwise. */
+  useEffect(() => {
+    if (!running || view !== 'log') return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [running, view]);
+
   const start = useCallback(async () => {
     const t = brief.trim();
     if (!t || running) {
@@ -726,6 +865,8 @@ export default function Authoring() {
     setRunning(true);
     requestAnimationFrame(() => stopRef.current?.focus());
     setErr(''); setNote('drafting…'); setLogs([]); setAnswer(''); setFiles([]);
+    nodeStarts.current.clear(); setNow(Date.now());
+    setRunNodes([]); setRunSources([]);
     setPreview({}); setPreviewErr(''); setActiveId('');
     setView('receipt');
 
@@ -768,7 +909,31 @@ export default function Authoring() {
           }
         } else if (ev.type === 'log') {
           const txt = String((ev as { text?: string }).text || '');
-          if (txt.trim()) setLogs((l) => [...l.slice(-500), txt]);
+          if (txt.trim()) {
+            const parsed = parseLogLine(txt);
+            if (parsed.kind === 'node' && parsed.id) {
+              if (parsed.status === 'running'
+                  && !nodeStarts.current.has(parsed.id)) {
+                nodeStarts.current.set(parsed.id, Date.now());
+              }
+              // Upsert by node id: the running line is REPLACED by its
+              // complete/failed line, so the log shows one row per node with
+              // its final status and duration instead of a stale "running".
+              setLogs((l) => {
+                const idx = l.findIndex((x) => {
+                  const p = parseLogLine(x);
+                  return p.kind === 'node' && p.id === parsed.id;
+                });
+                if (idx < 0) return [...l.slice(-500), txt];
+                if (l[idx] === txt) return l;
+                const copy = l.slice();
+                copy[idx] = txt;
+                return copy;
+              });
+            } else {
+              setLogs((l) => [...l.slice(-500), txt]);
+            }
+          }
         } else if (ev.type === 'status') {
           // Heartbeats ("working… 40s elapsed") are progress, not log output.
           // They used to be appended to the same list, so the run log filled
@@ -800,6 +965,17 @@ export default function Authoring() {
           setFiles(made);
           setActiveId(sid);
           setView(made.length ? 'preview' : 'receipt');
+          /* The done frame carries files but not the node rollup or the
+           * sources; read /produced once so the receipt can show what the run
+           * did and what it checked. */
+          setRunNodes([]);
+          setRunSources([]);
+          if (sid) {
+            void api.runProduced(sid).then((snap) => {
+              setRunNodes(snap.nodes || []);
+              setRunSources(snap.sources || []);
+            }).catch(() => { /* the receipt still has the answer */ });
+          }
 
           /* A document request that produced no file is NOT a success. The
            * planner can short-circuit (a stray "reply with only OK" memory
@@ -1465,10 +1641,12 @@ export default function Authoring() {
     </div>
   ));
 
-  const discTarget: DocumentTarget | null = discDoc ? {
+  /* Memoised: a fresh object identity on every render made FilePreview reload
+     the document on every stream delta — the visible blink in focus mode. */
+  const discTarget = useMemo<DocumentTarget | null>(() => discDoc ? {
     kind: 'artifact', artifact: discDoc.artifact,
     format: discDoc.format || 'pdf', label: discDoc.filename,
-  } : null;
+  } : null, [discDoc?.artifact, discDoc?.format, discDoc?.filename]);
   const discussing = (view === 'discuss' || focus) && !!discDoc && !!discTarget;
 
   /** The words Aria pointed at, as chips under her answer.
@@ -1840,19 +2018,28 @@ export default function Authoring() {
                   onChange={(e) => setDocStyle(e.target.value)}
                   className="rounded-md border border-white/10 bg-black/40 px-2 py-1 text-[11px] text-zinc-200 outline-none focus:border-violet-400">
                   <option value="auto">Auto — Aria picks from the brief</option>
-                  <option value="report">Report</option>
-                  <option value="brief">Brief</option>
-                  <option value="memo">Memo</option>
-                  <option value="academic">Academic</option>
-                  <option value="whitepaper">Whitepaper</option>
-                  <option value="manual">Manual</option>
-                  <option value="newsletter">Newsletter (2-col)</option>
-                  <option value="technical">Technical</option>
-                  <option value="book">Book</option>
-                  <option value="plain">Plain</option>
+                  <optgroup label="Study & course material">
+                    <option value="lecture">Lecture — centred masthead, colour heads</option>
+                    <option value="exambook">Exam book — ruled masthead, red heads</option>
+                    <option value="coursework">Coursework — navy cover band</option>
+                  </optgroup>
+                  <optgroup label="Business & reference">
+                    <option value="report">Report</option>
+                    <option value="brief">Brief</option>
+                    <option value="memo">Memo</option>
+                    <option value="whitepaper">Whitepaper</option>
+                    <option value="manual">Manual</option>
+                    <option value="technical">Technical</option>
+                    <option value="newsletter">Newsletter (2-col)</option>
+                  </optgroup>
+                  <optgroup label="Book-like">
+                    <option value="academic">Academic</option>
+                    <option value="book">Book</option>
+                    <option value="plain">Plain</option>
+                  </optgroup>
                 </select>
                 <span className="text-zinc-600">
-                  Typography and structure; Auto reads the brief.
+                  Layout and visual identity, not just type; Auto reads the brief.
                 </span>
               </div>
               <div className="mt-2.5 flex items-center justify-between gap-2">
@@ -2143,11 +2330,52 @@ export default function Authoring() {
                   id="panel-log"
                   aria-labelledby="tab-log"
                   tabIndex={0}
-                  className="p-3 font-mono text-[11.5px] leading-relaxed text-zinc-400"
+                  className="p-3 font-mono text-[12.5px] leading-relaxed"
                 >
-                  {logs.map((l, i) => (
-                    <div key={i} className="whitespace-pre-wrap break-words">{l}</div>
-                  ))}
+                  {logs.map((l, i) => {
+                    const p = parseLogLine(l);
+                    if (p.kind === 'node') {
+                      const isRunning = p.status === 'running';
+                      const elapsed = isRunning
+                        ? fmtElapsed(now - (nodeStarts.current.get(p.id || '') ?? now))
+                        : p.duration;
+                      const Icon = p.status === 'complete' ? Check
+                        : p.status === 'failed' ? X
+                        : p.status === 'skipped' ? SkipForward : Clock;
+                      const tone = p.status === 'complete' ? 'text-emerald-300'
+                        : p.status === 'failed' ? 'text-red-300'
+                        : p.status === 'skipped' ? 'text-zinc-500'
+                        : 'text-amber-300';
+                      return (
+                        <div key={i} className="flex items-start gap-2">
+                          <Icon size={13} className={tone + ' mt-0.5 flex-none'} />
+                          <span className={tone + ' min-w-0 flex-1 whitespace-pre-wrap break-words'}>
+                            <span className="font-semibold">{p.skill}</span>
+                            {isRunning && p.detail ? (
+                              <span className="text-zinc-500"> · {p.detail.slice(0, 96)}</span>
+                            ) : null}
+                            {p.status === 'failed' && p.detail ? (
+                              <span className="text-red-300/80"> · {p.detail.slice(0, 120)}</span>
+                            ) : null}
+                          </span>
+                          {elapsed ? (
+                            <span className="flex-none tabular-nums text-zinc-500">{elapsed}</span>
+                          ) : null}
+                        </div>
+                      );
+                    }
+                    return (
+                      <div
+                        key={i}
+                        className={
+                          'whitespace-pre-wrap break-words '
+                          + (p.kind === 'error' ? 'text-red-300/90' : 'text-zinc-400')
+                        }
+                      >
+                        {l}
+                      </div>
+                    );
+                  })}
                   {!logs.length && <div className="text-zinc-muted">no output yet</div>}
                   <label className="sticky bottom-0 mt-2 block bg-[#08080a] pt-1 text-[11px] text-zinc-500">
                     <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> follow
@@ -2173,8 +2401,10 @@ export default function Authoring() {
                       ref={resultRef}
                       aria-live="polite"
                       className="prose-chat prose-report prose-wide px-4 py-3.5"
-                      dangerouslySetInnerHTML={{ __html: renderMarkdown(answer, 1, true) }}
-                    />
+                    >
+                      <RunSummary nodes={runNodes} sources={runSources} />
+                      <div dangerouslySetInnerHTML={{ __html: renderMarkdown(answer, 1, true) }} />
+                    </article>
                   ) : files.length ? (
                     <p className="p-4 text-[12.5px] text-zinc-muted">
                       This run produced {files.length} file{files.length === 1 ? '' : 's'} and no

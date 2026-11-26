@@ -42,16 +42,47 @@ async def _run(service: str, op: str, args: dict[str, Any]):
     """Dispatch to the service module in a worker thread (blocking httpx)."""
     if service == "gmail":
         from integrations import gmail as g
-        fn = {"send": g.send_email, "query": g.query, "refresh": g.refresh}.get(op)
+        fn = {"send": g.send_email, "query": g.query, "refresh": g.refresh,
+              "profile": g.profile}.get(op)
+    elif service == "zoho_mail":
+        from integrations import zoho_mail as z
+        fn = {"send": z.send_email, "query": z.query, "refresh": z.refresh,
+              "profile": z.profile, "folders": z.list_folders, "reply": z.reply,
+              "mark": z.mark, "move": z.move, "delete": z.delete}.get(op)
+    elif service == "zoho_calendar":
+        from integrations import zoho_calendar as zc
+        fn = {"list_calendars": zc.list_calendars, "list_events": zc.list_events,
+              "create": zc.create_event}.get(op)
+    elif service == "ntfy":
+        from integrations import ntfy as n
+        fn = {"send": n.send, "history": n.history}.get(op)
+    elif service == "zoho_cliq":
+        from integrations import cliq as c
+        fn = {"send": c.send}.get(op)
+    elif service == "bluesky":
+        from integrations import bluesky as b
+        fn = {"send": b.send}.get(op)
+    elif service == "mastodon":
+        from integrations import mastodon as m
+        fn = {"send": m.send}.get(op)
+    elif service == "google_chat":
+        from integrations import google_chat as gc
+        fn = {"send": gc.send}.get(op)
     elif service == "calendar":
         from integrations import calendar as c
         fn = {"create": c.create_event, "list": c.list_events, "refresh": c.refresh}.get(op)
     elif service == "github":
         from integrations import github as g
-        fn = {"query": g.query}.get(op)
+        fn = {"query": g.query, "call": g.call}.get(op)
     elif service == "notion":
         from integrations import notion as n
-        fn = {"query": n.query}.get(op)
+        fn = {"query": n.query, "call": n.call}.get(op)
+    elif service == "telegram":
+        from integrations import telegram_api as t
+        fn = {"call": t.call}.get(op)
+    elif service == "discord":
+        from integrations import discord_api as d
+        fn = {"call": d.call, "invite_url": d.invite_url}.get(op)
     elif service == "slack":
         from integrations import slack as s
         fn = {"history": s.history, "refresh": s.refresh}.get(op)
@@ -138,10 +169,17 @@ async def integration_inventory():
     import os
     keys = {
         "gmail": ["GMAIL_TOKEN"],
+        "zoho_mail": ["ZOHO_TOKEN"],
+        "zoho_calendar": ["ZOHO_TOKEN"],
         "calendar": ["GOOGLE_CALENDAR_TOKEN"],
         "github": ["GITHUB_TOKEN"],
         "notion": ["NOTION_TOKEN"],
         "websearch": ["TAVILY_API_KEY"],
+        "ntfy": [],
+        "zoho_cliq": ["ZOHO_CLIQ_TOKEN"],
+        "bluesky": ["BSKY_HANDLE", "BSKY_APP_PASSWORD"],
+        "mastodon": ["MASTODON_TOKEN", "MASTODON_INSTANCE"],
+        "google_chat": ["GOOGLE_CHAT_WEBHOOK"],
     }
     out = []
     for svc, ks in keys.items():

@@ -23,7 +23,9 @@ const LOADERS: Record<string, () => Promise<unknown>> = {
   '/settings': () => import('../views/Settings'),
   '/code': () => import('../views/Code'),
   '/studio': () => import('../views/studio/Studio'),
+  '/model-lab': () => import('../views/ModelLab'),
   '/authoring': () => import('../views/Authoring'),
+  '/architecture': () => import('../views/Architecture'),
   '/parts': () => import('../views/Parts'),
   '/computer': () => import('../views/Computer'),
 };

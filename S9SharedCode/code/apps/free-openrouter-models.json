@@ -1,0 +1,37 @@
+{
+  "id": "free-openrouter-models",
+  "name": "Free OpenRouter models",
+  "kind": "openrouter_free",
+  "schedule": "daily@09:00",
+  "id_field": "id",
+  "fields": [
+    "id",
+    "name",
+    "context_length"
+  ],
+  "max_items": 200,
+  "history": 30,
+  "ui": {
+    "view": "table",
+    "columns": [
+      {
+        "field": "id",
+        "label": "id"
+      },
+      {
+        "field": "name",
+        "label": "name"
+      },
+      {
+        "field": "context_length",
+        "label": "context_length"
+      }
+    ],
+    "sort": "id",
+    "highlight_new": true
+  },
+  "url": "https://openrouter.ai/api/v1/models",
+  "created": 1794058022.1381958,
+  "updated": 1794058022.1381958,
+  "next_refresh": 1794108600.0
+}

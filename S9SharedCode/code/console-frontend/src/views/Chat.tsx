@@ -12,13 +12,13 @@ import { Rail, TopBar, Empty, Skel, Pill, useHealth, SkipLink } from '../compone
 import { useMainId, useSectionActive } from '../components/KeepAlive';
 import { Pane, PaneStrip, usePaneMode } from '../lib/panes';
 
-/* The same list the Documents drop-zone accepts, because this calls the same
-   api.uploadDocument. The server rejects anything else with a 400 naming the
-   problem, so a wider filter here would only produce failures. Note that
-   images are NOT in it: `parsers.detect_type` accepts no image type, so an
-   image cannot be uploaded anywhere in this app today. */
+/* Chat grounds the turn in retrievable TEXT, so this lists the text-bearing
+   formats only. Images carry no search text (there is no OCR), so they are
+   excluded here on purpose — Documents accepts them as figure sources an
+   author can place. Same api.uploadDocument otherwise; the server rejects
+   anything else with a 400 naming the problem. */
 const UPLOAD_ACCEPT =
-  '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm';
+  '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm,.pptx';
 import { renderMarkdown } from '../components/markdown';
 import {
   api, ago, CONF, headers, type ChatThread, type DocFolder, type DocPreview,
@@ -255,6 +255,11 @@ const KIND_ICON: Record<string, typeof FileText> = {
   webp: ImageIcon, bmp: ImageIcon, svg: ImageIcon, image: ImageIcon,
 };
 
+// Kinds that should render as an inline picture in the transcript, not just a
+// file row. A browser <img src="/api/artifact/…"> cannot send the auth header
+// (403), so the bytes are fetched with headers() and handed a blob URL.
+const IMG_KINDS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'image']);
+
 /* The server names the kind from the artifact descriptor, and an image stored by
    `fetch_image` arrives with the format it was uploaded as. Falling back to the
    label's own extension means a photograph does not present as `document.bin`
@@ -277,9 +282,26 @@ function ArtRow({ art, label, state }: { art: string; label?: string; state: Art
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ text: string; bad: boolean } | null>(null);
+  const [imgUrl, setImgUrl] = useState('');
   const p = state.status === 'ok' ? state.preview : null;
   const kind = artKind(p && p.kind !== 'unknown' ? p.kind : '', label || '');
   const Icon = KIND_ICON[kind] || FileText;
+  // Inline picture for image artifacts: fetch with the auth header and use a
+  // blob URL (a plain <img src> would 403). Clicking it opens the full preview.
+  useEffect(() => {
+    if (!IMG_KINDS.has(kind) || state.status !== 'ok') { setImgUrl(''); return; }
+    let live = true; let url = '';
+    (async () => {
+      try {
+        const r = await fetch(`/api/artifact/${art}`, { headers: headers() });
+        if (!r.ok) return;
+        const b = await r.blob();
+        url = URL.createObjectURL(b);
+        if (live) setImgUrl(url);
+      } catch { /* leave the row as a file if the bytes cannot be read */ }
+    })();
+    return () => { live = false; if (url) URL.revokeObjectURL(url); };
+  }, [art, kind, state.status]);
   // Prefer the model's own link text when it looks like a filename. The server
   // re-derives a name from the artifact descriptor and that is the name the
   // saved file actually gets, so this is a label, not the save name.
@@ -358,6 +380,14 @@ function ArtRow({ art, label, state }: { art: string; label?: string; state: Art
           </>
         )}
       </div>
+      {imgUrl && (
+        <button type="button" onClick={() => setOpen(true)}
+                aria-label={`Open ${name} in the document window`}
+                className="mt-2 block w-full overflow-hidden rounded-md border border-white/10 hover:border-violet-400">
+          <img src={imgUrl} alt={name}
+               className="max-h-[280px] w-full bg-black/40 object-contain" />
+        </button>
+      )}
       {state.status === 'pending' && (
         <p className="mt-1 text-[11px] text-zinc-muted">checking the artifact store…</p>
       )}
@@ -2297,7 +2327,7 @@ const settle = (meta: string, files?: StreamFile[], kind?: string,
             <button
               onClick={() => fileRef.current?.click()}
               disabled={busy || uploading}
-              title="Attach a document: PDF, DOCX, MD, TXT, HTML, CSV or XLSX (images cannot be read yet)"
+              title="Attach a document: PDF, DOCX, PowerPoint, MD, TXT, HTML, CSV or XLSX (images have no search text — add them in Documents as figures)"
               aria-label="Attach files"
               className="flex h-10 w-10 flex-none items-center justify-center self-end rounded-md border border-white/15 bg-white/5 text-zinc-300 transition-colors hover:border-violet-400 hover:text-zinc-100 disabled:opacity-50"
             >

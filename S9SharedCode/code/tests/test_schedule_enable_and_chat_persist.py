@@ -145,6 +145,12 @@ def test_a_re_enabled_schedule_actually_reaches_the_worker(sched, monkeypatch):
     spec = sched._SCHEDULES[sid]
     spec["next_fire"] = time.time() - 1
     sched._HEAP = [(spec["next_fire"], sid)]
+    # The worker reloads from disk when the schedule file's mtime moved (so a
+    # reminder created in the MCP child reaches this process). That reload
+    # rebuilds the heap from disk and would discard the in-memory next_fire we
+    # just set. This test exercises the fire path in isolation, so pin the mtime
+    # sentinel to skip the reload for this tick.
+    sched._WORKER_MTIME = None
     fired = []
     monkeypatch.setattr(sched, "_fire", lambda s, _snap: fired.append(s))
 

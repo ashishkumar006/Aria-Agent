@@ -337,12 +337,29 @@ def search_images(*, query: str, max_results: int = 8,
         params["license_type"] = "commercial,modification"
     try:
         with _hx.Client(timeout=IMAGE_TIMEOUT_S) as c:
-            r = c.get(_OPENVERSE_URL, params=params,
-                      headers={"Accept": "application/json"})
-            if r.status_code == 429:
+            # Openverse goes through Cloudflare and returns 5xx when its origin
+            # is briefly overloaded: measured live, two of three consecutive
+            # requests did. A single attempt turned that blip into "image search
+            # failed" for the whole document, so a 5xx is retried twice with a
+            # short wait. A 429 is NOT retried - that is our own rate limit and
+            # waiting would only make it worse.
+            r = None
+            for _attempt in range(3):
+                r = c.get(_OPENVERSE_URL, params=params,
+                          headers={"Accept": "application/json"})
+                if r.status_code == 429:
+                    return {"ok": False,
+                            "error": "openverse rate limit reached; try again in a "
+                                     "moment or narrow the query"}
+                if r.status_code < 500:
+                    break
+                import time as _t
+                _t.sleep(4.0 * (_attempt + 1))
+            if r is not None and r.status_code >= 500:
                 return {"ok": False,
-                        "error": "openverse rate limit reached; try again in a "
-                                 "moment or narrow the query"}
+                        "error": f"openverse is temporarily unavailable "
+                                 f"(HTTP {r.status_code}); image search can be "
+                                 f"retried later"}
             r.raise_for_status()
             payload = r.json()
     except Exception as e:

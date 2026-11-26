@@ -212,7 +212,7 @@ def test_vision_pixel_click_does_not_send_snapshot_id(monkeypatch):
 
     monkeypatch.setattr(engine.daemon, "call", fake_call)
     monkeypatch.setattr(engine.layers, "draw_set_of_marks",
-                        lambda b64, elements: (b64, []))
+                        lambda b64, elements, offset=(0, 0): (b64, []))
     skill = engine.ComputerUseSkill(
         llm_chat=lambda *a, **k: None,
         llm_vision=lambda *a, **k: {

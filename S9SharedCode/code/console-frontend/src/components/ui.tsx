@@ -7,9 +7,10 @@ import { Link, useLocation } from 'react-router-dom';
 import { motion } from 'motion/react';
 import {
   Zap, MessageSquare, Play, Database, Search, CalendarDays, Package,
-  LayoutGrid, Receipt, Terminal, Settings, SearchX, FileText, Code2, FileOutput, Braces,
-  TriangleAlert, Boxes, Monitor, PanelLeftClose, PanelLeftOpen,
+  LayoutGrid, Receipt, Terminal, Settings, FileText, Code2, FileOutput, Braces,
+  TriangleAlert, Boxes, Monitor, PanelLeftClose, PanelLeftOpen, Network, Cpu,
 } from 'lucide-react';
+import { api, CONF } from '../api';
 import { openCommandPalette } from '../lib/palette';
 import { LayoutMenu } from '../lib/panes';
 import { prefetchSection } from '../lib/prefetch';
@@ -110,6 +111,9 @@ export const RAIL: { group: string; items: { to: string; label: string; icon: Re
     { to: '/documents', label: 'Documents', icon: <FileText size={16} /> },
     { to: '/research', label: 'Research', icon: <Search size={16} /> },
   ]},
+  { group: 'Showcase', items: [
+    { to: '/model-lab', label: 'Model Lab', icon: <Cpu size={16} /> },
+  ]},
   { group: 'Automate', items: [
     { to: '/scheduler', label: 'Scheduler', icon: <CalendarDays size={16} /> },
     { to: '/skills', label: 'Skills', icon: <Package size={16} /> },
@@ -118,6 +122,7 @@ export const RAIL: { group: string; items: { to: string; label: string; icon: Re
     { to: '/authoring', label: 'Authoring', icon: <FileOutput size={16} /> },
   ]},
   { group: 'Insight', items: [
+    { to: '/architecture', label: 'Architecture', icon: <Network size={16} /> },
     { to: '/apps', label: 'Apps', icon: <LayoutGrid size={16} /> },
     { to: '/ledger', label: 'Ledger', icon: <Receipt size={16} /> },
     { to: '/mission', label: 'Console', icon: <Terminal size={16} /> },

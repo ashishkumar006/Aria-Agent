@@ -333,6 +333,93 @@ class Browser:
                 "title": await _safe_title(page), "tabs": len(self.pages),
                 "error": err or ""}
 
+    async def _history(self, which: str) -> dict:
+        page = self.page
+        if page is None:
+            return {"ok": False, "url": "", "error": "no page"}
+        err = None
+        try:
+            coro = (page.go_back(wait_until="domcontentloaded",
+                                 timeout=NAV_TIMEOUT_S * 1000)
+                    if which == "back" else
+                    page.go_forward(wait_until="domcontentloaded",
+                                    timeout=NAV_TIMEOUT_S * 1000))
+            await asyncio.wait_for(coro, timeout=NAV_TIMEOUT_S + 5)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        self.snapshots[self.active] = None
+        self.snap_epoch += 1
+        self.touch()
+        return {"ok": err is None, "url": page.url,
+                "title": await _safe_title(page), "tabs": len(self.pages),
+                "error": err or ""}
+
+    async def back(self) -> dict:
+        return await self._history("back")
+
+    async def forward(self) -> dict:
+        return await self._history("forward")
+
+    async def reload(self) -> dict:
+        page = self.page
+        if page is None:
+            return {"ok": False, "url": "", "error": "no page"}
+        err = None
+        try:
+            await asyncio.wait_for(
+                page.reload(wait_until="domcontentloaded",
+                            timeout=NAV_TIMEOUT_S * 1000),
+                timeout=NAV_TIMEOUT_S + 5)
+        except Exception as e:
+          err = f"{type(e).__name__}: {e}"
+        self.snapshots[self.active] = None
+        self.snap_epoch += 1
+        self.touch()
+        return {"ok": err is None, "url": page.url,
+                "title": await _safe_title(page), "tabs": len(self.pages),
+                "error": err or ""}
+
+    # ── input forwarding (the screencast is a view; this is the mouse) ──
+    async def click_xy(self, x: float, y: float) -> dict:
+        page = self.page
+        if page is None:
+            return {"ok": False, "error": "no page"}
+        try:
+          await page.mouse.click(x, y)
+          return {"ok": True}
+        except Exception as e:
+          return {"ok": False, "error": str(e)[:200]}
+
+    async def wheel_xy(self, dx: float, dy: float) -> dict:
+        page = self.page
+        if page is None:
+          return {"ok": False, "error": "no page"}
+        try:
+          await page.mouse.wheel(dx, dy)
+          return {"ok": True}
+        except Exception as e:
+          return {"ok": False, "error": str(e)[:200]}
+
+    async def type_text(self, text: str) -> dict:
+        page = self.page
+        if page is None:
+          return {"ok": False, "error": "no page"}
+        try:
+          await page.keyboard.type(text)
+          return {"ok": True}
+        except Exception as e:
+          return {"ok": False, "error": str(e)[:200]}
+
+    async def press_key(self, key: str) -> dict:
+        page = self.page
+        if page is None:
+          return {"ok": False, "error": "no page"}
+        try:
+          await page.keyboard.press(key)
+          return {"ok": True}
+        except Exception as e:
+          return {"ok": False, "error": str(e)[:200]}
+
     # ── perception ───────────────────────────────────────────────────
     async def snapshot(self, max_elements: int = 120) -> dict:
         """The interactive-element legend, plus what the page is.
@@ -574,8 +661,13 @@ class Browser:
                          "console_errors": sum(
                              1 for r in self.rings[i].items
                              if r.get("level") == "error")})
+        vp = {}
+        try:
+            vp = self.page.viewport_size or {}
+        except Exception:
+            vp = {}
         return {"ok": True, "tabs": rows, "active": self.active,
-                "limit": MAX_TABS}
+                "limit": MAX_TABS, "viewport": vp}
 
     async def tab_select(self, index: int) -> dict:
         if not (0 <= int(index) < len(self.pages)):
@@ -657,7 +749,7 @@ class Browser:
         self.cast_dropped = 0
         self.cast_latest = None
         self.cast_at = 0.0
-        every = max(120, min(int(every_ms or 250), 2000))
+        every = max(33, min(int(every_ms or 50), 2000))
         self.cast_fps = round(1000.0 / every, 1)
 
         def _on_frame(params: dict, session_id=None):
@@ -675,7 +767,7 @@ class Browser:
         cdp.on("Page.screencastFrame", _on_frame)
         try:
             await cdp.send("Page.startScreencast", {
-                "format": "jpeg", "quality": 60,
+                "format": "jpeg", "quality": 80,
                 # Every frame the compositor makes. The pane serves the newest
                 # one and drops the rest, so asking Chromium to skip frames
                 # only makes a *repainted* page look frozen.
@@ -942,6 +1034,34 @@ def tab_new(sid: str, url: str = "") -> dict:
     async def _run():
         return await b.new_tab(url)
     return _call(_run, NAV_TIMEOUT_S)
+
+
+def back(sid: str) -> dict:
+    return _do(sid, "back", NAV_TIMEOUT_S)
+
+
+def forward(sid: str) -> dict:
+    return _do(sid, "forward", NAV_TIMEOUT_S)
+
+
+def reload(sid: str) -> dict:
+    return _do(sid, "reload", NAV_TIMEOUT_S)
+
+
+def click_xy(sid: str, x: float, y: float) -> dict:
+    return _do(sid, "click_xy", ACTION_TIMEOUT_S, x=x, y=y)
+
+
+def wheel_xy(sid: str, dx: float, dy: float) -> dict:
+    return _do(sid, "wheel_xy", ACTION_TIMEOUT_S, dx=dx, dy=dy)
+
+
+def type_text(sid: str, text: str) -> dict:
+    return _do(sid, "type_text", ACTION_TIMEOUT_S, text=text)
+
+
+def press_key(sid: str, key: str) -> dict:
+    return _do(sid, "press_key", ACTION_TIMEOUT_S, key=key)
 
 
 def tab_close(sid: str, index: int) -> dict:

@@ -37,6 +37,14 @@ function Start-Svc([string]$name, [string]$dir, [string]$script, [int]$port) {
   ) | Out-Null
 }
 
+# Image-content retrieval: describe embedded pictures (and bare image uploads)
+# at index time so a question about an image can be answered from the deck.
+# Alt-text is used when an author wrote it; otherwise a vision call describes
+# the picture and the description becomes a searchable chunk. Read when the
+# gateway PROCESS starts, so restart to change it. Off leaves indexing exactly
+# as it was; existing decks pick up captions on their next re-index.
+$env:DOCUMENT_IMAGE_CAPTION = '1'
+
 Start-Svc 'gateway' $gwDir 'main.py' 8109
 
 # Computer-use. The safety gates are OFF unless the host opts in

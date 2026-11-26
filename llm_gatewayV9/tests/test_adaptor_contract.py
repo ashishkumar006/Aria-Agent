@@ -30,10 +30,11 @@ from adaptors.base import BaseAdaptor, Capability
 EXPECTED = sorted([
     "telegram", "discord", "matrix", "line", "webhook", "webui", "slack",
     "signal", "gmail", "imap", "twilio_sms", "whatsapp_twilio", "local_mic",
-    "teams", "whatsapp_meta", "twilio_voice",
+    "teams", "whatsapp_meta", "twilio_voice", "zoho_mail", "ntfy",
+    "zoho_cliq", "bluesky", "mastodon", "google_chat",
 ])
 
-KEYLESS = {"webhook", "webui", "local_mic"}
+KEYLESS = {"webhook", "webui", "local_mic", "ntfy"}
 
 
 def test_all_names_registered():

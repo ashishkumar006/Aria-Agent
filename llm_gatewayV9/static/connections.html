@@ -19,6 +19,20 @@
   * { box-sizing: border-box; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); margin: 0; }
   a { color: var(--blue); }
+  /* Provider "get key" link: logo + label, styled as a small pill so the key
+     rows read as a polished directory rather than a wall of text links. */
+  .keylink { display:inline-flex; align-items:center; gap:5px; padding:2px 4px;
+    border-radius:6px; border:1px solid transparent; background:transparent;
+    color:var(--muted); text-decoration:none; font-size:11.5px; line-height:1; vertical-align:middle;
+    transition:background .12s ease, color .12s ease; }
+  .keylink:hover { background:rgba(255,255,255,.05); color:var(--text); }
+  .keylink .logo { position:relative; width:18px; height:18px; flex:none; border-radius:5px;
+    overflow:hidden; background:#1f2430; box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+  .keylink .logo .mono { position:absolute; inset:0; display:flex; align-items:center;
+    justify-content:center; font-size:10px; font-weight:700; color:inherit; }
+  .keylink .logo img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  .keylink .arrow { color:var(--faint); font-size:10px; }
+  .keylink:hover .arrow { color:var(--blue); }
 </style>
 <link rel="stylesheet" href="/static/console-theme.css">
 </head>
@@ -46,6 +60,18 @@
     <button onclick="testAllConn()">Test all</button>
     <button class="ghost" onclick="loadConnections()">Refresh</button>
   </div>
+  <section class="card" id="oauth-card" style="margin-bottom:14px;">
+    <div class="card-head"><div><h2>OAuth <span class="pill cap">gmail · calendar · zoho mail · zoho calendar</span></h2>
+      <p>One-click connect (browser consent) or refresh the tokens you already have (no browser). For first-time setup, set the client id/secret below, then click Connect.</p></div></div>
+    <div class="card-body" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <button class="ghost" onclick="oauthStart('gmail')">Connect Gmail</button>
+      <button class="ghost" onclick="oauthStart('calendar')">Connect Calendar</button>
+      <button class="ghost" onclick="oauthStart('zoho_mail')">Connect Zoho (Mail + Calendar)</button>
+      <button class="ghost" onclick="oauthRefresh()">Refresh tokens</button>
+      <span id="oauth-status" class="hint" style="margin:0;"></span>
+    </div>
+    <p id="oauth-accounts" class="hint" style="margin:4px 0 0;"></p>
+  </section>
   <div id="conn-out" class="hint" style="margin-bottom:4px;"></div>
 
   <h2 class="sec">Essential for agents</h2>
@@ -68,6 +94,14 @@ const SERVICES = [
   keys: [['GMAIL_CLIENT_ID', 'Google Cloud → OAuth Desktop client'], ['GMAIL_CLIENT_SECRET', 'client secret (token minted by setup)']],
   steps: ['Google Cloud → OAuth client (Desktop) → put the id + secret below, Save, restart gateway.', 'Run once: <b>uv run python gmail_oauth_setup.py</b> in <b>llm_gatewayV9/</b> — writes <b>GMAIL_TOKEN</b> + refresh automatically.'],
   use: 'Read via <b>POST /v1/integrations/gmail/query</b>. Hourly expiry renews with the MCP <b>gmail_refresh_token()</b> tool.'},
+ {group: 'ess', name: 'zoho_mail', kind: 'channel + integration', blurb: 'Custom-domain email over Zoho REST + OAuth (free plan, India DC).',
+  keys: [['ZOHO_CLIENT_ID', 'Zoho API Console -> Server-based app'], ['ZOHO_CLIENT_SECRET', 'client secret (token minted by setup)'], ['ZOHO_DC', 'data centre: com | eu | in | com.au | jp | ca']],
+  steps: ['Zoho API Console -> <b>api-console.zoho.com</b> -> Server-based app -> redirect <b>http://localhost:8080</b> -> scopes <b>ZohoMail.accounts.READ + messages.READ + messages.CREATE</b> -> paste id + secret, Save, restart gateway.', 'Run once: <b>uv run python zoho_mail_oauth_setup.py</b> in <b>llm_gatewayV9/</b> - writes <b>ZOHO_TOKEN</b> + refresh automatically.'],
+  use: 'Send via <b>POST /v1/channels/zoho_mail/send</b>; read via <b>POST /v1/integrations/zoho_mail/query</b>. Hourly expiry renews with <b>zoho_mail_refresh_token()</b>.'},
+ {group: 'ess', name: 'ntfy', kind: 'channel', blurb: 'Free phone push with approve/deny buttons - zero setup (keyless).',
+  keys: [['NTFY_URL', 'optional self-host base (default ntfy.sh)'], ['NTFY_TOKEN', 'optional reserved-topic token']],
+  steps: ['Nothing required on hosted <b>ntfy.sh</b> - pick a topic name and it works.', 'Optional: self-host and set <b>NTFY_URL</b>; reserve a topic with <b>NTFY_TOKEN</b>.'],
+  use: 'Send via <b>POST /v1/channels/ntfy/send</b> with <b>to</b> = topic. Subscribe on your phone with the ntfy app.'},
  {group: 'ess', name: 'github', kind: 'integration', blurb: 'Repos, issues and code search for the coder skill.',
   keys: [['GITHUB_TOKEN', 'PAT with repo + read:org']],
   steps: ['github.com → Settings → Developer settings → <b>Personal access tokens</b> (repo, read:org) → copy.'],
@@ -140,8 +174,61 @@ const SERVICES = [
   keys: [['TWILIO_VOICE_FROM', 'voice-capable Twilio number'], ['VOICE_WS_URL', 'wss:// media endpoint you host']],
   steps: ['Twilio number with <b>Voice</b> capability (SID/AUTH shared with SMS).', 'Host a WebSocket media endpoint, or skip it: plain calls just speak <b>text</b> via TwiML &lt;Say&gt;.'],
   use: 'Create calls with spoken text; per-minute cost hint recorded.'},
+ {group: 'adv', name: 'zoho_cliq', kind: 'channel', blurb: 'Zoho Cliq team chat (Slack/Teams peer, free tier).',
+  keys: [['ZOHO_CLIQ_TOKEN', 'Cliq bot -> webhook token'], ['ZOHO_CLIQ_DC', 'data centre if not com']],
+  steps: ['Zoho Cliq -> create a <b>bot</b> (or use a channel webhook) -> copy its <b>webhook token</b>.', 'Set <b>ZOHO_CLIQ_TOKEN</b> (and <b>ZOHO_CLIQ_DC</b> if your org is on .in/.eu).'],
+  use: 'Send via <b>POST /v1/channels/zoho_cliq/send</b> with <b>to</b> = bot/channel unique name.'},
+ {group: 'adv', name: 'bluesky', kind: 'channel', blurb: 'Post to Bluesky (AT Protocol) - free, no app review.',
+  keys: [['BSKY_HANDLE', 'your handle, e.g. name.bsky.social'], ['BSKY_APP_PASSWORD', 'Settings -> App passwords']],
+  steps: ['<b>bsky.app</b> -> Settings -> <b>App passwords</b> -> create one -> use the handle + app password (not your login password).'],
+  use: 'Post via <b>POST /v1/channels/bluesky/send</b> (text only). <b>to</b> is unused for a top-level post.'},
+ {group: 'adv', name: 'mastodon', kind: 'channel', blurb: 'Post to any Mastodon instance (fediverse).',
+  keys: [['MASTODON_TOKEN', 'Preferences -> Development -> app token'], ['MASTODON_INSTANCE', 'your server, e.g. mastodon.social']],
+  steps: ['Your Mastodon instance -> <b>Preferences -> Development -> New application</b> (scope <b>write</b>) -> copy the token.', 'Set <b>MASTODON_INSTANCE</b> to the server host.'],
+  use: 'Post via <b>POST /v1/channels/mastodon/send</b> (text). <b>to</b> is unused.'},
+ {group: 'adv', name: 'google_chat', kind: 'channel', blurb: 'Post to a Google Chat space (Workspace, free).',
+  keys: [['GOOGLE_CHAT_WEBHOOK', 'space -> Apps & integrations -> Webhooks']],
+  steps: ['Google Chat space -> <b>Apps &amp; integrations -> Webhooks -> Add</b> -> name it -> copy the URL.', 'Paste the URL into <b>GOOGLE_CHAT_WEBHOOK</b>.'],
+  use: 'Post via <b>POST /v1/channels/google_chat/send</b> (text). The webhook is bound to one space; <b>to</b> is unused.'},
 ];
 let CONN_BUILT = false;
+/* Brand colours for the fallback tile when a favicon cannot be fetched. */
+const LOGO_BG = {
+  't.me': '#2AABEE', 'telegram.org': '#2AABEE',
+  'discord.com': '#5865F2',
+  'api.slack.com': '#4A154B', 'slack.com': '#4A154B',
+  'github.com': '#24292f',
+  'aistudio.google.com': '#4285F4', 'console.cloud.google.com': '#4285F4',
+  'notion.so': '#111111', 'www.notion.so': '#111111',
+  'console.twilio.com': '#F22F46',
+  'developers.facebook.com': '#0866FF', 'business.facebook.com': '#0866FF',
+  'portal.azure.com': '#0078D4',
+  'console.groq.com': '#F55036', 'cloud.cerebras.ai': '#F59E0B',
+  'ngc.nvidia.com': '#76B900', 'openrouter.ai': '#6467F2',
+  'app.tavily.com': '#0F766E', 'matrix.org': '#0DBD8B',
+  'signal.org': '#3A76F0', 'developers.line.biz': '#06C755',
+};
+function logoInk(hex) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substr(0, 2), 16), g = parseInt(h.substr(2, 2), 16), b = parseInt(h.substr(4, 2), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 150 ? '#111111' : '#ffffff';
+}
+/* Simple Icons slug per host — monochrome brand marks (white on the brand tile). */
+const LOGO_SLUG = {
+  't.me': 'telegram', 'telegram.org': 'telegram',
+  'discord.com': 'discord',
+  'api.slack.com': 'slack', 'slack.com': 'slack',
+  'github.com': 'github',
+  'aistudio.google.com': 'google', 'console.cloud.google.com': 'google',
+  'accounts.google.com': 'google',
+  'notion.so': 'notion', 'www.notion.so': 'notion',
+  'console.twilio.com': 'twilio',
+  'developers.facebook.com': 'meta', 'business.facebook.com': 'meta',
+  'portal.azure.com': 'microsoft',
+  'ngc.nvidia.com': 'nvidia',
+  'matrix.org': 'matrix', 'signal.org': 'signal',
+  'developers.line.biz': 'line',
+};
 async function loadConnections() {
   const out = document.getElementById('conn-out');
   let chans = [], svcs = [], keys = [];
@@ -159,7 +246,8 @@ async function loadConnections() {
   const svcByName = {};
   svcs.forEach((s) => { svcByName[s.service] = s; });
   const keySet = {};
-  keys.forEach((k) => { keySet[k.name] = k.set; });
+  const keyLink = {};
+  keys.forEach((k) => { keySet[k.name] = k.set; keyLink[k.name] = k.link || ''; });
   const essBox = document.getElementById('conn-essential');
   const advBox = document.getElementById('conn-advanced');
   essBox.innerHTML = ''; advBox.innerHTML = '';
@@ -183,10 +271,24 @@ async function loadConnections() {
       keysTotal++;
       const isSet = !!keySet[v];
       if (isSet) keysSet++;
+      const link = keyLink[v] || '';
+      let host = '';
+      try { host = link ? new URL(link).hostname : ''; } catch (e) { host = ''; }
+      const fav = host ? `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64` : '';
+      const slug = LOGO_SLUG[host] || '';
+      const icon = slug ? `/static/logos/${slug}.svg` : fav;
+      const letter = (v[0] || '?').toUpperCase();
+      const bg = LOGO_BG[host] || '#2a2f3a';
+      const ink = logoInk(bg);
+      const getLink = link
+        ? `<a class="keylink" href="${link}" target="_blank" rel="noopener" title="Open ${host || 'the provider page'} to get this key">` +
+          `<span class="logo" style="background:${bg};color:${ink}"><span class="mono">${letter}</span>${icon ? `<img src="${icon}" data-host="${host}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="if(!this.dataset.s1){this.dataset.s1='1';this.src='https://www.google.com/s2/favicons?domain='+encodeURIComponent(this.dataset.host)+'&sz=64'}else if(!this.dataset.s2){this.dataset.s2='1';this.src='https://icons.duckduckgo.com/ip3/'+encodeURIComponent(this.dataset.host)+'.ico'}else{this.remove()}"/>` : ''}</span>` +
+          `<span>get</span><span class="arrow">↗</span></a> `
+        : '';
       return `<tr><td class="prov" title="${hint}">${v}<div class="model">${hint}</div></td>` +
         `<td><span class="pill ${isSet ? 'ok' : 'err'}">${isSet ? 'set' : 'missing'}</span></td>` +
         `<td><input data-keyinput="${v}" type="password" placeholder="paste ${v}…" autocomplete="off" spellcheck="false" style="min-width:240px" /></td>` +
-        `<td><button class="ghost" onclick="saveConnKey('${v}')">Save</button></td></tr>`;
+        `<td>${getLink}<button class="ghost" onclick="saveConnKey('${v}')">Save</button></td></tr>`;
     }).join('');
     card.innerHTML =
       `<div class="card-head"><div><h2>${s.name} <span class="pill cap">${s.kind}</span> ` +
@@ -207,7 +309,58 @@ async function loadConnections() {
   document.getElementById('conn-keys').textContent = `${keysSet}/${keysTotal} keys set`;
   out.textContent = '';
   CONN_BUILT = true;
+  loadOAuthAccounts();
 }
+async function oauthStart(provider) {
+  const el = document.getElementById('oauth-status');
+  if (!el) return;
+  el.textContent = `starting ${provider}…`;
+  try {
+    const r = await fetch(`/v1/oauth/${provider}/start`, {method: 'POST'}).then((x) => x.json());
+    if (!r.ok) { el.textContent = r.error || 'failed to start'; return; }
+    window.open(r.url, '_blank');
+    el.textContent = 'waiting for authorization in the opened tab…';
+    const poll = setInterval(async () => {
+      let s;
+      try {
+        s = await fetch(`/v1/oauth/${provider}/status?flow_id=${encodeURIComponent(r.flow_id)}`).then((x) => x.json());
+      } catch (e) { return; }
+      if (s.done) {
+        clearInterval(poll);
+        el.textContent = s.ok
+          ? `${provider} connected ✓`
+          : `${provider} failed: ${s.error || 'unknown error'}`;
+      }
+    }, 2000);
+  } catch (e) { el.textContent = 'error: ' + e.message; }
+}
+
+async function oauthRefresh() {
+  const el = document.getElementById('oauth-status');
+  if (!el) return;
+  el.textContent = 'refreshing…';
+  try {
+    const r = await fetch('/v1/oauth/refresh', {method: 'POST'}).then((x) => x.json());
+    el.textContent = Object.entries(r)
+      .map(([k, v]) => `${k}: ${v && v.ok ? 'ok' : ((v && v.error) || 'fail')}`)
+      .join(' · ');
+  } catch (e) { el.textContent = 'error: ' + e.message; }
+}
+
+async function loadOAuthAccounts() {
+  const el = document.getElementById('oauth-accounts');
+  if (!el) return;
+  try {
+    const a = await fetch('/v1/oauth/accounts').then((r) => r.json());
+    const g = a.gmail || {}, c = a.calendar || {}, z = a.zoho_mail || {};
+    const parts = [];
+    parts.push(g.ok && g.email ? `Gmail: ${g.email}` : 'Gmail: not connected');
+    parts.push(c.ok ? 'Calendar: connected' : 'Calendar: not connected');
+    parts.push(z.ok && z.email ? `Zoho Mail: ${z.email}` : 'Zoho Mail: not connected');
+    el.textContent = parts.join('  ·  ');
+  } catch (e) { el.textContent = ''; }
+}
+
 async function saveConnKey(v) {
   const out = document.getElementById('conn-out');
   const inp = document.querySelector(`[data-keyinput="${v}"]`);

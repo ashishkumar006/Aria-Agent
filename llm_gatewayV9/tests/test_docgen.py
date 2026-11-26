@@ -133,7 +133,11 @@ def test_api_formats_and_schema_routes():
     app.include_router(router)
     c = TestClient(app)
     fmts = c.get("/v1/docgen/formats").json()
-    assert {f["id"] for f in fmts["formats"]} == {"pdf", "pptx", "docx", "xlsx"}
+    got = {f["id"] for f in fmts["formats"]}
+    # The four office/layout formats, plus the serialisations of the same block
+    # model added in docgen_markup (md/html/csv/json/epub).
+    assert {"pdf", "pptx", "docx", "xlsx"} <= got
+    assert {"md", "html", "csv", "json", "epub"} <= got
     sch = c.get("/v1/docgen/schema").json()
     assert "blocks" in sch["spec"]
 
@@ -192,3 +196,69 @@ def test_a_title_only_document_is_still_allowed():
 
     blob, _n, _ct = docgen.generate("pdf", {"title": "Cover only"})
     assert blob.startswith(b"%PDF-")
+
+def test_markup_formats_render_the_block_model():
+    """Markdown / HTML / CSV / JSON / EPUB are serialisations of the block
+    model (docgen_markup). They must round-trip the same spec without a layout
+    engine and produce their declared content type."""
+    import docgen
+    s = {
+        "title": "Fmt", "author": "A",
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "Intro"},
+            {"type": "paragraph", "text": "hello **world**"},
+            {"type": "table", "header": ["a", "b"], "rows": [["1", "2"]]},
+            {"type": "chart", "kind": "bar", "categories": ["x"],
+             "series": [{"name": "s", "data": [1]}]},
+        ],
+    }
+    data, name, ct = docgen.generate("md", s)
+    assert name.endswith(".md") and b"# Intro" in data and b"**world**" in data
+    data, name, ct = docgen.generate("html", s)
+    assert name.endswith(".html") and b"<h1>Intro</h1>" in data
+    data, name, ct = docgen.generate("csv", s)
+    assert name.endswith(".csv") and b"a,b" in data
+    data, name, ct = docgen.generate("json", s)
+    assert name.endswith(".json") and b"Content" not in data
+    data, name, ct = docgen.generate("epub", s)
+    import io, zipfile
+    z = zipfile.ZipFile(io.BytesIO(data))
+    assert z.read("mimetype") == b"application/epub+zip"
+    assert "OEBPS/content.opf" in z.namelist()
+
+
+def test_odf_and_typst_formats_render():
+    """ODT/ODS (odfpy) and Typst (bundled compiler) serialise the block model."""
+    import io, zipfile
+    import docgen
+    s = {"title": "Odf", "blocks": [
+        {"type": "heading", "level": 1, "text": "Intro"},
+        {"type": "paragraph", "text": "body"},
+        {"type": "table", "header": ["a", "b"], "rows": [["1", "2"]]},
+    ]}
+    data, name, ct = docgen.generate("odt", s)
+    assert name.endswith(".odt")
+    assert zipfile.is_zipfile(io.BytesIO(data))
+    assert "mimetype" in zipfile.ZipFile(io.BytesIO(data)).namelist()
+    data, name, ct = docgen.generate("ods", s)
+    assert name.endswith(".ods") and zipfile.is_zipfile(io.BytesIO(data))
+    data, name, ct = docgen.generate("typst", s)
+    assert name.endswith(".pdf") and data.startswith(b"%PDF")
+    data, name, ct = docgen.generate("typst", dict(s, slide=True))
+    assert name.endswith(".typst.pdf") and data.startswith(b"%PDF")
+
+
+def test_image_block_accepts_inlined_base64_bytes():
+    """An image block with base64 `data` (how the agent passes an `art:` handle
+    or a sandbox path, which the gateway process cannot read) must normalise to
+    raw bytes, not be dropped."""
+    import base64
+    import docgen
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+    out = docgen._norm_blocks(
+        [{"type": "image", "data": base64.b64encode(png).decode(), "ext": "png",
+          "caption": "a plot"}])
+    assert len(out) == 1
+    assert out[0]["type"] == "image"
+    assert isinstance(out[0]["data"], (bytes, bytearray)) and out[0]["data"]

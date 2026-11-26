@@ -2,7 +2,7 @@ import {
   useCallback, useEffect, useMemo, useRef, useState, type FormEvent,
 } from 'react';
 import {
-  Download, Eye, FileText, Folder, FolderPlus, Pencil, Plus,
+  ChevronDown, ChevronRight, Download, Eye, FileText, Folder, FolderPlus, Pencil, Plus,
   RefreshCw, Search, Trash2, Upload,
 } from 'lucide-react';
 import { Rail, TopBar, Empty, Stat, Pill, Skel, SkipLink } from '../components/ui';
@@ -22,7 +22,7 @@ const STATUS_TONE: Record<string, 'ok' | 'err' | 'warn' | 'info' | 'muted'> = {
   embedding: 'info', chunking: 'info', parsing: 'info', pending: 'muted',
 };
 
-const ACCEPT = '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm,.png,.jpg,.jpeg';
+const ACCEPT = '.pdf,.docx,.md,.markdown,.txt,.text,.log,.html,.htm,.csv,.tsv,.xlsx,.xlsm,.pptx,.png,.jpg,.jpeg';
 const MB = (n: number) => (n > 1048576 ? `${(n / 1048576).toFixed(1)} MB`
   : n > 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
@@ -55,6 +55,8 @@ export default function Documents() {
   const [editingFolder, setEditingFolder] = useState('');
   const [editingName, setEditingName] = useState('');
   const [folderErr, setFolderErr] = useState('');
+  /** Folders the user has collapsed (VS Code-style). */
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [folderBusy, setFolderBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const reqRef = useRef(0);
@@ -465,6 +467,16 @@ export default function Documents() {
           {folderNodes.map((f) => {
             const count = folderCounts.get(f.id) || 0;
             const selected = folderSel === f.id;
+            const hasChildren = folderNodes.some((x) => x.parent_id === f.id);
+            // Hide a folder when any ancestor is collapsed (VS Code-style).
+            let hidden = false;
+            let anc = f.parent_id;
+            while (anc) {
+              if (collapsed.has(anc)) { hidden = true; break; }
+              anc = folderNodes.find((x) => x.id === anc)?.parent_id || '';
+            }
+            if (hidden) return null;
+            const isCollapsed = collapsed.has(f.id);
             return (
               <div key={f.id} style={{ paddingLeft: 6 + f.depth * 12 }}
                    className={`group flex items-center rounded-md ${selected ? 'bg-violet-400/10 text-violet-100' : 'text-zinc-300 hover:bg-white/5'}`}>
@@ -481,6 +493,18 @@ export default function Documents() {
                   </form>
                 ) : (
                   <>
+                    {hasChildren ? (
+                      <button type="button"
+                              onClick={() => setCollapsed((s) => {
+                                const n = new Set(s);
+                                if (n.has(f.id)) n.delete(f.id); else n.add(f.id);
+                                return n;
+                              })}
+                              aria-label={isCollapsed ? `Expand ${f.path}` : `Collapse ${f.path}`}
+                              className="flex h-5 w-4 flex-none items-center justify-center text-zinc-500 hover:text-zinc-200">
+                        {isCollapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+                      </button>
+                    ) : <span className="w-4 flex-none" />}
                     <button
                       onClick={() => setFolderSel(f.id)}
                       aria-pressed={selected}
@@ -581,8 +605,8 @@ export default function Documents() {
               <Upload size={14} /> {uploading ? 'uploading…' : 'Upload documents'}
             </button>
             <p className="mt-2 text-[11px] leading-snug text-zinc-muted">
-              Drop files here or choose. PDF, DOCX, Markdown, text, HTML, CSV,
-              Excel and PNG/JPG images, up to 25 MB. A document is switched on
+              Drop files here or choose. PDF, DOCX, PowerPoint, Markdown, text,
+              HTML, CSV, Excel and PNG/JPG images, up to 25 MB. A document is switched on
               for agent search as soon as it finishes indexing — switch it off
               here if it should not answer. An image holds no search text: it is
               there for the author to place in a document as a figure.
@@ -679,6 +703,11 @@ export default function Documents() {
                         <span className="text-[11px] text-zinc-muted">
                           {d.doc_type} · {MB(d.size_bytes)} · {d.chunk_count} chunk{d.chunk_count === 1 ? '' : 's'}
                         </span>
+                        <code
+                          className="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] text-zinc-400"
+                          title={'Document id — pass this to the agent to refer to this file (e.g. read doc-… or email doc-…)'}>
+                          {d.id}
+                        </code>
                       </div>
                       {/* Progress is only meaningful while indexing. */}
                       {['parsing', 'chunking', 'embedding'].includes(d.status) && d.chunk_count > 0 && (

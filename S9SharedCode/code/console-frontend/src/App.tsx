@@ -26,9 +26,11 @@ const Mission = lazy(() => import('./views/Mission'));
 const Settings = lazy(() => import('./views/Settings'));
 const Code = lazy(() => import('./views/Code'));
 const Authoring = lazy(() => import('./views/Authoring'));
+const Architecture = lazy(() => import('./views/Architecture'));
 const Parts = lazy(() => import('./views/Parts'));
 const Computer = lazy(() => import('./views/Computer'));
 const Studio = lazy(() => import('./views/studio/Studio'));
+const ModelLab = lazy(() => import('./views/ModelLab'));
 
 /* Warm the split chunks shortly after first paint so that only the very
    first section can suspend; afterwards every hop is served from the module
@@ -148,7 +150,9 @@ export const SECTIONS = [
   { id: '/settings', render: () => <Settings /> },
   { id: '/code', render: () => <Code /> },
   { id: '/studio', render: () => <Studio /> },
+  { id: '/model-lab', render: () => <ModelLab /> },
   { id: '/authoring', render: () => <Authoring /> },
+  { id: '/architecture', render: () => <Architecture /> },
   { id: '/parts', render: () => <Parts /> },
   { id: '/computer', render: () => <Computer /> },
 ] as const;

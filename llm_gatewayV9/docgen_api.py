@@ -30,6 +30,14 @@ FORMATS = {
     "pptx": "PowerPoint deck — title slide + one section per block group",
     "docx": "Word document",
     "xlsx": "Excel workbook — one sheet per table",
+    "md": "Markdown — the block model as a .md file",
+    "html": "HTML — a standalone, styled page",
+    "csv": "CSV — one table per file (or section/text rows when there are no tables)",
+    "json": "JSON — the full spec as structured data",
+    "epub": "EPUB 3 e-book — chapters split on level-1 headings",
+    "odt": "OpenDocument text (LibreOffice Writer)",
+    "ods": "OpenDocument spreadsheet (LibreOffice Calc)",
+    "typst": "PDF typeset by Typst (set `slide: true` for a 16:9 deck)",
 }
 
 
@@ -125,9 +133,13 @@ async def docgen_preview(request: Request):
         if not fmt:
             fmt = _artifact_format(art)
     try:
-        out = _preview.render_preview(fmt, blob, spec,
-                                      body.get("max_pages") or
-                                      _preview.MAX_PREVIEW_PAGES)
+        # Same reason as /v1/docgen: a preview of a LaTeX spec may compile, and
+        # of a deck rasterises every slide. Either can take seconds; neither
+        # belongs on the event loop.
+        import asyncio as _aio
+        out = await _aio.to_thread(
+            _preview.render_preview, fmt, blob, spec,
+            body.get("max_pages") or _preview.MAX_PREVIEW_PAGES)
     except _preview.ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)[:200]})
     except Exception as e:
@@ -184,7 +196,15 @@ async def docgen_create(request: Request):
         return JSONResponse(status_code=400, content={
             "error": "nothing to render: send a `spec` with a title or blocks"})
     try:
-        data, name, ctype = docgen.generate(str(fmt), spec)
+        # NOT called inline: a LaTeX compile shells out to tectonic and can run
+        # for a minute, and this handler is async. Running it on the event loop
+        # froze EVERY other route for the duration - measured live, the agent's
+        # own tool call to /v1/documents timed out and the author node died with
+        # a 502 while the gateway was busy typesetting. A render is exactly the
+        # kind of work a thread is for.
+        import asyncio as _aio
+        data, name, ctype = await _aio.to_thread(
+            docgen.generate, str(fmt), spec)
     except docgen.DocGenError as e:
         return JSONResponse(status_code=400, content={"error": str(e)[:300]})
     except ImportError as e:

@@ -42,11 +42,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 
 # The MCP transport is JSON-RPC over stdio, and tool results routinely
@@ -67,6 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import code_intel as _code_intel
+import code_index as _code_index
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -1569,10 +1572,11 @@ def fetch_image(url: str, credit: str = "", filename: str = "") -> dict:
     block = {"type": "image", "document": doc_id, "page": 1, "index": 0,
              "caption": str(credit or "")[:300]}
     return {"ok": True, "document": doc_id, "page": 1, "index": 0,
-            "filename": name, "bytes": len(blob), "block": block,
+            "url": src, "filename": name, "bytes": len(blob), "block": block,
             "note": "Filed in the user's Documents under Images. Use `block` in "
                    "the `image` block of render_document as-is; put the creator "
-                   "and licence in the caption."}
+                   "and licence in the caption. To show the picture in a chat "
+                   "answer, pass `url` downstream as a direct image link."}
 
 
 @mcp.tool()
@@ -1668,15 +1672,95 @@ def delete_file(path: str) -> dict:
     return {"ok": True, "path": path, "deleted": "file"}
 
 
+def _rg_search(pattern: str, root: Path, glob: str, ignore_case: bool,
+               ctx: int, n: int) -> dict | None:
+    """ripgrep fast path. Returns the same shape as the Python walk, or None
+    when rg is absent/misbehaves so the caller falls back. rg respects .gitignore
+    and skips binaries natively, which is both faster and quieter than the walk."""
+    import shutil as _sh
+    import subprocess as _sp
+    exe = _sh.which("rg")
+    if not exe:
+        return None
+    argv = [exe, "--json", "--no-messages", "-n", "--no-ignore"]
+    # The sandbox is already confined; the repo .gitignore often ignores the
+    # workspace (state/), which would make rg skip everything. Search all files
+    # but exclude vendored/build dirs, matching the Python walk.
+    for excl in ("!.git", "!node_modules", "!__pycache__", "!dist", "!build"):
+        argv += ["-g", excl]
+    if ignore_case:
+        argv.append("-i")
+    if glob:
+        argv += ["-g", glob]
+    if ctx:
+        argv += ["-C", str(ctx)]
+    argv += ["--", pattern, str(root)]
+    try:
+        proc = _sp.run(argv, capture_output=True, text=True, timeout=60,
+                       stdin=_sp.DEVNULL)
+    except Exception:
+        return None
+    if proc.returncode not in (0, 1):   # 1 = no matches, still valid
+        return None
+    hits = []
+    files = set()
+    # The agent-facing contract for files_scanned is "how much of the tree was
+    # examined" — the Python fallback counts files it READ, which is the only
+    # honest signal of coverage. rg cannot report examined files from its
+    # JSON output, so enumerate the tree the same way (metadata only, capped
+    # the same way) rather than reporting files-with-hits, which understated
+    # the search exactly when it found nothing.
+    files_scanned = 0
+    for _ in _walk_files(root):
+        files_scanned += 1
+        if files_scanned >= 2000:
+            break
+    pending_ctx: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        t = ev.get("type")
+        d = ev.get("data") or {}
+        if t == "context":
+            pending_ctx.append(d.get("lines", {}).get("text", "").rstrip("\n"))
+            continue
+        if t != "match":
+            continue
+        path = d.get("path", {}).get("text", "")
+        try:
+            rel = str(Path(path).relative_to(_safe(".")))
+        except ValueError:
+            rel = path
+        ln = d.get("line_number", 0)
+        text = d.get("lines", {}).get("text", "").rstrip("\n")
+        hit = {"file": rel, "line": ln, "text": text.strip()[:300]}
+        if ctx:
+            hit["before"] = [l.strip()[:200] for l in pending_ctx[-ctx:]]
+            hit["after"] = []
+        hits.append(hit)
+        files.add(rel)
+        pending_ctx = []
+        if len(hits) >= n:
+            break
+    return {"pattern": pattern, "hits": hits, "n_hits": len(hits),
+            "files_scanned": files_scanned, "truncated": len(hits) >= n,
+            "engine": "ripgrep"}
+
+
 @mcp.tool()
 def search_files(pattern: str, path: str = ".", max_hits: int = 20,
-                 include: str = "", ignore_case: bool = False) -> dict:
+                 include: str = "", ignore_case: bool = False,
+                 context: int = 0) -> dict:
     """Regex-search file contents inside the sandbox (this is the grep).
 
     Skips binary files; caps hits. `include` is an fnmatch glob to scope the
     search to matching files, e.g. "*.py" or "*test*"; empty means every file.
-    `ignore_case` makes the match case-insensitive. Example:
-    search_files("def fetch_", ".", 10, "*.py")."""
+    `ignore_case` makes the match case-insensitive. `context` adds N lines of
+    before/after around each hit (like grep -C). Each hit carries `file`,
+    `line` (1-based), `text`, and `before`/`after` line arrays when context>0.
+    Example: search_files("def fetch_", ".", 10, "*.py", context=2)."""
     import re as _re
     import fnmatch as _fnmatch
     try:
@@ -1687,10 +1771,17 @@ def search_files(pattern: str, path: str = ".", max_hits: int = 20,
         n = max(1, min(int(max_hits or 20), 100))
     except (TypeError, ValueError):
         n = 20
+    try:
+        ctx = max(0, min(int(context or 0), 10))
+    except (TypeError, ValueError):
+        ctx = 0
     root = _safe(path)
     if not root.exists():
         raise ValueError(f"Path '{path}' does not exist")
     glob = str(include or "").strip()
+    rg = _rg_search(pattern, root, glob, ignore_case, ctx, n)
+    if rg is not None:
+        return rg
     hits = []
     files_scanned = 0
     # One resilient walk (see _walk_files): a bad link under a vendored dir
@@ -1715,14 +1806,18 @@ def search_files(pattern: str, path: str = ".", max_hits: int = 20,
         except (UnicodeDecodeError, OSError):
             continue  # binary or unreadable — skip, don't fail
         files_scanned += 1
-        for i, line in enumerate(text.splitlines(), 1):
+        flines = text.splitlines()
+        for i, line in enumerate(flines, 1):
             if rx.search(line):
                 try:
                     rel = str(f.relative_to(_safe(".")))
                 except ValueError:
                     rel = f.name
-                hits.append({"file": rel, "line": i,
-                             "text": line.strip()[:300]})
+                hit = {"file": rel, "line": i, "text": line.strip()[:300]}
+                if ctx:
+                    hit["before"] = [l.strip()[:200] for l in flines[max(0, i - 1 - ctx):i - 1]]
+                    hit["after"] = [l.strip()[:200] for l in flines[i:i + ctx]]
+                hits.append(hit)
                 if len(hits) >= n:
                     break
     return {"pattern": pattern, "hits": hits, "n_hits": len(hits),
@@ -1877,16 +1972,19 @@ def read_artifact(artifact_id: str, offset: int = 0,
 
 
 @mcp.tool()
-def read_file(path: str, offset: int = 1, limit: int = 0) -> dict:
+def read_file(path: str, offset: int = 1, limit: int = 0,
+              start_line: int = 0, end_line: int = 0) -> dict:
     """Read a UTF-8 text file from the sandbox, optionally a line range.
 
-    `offset` is the first line (1-based); `limit` is how many lines, 0 meaning
-    "to the end". A large file is capped and the result says so via
-    `truncated` / `next_offset`, so page with `read_file(path, next_offset)`
-    instead of re-reading the same head. `line_count` is the whole file's
-    length, so you can jump straight to a line you saw in a search hit.
+    Prefer `start_line`/`end_line` (1-based, inclusive): read_file("t.py",
+    start_line=30, end_line=40). `offset`/`limit` still work (offset=first line,
+    limit=count, 0=to end). The result carries `content` (raw, for exact-string
+    edits) AND `numbered` (each line prefixed "N: ") so you can cite exact lines
+    and target `edit_file`. `line_count` is the whole file's length; a large
+    selection is capped with `truncated`/`next_offset` so page rather than
+    re-read the same head.
 
-    Example: read_file("agent_server.py", 3920, 20).
+    Example: read_file("agent_server.py", start_line=3920, end_line=3940).
     """
     p = _safe(path)
     if _is_secret_file(p.name):
@@ -1898,16 +1996,20 @@ def read_file(path: str, offset: int = 1, limit: int = 0) -> dict:
     # 1-based, clamped. A model that has just seen "line 3929" should be able to
     # ask for it and get it, however large the file is.
     try:
-        off = int(offset) if offset else 1
+        off = int(start_line) if start_line else (int(offset) if offset else 1)
     except (TypeError, ValueError):
         off = 1
     try:
-        lim = int(limit) if limit else 0
+        if end_line:
+            lim = max(0, int(end_line) - off + 1)
+        else:
+            lim = int(limit) if limit else 0
     except (TypeError, ValueError):
         lim = 0
     start = max(0, min(off - 1, total))
     sel = lines[start:] if lim <= 0 else lines[start:start + max(0, lim)]
     text = "".join(sel)
+    numbered = "".join(f"{start + 1 + i}:{ln}" for i, ln in enumerate(sel))
     truncated = False
     if len(text) > _READ_FILE_MAX_CHARS:
         # Cut on a line boundary: a half-line would misreport line numbers and
@@ -1927,6 +2029,7 @@ def read_file(path: str, offset: int = 1, limit: int = 0) -> dict:
         "truncated": truncated,
         "next_offset": (end_line + 1) if truncated else None,
         "content": text,
+        "numbered": numbered,
         "encoding": "utf-8",
     }
 
@@ -2034,6 +2137,31 @@ def _audit_exec(entry: dict) -> None:
         pass
 
 
+def _posix_orientation(command: str) -> str:
+    """A model trained on POSIX shells reaches for `ls -la`/`pwd`/`cat` here,
+    but this sandbox runs Windows PowerShell: those return empty or garbage
+    "success", the model reads that as "didn't work" and retries until the
+    repeat guard kills the run. Return an actionable refusal instead so the
+    model switches to the file tools rather than looping on a dead shell."""
+    head = command.split()[0].lower() if command.split() else ""
+    if head == "cd" or "/workspace" in command:
+        return ("the current directory IS already your workspace; there is no "
+                "/workspace or other root to discover or cd into. Use relative "
+                "paths. Use list_dir('.') to look and create_file/edit_file to "
+                "write; do not spend calls on shell orientation.")
+    if head in {"pwd", "ls", "cat", "head", "tail", "grep", "find", "tree",
+                "which", "whoami", "sed", "awk"}:
+        return (f"'{head}' is a POSIX command; this sandbox runs Windows "
+                "PowerShell and it will not work here. Use list_dir(path) to "
+                "list, read_file(path) to read, search_files(...) to search, "
+                "and create_file/edit_file to write. Reserve run_command for "
+                "running programs and tests (e.g. python -m pytest -q).")
+    if head in {"echo", "printf"} and ">" in command:
+        return ("do not create files with shell redirection; use create_file "
+                "(or edit_file) so the change is reviewable.")
+    return ""
+
+
 def _refuse_command(command: str, root: Path) -> str:
     """Return a refusal reason, or '' when the command may run."""
     for rx, why in _DANGEROUS_COMMANDS:
@@ -2057,8 +2185,25 @@ def _refuse_command(command: str, root: Path) -> str:
 #: those keys; drop credential-shaped names and this app's own ARIA_* config.
 #: The scrub lives in sandbox.py so run_command gets exactly the same one.
 def _check_env() -> dict:
-    """A scrubbed environment for the project's own commands."""
-    return _sandbox.clean_env()
+    """A scrubbed environment for the project's own commands.
+
+    Every cache a real tool would write into the project is redirected first.
+    A verification step should leave no trace beyond its own output: those
+    directories then show up in the Explorer, in `git status`, and in the next
+    diff the agent reads — and a project that grows a `.ruff_cache/` every time
+    someone runs the checks is a project people stop running checks in.
+    """
+    env = _sandbox.clean_env()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Forward slashes: a Windows path with backslashes inside `-o cache_dir=`
+    # is split by the shell, and pytest then creates a directory literally
+    # named `UsersAISHWA~1AppDataLocalTemparia-check-cachepytest` inside the
+    # project — the exact litter this was meant to prevent.
+    cache = (Path(tempfile.gettempdir()) / "aria-check-cache").as_posix()
+    env["RUFF_CACHE_DIR"] = cache
+    env["MYPY_CACHE_DIR"] = cache
+    env["PYTEST_ADDOPTS"] = f"-o cache_dir={cache}/pytest"
+    return env
 
 # Detected from what the project actually contains, not from a language guess.
 # Each entry: (marker file, resolved executable name, argv AFTER that exe).
@@ -2069,10 +2214,13 @@ def _check_env() -> dict:
 # `pytest -m pytest` - a MARKER filter. It matched nothing and exited 5, which
 # read as "tests failed" rather than "you invoked me wrongly".
 _CHECK_PROFILES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("pyproject.toml", "pytest", ("-q", "--no-header")),
-    ("pytest.ini", "pytest", ("-q", "--no-header")),
-    ("setup.cfg", "pytest", ("-q", "--no-header")),
-    ("tox.ini", "pytest", ("-q", "--no-header")),
+    # `-p no:cacheprovider`: pytest's cache dir is written into the project, so
+    # merely RUNNING the checks adds `.pytest_cache/` to someone's repo — visible
+    # in the Explorer, in git status, and in the next diff the agent reads.
+    ("pyproject.toml", "pytest", ("-q", "--no-header", "-p", "no:cacheprovider")),
+    ("pytest.ini", "pytest", ("-q", "--no-header", "-p", "no:cacheprovider")),
+    ("setup.cfg", "pytest", ("-q", "--no-header", "-p", "no:cacheprovider")),
+    ("tox.ini", "pytest", ("-q", "--no-header", "-p", "no:cacheprovider")),
     ("package.json", "npm", ("test", "--silent")),
     ("tsconfig.json", "tsc", ("--noEmit",)),
     ("ruff.toml", "ruff", ("check", "--no-cache")),
@@ -2080,6 +2228,79 @@ _CHECK_PROFILES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("Cargo.toml", "cargo", ("check", "--quiet")),
     ("go.mod", "go", ("vet", "./...")),
 )
+# The fallback: no config file at all, but the folder holds Python tests. An
+# empty project that already has `test_*.py` files HAS a checker — pytest — and
+# answering "no checker detected" sends the agent off to invent a command, or
+# worse, to conclude there is nothing to run. `tests/` alone is not enough: a
+# package directory with no tests in it is not a suite.
+_PY_TEST_GLOBS = ("test_*.py", "*_test.py")
+_PY_TEST_DIRS = ("tests", "test")
+
+
+def detect_checks(root) -> list[dict]:
+    """Which check commands apply to this folder, and whether they can run.
+
+    One function for both surfaces on purpose: the editor's `run_checks` and the
+    agent's `run_checks` used to keep their own copy of this list, which is how
+    a panel could report green while the agent reported failure.
+
+    Markers are deduped by the command they produce, so a project carrying both
+    pyproject.toml and pytest.ini runs pytest ONCE instead of twice.
+    """
+    import shutil
+
+    root = Path(root)
+    found: list[dict] = []
+    seen: set[str] = set()
+    for marker, tool, args in _CHECK_PROFILES:
+        if not (root / marker).exists():
+            continue
+        argv_key = f"{tool} {args}"
+        if argv_key in seen:
+            continue
+        seen.add(argv_key)
+        exe = shutil.which(tool)
+        if not exe:
+            # A marker exists but the tool is not installed. Say so rather than
+            # reporting "no checks configured" and implying it passed.
+            found.append({"marker": marker, "tool": tool, "available": False})
+            continue
+        found.append({"marker": marker, "tool": tool, "available": True,
+                      "argv": [exe, *args]})
+    if found:
+        return found
+
+    # No marker file: look for tests themselves, at any depth. A suite in
+    # `app/tests/` is still a suite, and answering "no checker" there sends the
+    # agent off to invent a command (or to conclude there is nothing to run).
+    hit = _find_test_file(root)
+    if hit is not None:
+        exe = shutil.which("pytest")
+        if exe:
+            return [{"marker": hit, "tool": "pytest", "available": True,
+                     "argv": [exe, "-q", "--no-header", "-p", "no:cacheprovider"]}]
+        return [{"marker": hit, "tool": "pytest", "available": False}]
+    return []
+
+
+def _find_test_file(root, *, max_files: int = 20000) -> str | None:
+    """A pytest-looking file anywhere under root, as a root-relative path.
+
+    Bounded and pruned: this only runs when no marker matched, but a repository
+    can still be enormous, and `_find` must never become the slow path it was
+    added to avoid.
+    """
+    root = Path(root)
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in _VENDOR_DIRS]
+        for name in filenames:
+            seen += 1
+            if seen > max_files:
+                return None
+            if any(fnmatch.fnmatch(name, pat) for pat in _PY_TEST_GLOBS):
+                return (Path(dirpath) / name).relative_to(root).as_posix()
+    return None
 
 
 @mcp.tool()
@@ -2115,24 +2336,15 @@ def run_checks(path: str = ".", timeout: int = 0) -> dict:
     to = int(timeout) if timeout else _CHECK_TIMEOUT_S
     to = max(10, min(int(to), 900))
 
-    found: list[dict] = []
-    for marker, tool, args in _CHECK_PROFILES:
-        if not (root / marker).exists():
-            continue
-        exe = shutil.which(tool)
-        if not exe:
-            # A marker exists but the tool is not installed. Say so rather
-            # than reporting "no checks configured" and implying it passed.
-            found.append({"marker": marker, "tool": tool, "available": False})
-            continue
-        found.append({"marker": marker, "tool": tool, "available": True,
-                      "argv": [exe, *args]})
+    found = detect_checks(root)
     if not found:
         return {"ok": False,
-                "error": "no checker detected: this project has none of "
-                         "pyproject.toml, pytest.ini, setup.cfg, tox.ini, "
-                         "package.json, tsconfig.json, ruff.toml, "
-                         "Cargo.toml or go.mod",
+                "error": "no checker detected: this project has no marker file "
+                         "(pyproject.toml, pytest.ini, setup.cfg, tox.ini, "
+                         "package.json, tsconfig.json, ruff.toml, Cargo.toml, "
+                         "go.mod) and no test_*.py / *_test.py files. Add a "
+                         "test file or a config, or run the command yourself "
+                         "with run_command",
                 "path": path}
 
     results = []
@@ -2228,6 +2440,11 @@ def run_command(command: str, cwd: str = ".", timeout: int = 0) -> dict:
         _audit_exec({**audit, "refused": refusal, "ok": False})
         return {"ok": False, "refused": True, "error": refusal,
                 "command": command[:2000], "cwd": cwd}
+    posix = _posix_orientation(command)
+    if posix:
+        _audit_exec({**audit, "refused": posix, "ok": False})
+        return {"ok": False, "error": posix, "command": command[:2000],
+                "cwd": cwd}
 
     # -EncodedCommand takes base64 UTF-16LE, which sidesteps every quoting
     # problem an arbitrary PowerShell snippet would otherwise create. The
@@ -2430,6 +2647,82 @@ def find_symbol(name: str, path: str = ".", max_hits: int = 40) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _project_map(root=None) -> dict | None:
+    """The project map, built or refreshed on demand.
+
+    Always the WHOLE workspace, never the subfolder a call happened to name:
+    an index of ``src/`` alone would answer "no references" for a caller in
+    ``tests/``, which is the exact wrong answer this exists to prevent.
+
+    Returns None when it cannot be built, so every caller has a fallback rather
+    than a failure: the tools that use it are faster with a map and unchanged
+    without one.
+    """
+    try:
+        got = _code_index.refresh(Path(root or _safe(".")))
+        files = got.get("index", {}).get("files") or {}
+        return got["index"] if files else None
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def project_map(what: str = "summary", path: str = ".", name: str = "") -> dict:
+    """The map of the project's code, so you navigate it instead of guessing.
+
+    `what`:
+      - "summary": the folder overview (which directories hold what) plus the
+        files worth reading first in a project you have not seen.
+      - "file": one file's classes, functions with line numbers, and imports.
+      - "refs": every use of a symbol, declarations marked.
+      - "blast": what changing a symbol would touch, ranked.
+
+    Built from Python's `ast` where it can be exact and a conservative scan
+    elsewhere; refreshed from file fingerprints, so it is current. Prefer this
+    to listing directories when you need to know what a project contains, and
+    prefer "refs"/"blast" to a text search when you need to know what a change
+    would break.
+
+    Example: project_map("summary", ".")
+    Example: project_map("file", "src/app.py")
+    Example: project_map("refs", ".", "load_config")"""
+    root = _safe(path or ".")
+    if not root.is_dir():
+        return {"ok": False, "error": f"'{path}' is not a directory"}
+    try:
+        got = _code_index.refresh(_safe("."))
+        index = got["index"]
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    action = (what or "summary").strip().lower()
+    files = index.get("files") or {}
+    if action in ("file", "symbols"):
+        rel = (name or "").replace("\\", "/").lstrip("./")
+        entry = files.get(rel)
+        if entry is None:
+            return {"ok": False, "error": f"no such file in the map: {name}",
+                    "indexed": len(files)}
+        return {"ok": True, "path": rel, "indexed": len(files),
+                "symbols": entry}
+    if action in ("refs", "references"):
+        if not name:
+            return {"ok": False, "error": "name is required"}
+        return {"ok": True, **_code_index.find_references(index, name)}
+    if action == "blast":
+        if not name:
+            return {"ok": False, "error": "name is required"}
+        return {"ok": True, **_code_index.blast_radius(index, name)}
+
+    return {
+        "ok": True,
+        "indexed": len(files),
+        "tree": _code_index.tree(index),
+        "entry_points": _code_index.entry_points(index),
+        "note": "summary only - ask again with what='file'|'refs'|'blast'",
+    }
+
+
 @mcp.tool()
 def document_symbols(path: str) -> dict:
     """The file's outline: classes, functions, methods and constants.
@@ -2449,6 +2742,104 @@ def document_symbols(path: str) -> dict:
 
 
 @mcp.tool()
+def studio_coder(task: str, paths: list | None = None,
+                 session: str = "", read_only: bool = False) -> dict:
+    """Delegate a coding task to the Studio coding agent.
+
+    This is the FULL code agent that reads, edits and runs the project's OWN
+    checks on the session's REAL project roots — NOT the throwaway sandbox the
+    `coder` skill's file tools write into. Use it when the goal is to change the
+    user's actual codebase: it plans, edits files, runs the project's checks and
+    iterates until done, then reports a receipt (the files it wrote, the check
+    result and its final summary). Edits are auto-approved inside the session
+    roots and checkpointed, so they are revertible.
+
+    `session` names the Studio session whose project to work in; leave it empty
+    to use the most recently active session that has a project open. `paths` are
+    extra files to attach as context. `read_only=True` investigates without
+    editing.
+
+    Example: studio_coder("Add a --version flag to the CLI and a test for it")
+    """
+    import os as _os
+    import json as _json
+    base = (_os.environ.get("ARIA_AGENT_URL") or "http://127.0.0.1:8500").rstrip("/")
+    tok = (_os.environ.get("ARIA_API_TOKEN") or "").strip()
+    if not tok:
+        try:
+            tok = (Path(__file__).resolve().parent / "state" / "agent.token"
+                   ).read_text(encoding="utf-8").strip()
+        except Exception:                          # noqa: BLE001
+            tok = ""
+    headers = {"Content-Type": "application/json"}
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+        headers["X-Aria-Token"] = tok
+    # Resolve the target session: explicit wins; else the most recently active
+    # session that actually has a project (roots) open. The DAG chat carries a
+    # conversation id, not a studio sid, so without this the coder would fall
+    # back to the empty process default and edit nothing the user recognises.
+    sid = (session or "").strip()
+    if not sid:
+        try:
+            import studio_workspace as _sw
+            for row in _sw.sessions():
+                if row.get("archived"):
+                    continue
+                if int(row.get("roots") or 0) > 0:
+                    sid = str(row.get("sid") or "")
+                    break
+        except Exception:                          # noqa: BLE001
+            sid = ""
+    if not sid:
+        return {"ok": False, "session": "",
+                "error": "no Studio session with a project is open; "
+                         "pass `session` (the sid) explicitly"}
+    payload: dict = {"question": task, "sid": sid,
+                     "auto_approve": True, "read_only": bool(read_only)}
+    if paths:
+        payload["paths"] = [str(p) for p in paths][:6]
+    writes: list[dict] = []
+    errors: list[str] = []
+    answer = ""
+    tool_calls = 0
+    try:
+        import httpx as _h
+        with _h.Client(timeout=_h.Timeout(900.0, connect=10.0)) as c:
+            with c.stream("POST", base + "/api/code/agent",
+                          json=payload, headers=headers) as r:
+                if r.status_code != 200:
+                    detail = r.read().decode("utf-8", "replace")[:300]
+                    return {"ok": False, "session": sid,
+                            "error": f"code agent HTTP {r.status_code}: {detail}"}
+                for line in r.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    try:
+                        ev = _json.loads(line[5:].strip())
+                    except Exception:              # noqa: BLE001
+                        continue
+                    kind = ev.get("type")
+                    if kind == "write":
+                        writes.append({"path": ev.get("path") or "",
+                                       "tool": ev.get("tool") or "",
+                                       "summary": ev.get("summary") or ""})
+                    elif kind == "error":
+                        errors.append(str(ev.get("text") or "")[:300])
+                    elif kind == "done":
+                        answer = str(ev.get("answer") or "")
+                        tool_calls = int(ev.get("tool_calls") or 0)
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "session": sid,
+                "error": f"studio coder failed: {type(exc).__name__}: {exc}"}
+    ok = not errors and bool(answer or writes)
+    return {"ok": ok, "session": sid, "read_only": bool(read_only),
+            "files_changed": writes, "file_count": len(writes),
+            "tool_calls": tool_calls, "summary": answer[:4000],
+            "errors": errors[:5]}
+
+
+@mcp.tool()
 def find_references(name: str, path: str = ".", max_hits: int = 200) -> dict:
     """Every USE of a symbol, with its declaration reported separately.
 
@@ -2457,11 +2848,26 @@ def find_references(name: str, path: str = ".", max_hits: int = 200) -> dict:
     its own documentation. The declaration comes back under `definitions`;
     everything else under `references`.
 
+    Answered from the project map when one exists, which is why it is fast:
+    only the files that define or import the name are read. Falls back to a full
+    scan for a project the map does not cover, and `indexed` says which you got.
+
     Example: find_references("ensure_authoring_research", ".")"""
     try:
         p = _safe(path)
         if p.is_file():
             _refuse_secret(p)
+        idx = _project_map()
+        if idx is not None:
+            if not _code_index.knows_name(idx, name):
+                # Definitively not in the source: do not pay for a full scan to
+                # be told the same thing.
+                return _code_index.find_references(idx, name, max_hits=max_hits)
+            r = _code_index.find_references(idx, name, max_hits=max_hits)
+            if r["definitions"] or r["references"]:
+                return r
+            # In the source but no hits: unusual (a keyword, a name built
+            # dynamically). The honest answer comes from the full scan.
         r = _code_intel.find_references(name, str(p), max_hits=max_hits)
         r["exact"] = bool(r.get("exact"))
         return r
@@ -2477,13 +2883,18 @@ def blast_radius(name: str, path: str = ".", max_files: int = 50) -> dict:
     Ask this BEFORE editing anything shared. `risk` is low/medium/high by how
     many files are involved, and `blast` lists the files in descending order of
     how many references each has - the ones at the top are what your change is
-    most likely to break.
+    most likely to break. Answered from the project map when there is one.
 
     Example: blast_radius("run_skill", "S9SharedCode/code")"""
     try:
         p = _safe(path)
         if p.is_file():
             _refuse_secret(p)
+        idx = _project_map()
+        if idx is not None:
+            got = _code_index.blast_radius(idx, name, max_files=max_files)
+            if got["references"] or not _code_index.knows_name(idx, name):
+                return got
         return _code_intel.blast_radius(name, str(p), max_files=max_files)
     except Exception as exc:                       # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
@@ -2552,7 +2963,15 @@ def create_file(path: str, content: str) -> dict:
     p = _safe(path)
     _refuse_secret(p)
     if p.exists():
-        raise ValueError(f"File '{path}' already exists")
+        # Say what to do, not just what went wrong. A model that has just
+        # written a file and wants to change it reaches for create_file again;
+        # "already exists" reads as a dead end, and it retries until the loop
+        # guard stops the run. Live: fields.py created three times, then the
+        # run ended with the project half-built.
+        raise ValueError(
+            f"File '{path}' already exists. To change it use edit_file with "
+            "start_line/end_line and the exact current code, or update_file to "
+            "replace the whole file. create_file is for new files only.")
     # Parents are made here rather than demanded of the model: writing
     # "src/new/mod.py" without a prior mkdir is the natural edit, and the
     # strict parent check it replaced turned every such write into a dead end
@@ -2583,28 +3002,71 @@ def update_file(path: str, content: str) -> dict:
     return {"ok": True, "path": path, "size_bytes": p.stat().st_size}
 
 
+def _norm_code(s: str) -> str:
+    """Normalize for the edit double-check: unify newlines, drop trailing
+    per-line whitespace and leading/trailing blank lines, but KEEP indentation
+    (it is significant in Python). Two snippets match iff their code matches."""
+    return "\n".join(l.rstrip() for l in str(s).replace("\r\n", "\n").split("\n")).strip("\n")
+
+
+def _verify_range(lines: list, s: int, e: int, expected: str, path: str) -> None:
+    """Refuse an edit whose stated old code does not match the file at the given
+    lines, showing the ACTUAL numbered lines so the model can re-read and fix
+    its target instead of corrupting the file."""
+    actual = "\n".join(lines[s - 1:e])
+    if _norm_code(actual) != _norm_code(expected):
+        numbered = "\n".join(f"{s + i}:{l}" for i, l in enumerate(lines[s - 1:e]))
+        raise ValueError(
+            f"edit double-check failed: lines {s}-{e} of '{path}' do not match "
+            f"the old code you gave. Actual current lines:\n{numbered}\n"
+            "Re-read the range and retry with the exact current code.")
+
+
 @mcp.tool()
-def edit_file(path: str, find: str, replace: str, replace_all: bool = False) -> dict:
-    """Find-and-replace inside a sandbox file. Example: edit_file("hello.txt", "foo", "bar")."""
+def edit_file(path: str, find: str, replace: str, replace_all: bool = False,
+              start_line: int = 0, end_line: int = 0) -> dict:
+    """The single verified edit tool: replace, insert, or delete code.
+
+    PREFERRED: give start_line/end_line (1-based, from read_file's numbered
+    output) AND `find` = the EXACT current code in that range; the harness
+    double-checks the range matches before writing and refuses (showing the
+    actual lines) on mismatch. `replace` is the new code; replace="" DELETES the
+    range; to INSERT after line N use start_line=N+1, end_line=N (find then
+    ignored). Without line numbers, `find` must occur exactly once (else
+    replace_all=True) - it never silently replaces every occurrence.
+
+    Example: edit_file("t.py", "return a+b", "return a-b", start_line=12, end_line=12)."""
     p = _safe(path)
     _refuse_secret(p)
     text = p.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if start_line:
+        s = int(start_line)
+        e = int(end_line) if end_line else s
+        if not (1 <= s <= len(lines) + 1) or not (s - 1 <= e <= len(lines)):
+            raise ValueError(f"line range {s}-{e} out of bounds (file has {len(lines)} lines)")
+        if e >= s:
+            _verify_range(lines, s, e, find, path)
+        new_lines = replace.split("\n") if replace else []
+        if replace.endswith("\n") and new_lines and new_lines[-1] == "":
+            new_lines.pop()
+        out = lines[:s - 1] + new_lines + lines[e:]
+        p.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+        return {"ok": True, "path": path, "start_line": s, "end_line": e,
+                "new_line_count": len(out)}
     count = text.count(find)
     if count == 0:
         raise ValueError(f"'{find}' not found in '{path}'")
     if count > 1 and not replace_all:
         raise ValueError(
-            f"'{find}' occurs {count} times in '{path}'; pass replace_all=True"
+            f"'{find}' occurs {count} times in '{path}'; give start_line/end_line "
+            "to target one, or pass replace_all=True"
         )
     new_text = text.replace(find, replace) if replace_all else text.replace(find, replace, 1)
     p.write_text(new_text, encoding="utf-8")
-    replacements = count if replace_all else 1
-    return {
-        "ok": True,
-        "path": path,
-        "replacements": replacements,
-        "size_bytes": p.stat().st_size,
-    }
+    return {"ok": True, "path": path,
+            "replacements": count if replace_all else 1,
+            "size_bytes": p.stat().st_size}
 
 
 # ── document indexing (Session 7) ───────────────────────────────────────────
@@ -2753,25 +3215,110 @@ def _gw_channel(name: str, to: str, text: str, **kw) -> dict:
                 "error": f"gateway unreachable: {type(e).__name__}: {e}"}
 
 
+def _document_blob(src: str) -> tuple[bytes, str, str]:
+    """Bytes + filename for a document id, `art:` handle or sandbox path.
+
+    A DAG action node is handed a document id (from search_knowledge /
+    list of Documents) far more often than a filesystem path, and the
+    file lives on the GATEWAY, not in the sandbox. Before this existed
+    the only sendable thing was text, so "send me that report on
+    Telegram" had no path to the bytes at all.
+    """
+    s = (src or "").strip()
+    if not s:
+        return b"", "", "no document given"
+    if s.startswith("art:") or os.path.sep in s or "/" in s:
+        return _read_blob(s)
+    try:
+        with httpx.Client(timeout=120, follow_redirects=True,
+                          headers=_gw_headers()) as client:
+            r = client.get(f"{_GW}/v1/documents/{s}/source")
+            if r.status_code == 404:
+                return b"", "", f"no document with id {s!r}"
+            r.raise_for_status()
+            blob = r.content
+            name = ""
+            try:
+                meta = client.get(f"{_GW}/v1/documents/{s}").json() or {}
+                name = str((meta.get("document") or meta).get("filename")
+                           or (meta.get("document") or meta).get("title")
+                           or "")
+            except Exception:
+                pass
+            return blob, name, ""
+    except Exception as e:
+        return b"", "", f"gateway unreachable: {type(e).__name__}: {e}"
+
+
 @mcp.tool()
-def send_telegram(chat_id: str, message: str) -> dict:
-    """Send a text message to a Telegram chat. Credential lives on the
-    gateway (TELEGRAM_BOT_TOKEN); this is a thin forwarder preserving the
-    legacy shape. `chat_id` is the numeric id (or @channel).
-    Example: send_telegram("123456789", "Reminder: standup in 5 min")."""
-    d = _gw_channel("telegram", chat_id, message[:4096])
+def send_telegram(chat_id: str, message: str, document: str = "",
+                  filename: str = "") -> dict:
+    """Send a text message to a Telegram chat, optionally WITH A FILE.
+
+    Credential lives on the gateway (TELEGRAM_BOT_TOKEN).
+    `chat_id` is the numeric id (or @channel). `document` accepts a
+    document id from the user's Documents (doc-...), an `art:` artifact
+    handle, or a sandbox path - the file is uploaded as a Telegram
+    document and `message` becomes its caption (max 1024 chars). Leave
+    `document` empty to send plain text.
+
+    Example: send_telegram("123456789", "Standup in 5 min")
+    Example: send_telegram("123456789", "Here is the report",
+                           document="doc-1a2b3c")
+    """
+    media = None
+    if (document or "").strip():
+        blob, name, err = _document_blob(document)
+        if err:
+            return {"ok": False, "error": f"could not attach {document!r}: {err}"}
+        if not blob:
+            return {"ok": False, "error": f"{document!r} has no bytes to send"}
+        import base64 as _b64
+        media = [{"filename": (filename or "").strip() or name
+                  or f"{document.strip()}.pdf",
+                  "data_b64": _b64.b64encode(blob).decode("ascii"),
+                  "caption": message[:1024]}]
+    d = _gw_channel("telegram", chat_id, message[:4096], media=media)
     if d.get("ok"):
-        return {"ok": True, "result": {"message_id": d.get("msg_id")}}
+        return {"ok": True, "result": {"message_id": d.get("msg_id")},
+                "sent_file": bool(media)}
     return d
 
 
 @mcp.tool()
-def send_email(to: str, subject: str, body: str) -> dict:
+def send_email(to: str, subject: str, body: str, document: str = "",
+               filename: str = "", documents: list | None = None) -> dict:
     """Send an email via Gmail (OAuth, no SMTP/app password). Credential
     lives on the gateway; thin forwarder preserving the legacy shape.
-    Example: send_email("friend@example.com", "Hello", "Sent by Aria")."""
-    return _gw_integration("gmail", "send",
-                           {"to": to, "subject": subject, "body": body})
+
+    `document` (or `documents`, a list) ATTACHES FILE(S) — each a document id
+    (doc-...), an `art:` artifact handle, or a sandbox path. Use it for "email
+    me that report" / "email the package": attach the files, do not just
+    describe them. Leave empty for a plain email.
+
+    Example: send_email("friend@example.com", "Hello", "Sent by Aria")
+    Example: send_email("me@x.com", "Report", "See attached.", document="doc-1a2b3c")
+    Example: send_email("me@x.com", "Package", "See attached.",
+                        documents=["doc-pdf", "doc-pptx"])
+    """
+    args: dict = {"to": to, "subject": subject, "body": body}
+    docs = [str(d) for d in (documents or []) if str(d or "").strip()]
+    if (document or "").strip():
+        docs = [document] + docs
+    if docs:
+        import base64 as _b64
+        atts = []
+        for d in docs[:8]:
+            blob, name, err = _document_blob(d)
+            if err or not blob:
+                continue
+            atts.append({
+                "name": ((filename or "").strip() if len(docs) == 1 else "")
+                        or name or "attachment",
+                "data_b64": _b64.b64encode(blob).decode("ascii")})
+        if atts:
+            args["attachments"] = atts
+    return _gw_integration("gmail", "send", args)
 
 
 @mcp.tool()
@@ -3107,6 +3654,204 @@ def notion_query(api_method: str, page_id: str = "", database_id: str = "",
                             "body": body})
 
 
+# ── GitHub (generic dispatcher) ────────────────────────────────────────────
+@mcp.tool()
+def github_get_user() -> dict:
+    """GitHub: the authenticated user (login, id, name, public_repos)."""
+    return _gw_integration("github", "call", {"api_method": "get_user"})
+
+
+@mcp.tool()
+def github_list_repos(limit: int = 30) -> dict:
+    """GitHub: the authenticated user's repositories (name, full_name, private, url)."""
+    return _gw_integration("github", "call", {"api_method": "list_repos", "limit": limit})
+
+
+@mcp.tool()
+def github_get_repo(owner: str, repo: str) -> dict:
+    """GitHub: repository metadata (description, default_branch, open_issues)."""
+    return _gw_integration("github", "call", {"api_method": "get_repo", "owner": owner, "repo": repo})
+
+
+@mcp.tool()
+def github_read_file(owner: str, repo: str, path: str, ref: str = "") -> dict:
+    """GitHub: read a file's text (and blob sha) from a repository."""
+    return _gw_integration("github", "call", {"api_method": "read_file", "owner": owner,
+                                              "repo": repo, "path": path, "ref": ref})
+
+
+@mcp.tool()
+def github_list_issues(owner: str, repo: str, state: str = "open", limit: int = 30) -> dict:
+    """GitHub: list issues (pull requests excluded). state = open|closed|all."""
+    return _gw_integration("github", "call", {"api_method": "list_issues", "owner": owner,
+                                              "repo": repo, "state": state, "limit": limit})
+
+
+@mcp.tool()
+def github_create_issue(owner: str, repo: str, title: str, body: str = "") -> dict:
+    """GitHub: create an issue; returns its number and url."""
+    return _gw_integration("github", "call", {"api_method": "create_issue", "owner": owner,
+                                              "repo": repo, "title": title, "body": body})
+
+
+@mcp.tool()
+def github_update_issue(owner: str, repo: str, number: int, state: str = "closed",
+                        title: str = "", body: str = "") -> dict:
+    """GitHub: update an issue (state=open|closed, optional title/body)."""
+    return _gw_integration("github", "call", {"api_method": "update_issue", "owner": owner,
+                                              "repo": repo, "number": number,
+                                              "state": state, "title": title, "body": body})
+
+
+@mcp.tool()
+def github_comment_issue(owner: str, repo: str, number: int, body: str) -> dict:
+    """GitHub: comment on an issue or pull request."""
+    return _gw_integration("github", "call", {"api_method": "comment_issue", "owner": owner,
+                                              "repo": repo, "number": number, "body": body})
+
+
+@mcp.tool()
+def github_list_prs(owner: str, repo: str, state: str = "open", limit: int = 30) -> dict:
+    """GitHub: list pull requests (number, title, head, base)."""
+    return _gw_integration("github", "call", {"api_method": "list_prs", "owner": owner,
+                                              "repo": repo, "state": state, "limit": limit})
+
+
+@mcp.tool()
+def github_create_pr(owner: str, repo: str, title: str, head: str, base: str, body: str = "") -> dict:
+    """GitHub: open a pull request from head branch into base branch."""
+    return _gw_integration("github", "call", {"api_method": "create_pr", "owner": owner,
+                                              "repo": repo, "title": title, "head": head,
+                                              "base": base, "body": body})
+
+
+@mcp.tool()
+def github_search_repos(query: str, limit: int = 20) -> dict:
+    """GitHub: search repositories by keyword."""
+    return _gw_integration("github", "call", {"api_method": "search_repos",
+                                              "query": query, "limit": limit})
+
+
+# ── Notion (generic dispatcher) ────────────────────────────────────────────
+@mcp.tool()
+def notion_search(query: str = "", page_size: int = 20) -> dict:
+    """Notion: search pages/databases by title (query="" returns everything shared)."""
+    return _gw_integration("notion", "call", {"api_method": "search", "query": query,
+                                              "page_size": page_size})
+
+
+@mcp.tool()
+def notion_get_page(page_id: str) -> dict:
+    """Notion: page metadata (id, title, url)."""
+    return _gw_integration("notion", "call", {"api_method": "get_page", "page_id": page_id})
+
+
+@mcp.tool()
+def notion_get_page_markdown(page_id: str) -> dict:
+    """Notion: page content as markdown."""
+    return _gw_integration("notion", "call", {"api_method": "get_page_markdown", "page_id": page_id})
+
+
+@mcp.tool()
+def notion_get_blocks(block_id: str, page_size: int = 100) -> dict:
+    """Notion: child blocks of a page/block."""
+    return _gw_integration("notion", "call", {"api_method": "get_blocks",
+                                              "block_id": block_id, "page_size": page_size})
+
+
+@mcp.tool()
+def notion_append_blocks(block_id: str, text: str = "", children: list | None = None) -> dict:
+    """Notion: append a paragraph (text) or raw children blocks to a page/block."""
+    return _gw_integration("notion", "call", {"api_method": "append_blocks", "block_id": block_id,
+                                              "text": text, "children": children})
+
+
+@mcp.tool()
+def notion_query_database(database_id: str, filter: dict | None = None) -> dict:
+    """Notion: query a database (optional filter dict)."""
+    return _gw_integration("notion", "call", {"api_method": "query_database",
+                                              "database_id": database_id, "filter": filter})
+
+
+# ── Telegram (Bot API passthrough) ─────────────────────────────────────────
+@mcp.tool()
+def telegram_get_me() -> dict:
+    """Telegram: bot identity (username, id, can_join_groups, privacy mode)."""
+    return _gw_integration("telegram", "call", {"method": "getMe", "params": {}})
+
+
+@mcp.tool()
+def telegram_get_updates(offset: int = 0, limit: int = 100) -> dict:
+    """Telegram: recent updates (messages). Use this to discover a chat_id."""
+    return _gw_integration("telegram", "call", {"method": "getUpdates",
+                                                "params": {"offset": offset, "limit": limit}})
+
+
+@mcp.tool()
+def telegram_get_chat(chat_id: str) -> dict:
+    """Telegram: chat metadata (title, type, member count)."""
+    return _gw_integration("telegram", "call", {"method": "getChat",
+                                                "params": {"chat_id": chat_id}})
+
+
+@mcp.tool()
+def telegram_send_message(chat_id: str, text: str) -> dict:
+    """Telegram: send a text message to a chat."""
+    return _gw_integration("telegram", "call", {"method": "sendMessage",
+                                                "params": {"chat_id": chat_id, "text": text}})
+
+
+@mcp.tool()
+def telegram_edit_message(chat_id: str, message_id: int, text: str) -> dict:
+    """Telegram: edit a message the bot sent."""
+    return _gw_integration("telegram", "call", {"method": "editMessageText",
+                                                "params": {"chat_id": chat_id, "message_id": message_id, "text": text}})
+
+
+@mcp.tool()
+def telegram_delete_message(chat_id: str, message_id: int) -> dict:
+    """Telegram: delete a message the bot sent."""
+    return _gw_integration("telegram", "call", {"method": "deleteMessage",
+                                                "params": {"chat_id": chat_id, "message_id": message_id}})
+
+
+# ── Discord (read + invite helper) ─────────────────────────────────────────
+@mcp.tool()
+def discord_get_me() -> dict:
+    """Discord: the bot's own user (id, username)."""
+    return _gw_integration("discord", "call", {"method": "GET", "path": "/users/@me"})
+
+
+@mcp.tool()
+def discord_list_guilds() -> dict:
+    """Discord: guilds the bot is in. Empty until the bot is invited to a server
+    (use discord_invite_url to get the link)."""
+    return _gw_integration("discord", "call", {"method": "GET",
+                                               "path": "/users/@me/guilds"})
+
+
+@mcp.tool()
+def discord_list_channels(guild_id: str) -> dict:
+    """Discord: channels in a guild (needs the bot to be a member)."""
+    return _gw_integration("discord", "call", {"method": "GET",
+                                               "path": f"/guilds/{guild_id}/channels"})
+
+
+@mcp.tool()
+def discord_invite_url(permissions: str = "0") -> dict:
+    """Discord: OAuth2 URL to invite the bot to a server. `permissions` is a
+    bitfield string ('8' = Administrator, '2048' = Send Messages). Returns the
+    url; open it in a browser and pick a server."""
+    return _gw_integration("discord", "invite_url", {"permissions": permissions})
+
+
+@mcp.tool()
+def gmail_profile() -> dict:
+    """Gmail: the signed-in account (email address, message/thread counts).
+    Use this to answer "which account is connected?"."""
+    return _gw_integration("gmail", "profile", {})
+
+
 @mcp.tool()
 def gmail_query(api_method: str, query: str = "", max_results: int = 5) -> dict:
     """Gmail via Google REST API (credential lives on the gateway; thin
@@ -3128,6 +3873,174 @@ def gmail_refresh_token(write_env: bool = True) -> dict:
     past the ~1-hour expiry. Thin forwarder.
     Example: gmail_refresh_token()"""
     return _gw_integration("gmail", "refresh", {"write_env": write_env})
+
+
+@mcp.tool()
+def zoho_mail_send(to: str, subject: str, body: str, document: str = "",
+                   filename: str = "", documents: list | None = None,
+                   mail_format: str = "html") -> dict:
+    """Send an email via Zoho Mail (OAuth; credential lives on the gateway).
+
+    `document` (or `documents`, a list) ATTACHES FILE(S) — each a document id
+    (doc-...), an `art:` artifact handle, or a sandbox path. Any file type is
+    supported. Leave empty for a plain email. `mail_format` is 'html' or
+    'text'.
+
+    Example: zoho_mail_send("friend@example.com", "Hello", "Sent by Aria")
+    Example: zoho_mail_send("me@x.com", "Report", "See attached.",
+                            documents=["doc-pdf", "doc-pptx"])
+    """
+    args: dict = {"to": to, "subject": subject, "body": body,
+                  "mail_format": mail_format}
+    docs = [str(d) for d in (documents or []) if str(d or "").strip()]
+    if (document or "").strip():
+        docs = [document] + docs
+    if docs:
+        import base64 as _b64
+        atts = []
+        for d in docs[:8]:
+            blob, name, err = _document_blob(d)
+            if err or not blob:
+                continue
+            atts.append({
+                "name": ((filename or "").strip() if len(docs) == 1 else "")
+                        or name or "attachment",
+                "data_b64": _b64.b64encode(blob).decode("ascii")})
+        if atts:
+            args["attachments"] = atts
+    return _gw_integration("zoho_mail", "send", args)
+
+
+@mcp.tool()
+def zoho_mail_query(api_method: str, query: str = "", max_results: int = 5) -> dict:
+    """Read Zoho Mail via the gateway (OAuth); api_method 'list' returns message
+    summaries + ids, 'read' returns one message's content. `query` is a search
+    string for 'list' or a message id for 'read'.
+      zoho_mail_query("list", "unread")
+      zoho_mail_query("read", "<messageId>")"""
+    return _gw_integration("zoho_mail", "query",
+                           {"api_method": api_method, "query": query,
+                            "max_results": max_results})
+
+
+@mcp.tool()
+def zoho_mail_profile() -> dict:
+    """Zoho Mail: the connected mailbox (email address, account id, folders).
+    Use this to answer "which Zoho account is connected?"."""
+    return _gw_integration("zoho_mail", "profile", {})
+
+
+@mcp.tool()
+def zoho_mail_folders() -> dict:
+    """List the Zoho Mailbox folders (Inbox, Sent, Drafts, custom)."""
+    return _gw_integration("zoho_mail", "folders", {})
+
+
+@mcp.tool()
+def zoho_mail_refresh_token(write_env: bool = True) -> dict:
+    """Renew the gateway Zoho Mail OAuth access token (gateway-owned refresh
+    triple). Call this if zoho_mail_send / zoho_mail_query returns a
+    401/expired error. Thin forwarder. Example: zoho_mail_refresh_token()"""
+    return _gw_integration("zoho_mail", "refresh", {"write_env": write_env})
+
+
+@mcp.tool()
+def zoho_mail_reply(message_id: str, body: str, to: str = "", subject: str = "") -> dict:
+    """Reply to a Zoho Mail message. If `to`/`subject` are omitted they are read
+    from the original (a "Re:" subject is added). Uses messages.CREATE.
+    Example: zoho_mail_reply("<messageId>", "Thanks!")"""
+    return _gw_integration("zoho_mail", "reply",
+                           {"message_id": message_id, "body": body, "to": to, "subject": subject})
+
+
+@mcp.tool()
+def zoho_mail_mark(message_id: str, mode: str = "read") -> dict:
+    """Mark a Zoho Mail message read or unread. `mode` = 'read' | 'unread'.
+    Example: zoho_mail_mark("<messageId>", "read")"""
+    return _gw_integration("zoho_mail", "mark", {"message_id": message_id, "mode": mode})
+
+
+@mcp.tool()
+def zoho_mail_move(message_id: str, dest_folder_id: str) -> dict:
+    """Move a Zoho Mail message to a folder (id from zoho_mail_folders).
+    Example: zoho_mail_move("<messageId>", "<folderId>")"""
+    return _gw_integration("zoho_mail", "move",
+                           {"message_id": message_id, "dest_folder_id": dest_folder_id})
+
+
+@mcp.tool()
+def zoho_mail_delete(message_id: str) -> dict:
+    """Move a Zoho Mail message to Trash (recoverable).
+    Example: zoho_mail_delete("<messageId>")"""
+    return _gw_integration("zoho_mail", "delete", {"message_id": message_id})
+
+
+@mcp.tool()
+def ntfy_send(topic: str, message: str, title: str = "") -> dict:
+    """Push a notification to an ntfy topic — free phone push (hosted ntfy.sh,
+    keyless). `topic` is the topic name; `message` is the body; optional
+    `title`. Use for instant alerts or approve/deny prompts. Example:
+    ntfy_send("alerts", "Build finished")"""
+    return _gw_integration("ntfy", "send",
+                           {"topic": topic, "message": message, "title": title})
+
+
+@mcp.tool()
+def ntfy_history(topic: str, since: str = "", max_results: int = 20) -> dict:
+    """Read recent messages posted to an ntfy topic (poll). `since` = a message
+    id, a duration ('1h', '10m') or a timestamp; empty = latest.
+    Example: ntfy_history("alerts")"""
+    return _gw_integration("ntfy", "history",
+                           {"topic": topic, "since": since, "max_results": max_results})
+
+
+@mcp.tool()
+def zoho_cliq_message(target: str, text: str) -> dict:
+    """Post a message to a Zoho Cliq bot/channel (free team chat). `target` is
+    the bot/channel unique name. Credential lives on the gateway; thin
+    forwarder. Example: zoho_cliq_message("my-bot", "Deploy finished")"""
+    return _gw_integration("zoho_cliq", "send", {"to": target, "text": text})
+
+
+@mcp.tool()
+def bluesky_post(text: str) -> dict:
+    """Post to Bluesky (AT Protocol) as the configured account. `text` is the
+    post body (<=300 chars). Credential lives on the gateway; thin forwarder.
+    Example: bluesky_post("Hello from Aria")"""
+    return _gw_integration("bluesky", "send", {"text": text})
+
+
+@mcp.tool()
+def mastodon_post(text: str, visibility: str = "public") -> dict:
+    """Post a status to the configured Mastodon instance. `visibility` is one
+    of public/unlisted/private/direct. Credential lives on the gateway; thin
+    forwarder. Example: mastodon_post("Hello from Aria")"""
+    return _gw_integration("mastodon", "send",
+                           {"text": text, "visibility": visibility})
+
+
+@mcp.tool()
+def google_chat_message(text: str) -> dict:
+    """Post a message to the configured Google Chat space (Workspace). The
+    credential (space webhook) lives on the gateway; thin forwarder. Example:
+    google_chat_message("Deploy finished")"""
+    return _gw_integration("google_chat", "send", {"text": text})
+
+
+@mcp.tool()
+def zoho_calendar_list_calendars() -> dict:
+    """List the Zoho Calendar calendars (id + name) on the connected account.
+    Shares the Zoho Mail OAuth credential. Example: zoho_calendar_list_calendars()"""
+    return _gw_integration("zoho_calendar", "list_calendars", {})
+
+
+@mcp.tool()
+def zoho_calendar_list_events(calendar_id: str = "primary",
+                              max_results: int = 10) -> dict:
+    """List upcoming events from a Zoho Calendar (default 'primary').
+    Example: zoho_calendar_list_events("primary", 10)"""
+    return _gw_integration("zoho_calendar", "list_events",
+                           {"calendar_id": calendar_id, "max_results": max_results})
 
 
 # ── F4 FIX: scheduler CRUD tools ─────────────────────────────────────────────
@@ -3260,6 +4173,57 @@ def schedule_task(query: str, when: str, conversation_id: str = "",
 
 
 @mcp.tool()
+def schedule_self(goal: str, when: str = "", email_from: str = "",
+                  context: str = "", conversation_id: str = "",
+                  interim: str = "", every_s: int = 120) -> dict:
+    """Continue a goal in a FUTURE turn of yourself — end now, wake later.
+
+    This is how you hand a task to your future self. You set a `goal` (what the
+    future you must do) and a trigger, then this turn ends with an interim
+    message. When the trigger fires, a fresh you is spun up and told BOTH the
+    goal and the `context` (what you already did), so it does not redo work.
+
+    Give EXACTLY ONE trigger:
+      - `when`: a time — 'in 1h', 'in 30m', 'tomorrow 9am', '9am', ISO datetime.
+        Fires a new turn at that time carrying the goal + context.
+      - `email_from`: an email address. Wakes you when a message from that
+        person arrives (polled read-only; no cost while nothing matches). Use
+        this for "wake me when <person> emails".
+
+    `context` is what you already did this turn (findings, ids, decisions) so the
+    future you continues instead of restarting. `interim` is the line shown now
+    ("I'll pick this up at 9am" / "I'll continue when <person> writes").
+
+    Use this when the work is best finished LATER — waiting on research, waiting
+    on an email, a long task you want to pause and resume. For "remind me to X"
+    (a nudge with no work) use schedule_task instead.
+    """
+    try:
+        import sleeps
+        cid = (conversation_id or os.environ.get("ARIA_SESSION", "")).strip()
+        rec = sleeps.arm(
+            goal=goal, conversation_id=cid,
+            session_id=os.environ.get("ARIA_SESSION", ""),
+            when=when, email_from=email_from, context=context,
+            interim=interim, every_s=every_s)
+        out = {"ok": rec.get("status") == "armed", "sleep_id": rec["id"],
+               "trigger": rec.get("trigger"),
+               "goal": rec.get("goal")}
+        if rec.get("status") != "armed":
+            out["error"] = rec.get("error") or "could not arm the continuation"
+            return out
+        if rec.get("trigger") == "time":
+            out["wakes_at"] = "the time you gave"
+            out["schedule_id"] = rec.get("schedule_id")
+        else:
+            out["watching_for_email_from"] = rec.get("email_from")
+            out["poll_seconds"] = rec.get("every_s")
+        return out
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
 def list_channels() -> dict:
     """Chat channels a notification can be delivered on, and what each needs.
 
@@ -3294,6 +4258,16 @@ def check_channel(channel: str) -> dict:
         return _notify.refresh_channel_token(channel)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def load_tool_bundle(bundle_id: str) -> dict:
+    """Load a channel's tool schemas into the current run (e.g. 'github',
+    'notion', 'telegram', 'slack'). In the DAG action skill this is intercepted
+    by the runner, which appends the bundle's schemas so the next step can call
+    them. Called outside a tool loop it reports that it needs one."""
+    return {"ok": False,
+            "error": "load_tool_bundle must run inside a tool-enabled agent turn"}
 
 
 @mcp.tool()
@@ -3510,10 +4484,11 @@ def render_document(format: str, title: str, blocks: list = None,
                     orientation: str = "", margins: str = "",
                     columns: int = 0, style: str = "",
                     citation_style: str = "", references: list = None,
-                    slide_size: str = "") -> dict:
+                    slide_size: str = "", typeset: str = "") -> dict:
     """Render a document and return a downloadable artifact.
 
-    Formats: pdf, pptx, docx, xlsx.
+    Formats: pdf, pptx, docx, xlsx (layout engines) and md, html, csv, json,
+    epub (serialisations of the same block model — no layout engine).
 
     `blocks` is a list of content blocks, each a dict:
       {"type": "heading",   "level": 1-3, "text": "..."}
@@ -3560,6 +4535,14 @@ def render_document(format: str, title: str, blocks: list = None,
     For xlsx you may instead pass `sheets`: [{"name","header","rows"}].
     xlsx also renders one sheet per `table` block if `sheets` is omitted.
 
+    `typeset` (pdf only): "latex" typesets the whole document with a real
+    TeX engine. Use it whenever the document contains MATHEMATICS - write
+    inline maths as `$...$` and display maths as `\\[...\\]` and it is SET,
+    not printed. It also buys TeX hyphenation, real small caps and proper
+    table rules. Leave it empty for prose documents: the default renderer is
+    faster and needs no TeX install. Currency is safe on both paths
+    (`$5 per seat` stays money).
+
     Returns {"ok": true, "artifact": "art:...", "filename", "format",
     "bytes", "stats"} on success. The file is stored as an artifact and the
     console offers it as a download; report the filename to the user. Copy
@@ -3570,8 +4553,10 @@ def render_document(format: str, title: str, blocks: list = None,
       {"type": "paragraph", "text": "Revenue grew 12%."}])
     """
     fmt = str(format or "").strip().lower()
-    if fmt not in ("pdf", "pptx", "docx", "xlsx"):
-        return {"ok": False, "error": f"format must be one of pdf/pptx/docx/xlsx, "
+    _FORMATS = ("pdf", "pptx", "docx", "xlsx", "md", "markdown", "html",
+                "csv", "json", "epub", "odt", "ods", "typst")
+    if fmt not in _FORMATS:
+        return {"ok": False, "error": f"format must be one of {', '.join(_FORMATS)}, "
                                      f"got {format!r}"}
     spec: dict = {"title": str(title or "").strip()[:200]}
     if subtitle:
@@ -3600,10 +4585,41 @@ def render_document(format: str, title: str, blocks: list = None,
     if isinstance(references, list) and references:
         spec["references"] = [r for r in references[:200]
                               if isinstance(r, (dict, str))]
+    if (typeset or "").strip().lower() in ("latex", "tex", "tectonic"):
+        # Only pdf has a TeX path; silently asking for it on a deck would
+        # look like it worked and change nothing.
+        if fmt == "pdf":
+            spec["engine"] = "latex"
     if isinstance(blocks, list) and blocks:
         # Clip before the wire: a runaway list is a client bug, and the
         # gateway would 400 on the whole document rather than trimming.
         spec["blocks"] = [b for b in blocks[:400] if isinstance(b, dict)]
+        # An image block may name an `art:` handle or a sandbox `path` — e.g. a
+        # plot a sandbox/coder node just wrote with matplotlib. The gateway
+        # renders in its OWN process and cannot read the agent's artifact store
+        # or sandbox, so resolve the bytes HERE and inline them as base64
+        # `data`, which the gateway's image normaliser decodes. A `document`
+        # (uploaded doc id) is left alone: the gateway resolves that against
+        # its own document store.
+        import base64 as _b64
+        for _b in spec["blocks"]:
+            if not isinstance(_b, dict):
+                continue
+            if str(_b.get("type") or "").strip().lower() != "image":
+                continue
+            _src = str(_b.get("artifact") or _b.get("path") or "").strip()
+            if not _src or _b.get("document"):
+                continue
+            _blob, _name, _err = _read_blob(_src)
+            if _err or not _blob:
+                # Leave it for the gateway to reject with a clear reason rather
+                # than dropping the block silently.
+                continue
+            _b["data"] = _b64.b64encode(_blob).decode("ascii")
+            _b["ext"] = (_name.rsplit(".", 1)[-1].lower()
+                         if "." in _name else "png")
+            _b.pop("artifact", None)
+            _b.pop("path", None)
     if isinstance(sheets, list) and sheets:
         spec["sheets"] = [s for s in sheets[:20] if isinstance(s, dict)]
     if not spec.get("blocks") and not spec.get("sheets") and not spec["title"]:

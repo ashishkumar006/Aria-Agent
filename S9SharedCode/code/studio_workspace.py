@@ -115,7 +115,7 @@ def sessions() -> list[dict]:
             "created": state.get("created") or 0,
             "updated": state.get("updated") or 0,
             "roots": len(state.get("roots") or []),
-            "paths": [str(r.get("name") or "") for r in (state.get("roots") or [])][:8],
+            "paths": [str(r.get("path") or r.get("name") or "") for r in (state.get("roots") or [])][:8],
             "archived": False,
         })
         known.add(sid)

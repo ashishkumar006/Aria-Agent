@@ -39,13 +39,18 @@ _WORKER: "threading.Thread | None" = None
 # before this point was missed while the agent was off: it must not be
 # delivered at startup, and it must not move the schedule's phase.
 _PROCESS_START = time.time()
+# mtime of schedules.json as of our last load; the worker reloads when another
+# process (the MCP child, where schedule_task/schedule_self run) writes it.
+# None until start() runs, so tests that drive the worker with in-memory state
+# are not clobbered by a disk reload.
+_WORKER_MTIME = None
 _RECUR_INTERVAL = _re.compile(r"every\s+(\d+)\s*([smh]?)\s*$",
                               _re.IGNORECASE)
 _RECUR_START_GRACE_S = 60.0
 
 
 def _load() -> None:
-    global _SCHEDULES, _HEAP
+    global _SCHEDULES, _HEAP, _WORKER_MTIME
     try:
         data = json.loads(_SCHED_PATH.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
@@ -62,6 +67,12 @@ def _load() -> None:
              if isinstance(s, dict) and s.get("enabled", True)
              and isinstance(s.get("next_fire"), (int, float))]
     heapq.heapify(_HEAP)
+    # Re-baseline the worker's mtime so it only reloads on a GENUINE external
+    # change (another process writing the file), never after our own load.
+    try:
+        _WORKER_MTIME = _SCHED_PATH.stat().st_mtime
+    except OSError:
+        _WORKER_MTIME = 0.0
 
 
 _LOG_PATH = _STATE_DIR / "scheduler.log"
@@ -411,6 +422,19 @@ def schedule(query: str, when: str, *,
             f"date, check the year.")
     with _SCHED_LOCK:
         _load()
+        # A reminder stored as a re-runnable `query` reproduces itself: the job
+        # fires, the agent reads "remind me to stretch", schedules a NEW
+        # reminder, and the user gets a confirmation instead of the reminder.
+        # Derive the words once, here, so the stored job is a nudge and the
+        # DAG never runs. Explicit `message` always wins; a query that asks for
+        # real work is left alone.
+        if not str(message or "").strip():
+            _derived = _reminder_text(query)
+            if _derived:
+                message = _derived
+                # Nudge rows still need a channel to be pushed; a reminder with
+                # no channel lands in the console feed, which is where the rest
+                # of "tell me later" output goes when nothing was paired.
         # Build and validate the policy BEFORE the idempotency short-circuit.
         # Returning an existing id first meant a repeat of an invalid request
         # (unknown channel, unparseable lead time) came back 200 with the old
@@ -1088,6 +1112,67 @@ def purge_disabled(max_age_days: float = 7) -> int:
 # text IS the deliverable and running a pipeline to produce more text is both
 # slow and wrong. A job with no authored message still runs the DAG, because
 # then the task genuinely is "go and do/find something".
+# A reminder request is a sentence about the USER ("remind me to stretch"),
+# not an instruction to an agent ("check the weather and notify me"). Storing
+# the former as `query` is what produced the live loop behind
+# sch-14effc0f: every two hours the job re-ran "remind me to stretch and drink
+# water", the agent dutifully called schedule_task again, and the user got a
+# scheduling CONFIRMATION instead of a reminder — carrying a dead id
+# (sch-388b780f) that had already fired once and been disabled.
+#
+# The scheduler is the last place that can tell the difference, so it does.
+_REMINDER_IMPERATIVE = _re.compile(
+    r"^\s*(?:please\s+)?(?:can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+    r"(?:remind\s+(?:me|us)|reminder\s+(?:to|for)\b|nudge\s+me|ping\s+me|"
+    r"don't\s+let\s+me\s+forget|dont\s+let\s+me\s+forget|"
+    r"tell\s+me\s+to\b|prompt\s+me\s+to\b)",
+    _re.I)
+
+
+def _reminder_text(query: str) -> str:
+    """The sentence a reminder should SAY, or "" if this is not one.
+
+    "remind me to stretch and drink water" -> "Stretch and drink water."
+    A query that asks for work ("check the weather and tell me if it rains")
+    returns "", because that job must still run.
+    """
+    q = str(query or "").strip()
+    if not q or not _REMINDER_IMPERATIVE.match(q):
+        return ""
+    # Strip the imperatives that wrap the actual message.
+    body = _REMINDER_IMPERATIVE.sub("", q).strip()
+    body = _re.sub(r"^(?:to|that|about)\s+", "", body, flags=_re.I).strip()
+    # Drop a trailing clock expression: the timing is already in `when`, and
+    # "stretch and drink water in 1 hour" reads wrong when it arrives on time.
+    body = _re.sub(
+        r"[\s,]+(?:in\s+\d+\s*(?:s|sec|secs|seconds?|m|min|mins|minutes?|"
+        r"h|hr|hrs|hours?|d|days?)|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|"
+        r"tomorrow(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?|"
+        r"tonight|every\s+\S+)\s*$",
+        "", body, flags=_re.I).strip(" .,:;-")
+    if not body:
+        return ""
+    # A request for the AGENT to go and find something out is work, not a
+    # nudge: "notify me if it rains", "summarise yesterday", "look up the
+    # price". A reminder to do a HUMAN action keeps its verb - "remind me to
+    # check the oven" is you doing the checking, and dropping it to nothing or
+    # running a pipeline for it are both wrong.
+    if _re.search(r"\b(?:notify\s+me|tell\s+me\s+if|let\s+me\s+know|"
+                  r"summari[sz]e|look\s+up|find\s+out|search\s+for|"
+                  r"monitor|keep\s+an\s+eye)\b", body, _re.I):
+        return ""
+    # A bare work verb with no human subject is the agent's job; a verb with a
+    # following object the user owns ("check the oven", "read me a story") is
+    # a reminder. Only reject when the sentence is nothing but the verb.
+    if _re.fullmatch(r"(?:check|search|find|fetch|read|list)\b.*", body,
+                     _re.I) and _re.search(
+            r"\b(?:the\s+(?:weather|news|price|stock|market|inbox|calendar)|"
+            r"yesterday|today\s+console|my\s+(?:inbox|calendar|email))\b",
+            body, _re.I):
+        return ""
+    return body[:1].upper() + body[1:] + ("." if not body.endswith((".", "!", "?")) else "")
+
+
 def _is_nudge_only(spec: dict) -> bool:
     """A row that exists only to deliver text the agent already wrote.
 
@@ -1110,6 +1195,69 @@ def _is_nudge_only(spec: dict) -> bool:
     """
     pol = spec.get("notify_policy") or {}
     return bool(str(pol.get("message") or "").strip())
+
+
+def _session_research_context(sid: str) -> str:
+    """The most recent research findings filed for this session, as text.
+
+    Reads the session's own graph.json (local, no gateway): the latest
+    researcher/retriever/distiller write-up. Empty when the session has no
+    research, so a plain reminder is never burdened with unrelated context.
+    Bounded so a huge research doc cannot blow up the wake prompt.
+    """
+    try:
+        import json as _json
+        from persistence import SESSIONS_ROOT
+        p = SESSIONS_ROOT / sid / "graph.json"
+        if not p.exists():
+            return ""
+        data = _json.loads(p.read_text(encoding="utf-8-sig"))
+        findings: list[str] = []
+        for n in (data.get("nodes") or []):
+            if not isinstance(n, dict):
+                continue
+            if str(n.get("skill") or "") not in ("researcher", "retriever",
+                                                  "distiller"):
+                continue
+            res = n.get("result")
+            out = res.get("output") if isinstance(res, dict) else None
+            if not isinstance(out, dict):
+                continue
+            for key in ("findings", "summary", "text"):
+                v = out.get(key)
+                if isinstance(v, str) and v.strip():
+                    findings.append(v.strip())
+                    break
+        if not findings:
+            return ""
+        # The LAST filed write-up is the most recent research this session did.
+        return ("CONTEXT FROM YOUR PREVIOUS RESEARCH THIS SESSION "
+                "(use it; do not redo the work):\n\n" + findings[-1][:2500])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _graph_has_unfinished(sid: str) -> bool:
+    """Does this session's persisted graph still have pending/running nodes?
+
+    A graph.json in NetworkX node_link_data shape: {"nodes": [{"id", "status",
+    ...}], "edges": [...]}. Any node not yet `complete`/`failed`/`skipped` means
+    an interrupted run is waiting to be resumed — the only case where
+    `Executor.run(resume=True)` should be used.
+    """
+    try:
+        from persistence import SESSIONS_ROOT
+        p = SESSIONS_ROOT / sid / "graph.json"
+        if not p.exists():
+            return False
+        import json as _json
+        data = _json.loads(p.read_text(encoding="utf-8-sig"))
+        for n in (data.get("nodes") or []):
+            if isinstance(n, dict) and n.get("status") in ("pending", "running"):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _fire(sid: str, spec: dict | None = None) -> None:
@@ -1161,10 +1309,25 @@ def _fire(sid: str, spec: dict | None = None) -> None:
             # missing session and start fresh instead. Probe the graph file
             # directly â€” constructing SessionStore would mkdir empty session
             # dirs that pollute list_sessions().
-            from persistence import SESSIONS_ROOT
-            resume = (SESSIONS_ROOT / derived_sid / "graph.json").exists()
+            # Resume ONLY if the prior run left unfinished work. Resuming a
+            # fully-complete graph makes Executor.run find no ready nodes and
+            # replay the OLD answer — so a scheduled follow-up (or a self-wake
+            # carrying a NEW goal) would silently do nothing. A fresh graph is
+            # what actually runs the new query; memory/turnlog still carry
+            # continuity through the session id.
+            resume = _graph_has_unfinished(derived_sid)
+            # CONTEXT INJECTION: a scheduler-fired continuation must not run on a
+            # terse query alone. If this session produced research, prepend it so
+            # the fresh planner has the full findings inline (no search needed) —
+            # this is "waking the future self with full info", not a bare goal.
+            _run_query = spec["query"]
+            _ctx = _session_research_context(derived_sid)
+            if _ctx:
+                _run_query = f"{spec['query']}\n\n{_ctx}"
+                _log(f"[{sid}] injected {len(_ctx)} chars of prior research "
+                     f"into the wake query")
             answer = asyncio.run(
-                Executor().run(spec["query"],
+                Executor().run(_run_query,
                                session_id=derived_sid, resume=resume)
             )
             _log(f"[{sid}] ok in {round(_t.time() - _start, 1)}s -> "
@@ -1280,12 +1443,32 @@ def _worker() -> None:
             # again immediately: one bad value silently stopped ALL
             # scheduled work. Log, skip the tick, stay alive.
             _log(f"worker tick failed, skipping: {traceback.format_exc()}")
+        # Event-driven self-wakes (e.g. "wake when an email from X arrives").
+        # Cheap: poll_due throttles the actual Gmail call per record via
+        # `every_s`, so this is a no-op on most ticks.
+        try:
+            import sleeps
+            sleeps.poll_due()
+        except Exception:  # noqa: BLE001
+            _log(f"sleeps.poll_due failed, skipping: {traceback.format_exc()}")
 
 
 def _worker_tick() -> None:
+    global _WORKER_MTIME
     now = time.time()
     skip_missed = False
     with _SCHED_LOCK:
+        # Pick up schedules written by OTHER processes (the MCP child, where
+        # schedule_task/schedule_self actually run) since our last load. Without
+        # this the worker's in-memory heap is frozen at startup and a reminder
+        # created in chat never fires until the agent restarts.
+        try:
+            _mt = _SCHED_PATH.stat().st_mtime
+        except OSError:
+            _mt = 0.0
+        if _WORKER_MTIME is not None and _mt != _WORKER_MTIME:
+            _WORKER_MTIME = _mt
+            _load()
         if not _HEAP:
             return
         fire, sid = _HEAP[0]
@@ -1436,7 +1619,12 @@ def _ensure_worker() -> None:
 
 def start() -> None:
     """Load persisted schedules and start the background worker."""
+    global _WORKER_MTIME
     with _SCHED_LOCK:
         _load()
+        try:
+            _WORKER_MTIME = _SCHED_PATH.stat().st_mtime
+        except OSError:
+            _WORKER_MTIME = 0.0
     _ensure_worker()
 

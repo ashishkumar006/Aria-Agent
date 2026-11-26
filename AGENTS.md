@@ -49,11 +49,16 @@
   `studio_files.py` (file ops, search/replace plans, git argv — planners only,
   it never writes), `browser_session.py` (the session's persistent Chromium).
   `agent_server.py` owns the routes and the path vocabulary.
-- **The code agent's system prompt is inline in `agent_server.py`**, not in
-  `prompts/`. Editing `prompts/coder.md` changes nothing for the IDE agent.
-  The prompt directory is `prompts/`; the tool payload is built by
-  `skills.tool_payload`, and `tests/test_studio_prompt_truth.py` fails if the
-  prompt names a tool the payload does not carry.
+- **The code agent's system prompt is `prompts/studio_coder.md`**, rendered by
+  `agent_server.render_studio_coder_prompt()` with `{{TOKEN}}` placeholders for
+  the per-request parts (layout, approval mode, the optional git and browser
+  blocks, attached files, workspace brief). It is re-read when its mtime
+  changes, so an edit applies on the next message — no restart. A missing or
+  empty file falls back to a short built-in prompt instead of killing the run.
+  `prompts/coder.md` is a different agent: the DAG Coder skill, which the
+  studio does not use. The tool payload is built by `skills.tool_payload`, and
+  `tests/test_studio_prompt_truth.py` fails if the prompt names a tool the
+  payload does not carry.
 - Default code workspace is `state/code_workspace` (an empty scratch folder),
   and with a studio session bound it is that session's own roots — never the
   process default.

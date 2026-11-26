@@ -128,14 +128,25 @@ def test_the_researcher_prompt_states_the_contract_in_its_own_words():
 
 
 def test_a_pure_synthesis_skill_is_not_padded_with_the_clause():
-    """The formatter only sees upstream node output — padding it would add
-    noise to every research run for no protection."""
+    """A pure synthesis skill only sees upstream node output — padding it would
+    add noise for no protection.
+
+    `critic` is the pure case: its only tool is read_artifact, which returns
+    material the run already holds, not remote text. It must NOT get the clause.
+
+    `formatter` used to be pure too, but it was deliberately given read-only
+    web tools (web_search, fetch_url) so a chat answer can settle a detail the
+    upstream nodes left as a pointer instead of claiming it cannot check. That
+    makes it a skill that CAN see remote text, so it correctly DOES get the
+    clause — asserted here so the two facts cannot drift apart again.
+    """
     reg = skills.SkillRegistry()
-    for name in ("formatter", "critic"):
-        if name not in reg.names():
-            continue
-        sk = reg.get(name)
-        assert not skills._skill_touches_untrusted(sk), \
-            f"{name} should not be treated as seeing untrusted content"
-        prompt = skills.render_prompt(sk, "q", [])
-        assert "UNTRUSTED CONTENT" not in prompt
+    critic = reg.get("critic")
+    if critic is not None:
+        assert not skills._skill_touches_untrusted(critic), \
+            "critic should not be treated as seeing untrusted content"
+        assert "UNTRUSTED CONTENT" not in skills.render_prompt(critic, "q", [])
+    formatter = reg.get("formatter")
+    if formatter is not None and skills._skill_touches_untrusted(formatter):
+        # It has read-only web tools now; the anti-injection clause must be on.
+        assert "UNTRUSTED CONTENT" in skills.render_prompt(formatter, "q", [])
