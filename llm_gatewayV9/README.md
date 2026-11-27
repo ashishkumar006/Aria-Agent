@@ -1,5 +1,48 @@
 # LLM Gateway V9
 
+## Folder & file guide
+
+The gateway is the single place that holds keys, talks to model providers, and
+owns external state (memory, documents, channels). The agent (`:8500`) always
+calls it; it never holds a credential.
+
+### Subfolders (each has its own README)
+| Folder | Role |
+|---|---|
+| `adaptors/` | Per-channel adaptors (transport + credentials); typed envelopes, trust. |
+| `integrations/` | Per-service functions the agent's tools call (`{ok: ...}`). |
+| `policy/` | Declarative allow/deny engine + `policy.yaml` + spend caps. |
+| `docs/` | Gateway design docs (protocols, channel catalogue, documents plan). |
+| `tests/` | Pytest suite (run the whole tree, not just `tests/`). |
+| `memory/`, `parts/`, `documents/`, `static/`, `state/` | Runtime data / static assets (not source). |
+
+### Top-level files
+| File | Responsibility |
+|---|---|
+| `main.py` | FastAPI app (`:8109`), `/v1/chat`, empty-completion retry + failover ladder. |
+| `providers.py` | Provider adapters (Gemini, Kilo, OpenAI-compat, …) + `ProviderError`. |
+| `router.py` | Model routing + capability eval + rate state. |
+| `agent_routing.yaml` | Per-agent provider preferences/pins (soft; 502 failover). |
+| `cache.py` | Response cache. |
+| `pricing.py`, `budget.py` | Pricing tables + per-call/agent/session spend caps. |
+| `embedders.py` | Embedding backends (fixed-dim; do not change after indexing). |
+| `memory_api.py` | `/v1/memory/*` — drawers, search, record_outcome, supersede. |
+| `docgen.py`, `docgen_latex.py`, `docgen_typst.py`, `docgen_markup.py`, `doclayout.py` | Document renderers + layout. |
+| `channels_api.py`, `integrations_api.py` | `/v1/integrations/{service}/{op}`, `/v1/channels/*`. |
+| `key_info.py` | Human docs for each key (names/purpose, never values). |
+| `telegram_poller.py`, `gmail_poller.py`, `slack_poller.py` | Inbound pollers → `_record_inbound`. |
+| `secret_vault.py`, `gateway_auth.py`, `user_store.py`, `users_api.py`, `user_pools.py` | Secrets, auth, users. |
+| `oauth_flows.py`, `gmail_oauth_setup.py`, `calendar_oauth_setup.py`, `zoho_mail_oauth_setup.py`, `refresh_tokens.py` | One-time OAuth consent + refresh. |
+| `db.py`, `schemas.py`, `client.py` | SQLite layer, Pydantic models, Python SDK. |
+| `approvals.py`, `policy/` | Approvals + policy. |
+| `safe_fetch.py`, `scrub.py`, `redact.py`, `security_audit.py` | Fetch safety + secret redaction/scrubbing. |
+| `voice_api.py`, `voice_chunking.py` | Voice endpoints. |
+| `channel_probe.py`, `check_keys.py`, `deploy_api.py` | Health/probe/setup helpers. |
+| `run.sh`, `pyproject.toml`, `requirements.txt` | Run + deps. |
+
+> The long historical V3/V7 design notes below are kept for reference — live
+> values are port **8109**, `llm_gatewayV9/.env`, `gateway_v8.db`.
+
 V9 is the current gateway: chat + vision (`POST /v1/vision`) + embeddings
 (`POST /v1/embed`) + router pool + per-agent cost ledger, on port **8109**
 (`GATEWAY_V9_PORT`, default 8109; a stale `GATEWAY_V3_PORT` line is ignored).

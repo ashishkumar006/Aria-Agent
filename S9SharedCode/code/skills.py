@@ -2405,6 +2405,41 @@ _JSON_CONTRACT_SKILLS = frozenset({"planner", "researcher", "distiller",
                                    "formatter", "coder", "action"})
 
 
+def _coder_code_from_output(out: dict) -> str:
+    """The code a coder node produced, whatever key the model used.
+
+    The coder is asked for `{"code","rationale"}`, but free-tier models
+    routinely rename the key to the task ("script", "script_content",
+    "analyze_csv_py"). The sandbox reads only "code", so a recoverable shape
+    became a hard "no code in upstream coder output" failure (observed live:
+    the code was right there under `script`/`analyze_csv_py`). Accept the known
+    aliases, then any `*_py` / code-ish key, then the longest string value.
+    """
+    if not isinstance(out, dict):
+        return ""
+    for k in ("code", "script", "script_content", "source", "content",
+              "main", "program"):
+        v = out.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    for k, v in out.items():
+        kl = str(k).lower()
+        if not (isinstance(v, str) and v.strip()):
+            continue
+        # Suffix/prefix match, NOT substring: "description" contains "script"
+        # (de-script-ion) and must not be mistaken for code.
+        if (kl.endswith("_py") or kl.endswith(".py")
+                or kl.endswith("code") or kl.endswith("_code")
+                or kl.startswith("script") or kl.endswith("_script")
+                or kl in ("source", "content", "main", "program")):
+            return v
+    best = ""
+    for v in out.values():
+        if isinstance(v, str) and v.strip() and len(v) > len(best):
+            best = v
+    return best
+
+
 async def _repair_json_reply(skill: "Skill", rendered: str, previous: str,
                              problem: str, session_id: str):
     """One extra call asking for the JSON the skill's contract requires.
@@ -5959,7 +5994,7 @@ policy_notes: list | None = None,
         code = ""
         for r in resolved:
             if r.get("kind") == "upstream" and isinstance(r.get("output"), dict):
-                code = r["output"].get("code") or code
+                code = _coder_code_from_output(r["output"]) or code
         if not code:
             return AgentResult(
                 success=False, agent_name=skill.name,
@@ -6823,6 +6858,18 @@ policy_notes: list | None = None,
             print(f"[skills] {skill.name}: wrote the render as data; "
                   f"recovering the spec")
             parsed = dict(_inner)
+
+    # Coder key normalization: the model often renames "code" to the task
+    # ("script", "script_content", "analyze_csv_py"). Map it back to "code" so
+    # every consumer (the sandbox handoff, replay, the UI) sees the same key.
+    if skill.name == "coder" and isinstance(parsed, dict) \
+            and not parsed.get("code"):
+        _code = _coder_code_from_output(parsed)
+        if _code:
+            parsed = dict(parsed)
+            parsed["code"] = _code
+            print("[skills] coder: normalized code key "
+                  f"(had {sorted(parsed.keys())})")
 
     # RECEIPT GUARD (action): the node claims it called a tool but the loop
     # dispatched NOTHING — the "result" is fabricated. Fail honestly instead of
